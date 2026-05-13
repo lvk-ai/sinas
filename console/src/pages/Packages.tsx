@@ -13,6 +13,7 @@ export function Packages() {
   const [yamlInput, setYamlInput] = useState('');
   const [previewResult, setPreviewResult] = useState<any>(null);
   const [installResult, setInstallResult] = useState<any>(null);
+  const [variableValues, setVariableValues] = useState<Record<string, any>>({});
   const [createForm, setCreateForm] = useState({ name: '', version: '1.0.0', description: '', author: '', url: '' });
   const [selectedResources, setSelectedResources] = useState<Array<{ type: string; namespace: string; name: string }>>([]);
   const [createdYaml, setCreatedYaml] = useState('');
@@ -37,15 +38,27 @@ export function Packages() {
   const { data: databaseTriggers } = useQuery({ queryKey: ['database-triggers'], queryFn: () => apiClient.listDatabaseTriggers(), enabled: showCreateModal });
 
   const previewMutation = useMutation({
-    mutationFn: (source: string) => apiClient.previewPackage(source),
+    mutationFn: ({ source, variables }: { source: string; variables?: Record<string, any> }) =>
+      apiClient.previewPackage(source, variables),
     onSuccess: (data) => {
       setPreviewResult(data);
+      // Pre-fill variable defaults
+      if (data.variables?.length) {
+        const defaults: Record<string, any> = {};
+        for (const v of data.variables) {
+          if (v.default !== undefined && v.default !== null) {
+            defaults[v.name] = v.default;
+          }
+        }
+        setVariableValues(prev => ({ ...defaults, ...prev }));
+      }
       setInstallStep('preview');
     },
   });
 
   const installMutation = useMutation({
-    mutationFn: (source: string) => apiClient.installPackage(source),
+    mutationFn: ({ source, variables }: { source: string; variables?: Record<string, any> }) =>
+      apiClient.installPackage(source, variables),
     onSuccess: (data) => {
       setInstallResult(data);
       setInstallStep('done');
@@ -79,13 +92,15 @@ export function Packages() {
 
   const handlePreview = () => {
     if (yamlInput.trim()) {
-      previewMutation.mutate(yamlInput);
+      const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
+      previewMutation.mutate({ source: yamlInput, variables: vars });
     }
   };
 
   const handleInstall = () => {
     setInstallStep('installing');
-    installMutation.mutate(yamlInput);
+    const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
+    installMutation.mutate({ source: yamlInput, variables: vars });
   };
 
   const handleExport = async (name: string) => {
@@ -109,6 +124,7 @@ export function Packages() {
     setYamlInput('');
     setPreviewResult(null);
     setInstallResult(null);
+    setVariableValues({});
     previewMutation.reset();
     installMutation.reset();
   };
@@ -333,6 +349,64 @@ export function Packages() {
                   </div>
                 )}
 
+                {/* Variable form (if package requires input) */}
+                {previewResult.variables && previewResult.variables.length > 0 && (
+                  <div className="p-3 bg-[#1a1a1a] border border-white/[0.06] rounded">
+                    <h3 className="text-sm font-medium text-gray-200 mb-3">Configuration</h3>
+                    <div className="space-y-3">
+                      {previewResult.variables.map((v: any) => (
+                        <div key={v.name}>
+                          <label className="block text-xs font-medium text-gray-400 mb-1">
+                            {v.description || v.name}
+                            {v.required && !v.default && <span className="text-red-400 ml-1">*</span>}
+                          </label>
+
+                          {v.type === 'boolean' ? (
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={variableValues[v.name] ?? v.default ?? false}
+                                onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.checked }))}
+                                className="w-4 h-4 text-primary-600 border-white/10 rounded"
+                              />
+                              <span className="text-sm text-gray-300 font-mono">{v.name}</span>
+                            </label>
+                          ) : v.type === 'enum' && v.choices ? (
+                            <select
+                              value={variableValues[v.name] ?? v.default ?? ''}
+                              onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
+                              className="w-full px-2.5 py-1.5 text-sm bg-[#0d0d0d] border border-white/10 rounded text-gray-200"
+                            >
+                              <option value="">Select...</option>
+                              {v.choices.map((c: string) => (
+                                <option key={c} value={c}>{c}</option>
+                              ))}
+                            </select>
+                          ) : v.type === 'resource_ref' && v.resource === 'llm_providers' ? (
+                            <LLMProviderSelect
+                              value={variableValues[v.name] ?? ''}
+                              onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
+                            />
+                          ) : v.type === 'resource_ref' && v.resource === 'database_connections' ? (
+                            <DatabaseConnectionSelect
+                              value={variableValues[v.name] ?? ''}
+                              onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
+                            />
+                          ) : (
+                            <input
+                              type={v.type === 'secret' ? 'password' : 'text'}
+                              value={variableValues[v.name] ?? v.default ?? ''}
+                              placeholder={v.example || `Enter ${v.name}`}
+                              onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
+                              className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#0d0d0d] border border-white/10 rounded text-gray-200 placeholder-gray-600"
+                            />
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex justify-between">
                   <button onClick={() => setInstallStep('input')} className="btn btn-secondary">
                     Back
@@ -540,5 +614,47 @@ export function Packages() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Async dropdown for LLM provider selection in package variables */
+function LLMProviderSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { data: providers } = useQuery({
+    queryKey: ['llm-providers'],
+    queryFn: () => apiClient.listLLMProviders(),
+  });
+
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full px-2.5 py-1.5 text-sm bg-[#0d0d0d] border border-white/10 rounded text-gray-200"
+    >
+      <option value="">Select LLM provider...</option>
+      {(providers || []).map((p: any) => (
+        <option key={p.id} value={p.name}>{p.name} ({p.provider_type})</option>
+      ))}
+    </select>
+  );
+}
+
+/** Async dropdown for database connection selection in package variables */
+function DatabaseConnectionSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { data: connections } = useQuery({
+    queryKey: ['databaseConnections'],
+    queryFn: () => apiClient.listDatabaseConnections(),
+  });
+
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full px-2.5 py-1.5 text-sm bg-[#0d0d0d] border border-white/10 rounded text-gray-200"
+    >
+      <option value="">Select database connection...</option>
+      {(connections || []).map((c: any) => (
+        <option key={c.id} value={c.name}>{c.name}</option>
+      ))}
+    </select>
   );
 }

@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 
 
 class DependencyInstall(BaseModel):
-    package_name: str = Field(..., min_length=1, max_length=255)
+    package_name: str = Field(
+        ..., min_length=1, max_length=255,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$",
+        description="Package name only (no version specifiers like ==, >=)",
+    )
     version: Optional[str] = None
 
 

@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
-import { Users as UsersIcon, UserPlus, Edit2, Trash2, Shield, UserMinus, Plus, Lock, Search, AlertTriangle, ChevronLeft, ChevronRight, X } from 'lucide-react';
+import { useAuth } from '../lib/auth-context';
+import { Users as UsersIcon, UserPlus, Edit2, Trash2, Shield, UserMinus, Plus, Lock, Search, AlertTriangle, ChevronLeft, ChevronRight, X, KeyRound, Copy, Check } from 'lucide-react';
 import { Permissions as PermissionsTab } from './Permissions';
+import type { AdminCreateResetLinkResponse } from '../types';
 
 type Tab = 'users' | 'roles' | 'permissions';
 
@@ -70,9 +72,13 @@ const PAGE_SIZE = 50;
 
 function UsersTab() {
   const queryClient = useQueryClient();
+  const { authMode } = useAuth();
+  const passwordEnabled = authMode === 'password' || authMode === 'password+otp';
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingUser, setEditingUser] = useState<any>(null);
   const [deletingUser, setDeletingUser] = useState<any>(null);
+  const [resetUser, setResetUser] = useState<any>(null);
+  const [resetResult, setResetResult] = useState<AdminCreateResetLinkResponse | null>(null);
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [page, setPage] = useState(0);
@@ -107,6 +113,14 @@ function UsersTab() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['users'] });
       setDeletingUser(null);
+    },
+  });
+
+  const resetLinkMutation = useMutation({
+    mutationFn: (userId: string) => apiClient.adminCreatePasswordResetLink(userId),
+    onSuccess: (data) => {
+      setResetResult(data);
+      setResetUser(null);
     },
   });
 
@@ -195,6 +209,15 @@ function UsersTab() {
                         >
                           <Edit2 className="w-4 h-4" />
                         </button>
+                        {passwordEnabled && (
+                          <button
+                            onClick={() => setResetUser(user)}
+                            className="text-gray-400 hover:text-gray-200 p-1"
+                            title="Generate password reset link"
+                          >
+                            <KeyRound className="w-4 h-4" />
+                          </button>
+                        )}
                         <button
                           onClick={() => setDeletingUser(user)}
                           className="text-gray-400 hover:text-red-400 p-1"
@@ -254,6 +277,160 @@ function UsersTab() {
           error={deleteMutation.error}
         />
       )}
+      {resetUser && (
+        <ConfirmResetLinkModal
+          email={resetUser.email}
+          onConfirm={() => resetLinkMutation.mutate(resetUser.id)}
+          onCancel={() => setResetUser(null)}
+          isPending={resetLinkMutation.isPending}
+          error={resetLinkMutation.error}
+        />
+      )}
+      {resetResult && (
+        <ResetLinkResultModal
+          result={resetResult}
+          onClose={() => {
+            setResetResult(null);
+            resetLinkMutation.reset();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfirmResetLinkModal({
+  email,
+  onConfirm,
+  onCancel,
+  isPending,
+  error,
+}: {
+  email: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isPending: boolean;
+  error?: any;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="bg-[#161616] rounded-2xl p-6 border border-white/[0.06] w-full max-w-md">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-100">Generate password reset link</h3>
+            <p className="text-sm text-gray-400 mt-1">For {email}</p>
+          </div>
+          <button onClick={onCancel} className="text-gray-400 hover:text-gray-200">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <p className="text-sm text-gray-400 mb-4">
+          A one-time token will be generated. You'll need to deliver it to the user yourself
+          (Slack, in person, etc.) — Sinas does not send it for you. The token expires in 24 hours.
+        </p>
+        {error && (
+          <div className="p-3 bg-red-900/20 border border-red-800/30 rounded-lg text-sm text-red-400 mb-4">
+            {error?.response?.data?.detail || error?.message || 'Failed to generate reset link'}
+          </div>
+        )}
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel} className="btn btn-secondary" disabled={isPending}>
+            Cancel
+          </button>
+          <button onClick={onConfirm} className="btn btn-primary" disabled={isPending}>
+            {isPending ? 'Generating...' : 'Generate link'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResetLinkResultModal({
+  result,
+  onClose,
+}: {
+  result: AdminCreateResetLinkResponse;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState<'token' | 'url' | null>(null);
+  const resetUrl = `${window.location.origin}/reset-password?token=${encodeURIComponent(result.reset_token)}`;
+
+  const copy = async (value: string, kind: 'token' | 'url') => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(kind);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="bg-[#161616] rounded-2xl p-6 border border-white/[0.06] w-full max-w-lg">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-100">Password reset link</h3>
+            <p className="text-sm text-gray-400 mt-1">
+              Shown once. Copy and deliver out-of-band. Expires {new Date(result.expires_at).toLocaleString()}.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-200">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">
+              Reset URL
+            </label>
+            <div className="flex gap-2">
+              <input
+                readOnly
+                value={resetUrl}
+                onFocus={(e) => e.currentTarget.select()}
+                className="flex-1 px-3 py-2 bg-[#111111] border border-white/10 rounded-lg text-gray-100 font-mono text-xs"
+              />
+              <button
+                onClick={() => copy(resetUrl, 'url')}
+                className="btn btn-secondary px-3 flex items-center gap-1"
+                title="Copy URL"
+              >
+                {copied === 'url' ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">
+              Or just the token
+            </label>
+            <div className="flex gap-2">
+              <input
+                readOnly
+                value={result.reset_token}
+                onFocus={(e) => e.currentTarget.select()}
+                className="flex-1 px-3 py-2 bg-[#111111] border border-white/10 rounded-lg text-gray-100 font-mono text-xs"
+              />
+              <button
+                onClick={() => copy(result.reset_token, 'token')}
+                className="btn btn-secondary px-3 flex items-center gap-1"
+                title="Copy token"
+              >
+                {copied === 'token' ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-end mt-6">
+          <button onClick={onClose} className="btn btn-primary">
+            Done
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

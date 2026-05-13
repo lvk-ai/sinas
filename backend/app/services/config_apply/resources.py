@@ -880,6 +880,15 @@ async def apply_dependencies(
     """
     for dep_config in dependencies:
         package_name = dep_config.packageName
+        version = dep_config.version
+
+        # Guard: split "package==1.2.3" into name + version if baked together
+        if "==" in package_name:
+            parts = package_name.split("==", 1)
+            package_name = parts[0]
+            if not version:
+                version = parts[1]
+
         try:
             existing = await db.execute(
                 select(Dependency).where(Dependency.package_name == package_name)
@@ -888,9 +897,9 @@ async def apply_dependencies(
 
             if existing_dep:
                 # Update version if changed
-                if dep_config.version and existing_dep.version != dep_config.version:
+                if version and existing_dep.version != version:
                     if not dry_run:
-                        existing_dep.version = dep_config.version
+                        existing_dep.version = version
                         existing_dep.installed_at = datetime.now(tz.utc)
                     track_change("update", "dependencies", package_name)
                 else:
@@ -899,7 +908,7 @@ async def apply_dependencies(
                 if not dry_run:
                     dep = Dependency(
                         package_name=package_name,
-                        version=dep_config.version,
+                        version=version,
                         installed_at=datetime.now(tz.utc),
                         installed_by=uuid_lib.UUID(owner_user_id) if owner_user_id else None,
                     )

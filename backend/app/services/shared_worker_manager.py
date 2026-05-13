@@ -520,7 +520,11 @@ class SharedWorkerManager:
             packages_to_install = []
             for pkg in approved_packages:
                 if pkg.version:
-                    packages_to_install.append(f"{pkg.package_name}=={pkg.version}")
+                    # If version already has a specifier (>=, <=, ~=, !=), use as-is
+                    if any(pkg.version.startswith(op) for op in (">=", "<=", "~=", "!=", ">", "<")):
+                        packages_to_install.append(f"{pkg.package_name}{pkg.version}")
+                    else:
+                        packages_to_install.append(f"{pkg.package_name}=={pkg.version}")
                 else:
                     packages_to_install.append(pkg.package_name)
 
@@ -528,12 +532,18 @@ class SharedWorkerManager:
                 f"📦 Installing {len(packages_to_install)} packages in worker: {', '.join(packages_to_install)}"
             )
 
-            # Install packages in container
+            # Install packages in container. Point pip's scratch dir at the
+            # overlay-backed /app instead of the 100 MB tmpfs at /tmp — heavy
+            # deps like markitdown[all] can't fit otherwise.
+            await asyncio.to_thread(
+                container.exec_run, cmd=["mkdir", "-p", "/app/.pip-tmp"]
+            )
             install_cmd = ["pip", "install", "--no-cache-dir", "--upgrade"] + packages_to_install
 
             exec_result = await asyncio.to_thread(
                 container.exec_run,
                 cmd=install_cmd,
+                environment={"TMPDIR": "/app/.pip-tmp"},
                 demux=True,
             )
 

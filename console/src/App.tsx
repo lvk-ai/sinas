@@ -5,6 +5,7 @@ import { ToastProvider } from './lib/toast-context';
 import { APIErrorHandler } from './components/APIErrorHandler';
 import { Layout } from './components/Layout';
 import { Login } from './pages/Login';
+import { ResetPassword } from './pages/ResetPassword';
 import { Dashboard } from './pages/Dashboard';
 import { Chats } from './pages/Chats';
 import { ChatDetail } from './pages/ChatDetail';
@@ -102,6 +103,14 @@ function App() {
               element={
                 <PublicRoute>
                   <Login />
+                </PublicRoute>
+              }
+            />
+            <Route
+              path="/reset-password"
+              element={
+                <PublicRoute>
+                  <ResetPassword />
                 </PublicRoute>
               }
             />

@@ -2,7 +2,7 @@
 Package service for installing, uninstalling, and managing integration packages.
 """
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 from sqlalchemy import delete, select
@@ -73,17 +73,28 @@ class PackageService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def install(self, yaml_content: str, user_id: str) -> tuple[Package, ConfigApplyResponse]:
+    async def install(
+        self,
+        yaml_content: str,
+        user_id: str,
+        variables: Optional[dict[str, Any]] = None,
+    ) -> tuple[Package, ConfigApplyResponse]:
         """
         Install a package from YAML content.
 
         Args:
             yaml_content: YAML string with kind: SinasPackage
             user_id: ID of the user installing the package
+            variables: Install-time variable values (keyed by variable name)
 
         Returns:
             Tuple of (Package record, ConfigApplyResponse)
         """
+        # Substitute variables before parsing if provided
+        yaml_content, resolved_values = await self._resolve_variables(
+            yaml_content, variables or {}, user_id
+        )
+
         config, validation = await ConfigParser.parse_and_validate(yaml_content, db=self.db)
 
         if not validation.is_valid:
@@ -130,6 +141,7 @@ class PackageService:
             existing_package.author = config.package.author
             existing_package.source_url = config.package.url
             existing_package.source_yaml = yaml_content
+            existing_package.values = resolved_values
             package = existing_package
         else:
             package = Package(
@@ -139,6 +151,7 @@ class PackageService:
                 author=config.package.author,
                 source_url=config.package.url,
                 source_yaml=yaml_content,
+                values=resolved_values,
                 installed_by=user_id,
             )
             self.db.add(package)
@@ -149,12 +162,26 @@ class PackageService:
 
         return package, result
 
-    async def preview(self, yaml_content: str, user_id: str) -> ConfigApplyResponse:
+    async def preview(
+        self,
+        yaml_content: str,
+        user_id: str,
+        variables: Optional[dict[str, Any]] = None,
+    ) -> tuple[ConfigApplyResponse, list[dict], bool]:
         """
         Preview a package install (dry run).
 
-        Returns what would be created/updated without making changes.
+        Returns:
+            Tuple of (ConfigApplyResponse, variable_declarations, requires_input)
         """
+        # Parse first to extract variable declarations (before substitution)
+        variable_declarations = self._extract_variable_declarations(yaml_content)
+        requires_input = any(v.get("required", True) and v.get("default") is None for v in variable_declarations)
+
+        # Substitute variables if provided
+        if variables:
+            yaml_content, _ = await self._resolve_variables(yaml_content, variables, user_id)
+
         config, validation = await ConfigParser.parse_and_validate(yaml_content, db=self.db)
 
         if not validation.is_valid:
@@ -181,7 +208,7 @@ class PackageService:
 
         result = await apply_service.apply_config(config, dry_run=True)
         result.warnings.extend(validation.warnings)
-        return result
+        return result, variable_declarations, requires_input
 
     async def uninstall(self, package_name: str) -> dict:
         """
@@ -430,3 +457,193 @@ class PackageService:
 
     async def _export_connector(self, conn: Connector) -> dict:
         return serialize_connector(conn)
+
+    # ── Variable substitution ──────────────────────────────
+
+    _VAR_PATTERN = r'\$\{\{\s*vars\.([A-Z][A-Z0-9_]*)\s*\}\}'
+
+    def _extract_variable_declarations(self, yaml_content: str) -> list[dict]:
+        """Extract spec.variables from raw YAML without full parsing."""
+        import yaml as pyyaml
+        try:
+            doc = pyyaml.safe_load(yaml_content)
+        except Exception:
+            return []
+        if not isinstance(doc, dict):
+            return []
+        spec = doc.get("spec", {})
+        if not isinstance(spec, dict):
+            return []
+        variables = spec.get("variables", [])
+        if not isinstance(variables, list):
+            return []
+        return variables
+
+    async def _resolve_variables(
+        self,
+        yaml_content: str,
+        provided: dict[str, Any],
+        user_id: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate and substitute install-time variables.
+
+        Returns (substituted_yaml, stored_values).
+        stored_values is what gets persisted in Package.values
+        (secret values are masked).
+        """
+        import re
+
+        declarations = self._extract_variable_declarations(yaml_content)
+        if not declarations:
+            return yaml_content, {}
+
+        decl_by_name = {v["name"]: v for v in declarations}
+        stored_values: dict[str, Any] = {}
+        resolved: dict[str, str] = {}  # name -> substitution string
+
+        # Check for existing package values (for upgrade pre-fill)
+        for decl in declarations:
+            name = decl["name"]
+            var_type = decl.get("type", "text")
+            required = decl.get("required", True)
+            default = decl.get("default")
+
+            # Get value: provided > default
+            value = provided.get(name)
+            if value is None:
+                value = default
+
+            # For secret type: check if secret already exists in DB
+            if var_type == "secret" and value is None:
+                from app.models.secret import Secret
+                existing_secret = await self.db.execute(
+                    select(Secret).where(Secret.name == name)
+                )
+                if existing_secret.scalar_one_or_none():
+                    # Secret already exists, skip — don't require re-entry
+                    resolved[name] = f"{{{{{{{{name}}}}}}}}"  # keep original reference
+                    stored_values[name] = "***"
+                    continue
+
+            if value is None and required:
+                raise ValueError(f"Required variable '{name}' not provided")
+            if value is None:
+                continue
+
+            # Type validation
+            if var_type == "text":
+                value = str(value)
+                pattern = decl.get("pattern")
+                if pattern and not re.match(pattern, value):
+                    raise ValueError(f"Variable '{name}' does not match pattern '{pattern}'")
+
+            elif var_type == "boolean":
+                if isinstance(value, str):
+                    value = value.lower() in ("true", "1", "yes")
+                value = bool(value)
+
+            elif var_type == "enum":
+                choices = decl.get("choices", [])
+                if str(value) not in choices:
+                    raise ValueError(f"Variable '{name}' must be one of: {choices}")
+                value = str(value)
+
+            elif var_type == "resource_ref":
+                resource_type = decl.get("resource")
+                if resource_type:
+                    exists = await self._validate_resource_ref(resource_type, str(value))
+                    if not exists:
+                        raise ValueError(
+                            f"Variable '{name}': {resource_type} '{value}' not found"
+                        )
+                value = str(value)
+
+            elif var_type == "secret":
+                # Create/upsert the secret
+                from app.core.encryption import encryption_service
+                from app.models.secret import Secret
+                existing = await self.db.execute(
+                    select(Secret).where(Secret.name == name)
+                )
+                secret = existing.scalar_one_or_none()
+                if secret:
+                    secret.encrypted_value = encryption_service.encrypt(str(value))
+                else:
+                    secret = Secret(
+                        name=name,
+                        encrypted_value=encryption_service.encrypt(str(value)),
+                        description=decl.get("description"),
+                    )
+                    self.db.add(secret)
+                await self.db.flush()
+                # The substitution value is the secret reference syntax
+                resolved[name] = f"{{{{{name}}}}}"
+                stored_values[name] = "***"
+                continue
+
+            resolved[name] = str(value)
+            stored_values[name] = value if var_type != "secret" else "***"
+
+        # Perform substitution on raw YAML
+        def replace_var(m):
+            var_name = m.group(1)
+            if var_name in resolved:
+                return resolved[var_name]
+            return m.group(0)  # leave unresolved vars as-is
+
+        substituted = re.sub(self._VAR_PATTERN, replace_var, yaml_content)
+        return substituted, stored_values
+
+    def _is_uuid(self, value: str) -> bool:
+        """Check if a string is a valid UUID."""
+        import uuid as uuid_mod
+        try:
+            uuid_mod.UUID(value)
+            return True
+        except ValueError:
+            return False
+
+    async def _validate_resource_ref(self, resource_type: str, value: str) -> bool:
+        """Check that a resource_ref variable points to an existing resource."""
+        if resource_type == "llm_providers":
+            from app.models.llm_provider import LLMProvider
+            query = select(LLMProvider).where(LLMProvider.is_active == True)
+            if self._is_uuid(value):
+                query = query.where((LLMProvider.name == value) | (LLMProvider.id == value))
+            else:
+                query = query.where(LLMProvider.name == value)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none() is not None
+
+        elif resource_type == "database_connections":
+            from app.models.database_connection import DatabaseConnection
+            query = select(DatabaseConnection).where(DatabaseConnection.is_active == True)
+            if self._is_uuid(value):
+                query = query.where((DatabaseConnection.name == value) | (DatabaseConnection.id == value))
+            else:
+                query = query.where(DatabaseConnection.name == value)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none() is not None
+
+        elif resource_type == "collections":
+            if "/" in value:
+                ns, name = value.split("/", 1)
+                coll = await Collection.get_by_name(self.db, ns, name)
+                return coll is not None
+            return False
+
+        elif resource_type == "secrets":
+            from app.models.secret import Secret
+            result = await self.db.execute(
+                select(Secret).where(Secret.name == value)
+            )
+            return result.scalar_one_or_none() is not None
+
+        elif resource_type == "roles":
+            from app.models.user import Role
+            result = await self.db.execute(
+                select(Role).where(Role.name == value)
+            )
+            return result.scalar_one_or_none() is not None
+
+        return False

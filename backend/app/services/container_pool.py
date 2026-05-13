@@ -548,6 +548,16 @@ sys.exit(1)
         """Internal: actually create and configure the container."""
         logger.info(f"Creating sandbox container: {name}")
 
+        # Remove any stale container squatting on this name (e.g. left over
+        # from a crash or stopped lifecycle). Without this, create races with
+        # whatever brought the old one back and we 409 forever.
+        try:
+            stale = await asyncio.to_thread(self.client.containers.get, name)
+            logger.info(f"Removing stale container: {name}")
+            await asyncio.to_thread(stale.remove, force=True)
+        except NotFound:
+            pass
+
         container_config = {
             "image": settings.function_container_image,
             "name": name,
@@ -619,7 +629,10 @@ sys.exit(1)
             packages_to_install = []
             for pkg in approved_packages:
                 if pkg.version:
-                    packages_to_install.append(f"{pkg.package_name}=={pkg.version}")
+                    if any(pkg.version.startswith(op) for op in (">=", "<=", "~=", "!=", ">", "<")):
+                        packages_to_install.append(f"{pkg.package_name}{pkg.version}")
+                    else:
+                        packages_to_install.append(f"{pkg.package_name}=={pkg.version}")
                 else:
                     packages_to_install.append(pkg.package_name)
 
@@ -628,11 +641,17 @@ sys.exit(1)
                 f"{', '.join(packages_to_install)}"
             )
 
+            # Point pip's scratch dir at /app (overlay-backed) — the default
+            # /tmp is a 100 MB tmpfs that can't fit heavy deps like markitdown.
+            await asyncio.to_thread(
+                container.exec_run, cmd=["mkdir", "-p", "/app/.pip-tmp"]
+            )
             install_cmd = ["pip", "install", "--no-cache-dir", "--upgrade"] + packages_to_install
 
             exec_result = await asyncio.to_thread(
                 container.exec_run,
                 cmd=install_cmd,
+                environment={"TMPDIR": "/app/.pip-tmp"},
                 demux=True,
             )
 

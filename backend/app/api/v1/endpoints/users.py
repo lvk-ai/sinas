@@ -8,12 +8,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.auth import get_current_user_with_permissions, normalize_email, set_permission_used
+from app.core.auth import (
+    create_password_reset_token,
+    get_current_user_with_permissions,
+    normalize_email,
+    set_permission_used,
+)
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import check_permission
 from app.models.user import Role, User, UserRole
 from app.schemas import UserResponse, UserUpdate
-from app.schemas.auth import CreateUserRequest
+from app.schemas.auth import AdminCreateResetLinkResponse, CreateUserRequest
 from app.schemas.user import UserWithRolesResponse
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -202,6 +208,51 @@ async def update_user(
     await db.refresh(user)
 
     return user
+
+
+@router.post("/{user_id}/password-reset", response_model=AdminCreateResetLinkResponse)
+async def admin_create_password_reset(
+    request: Request,
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """
+    Admin generates a one-time password reset token for a user.
+
+    The plaintext token is returned exactly once and should be delivered to the
+    user out-of-band (Slack, in person, etc). The user redeems it via
+    POST /auth/password-reset.
+
+    Only available when AUTH_MODE includes password.
+    """
+    if "password" not in settings.auth_mode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset is not available in OTP-only auth mode.",
+        )
+
+    current_user_id, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.users.update:all"):
+        set_permission_used(request, "sinas.users.update:all", has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to reset passwords")
+
+    set_permission_used(request, "sinas.users.update:all")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    plain_token, record = await create_password_reset_token(
+        db, str(user.id), created_by=current_user_id
+    )
+    return AdminCreateResetLinkResponse(
+        user_id=user.id,
+        reset_token=plain_token,
+        expires_at=record.expires_at,
+    )
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

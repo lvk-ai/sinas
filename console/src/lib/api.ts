@@ -1,9 +1,13 @@
 import axios, { type AxiosInstance } from 'axios';
 import type {
+  AdminCreateResetLinkResponse,
+  ChangePasswordRequest,
+  InstanceInfo,
   LoginRequest,
   LoginResponse,
   OTPVerifyRequest,
   OTPVerifyResponse,
+  ResetPasswordRequest,
   User,
   UserCreate,
   APIKey,
@@ -239,6 +243,12 @@ class APIClient {
     this.errorHandler = handler;
   }
 
+  // Instance info (unauthenticated discovery)
+  async getInstanceInfo(): Promise<InstanceInfo> {
+    const response = await this.runtimeClient.get('/info');
+    return response.data;
+  }
+
   // Authentication (Runtime API)
   async login(data: LoginRequest): Promise<LoginResponse> {
     const response = await this.runtimeClient.post('/auth/login', data);
@@ -262,6 +272,19 @@ class APIClient {
 
   async logout(refreshToken: string): Promise<void> {
     await this.runtimeClient.post('/auth/logout', { refresh_token: refreshToken });
+  }
+
+  async changePassword(data: ChangePasswordRequest): Promise<void> {
+    await this.runtimeClient.post('/auth/change-password', data);
+  }
+
+  async redeemPasswordReset(data: ResetPasswordRequest): Promise<void> {
+    await this.runtimeClient.post('/auth/password-reset', data);
+  }
+
+  async adminCreatePasswordResetLink(userId: string): Promise<AdminCreateResetLinkResponse> {
+    const response = await this.configClient.post(`/users/${userId}/password-reset`);
+    return response.data;
   }
 
   // API Keys
@@ -745,13 +768,13 @@ class APIClient {
     return response.data;
   }
 
-  async installPackage(source: string): Promise<any> {
-    const response = await this.configClient.post('/packages/install', { source });
+  async installPackage(source: string, variables?: Record<string, any>): Promise<any> {
+    const response = await this.configClient.post('/packages/install', { source, variables });
     return response.data;
   }
 
-  async previewPackage(source: string): Promise<any> {
-    const response = await this.configClient.post('/packages/preview', { source });
+  async previewPackage(source: string, variables?: Record<string, any>): Promise<any> {
+    const response = await this.configClient.post('/packages/preview', { source, variables });
     return response.data;
   }
 

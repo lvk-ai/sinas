@@ -397,11 +397,38 @@ class DependencyConfig(BaseModel):
     version: Optional[str] = None
 
 
+class VariableConfig(BaseModel):
+    """Install-time variable declaration for packages.
+
+    Variables are resolved before resource persistence via ${{ vars.NAME }}
+    substitution in the raw YAML. NOT Jinja2 — simple regex replace.
+    """
+
+    name: str = Field(..., pattern=r"^[A-Z][A-Z0-9_]*$", description="Variable name (UPPER_SNAKE_CASE)")
+    type: str = Field(
+        ...,
+        description="Variable type: text, boolean, enum, resource_ref, secret",
+    )
+    description: Optional[str] = None
+    default: Optional[Any] = None
+    required: bool = True
+    example: Optional[str] = None
+
+    # Type-specific fields
+    pattern: Optional[str] = Field(None, description="Regex pattern for 'text' type validation")
+    choices: Optional[list[str]] = Field(None, description="Allowed values for 'enum' type")
+    resource: Optional[str] = Field(
+        None,
+        description="Resource type for 'resource_ref': llm_providers, database_connections, roles, secrets, collections",
+    )
+
+
 class ConfigSpec(BaseModel):
     """Configuration specification"""
 
     model_config = {"extra": "forbid"}
 
+    variables: list[VariableConfig] = Field(default_factory=list)
     roles: list[RoleConfig] = Field(default_factory=list)
     users: list[UserConfig] = Field(default_factory=list)
     llmProviders: list[LLMProviderConfig] = Field(default_factory=list)

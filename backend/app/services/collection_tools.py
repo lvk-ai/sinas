@@ -89,8 +89,11 @@ class CollectionToolConverter:
         """
         tools = []
 
+        # Expand wildcards in enabled_collections
+        expanded_entries: list[tuple[str, str, Collection]] = []  # (ref, access, model)
+        seen_ids = set()
+
         for entry in enabled_collections:
-            # Support both legacy strings and new dict format
             if isinstance(entry, str):
                 coll_ref = entry
                 access = "readonly"
@@ -105,12 +108,31 @@ class CollectionToolConverter:
                 logger.warning(f"Invalid collection reference format: {coll_ref}")
                 continue
 
-            namespace, name = coll_ref.split("/", 1)
-            collection = await Collection.get_by_name(db, namespace, name)
-            if not collection:
-                logger.warning(f"Collection {coll_ref} not found")
-                continue
+            if coll_ref == "*/*":
+                result = await db.execute(select(Collection))
+                for c in result.scalars().all():
+                    if c.id not in seen_ids:
+                        seen_ids.add(c.id)
+                        expanded_entries.append((f"{c.namespace}/{c.name}", access, c))
+            elif coll_ref.endswith("/*"):
+                ns = coll_ref[:-2]
+                result = await db.execute(select(Collection).where(Collection.namespace == ns))
+                for c in result.scalars().all():
+                    if c.id not in seen_ids:
+                        seen_ids.add(c.id)
+                        expanded_entries.append((f"{c.namespace}/{c.name}", access, c))
+            else:
+                namespace, name = coll_ref.split("/", 1)
+                collection = await Collection.get_by_name(db, namespace, name)
+                if not collection:
+                    logger.warning(f"Collection {coll_ref} not found")
+                    continue
+                if collection.id not in seen_ids:
+                    seen_ids.add(collection.id)
+                    expanded_entries.append((coll_ref, access, collection))
 
+        for coll_ref, access, collection in expanded_entries:
+            namespace, name = coll_ref.split("/", 1)
             is_readwrite = access == "readwrite"
 
             # Search tool (always)

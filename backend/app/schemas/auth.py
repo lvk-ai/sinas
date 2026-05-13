@@ -3,16 +3,36 @@ import uuid
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 class LoginRequest(BaseModel):
+    """
+    Login request payload. Required fields depend on AUTH_MODE:
+    - otp:          email
+    - password:     email + password
+    - password+otp: email + password (OTP verification follows separately)
+    """
+
     email: EmailStr
+    password: Optional[str] = None
 
 
 class LoginResponse(BaseModel):
+    """
+    Login response. For modes that require OTP, returns session_id and the
+    client should call /auth/verify-otp next. For password-only mode, tokens
+    are returned directly (session_id is None).
+    """
+
     message: str
-    session_id: uuid.UUID
+    session_id: Optional[uuid.UUID] = None
+    # When password-only, tokens are returned immediately
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[str] = None
+    expires_in: Optional[int] = None
+    user: Optional["AuthUserResponse"] = None
 
 
 class OTPVerifyRequest(BaseModel):
@@ -26,6 +46,36 @@ class OTPVerifyResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int  # Access token expiry in seconds
     user: "AuthUserResponse"
+
+
+class InfoResponse(BaseModel):
+    """Public, unauthenticated instance info for SDK/client discovery."""
+
+    auth_mode: Literal["otp", "password", "password+otp"]
+    version: str
+    features: dict[str, bool] = Field(default_factory=dict)
+
+
+class ChangePasswordRequest(BaseModel):
+    """User changes their own password."""
+
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class AdminCreateResetLinkResponse(BaseModel):
+    """Returned to admin after generating a one-time password reset token."""
+
+    user_id: uuid.UUID
+    reset_token: str  # Plaintext, returned once — admin delivers out-of-band
+    expires_at: datetime
+
+
+class ResetPasswordRequest(BaseModel):
+    """User redeems a reset token to set a new password."""
+
+    reset_token: str
+    new_password: str = Field(min_length=8)
 
 
 class AuthUserResponse(BaseModel):

@@ -7,7 +7,7 @@ description: "Install, update, and configure Sinas"
 
 - A VPS or server with 2+ CPU cores, 4GB+ RAM, 50GB+ storage
 - A domain name pointed at the server (A record)
-- An SMTP service for login emails (SendGrid, Mailgun, AWS SES, etc.)
+- An SMTP service for login emails (SendGrid, Mailgun, AWS SES, etc.) — only required if you choose `otp` or `password+otp` auth mode. Skip for `password`-only / airgapped installs.
 
 ## Install
 
@@ -18,7 +18,7 @@ sudo curl -fsSL https://raw.githubusercontent.com/sinas-platform/sinas/main/inst
 The installer will:
 - Install Docker if needed
 - Generate secure keys (`SECRET_KEY`, `ENCRYPTION_KEY`, `DATABASE_PASSWORD`)
-- Prompt for your domain, admin email, and SMTP credentials
+- Prompt for your domain, admin email, and authentication mode (and SMTP and/or admin password depending on the mode you pick)
 - Create `.env` in `/opt/sinas/`
 - Pull pre-built images from the container registry and start all services
 - Caddy automatically provisions SSL via Let's Encrypt
@@ -41,8 +41,11 @@ For local development, see [INSTALL.md](https://github.com/sinas-platform/sinas/
 
 1. Open the console at `https://yourdomain.com:51245`
 2. Enter your `SUPERADMIN_EMAIL` address
-3. Check your inbox for the 6-digit OTP code
-4. Enter the code to receive your access token
+3. Then, depending on your `AUTH_MODE`:
+   - `otp` — check your inbox for the 6-digit code
+   - `password` — enter your `SUPERADMIN_PASSWORD`
+   - `password+otp` — enter your password, then the emailed code
+4. You're in. See [Authentication](/platform/authentication) for the full reference.
 
 ## Configure an LLM provider
 

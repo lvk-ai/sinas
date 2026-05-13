@@ -9,6 +9,7 @@ export function Functions() {
   const queryClient = useQueryClient();
   const [showDependencyModal, setShowDependencyModal] = useState(false);
   const [dependencyName, setDependencyName] = useState('');
+  const [dependencyVersion, setDependencyVersion] = useState('');
   const [expandedFunctions, setExpandedFunctions] = useState<Set<string>>(new Set());
   const [searchFilter, setSearchFilter] = useState('');
   const [showExecuteModal, setShowExecuteModal] = useState(false);
@@ -129,7 +130,11 @@ export function Functions() {
   const handleInstallDependency = (e: React.FormEvent) => {
     e.preventDefault();
     if (dependencyName.trim()) {
-      installDependencyMutation.mutate({ package_name: dependencyName.trim() });
+      installDependencyMutation.mutate({
+        package_name: dependencyName.trim(),
+        version: dependencyVersion.trim() || undefined,
+      });
+      setDependencyVersion('');
     }
   };
 
@@ -474,22 +479,31 @@ export function Functions() {
               <label htmlFor="dependency" className="block text-sm font-medium text-gray-300 mb-2">
                 Install Dependency
               </label>
-              <div className="flex space-x-2">
+              <div className="space-y-2">
                 <input
                   id="dependency"
                   type="text"
                   value={dependencyName}
                   onChange={(e) => setDependencyName(e.target.value)}
-                  placeholder="requests, numpy, pandas..."
-                  className="input flex-1"
+                  placeholder="Package name (e.g. pandas)"
+                  className="input w-full"
                 />
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  disabled={installDependencyMutation.isPending || !dependencyName.trim()}
-                >
-                  {installDependencyMutation.isPending ? 'Installing...' : 'Install'}
-                </button>
+                <div className="flex space-x-2">
+                  <input
+                    type="text"
+                    value={dependencyVersion}
+                    onChange={(e) => setDependencyVersion(e.target.value)}
+                    placeholder="Version constraint (optional, e.g. 2.0.0 or >=1.5)"
+                    className="input flex-1"
+                  />
+                  <button
+                    type="submit"
+                    className="btn btn-primary shrink-0"
+                    disabled={installDependencyMutation.isPending || !dependencyName.trim()}
+                  >
+                    {installDependencyMutation.isPending ? 'Installing...' : 'Install'}
+                  </button>
+                </div>
               </div>
             </form>
 
@@ -501,7 +515,7 @@ export function Functions() {
                     <div key={dep.id} className="flex items-center justify-between p-2 bg-[#0d0d0d] rounded">
                       <div>
                         <span className="font-mono text-sm">{dep.package_name}</span>
-                        <span className="text-xs text-gray-500 ml-2">{dep.version}</span>
+                        {dep.version && <span className="text-xs text-gray-500 ml-2">=={dep.version}</span>}
                       </div>
                       <button
                         onClick={() => deleteDependencyMutation.mutate(dep.id)}

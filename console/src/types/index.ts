@@ -12,13 +12,28 @@ export interface UserCreate {
   email: string;
 }
 
+export type AuthMode = 'otp' | 'password' | 'password+otp';
+
+export interface InstanceInfo {
+  auth_mode: AuthMode;
+  version: string;
+  features: Record<string, boolean>;
+}
+
 export interface LoginRequest {
   email: string;
+  password?: string;
 }
 
 export interface LoginResponse {
   message: string;
-  session_id: string;
+  session_id?: string;
+  // Returned only for password-only mode (no OTP step)
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  user?: User;
 }
 
 export interface OTPVerifyRequest {
@@ -32,6 +47,22 @@ export interface OTPVerifyResponse {
   token_type: string;
   expires_in: number;
   user: User;
+}
+
+export interface ChangePasswordRequest {
+  current_password: string;
+  new_password: string;
+}
+
+export interface ResetPasswordRequest {
+  reset_token: string;
+  new_password: string;
+}
+
+export interface AdminCreateResetLinkResponse {
+  user_id: string;
+  reset_token: string;
+  expires_at: string;
 }
 
 // API Keys

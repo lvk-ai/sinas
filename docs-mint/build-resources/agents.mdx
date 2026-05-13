@@ -19,18 +19,39 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `input_schema` | JSON Schema for validating chat input variables |
 | `output_schema` | JSON Schema for validating agent output |
 | `initial_messages` | Few-shot example messages |
-| `enabled_functions` | Functions available as tools (list of `namespace/name`) |
+| `enabled_functions` | Functions available as tools. Supports wildcards: `namespace/*` or `*/*`. |
 | `function_parameters` | Default parameter values per function (supports Jinja2) |
-| `enabled_agents` | Other agents callable as sub-agents |
-| `enabled_skills` | Skills available to the agent |
-| `enabled_queries` | Database queries available as tools |
+| `enabled_agents` | Other agents callable as sub-agents. Supports wildcards. |
+| `enabled_skills` | Skills available to the agent. Supports wildcards. |
+| `enabled_queries` | Database queries available as tools. Supports wildcards. |
 | `query_parameters` | Default query parameter values |
-| `enabled_collections` | File collections the agent can access. Plain string (readonly) or `{"collection": "namespace/name", "access": "readonly\|readwrite"}`. Readwrite enables write/edit/delete file tools. |
+| `enabled_collections` | File collections the agent can access. Plain string (readonly) or `{"collection": "namespace/name", "access": "readonly\|readwrite"}`. Supports wildcards. Readwrite enables write/edit/delete file tools. |
 | `enabled_stores` | Stores the agent can access. List of `{"store": "namespace/name", "access": "readonly"}` or `{"store": "namespace/name", "access": "readwrite"}` |
 | `enabled_connectors` | Connectors available as tools. List of `{"connector": "namespace/name", "operations": [...], "parameters": {"op_name": {"param": "value"}}}`. Parameters support Jinja2 templates and are locked (hidden from LLM). |
 | `hooks` | Message lifecycle hooks. `{"on_user_message": [...], "on_assistant_message": [...]}` |
 | `system_tools` | Platform capabilities. List of strings or config objects. See [System Tools](#system-tools). |
 | `icon` | Icon reference (see [Icons](#icons)) |
+
+**Wildcard patterns** for `enabled_*` fields:
+
+| Pattern | Matches |
+|---|---|
+| `namespace/name` | Exact resource |
+| `namespace/*` | All active resources in that namespace |
+| `*/*` | All active resources |
+
+```yaml
+enabledFunctions:
+  - sales/*          # all functions in the sales namespace
+  - shared/utils     # one specific function
+enabledQueries:
+  - "*/*"            # all queries (quote wildcards in YAML)
+enabledCollections:
+  - collection: "docs/*"
+    access: readonly
+```
+
+Wildcards expand at tool discovery time. The resolved tools are validated against user permissions at execution time.
 
 **Message hooks:** Functions that run before/after agent messages. Each hook has:
 - `function`: reference to a function (`namespace/name`)

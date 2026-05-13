@@ -1,6 +1,6 @@
 # Development Environment Setup
 
-This guide is for **contributors and developers** working on the Sinas codebase. For production deployment, see [DOCS.md](DOCS.md).
+This guide is for **contributors and developers** working on the Sinas codebase. For production deployment, see the [documentation](https://docs.sinas.co).
 
 ## Prerequisites
 
@@ -109,4 +109,4 @@ mypy .           # Type check
 
 ## Architecture
 
-See [README.md](README.md) for architecture overview and [DOCS.md](DOCS.md) for the full feature reference.
+See [README.md](README.md) for architecture overview and the [documentation](https://docs.sinas.co) for the full feature reference.

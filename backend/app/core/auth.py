@@ -7,6 +7,7 @@ import uuid as uuid_lib
 from datetime import UTC, datetime, timedelta
 from typing import Optional
 
+import bcrypt
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -24,12 +25,15 @@ from app.core.permissions import (
 from app.models import (
     APIKey,
     OTPSession,
+    PasswordResetToken,
     RefreshToken,
     Role,
     RolePermission,
     User,
     UserRole,
 )
+
+PASSWORD_RESET_TOKEN_EXPIRY_HOURS = 24
 
 security = HTTPBearer()
 
@@ -42,6 +46,113 @@ def normalize_email(email: str) -> str:
 def generate_otp_code(length: int = 6) -> str:
     """Generate a random numeric OTP code."""
     return "".join(random.choices(string.digits, k=length))
+
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password using bcrypt."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a plaintext password against a bcrypt hash."""
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
+async def create_password_reset_token(
+    db: AsyncSession, user_id: str, created_by: Optional[str] = None
+) -> tuple[str, PasswordResetToken]:
+    """
+    Create a one-time password reset token. Plaintext is returned to the caller
+    (the admin) once; only the hash is stored.
+    """
+    plain_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
+    expires_at = datetime.now(UTC) + timedelta(hours=PASSWORD_RESET_TOKEN_EXPIRY_HOURS)
+
+    record = PasswordResetToken(
+        user_id=uuid_lib.UUID(user_id),
+        token_hash=token_hash,
+        expires_at=expires_at,
+        created_by=uuid_lib.UUID(created_by) if created_by else None,
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return plain_token, record
+
+
+async def consume_password_reset_token(
+    db: AsyncSession, plain_token: str
+) -> Optional[PasswordResetToken]:
+    """
+    Validate and consume a password reset token. Returns the record on success
+    (with used_at set) or None if the token is invalid, expired, or already used.
+    """
+    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
+
+    result = await db.execute(
+        select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash)
+    )
+    record = result.scalar_one_or_none()
+
+    if not record or record.used_at is not None:
+        return None
+    if record.expires_at < datetime.now(UTC):
+        return None
+
+    record.used_at = datetime.now(UTC)
+    await db.commit()
+    return record
+
+
+async def warn_if_users_lack_passwords(db: AsyncSession) -> None:
+    """
+    When AUTH_MODE includes password, log a warning listing how many users have
+    no password_hash set yet. Those users cannot log in until an admin generates
+    a reset link for them. No-op when AUTH_MODE is OTP-only.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    if "password" not in settings.auth_mode:
+        return
+
+    result = await db.execute(
+        select(User).where(User.password_hash.is_(None))
+    )
+    users_without_password = result.scalars().all()
+    count = len(users_without_password)
+    if count == 0:
+        return
+
+    sample = ", ".join(u.email for u in users_without_password[:5])
+    suffix = f" (showing first 5: {sample})" if count > 5 else f" ({sample})"
+    logger.warning(
+        f"AUTH_MODE={settings.auth_mode} but {count} user(s) have no password set "
+        f"and cannot sign in until an admin issues a reset link{suffix}"
+    )
+
+
+async def revoke_all_refresh_tokens(db: AsyncSession, user_id: str) -> int:
+    """Revoke every active refresh token for a user. Returns the count revoked."""
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.user_id == uuid_lib.UUID(user_id),
+            RefreshToken.is_revoked == False,
+        )
+    )
+    tokens = result.scalars().all()
+    now = datetime.now(UTC)
+    for tok in tokens:
+        tok.is_revoked = True
+        tok.revoked_at = now
+    if tokens:
+        await db.commit()
+    return len(tokens)
 
 
 async def create_otp_session(db: AsyncSession, email: str) -> OTPSession:
@@ -700,60 +811,64 @@ async def initialize_superadmin(db: AsyncSession):
     """
     Initialize superadmin user if SUPERADMIN_EMAIL is set.
 
-    Creates:
-    - Adds user to Admins role with full system access
-    - Only creates if Admins role is empty (prevents auto-creation after manual setup)
+    - Creates the user and grants Admins membership only when no other admins exist
+      (prevents accidental auto-creation after manual setup).
+    - When the user already exists, ensures Admins membership and (when auth_mode
+      includes password) syncs password_hash from SUPERADMIN_PASSWORD. This doubles
+      as the "admin lost their password" escape hatch: change SUPERADMIN_PASSWORD
+      and restart.
     """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     if not settings.superadmin_email:
-        return  # No superadmin email configured
+        return
 
     email = normalize_email(settings.superadmin_email)
+    auth_mode_includes_password = "password" in settings.auth_mode
 
-    # Get Admins role (should already exist from initialize_default_roles)
     result = await db.execute(select(Role).where(Role.name == "Admins"))
     admins_role = result.scalar_one_or_none()
 
     if not admins_role:
-        import logging
-
-        logger = logging.getLogger(__name__)
         logger.error("Admins role not found. Run initialize_default_roles first.")
         return
 
-    # Check if any user is already in Admins role
-    result = await db.execute(
-        select(UserRole).where(UserRole.role_id == admins_role.id, UserRole.active == True)
-    )
-    existing_members = result.scalars().all()
-
-    if existing_members:
-        # Admins role already has members, don't auto-create
-        return
-
-    # Get or create admin user
     user = await get_user_by_email(db, email)
 
     if not user:
-        # Create superadmin user (only happens on first startup)
-        normalized_email = normalize_email(email)
-        user = User(email=normalized_email)
+        # Only auto-create if no other admins exist
+        result = await db.execute(
+            select(UserRole).where(UserRole.role_id == admins_role.id, UserRole.active == True)
+        )
+        if result.scalars().first():
+            return
+
+        user = User(email=email)
         db.add(user)
         await db.commit()
         await db.refresh(user)
+        logger.info(f"Admin user created: {email}")
 
-    # Check if user is already in Admins role
     result = await db.execute(
         select(UserRole).where(UserRole.role_id == admins_role.id, UserRole.user_id == user.id)
     )
     existing_membership = result.scalar_one_or_none()
 
     if not existing_membership:
-        # Add user to Admins role
         membership = UserRole(role_id=admins_role.id, user_id=user.id, active=True)
         db.add(membership)
         await db.commit()
 
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.info(f"Admin user created: {email}")
+    if auth_mode_includes_password and settings.superadmin_password:
+        needs_update = not user.password_hash or not verify_password(
+            settings.superadmin_password, user.password_hash
+        )
+        if needs_update:
+            user.password_hash = hash_password(settings.superadmin_password)
+            await db.commit()
+            logger.info(
+                "Superadmin password set/updated from SUPERADMIN_PASSWORD env var "
+                f"for {email}"
+            )

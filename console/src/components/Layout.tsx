@@ -1,5 +1,6 @@
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth-context';
+import { apiClient } from '../lib/api';
 import {
   LayoutDashboard,
   MessageSquare,
@@ -90,8 +91,10 @@ const navigationSections = [
 export function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, logout } = useAuth();
+  const { user, logout, authMode } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const passwordEnabled = authMode === 'password' || authMode === 'password+otp';
 
   const handleLogout = async () => {
     await logout();
@@ -182,9 +185,18 @@ export function Layout() {
                 </p>
                 <p className="text-xs text-gray-500">Administrator</p>
               </div>
+              {passwordEnabled && (
+                <button
+                  onClick={() => setShowChangePassword(true)}
+                  className="ml-1 p-2 text-gray-400 hover:text-gray-200 hover:bg-white/5 rounded-md"
+                  title="Change password"
+                >
+                  <KeyRound className="w-5 h-5" />
+                </button>
+              )}
               <button
                 onClick={handleLogout}
-                className="ml-3 p-2 text-gray-400 hover:text-gray-200 hover:bg-white/5 rounded-md"
+                className="ml-1 p-2 text-gray-400 hover:text-gray-200 hover:bg-white/5 rounded-md"
                 title="Logout"
               >
                 <LogOut className="w-5 h-5" />
@@ -219,6 +231,118 @@ export function Layout() {
         <main className="p-6">
           <Outlet />
         </main>
+      </div>
+
+      {showChangePassword && (
+        <ChangePasswordModal onClose={() => setShowChangePassword(false)} />
+      )}
+    </div>
+  );
+}
+
+function ChangePasswordModal({ onClose }: { onClose: () => void }) {
+  const { logout } = useAuth();
+  const navigate = useNavigate();
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    if (newPassword.length < 8) {
+      setError('New password must be at least 8 characters.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await apiClient.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      // Backend revokes all refresh tokens on password change — log out so the
+      // user re-authenticates with the new password.
+      await logout();
+      navigate('/login');
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || 'Failed to change password');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="bg-[#161616] rounded-2xl p-6 border border-white/[0.06] w-full max-w-md">
+        <div className="flex items-start justify-between mb-4">
+          <h3 className="text-lg font-semibold text-gray-100">Change password</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-200">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">Current password</label>
+            <input
+              type="password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              autoComplete="current-password"
+              required
+              className="w-full px-3 py-2 bg-[#111111] border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">New password</label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              autoComplete="new-password"
+              required
+              minLength={8}
+              className="w-full px-3 py-2 bg-[#111111] border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">Confirm new password</label>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              autoComplete="new-password"
+              required
+              minLength={8}
+              className="w-full px-3 py-2 bg-[#111111] border border-white/10 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+
+          {error && (
+            <div className="p-3 bg-red-900/20 border border-red-800/30 rounded-lg text-sm text-red-400">
+              {error}
+            </div>
+          )}
+
+          <p className="text-xs text-gray-500">
+            You'll be signed out on success and need to sign in again with the new password.
+          </p>
+
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={onClose} className="btn btn-secondary" disabled={submitting}>
+              Cancel
+            </button>
+            <button type="submit" className="btn btn-primary" disabled={submitting}>
+              {submitting ? 'Updating...' : 'Update password'}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );
