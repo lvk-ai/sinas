@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.runtime import runtime_router
 from app.api.v1 import router as api_v1_router
-from app.core.auth import initialize_default_roles, initialize_superadmin
+from app.core.auth import initialize_default_roles, initialize_superadmin, warn_if_users_lack_passwords
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.templates import initialize_default_templates
 from app.core.config import settings
@@ -59,6 +59,10 @@ async def lifespan(app: FastAPI):
     # Initialize superadmin user
     async with AsyncSessionLocal() as db:
         await initialize_superadmin(db)
+
+    # Warn if any users have no password set when AUTH_MODE requires one
+    async with AsyncSessionLocal() as db:
+        await warn_if_users_lack_passwords(db)
 
     # Initialize default templates
     async with AsyncSessionLocal() as db:

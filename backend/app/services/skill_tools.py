@@ -34,29 +34,20 @@ class SkillToolConverter:
         if not enabled_skills:
             return tools
 
+        from app.services.resource_resolver import resolve_resource_refs
+
+        # Separate preloaded from on-demand, expand wildcards for on-demand
+        on_demand_refs = []
         for skill_config in enabled_skills:
-            # Skip if preloaded (will be injected into system prompt instead)
             if skill_config.get("preload", False):
                 continue
+            skill_ref = skill_config.get("skill", "")
+            if skill_ref:
+                on_demand_refs.append(skill_ref)
 
-            skill_ref = skill_config.get("skill")
-            if not skill_ref:
-                logger.warning(f"Invalid skill config: {skill_config}")
-                continue
+        resolved = await resolve_resource_refs(db, on_demand_refs, Skill)
 
-            # Parse namespace/name
-            if "/" not in skill_ref:
-                logger.warning(f"Invalid skill reference format: {skill_ref}")
-                continue
-
-            namespace, name = skill_ref.split("/", 1)
-
-            # Load skill by namespace/name
-            skill = await Skill.get_by_name(db, namespace, name)
-
-            if not skill or not skill.is_active:
-                logger.warning(f"Skill {skill_ref} not found or inactive")
-                continue
+        for skill_ref, skill in resolved:
 
             # Convert skill to tool format
             tool = self.skill_to_tool(skill)
@@ -85,31 +76,19 @@ class SkillToolConverter:
         if not enabled_skills:
             return ""
 
+        from app.services.resource_resolver import resolve_resource_refs
+
+        preload_refs = []
         for skill_config in enabled_skills:
-            # Only include preloaded skills
             if not skill_config.get("preload", False):
                 continue
+            skill_ref = skill_config.get("skill", "")
+            if skill_ref:
+                preload_refs.append(skill_ref)
 
-            skill_ref = skill_config.get("skill")
-            if not skill_ref:
-                logger.warning(f"Invalid skill config: {skill_config}")
-                continue
+        resolved = await resolve_resource_refs(db, preload_refs, Skill)
 
-            # Parse namespace/name
-            if "/" not in skill_ref:
-                logger.warning(f"Invalid skill reference format: {skill_ref}")
-                continue
-
-            namespace, name = skill_ref.split("/", 1)
-
-            # Load skill by namespace/name
-            skill = await Skill.get_by_name(db, namespace, name)
-
-            if not skill or not skill.is_active:
-                logger.warning(f"Preloaded skill {skill_ref} not found or inactive")
-                continue
-
-            # Add skill content with header
+        for skill_ref, skill in resolved:
             contents.append(f"# Skill: {skill.namespace}/{skill.name}\n\n{skill.content}")
 
         return "\n\n---\n\n".join(contents)

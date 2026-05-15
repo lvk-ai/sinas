@@ -36,7 +36,7 @@ async def install_package(
 
     service = PackageService(db)
     try:
-        package, apply_result = await service.install(body.source, user_id)
+        package, apply_result = await service.install(body.source, user_id, variables=body.variables)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -53,7 +53,7 @@ async def preview_package(
     db: AsyncSession = Depends(get_db),
     current_user_data: tuple = Depends(get_current_user_with_permissions),
 ):
-    """Preview a package install (dry run)."""
+    """Preview a package install (dry run). Returns variable declarations if the package requires input."""
     user_id, permissions = current_user_data
 
     if not check_permission(permissions, "sinas.packages.install:all"):
@@ -63,11 +63,16 @@ async def preview_package(
 
     service = PackageService(db)
     try:
-        result = await service.preview(body.source, user_id)
+        result, variable_declarations, requires_input = await service.preview(
+            body.source, user_id, variables=body.variables
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return result.model_dump(mode="json")
+    response = result.model_dump(mode="json")
+    response["variables"] = variable_declarations
+    response["requires_input"] = requires_input
+    return response
 
 
 @router.post("/create")

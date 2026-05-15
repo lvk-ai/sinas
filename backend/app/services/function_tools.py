@@ -47,20 +47,11 @@ class FunctionToolConverter:
         if not enabled_functions:
             return tools
 
-        for function_ref in enabled_functions:
-            # Parse namespace/name
-            if "/" not in function_ref:
-                # Legacy format or invalid - skip
-                continue
+        from app.services.resource_resolver import resolve_resource_refs
 
-            namespace, name = function_ref.split("/", 1)
+        resolved = await resolve_resource_refs(db, enabled_functions, Function)
 
-            # Load function by namespace/name (no user filter - permissions checked at execution)
-            function = await Function.get_by_name(db, namespace, name)
-
-            if not function or not function.is_active:
-                # Skip if function not found or inactive
-                continue
+        for function_ref, function in resolved:
 
             # Get pre-filled parameters for this function (if any)
             # Parse locked vs overridable parameters
@@ -224,8 +215,9 @@ class FunctionToolConverter:
         namespace, name = tool_name.split("/", 1)
         function_ref = f"{namespace}/{name}"
 
-        # SECURITY: Validate function is in enabled list
-        if enabled_functions is not None and function_ref not in enabled_functions:
+        # SECURITY: Validate function is in enabled list (supports wildcards)
+        from app.services.resource_resolver import matches_ref_pattern
+        if enabled_functions is not None and not matches_ref_pattern(function_ref, enabled_functions):
             logger.warning(
                 f"Security: LLM attempted to call non-enabled function '{function_ref}'. "
                 f"Enabled functions: {enabled_functions}"

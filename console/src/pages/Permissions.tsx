@@ -37,6 +37,7 @@ export function Permissions() {
   const queryClient = useQueryClient();
   const [showAddPermissionModal, setShowAddPermissionModal] = useState(false);
   const [newPermissions, setNewPermissions] = useState<string[]>([]);
+  const [newPermInput, setNewPermInput] = useState('');
   const [pendingChanges, setPendingChanges] = useState<Map<string, { groupName: string; permissionKey: string; value: boolean }>>(new Map());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [expandedOverrides, setExpandedOverrides] = useState<Set<string>>(new Set());
@@ -547,25 +548,54 @@ export function Permissions() {
                 </div>
               )}
 
-              <input
-                type="text"
-                autoFocus
-                placeholder="e.g. myapp.reports.read:own"
-                className="input w-full font-mono text-sm mb-4"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    const val = (e.target as HTMLInputElement).value.trim();
+              <div className="flex gap-2 mb-4">
+                <input
+                  type="text"
+                  autoFocus
+                  value={newPermInput}
+                  placeholder="e.g. myapp.reports.read:own"
+                  className="input flex-1 font-mono text-sm"
+                  onChange={(e) => setNewPermInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const val = newPermInput.trim();
+                      if (val && !newPermissions.includes(val)) {
+                        setNewPermissions(prev => [...prev, val]);
+                        setNewPermInput('');
+                      }
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const val = newPermInput.trim();
                     if (val && !newPermissions.includes(val)) {
                       setNewPermissions(prev => [...prev, val]);
-                      (e.target as HTMLInputElement).value = '';
+                      setNewPermInput('');
                     }
-                  }
-                }}
-              />
+                  }}
+                  className="btn btn-secondary text-sm"
+                  disabled={!newPermInput.trim()}
+                >
+                  +
+                </button>
+              </div>
 
               <div className="flex justify-end gap-3">
-                <button onClick={() => { setShowAddPermissionModal(false); setNewPermissions([]); }} className="btn btn-secondary">Cancel</button>
-                <button onClick={handleAddPermissions} className="btn btn-primary" disabled={!newPermissions.length}>
+                <button onClick={() => { setShowAddPermissionModal(false); setNewPermissions([]); setNewPermInput(''); }} className="btn btn-secondary">Cancel</button>
+                <button
+                  onClick={() => {
+                    const val = newPermInput.trim();
+                    if (val && !newPermissions.includes(val)) {
+                      newPermissions.push(val);
+                      setNewPermInput('');
+                    }
+                    handleAddPermissions();
+                  }}
+                  className="btn btn-primary"
+                  disabled={!newPermissions.length && !newPermInput.trim()}
+                >
                   Add {newPermissions.length > 1 ? `${newPermissions.length} Permissions` : 'Permission'}
                 </button>
               </div>

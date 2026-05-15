@@ -1,33 +1,73 @@
 ---
 title: "Authentication"
-description: "OTP login and API keys"
+description: "Auth modes, login flows, and API keys"
 ---
 
 
-Sinas uses email-based OTP authentication, with API keys available for programmatic access.
+Sinas supports three authentication modes for end-user login, plus API keys for programmatic access. The mode is set per-deployment via the `AUTH_MODE` environment variable and cannot be changed at runtime.
 
-## OTP Authentication
+## Auth Modes
 
-1. Client sends email to `POST /auth/login`
-2. Sinas sends a 6-digit code to that email (valid for 10 minutes by default)
-3. Client submits code to `POST /auth/verify-otp`
-4. Sinas returns an **access token** (short-lived JWT, default 15 min) and a **refresh token** (long-lived, default 30 days)
-5. Use the access token in the `Authorization: Bearer <token>` header
-6. When the access token expires, use `POST /auth/refresh` to get a new one
+| Mode | What's required to log in | When to use |
+|---|---|---|
+| `otp` (default) | Email + 6-digit OTP | Default. Proves email control on every login. Requires SMTP. |
+| `password` | Email + password | Airgapped or no-SMTP deployments. No email round-trip. |
+| `password+otp` | Email + password + OTP | Most secure. Treats the OTP as a liveness check on the email account — useful when you need to lock out ex-employees by revoking their work mailbox. Requires SMTP. |
 
-**Endpoints:**
+Clients (custom frontends, the JS/Python SDKs, the official console) discover the active mode via the unauthenticated `GET /info` endpoint and branch their login UI accordingly.
+
+## Login Flows
+
+### `otp`
+
+1. Client posts email to `POST /auth/login`
+2. Sinas sends a 6-digit code (valid 10 min by default)
+3. Client posts code to `POST /auth/verify-otp` and receives access + refresh tokens
+
+### `password`
+
+1. Client posts email + password to `POST /auth/login`
+2. Sinas verifies and immediately returns access + refresh tokens
+
+### `password+otp`
+
+1. Client posts email + password to `POST /auth/login`
+2. On password match, Sinas sends a 6-digit OTP and returns an OTP session id
+3. Client posts code to `POST /auth/verify-otp` and receives access + refresh tokens
+
+## Tokens
+
+All modes issue the same JWT pair:
+
+- **Access token** — short-lived (default 15 min), sent as `Authorization: Bearer <token>`
+- **Refresh token** — long-lived (default 30 days), exchanged at `POST /auth/refresh`
 
 ```
-POST   /auth/login                # Send OTP to email
-POST   /auth/verify-otp           # Verify OTP, receive tokens
-POST   /auth/refresh              # Get new access token using refresh token
+POST   /auth/login                # Start login (mode-dependent payload)
+POST   /auth/verify-otp           # Verify OTP for otp / password+otp modes
+POST   /auth/refresh              # Get new access token
 POST   /auth/logout               # Revoke refresh token
 GET    /auth/me                   # Get current user info
 ```
 
+## Superadmin Bootstrap
+
+The first admin user is seeded from environment variables on backend startup:
+
+- `SUPERADMIN_EMAIL` — email of the user to create / promote to Admins
+- `SUPERADMIN_PASSWORD` — only used when `AUTH_MODE` is `password` or `password+otp`. Setting this on a running deployment and restarting the backend will reset the password — the escape hatch for "admin lost their password."
+
+## Password Reset
+
+For modes that include passwords:
+
+- **User-initiated** — not implemented when `AUTH_MODE=password` (no email channel guaranteed). Use admin reset.
+- **Admin-initiated** — an admin generates a one-time reset link from the user management page in the console and delivers it out-of-band (Slack, in person).
+- **Lost-superadmin escape hatch** — set `SUPERADMIN_PASSWORD` in the env and restart the backend.
+
 ## API Keys
 
-For programmatic access (scripts, CI/CD, integrations), create API keys instead of using short-lived JWT tokens. Each key has its own set of permissions (a subset of the creating user's permissions).
+For programmatic access (scripts, CI/CD, integrations), create API keys instead of using short-lived JWT tokens. Each key has its own set of permissions (a subset of the creating user's permissions). API keys work identically across all auth modes.
 
 ```
 POST   /api/v1/api-keys           # Create key (plaintext returned once)

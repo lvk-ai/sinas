@@ -24,7 +24,7 @@ from .store import Store
 from .table_annotation import TableAnnotation
 from .template import Template
 from .tool_call_result import ToolCallResult
-from .user import APIKey, OTPSession, RefreshToken, Role, RolePermission, User, UserRole
+from .user import APIKey, OTPSession, PasswordResetToken, RefreshToken, Role, RolePermission, User, UserRole
 from .webhook import Webhook
 
 __all__ = [
@@ -43,6 +43,7 @@ __all__ = [
     "OTPSession",
     "APIKey",
     "RefreshToken",
+    "PasswordResetToken",
     "Chat",
     "Message",
     "Agent",

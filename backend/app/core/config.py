@@ -1,7 +1,10 @@
 import os
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+VALID_AUTH_MODES = {"otp", "password", "password+otp"}
 
 
 class Settings(BaseSettings):
@@ -123,6 +126,23 @@ class Settings(BaseSettings):
 
     # Superadmin
     superadmin_email: Optional[str] = None  # Email for superadmin user
+    superadmin_password: Optional[str] = None  # Seed password for superadmin (used when auth_mode includes password)
+
+    # Authentication mode: "otp", "password", or "password+otp"
+    # otp: email OTP only (default, requires SMTP)
+    # password: password only (works airgapped, no SMTP needed)
+    # password+otp: both required (password + email-OTP as liveness check)
+    auth_mode: str = "otp"
+
+    @field_validator("auth_mode")
+    @classmethod
+    def _validate_auth_mode(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in VALID_AUTH_MODES:
+            raise ValueError(
+                f"AUTH_MODE must be one of {sorted(VALID_AUTH_MODES)}, got {v!r}"
+            )
+        return normalized
 
     # Domain (for generating external URLs, e.g., temp file URLs)
     domain: Optional[str] = None  # FQDN like "app.example.com"; localhost or None = no external URLs

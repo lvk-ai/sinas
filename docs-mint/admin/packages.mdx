@@ -25,6 +25,7 @@ package:
   author: "team@company.com"
   url: "https://github.com/company/sinas-crm"
 spec:
+  variables: [...]     # Install-time configuration (optional)
   agents: [...]
   functions: [...]
   skills: [...]
@@ -49,6 +50,75 @@ spec:
 - **Upgrade**: Re-installing an existing package updates its resources in place (idempotent apply)
 - **Excluded types**: Packages cannot include roles, users, LLM providers, or database connections (these are environment-specific)
 - **Dependencies**: Packages can declare Python dependencies — these are recorded in the database and installed in containers on worker restart
+
+## Install-time Variables
+
+Packages can declare typed variables that are prompted during installation. Variables are substituted into the YAML before resources are persisted — the resulting resources contain literal values, no runtime template evaluation.
+
+**Declaring variables:**
+
+```yaml
+spec:
+  variables:
+    - name: GROVE_URL
+      type: text
+      description: Base URL where Grove is reachable from containers
+      example: http://host.docker.internal:8080
+      required: true
+
+    - name: PRIMARY_LLM
+      type: resource_ref
+      resource: llm_providers
+      description: LLM provider for capable agents
+      required: true
+
+    - name: CHEAP_LLM
+      type: resource_ref
+      resource: llm_providers
+      description: LLM provider for filtering/extraction agents
+      required: true
+
+    - name: ENABLE_LOGGING
+      type: boolean
+      default: false
+      description: Enable verbose logging in functions
+
+    - name: API_KEY
+      type: secret
+      description: External service API key
+      required: true
+```
+
+**Variable types:**
+
+| Type | Description | Validation |
+|---|---|---|
+| `text` | Free text input | Optional `pattern` (regex) |
+| `boolean` | True/false toggle | — |
+| `enum` | Fixed choices | `choices: [a, b, c]` |
+| `resource_ref` | Pointer to existing resource | `resource: llm_providers\|database_connections\|collections\|secrets\|roles` — validated at install |
+| `secret` | Masked input, stored encrypted | Creates/upserts a Secret. Not re-prompted on upgrade if already exists. |
+
+**Substitution syntax:**
+
+Use `${{ vars.NAME }}` anywhere in the package spec. Resolved by simple string replacement before parsing — not Jinja2, so no conflicts with system prompt templates.
+
+```yaml
+connectors:
+  - baseUrl: "${{ vars.GROVE_URL }}"
+
+agents:
+  - llmProviderName: "${{ vars.PRIMARY_LLM }}"
+```
+
+**API:**
+
+- `POST /api/v1/packages/preview` — response includes `variables` (declarations) and `requires_input` (bool). Pass `variables: {NAME: value}` in the request to preview with substitution.
+- `POST /api/v1/packages/install` — pass `variables: {NAME: value}` in the request. Required variables must be present.
+
+**Stored values:**
+
+Variable values from the last install are stored in `Package.values`. On upgrade, the console pre-fills the form with previous values. Secret values are stored as `"***"` — the actual credential lives in the Secrets table.
 
 **Endpoints:**
 

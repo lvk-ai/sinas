@@ -9,11 +9,13 @@ from pydantic import BaseModel, Field
 class PackageInstallRequest(BaseModel):
     """Request to install a package from YAML content."""
     source: str = Field(..., description="YAML content of the SinasPackage")
+    variables: Optional[dict[str, Any]] = Field(None, description="Install-time variable values")
 
 
 class PackagePreviewRequest(BaseModel):
     """Request to preview a package install (dry run)."""
     source: str = Field(..., description="YAML content of the SinasPackage")
+    variables: Optional[dict[str, Any]] = Field(None, description="Variable values for substitution")
 
 
 class PackageResourceRef(BaseModel):

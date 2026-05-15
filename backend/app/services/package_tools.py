@@ -60,9 +60,9 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "sinas_package_preview",
             "description": (
                 "Dry-run a package install. Shows what resources would be "
-                "created, updated, or skipped without making any changes. "
-                "Call this before sinas_package_install to let the user "
-                "see the planned changes."
+                "created, updated, or skipped. Also returns variable "
+                "declarations if the package requires install-time input. "
+                "Call this before sinas_package_install."
             ),
             "parameters": {
                 "type": "object",
@@ -74,6 +74,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "yaml": {
                         "type": "string",
                         "description": "Inline YAML content. Use file_path instead when the file is already saved.",
+                    },
+                    "variables": {
+                        "type": "object",
+                        "description": "Install-time variable values (keyed by variable name). Pass these if the package declares spec.variables.",
                     },
                 },
             },
@@ -100,6 +104,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "yaml": {
                         "type": "string",
                         "description": "Inline YAML content. Use file_path instead when the file is already saved.",
+                    },
+                    "variables": {
+                        "type": "object",
+                        "description": "Install-time variable values (keyed by variable name).",
                     },
                 },
             },
@@ -296,10 +304,22 @@ async def _resolve_yaml_content(db, arguments) -> str:
 # ── Individual tool implementations ──────────────────────────
 
 async def _validate(db, arguments, permissions):
+    import re
     if not check_permission(permissions, "sinas.config.validate:all"):
         raise PermissionError("sinas.config.validate:all required")
 
     yaml_content = await _resolve_yaml_content(db, arguments)
+
+    # Detect unsubstituted variables and warn
+    unresolved_vars = set(re.findall(r'\$\{\{\s*vars\.([A-Z][A-Z0-9_]*)\s*\}\}', yaml_content))
+    extra_warnings = []
+    if unresolved_vars:
+        extra_warnings.append(
+            f"Package has {len(unresolved_vars)} unsubstituted variable(s): "
+            f"{', '.join(sorted(unresolved_vars))}. "
+            f"Some validation errors may be caused by unresolved ${{{{ vars.* }}}} placeholders. "
+            f"Pass variables when installing, or use the console UI to fill them in."
+        )
 
     _config, validation = await ConfigParser.parse_and_validate(
         yaml_content, db=db, strict=False
@@ -307,7 +327,7 @@ async def _validate(db, arguments, permissions):
     return {
         "valid": validation.is_valid,
         "errors": [{"path": e.path, "message": e.message} for e in validation.errors],
-        "warnings": list(validation.warnings),
+        "warnings": extra_warnings + list(validation.warnings),
     }
 
 
@@ -316,10 +336,17 @@ async def _preview(db, arguments, user_id, permissions):
         raise PermissionError("sinas.packages.install:all required")
 
     yaml_content = await _resolve_yaml_content(db, arguments)
+    variables = arguments.get("variables")
 
     service = PackageService(db)
-    result = await service.preview(yaml_content, user_id)
-    return _apply_response_to_dict(result)
+    result, variable_declarations, requires_input = await service.preview(
+        yaml_content, user_id, variables=variables
+    )
+    response = _apply_response_to_dict(result)
+    if variable_declarations:
+        response["variables"] = variable_declarations
+        response["requires_input"] = requires_input
+    return response
 
 
 async def _install(db, arguments, user_id, permissions):
@@ -327,9 +354,10 @@ async def _install(db, arguments, user_id, permissions):
         raise PermissionError("sinas.packages.install:all required")
 
     yaml_content = await _resolve_yaml_content(db, arguments)
+    variables = arguments.get("variables")
 
     service = PackageService(db)
-    package, result = await service.install(yaml_content, user_id)
+    package, result = await service.install(yaml_content, user_id, variables=variables)
     return {
         "package": {
             "name": package.name,

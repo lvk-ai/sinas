@@ -1,11 +1,14 @@
 """Runtime API - Data Plane for execution, authentication, and runtime state."""
 from fastapi import APIRouter
 
-from app.api.runtime.endpoints import manifests, authentication, chats, components, discovery, executions, files, functions, queries, stores, templates, webhooks
+from app.api.runtime.endpoints import manifests, authentication, chats, components, discovery, executions, files, functions, info, queries, stores, templates, webhooks
 
 runtime_router = APIRouter()
 
 # Mount runtime endpoints
+# Info - public instance info (auth mode, version) for SDK/client discovery
+runtime_router.include_router(info.router, tags=["runtime-info"])
+
 # Auth - OTP, tokens, API keys
 runtime_router.include_router(authentication.router, prefix="/auth", tags=["runtime-auth"])
 

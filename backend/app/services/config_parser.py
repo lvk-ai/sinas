@@ -11,6 +11,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.config import SinasConfig
 
 
+def _is_variable_placeholder(ref: str) -> bool:
+    """Check if a value is an unsubstituted ${{ vars.* }} placeholder."""
+    return "${{" in ref and "vars." in ref
+
+
+def _is_wildcard(ref: str) -> bool:
+    """Check if a reference contains a wildcard pattern."""
+    return "*" in ref
+
+
+def _ref_matches_any(ref: str, known_names: set[str]) -> bool:
+    """Check if a ref matches any known name, supporting wildcards and variable placeholders.
+
+    Wildcards and variable placeholders always pass validation
+    (they resolve at runtime).
+    """
+    if _is_wildcard(ref):
+        return True
+    if _is_variable_placeholder(ref):
+        return True
+    return ref in known_names
+
+
 class ConfigValidationError:
     """Configuration validation error"""
 
@@ -238,7 +261,7 @@ class ConfigParser:
         for i, agent in enumerate(spec.get("agents", [])):
             # Validate LLM provider reference
             if "llmProviderName" in agent and agent["llmProviderName"]:
-                if agent["llmProviderName"] not in all_llm_provider_names:
+                if not _is_variable_placeholder(agent["llmProviderName"]) and agent["llmProviderName"] not in all_llm_provider_names:
                     errors.append(
                         ConfigValidationError(
                             path=f"spec.agents[{i}].llmProviderName",
@@ -249,7 +272,7 @@ class ConfigParser:
             # Validate enabled function references
             if "enabledFunctions" in agent and agent["enabledFunctions"]:
                 for func_name in agent["enabledFunctions"]:
-                    if func_name not in all_function_names:
+                    if not _ref_matches_any(func_name, all_function_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledFunctions",
@@ -262,7 +285,7 @@ class ConfigParser:
                 # Build current agent's full name for self-reference check
                 current_agent_ref = f"{agent.get('namespace', 'default')}/{agent['name']}"
                 for agent_ref in agent["enabledAgents"]:
-                    if agent_ref not in all_agent_names and agent_ref != current_agent_ref:
+                    if not _ref_matches_any(agent_ref, all_agent_names) and agent_ref != current_agent_ref:
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledAgents",
@@ -275,7 +298,7 @@ class ConfigParser:
                 for skill_ref in agent["enabledSkills"]:
                     # Support both string format and dict format {"skill": "ns/name", "preload": bool}
                     ref_name = skill_ref["skill"] if isinstance(skill_ref, dict) else skill_ref
-                    if ref_name not in all_skill_names:
+                    if not _ref_matches_any(ref_name, all_skill_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledSkills",
@@ -286,7 +309,7 @@ class ConfigParser:
             # Validate enabled query references
             if "enabledQueries" in agent and agent["enabledQueries"]:
                 for query_ref in agent["enabledQueries"]:
-                    if query_ref not in all_query_names:
+                    if not _ref_matches_any(query_ref, all_query_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledQueries",
@@ -304,7 +327,7 @@ class ConfigParser:
                         coll_ref = coll_entry.get("collection", "")
                     else:
                         coll_ref = str(coll_entry)
-                    if coll_ref not in all_collection_names:
+                    if not _ref_matches_any(coll_ref, all_collection_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledCollections",
@@ -315,7 +338,7 @@ class ConfigParser:
             # Validate enabled component references
             if "enabledComponents" in agent and agent["enabledComponents"]:
                 for comp_ref in agent["enabledComponents"]:
-                    if comp_ref not in all_component_names:
+                    if not _ref_matches_any(comp_ref, all_component_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledComponents",
@@ -327,7 +350,7 @@ class ConfigParser:
             if "enabledStores" in agent and agent["enabledStores"]:
                 for store_entry in agent["enabledStores"]:
                     store_ref = store_entry if isinstance(store_entry, str) else store_entry.get("store", "")
-                    if store_ref not in all_store_names:
+                    if not _ref_matches_any(store_ref, all_store_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.agents[{i}].enabledStores",
@@ -340,7 +363,7 @@ class ConfigParser:
             # Validate enabled function references
             if comp.get("enabledFunctions"):
                 for func_ref in comp["enabledFunctions"]:
-                    if func_ref not in all_function_names:
+                    if not _ref_matches_any(func_ref, all_function_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.components[{i}].enabledFunctions",
@@ -350,7 +373,7 @@ class ConfigParser:
             # Validate enabled query references
             if comp.get("enabledQueries"):
                 for query_ref in comp["enabledQueries"]:
-                    if query_ref not in all_query_names:
+                    if not _ref_matches_any(query_ref, all_query_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.components[{i}].enabledQueries",
@@ -360,7 +383,7 @@ class ConfigParser:
             # Validate enabled agent references
             if comp.get("enabledAgents"):
                 for agent_ref in comp["enabledAgents"]:
-                    if agent_ref not in all_agent_names:
+                    if not _ref_matches_any(agent_ref, all_agent_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.components[{i}].enabledAgents",
@@ -370,7 +393,7 @@ class ConfigParser:
             # Validate enabled component references
             if comp.get("enabledComponents"):
                 for comp_ref in comp["enabledComponents"]:
-                    if comp_ref not in all_component_names:
+                    if not _ref_matches_any(comp_ref, all_component_names):
                         errors.append(
                             ConfigValidationError(
                                 path=f"spec.components[{i}].enabledComponents",
@@ -380,7 +403,7 @@ class ConfigParser:
 
         # Validate query references
         for i, query in enumerate(spec.get("queries", [])):
-            if query["connectionName"] not in all_database_connection_names:
+            if not _is_variable_placeholder(query.get("connectionName", "")) and query["connectionName"] not in all_database_connection_names:
                 errors.append(
                     ConfigValidationError(
                         path=f"spec.queries[{i}].connectionName",
@@ -392,7 +415,7 @@ class ConfigParser:
         for i, coll in enumerate(spec.get("collections", [])):
             # Validate content filter function reference
             if coll.get("contentFilterFunction"):
-                if coll["contentFilterFunction"] not in all_function_names:
+                if not _is_variable_placeholder(coll["contentFilterFunction"]) and coll["contentFilterFunction"] not in all_function_names:
                     errors.append(
                         ConfigValidationError(
                             path=f"spec.collections[{i}].contentFilterFunction",
@@ -401,7 +424,7 @@ class ConfigParser:
                     )
             # Validate post-upload function reference
             if coll.get("postUploadFunction"):
-                if coll["postUploadFunction"] not in all_function_names:
+                if not _is_variable_placeholder(coll["postUploadFunction"]) and coll["postUploadFunction"] not in all_function_names:
                     errors.append(
                         ConfigValidationError(
                             path=f"spec.collections[{i}].postUploadFunction",
@@ -415,7 +438,7 @@ class ConfigParser:
             func_namespace = webhook.get("functionNamespace", "default")
             func_name = webhook["functionName"]
             func_ref = f"{func_namespace}/{func_name}"
-            if func_ref not in all_function_names:
+            if not _ref_matches_any(func_ref, all_function_names):
                 errors.append(
                     ConfigValidationError(
                         path=f"spec.webhooks[{i}].functionName",
@@ -429,7 +452,7 @@ class ConfigParser:
             func_namespace = schedule.get("functionNamespace", "default")
             func_name = schedule["functionName"]
             func_ref = f"{func_namespace}/{func_name}"
-            if func_ref not in all_function_names:
+            if not _ref_matches_any(func_ref, all_function_names):
                 errors.append(
                     ConfigValidationError(
                         path=f"spec.schedules[{i}].functionName",

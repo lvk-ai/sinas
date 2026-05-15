@@ -40,15 +40,12 @@ class QueryToolConverter:
         if not enabled_queries:
             return tools
 
-        for query_ref in enabled_queries:
-            if "/" not in query_ref:
-                continue
+        from app.services.resource_resolver import resolve_resource_refs
+        from app.models.query import Query
 
-            namespace, name = query_ref.split("/", 1)
+        resolved = await resolve_resource_refs(db, enabled_queries, Query)
 
-            query = await Query.get_by_name(db, namespace, name)
-            if not query or not query.is_active:
-                continue
+        for query_ref, query in resolved:
 
             # Parse locked vs overridable parameters
             locked_params = {}
@@ -180,8 +177,9 @@ class QueryToolConverter:
         namespace, name = tool_name.split("/", 1)
         query_ref = f"{namespace}/{name}"
 
-        # SECURITY: Validate query is in enabled list
-        if enabled_queries is not None and query_ref not in enabled_queries:
+        # SECURITY: Validate query is in enabled list (supports wildcards)
+        from app.services.resource_resolver import matches_ref_pattern
+        if enabled_queries is not None and not matches_ref_pattern(query_ref, enabled_queries):
             logger.warning(
                 f"Security: LLM attempted to call non-enabled query '{query_ref}'. "
                 f"Enabled queries: {enabled_queries}"

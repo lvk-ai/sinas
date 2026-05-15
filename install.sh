@@ -159,29 +159,77 @@ else
     echo -e "${GREEN}✓ Database password auto-generated${NC}"
 
     echo ""
+    echo -e "${YELLOW}Authentication mode:${NC}"
+    echo "  1) Email OTP            — emails a 6-digit code (requires SMTP)"
+    echo "  2) Password             — password only (works airgapped, no SMTP)"
+    echo "  3) Password + Email OTP — both required (most secure, requires SMTP)"
     echo ""
-    echo -e "${YELLOW}SMTP Configuration (required for login emails):${NC}"
-    echo "  SendGrid: smtp.sendgrid.net:587, user: apikey"
-    echo "  Mailgun:  smtp.mailgun.org:587"
-    echo "  AWS SES:  email-smtp.<region>.amazonaws.com:587"
-    echo ""
+    read -p "Choose [1-3, default 1]: " AUTH_CHOICE
+    AUTH_CHOICE=${AUTH_CHOICE:-1}
 
-    read -p "SMTP Host: " SMTP_HOST
-    read -p "SMTP Port [587]: " SMTP_PORT
-    SMTP_PORT=${SMTP_PORT:-587}
-    read -p "SMTP Username: " SMTP_USER
-    read -s -p "SMTP Password/API Key: " SMTP_PASSWORD
-    echo ""
+    case "$AUTH_CHOICE" in
+        1) AUTH_MODE="otp" ;;
+        2) AUTH_MODE="password" ;;
+        3) AUTH_MODE="password+otp" ;;
+        *)
+            echo -e "${RED}Invalid choice, defaulting to OTP${NC}"
+            AUTH_MODE="otp"
+            ;;
+    esac
+    echo -e "${GREEN}✓ Auth mode: $AUTH_MODE${NC}"
 
-    while [ -z "$SMTP_HOST" ] || [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASSWORD" ]; do
-        echo -e "${RED}SMTP configuration is required for OTP login${NC}"
-        read -p "SMTP Host: " SMTP_HOST
-        read -p "SMTP Username: " SMTP_USER
-        read -s -p "SMTP Password: " SMTP_PASSWORD
+    # Password prompt (when auth mode includes password)
+    SUPERADMIN_PASSWORD=""
+    PASSWORD_GENERATED=false
+    if [[ "$AUTH_MODE" == *"password"* ]]; then
         echo ""
-    done
+        read -s -p "Superadmin password (or press enter to auto-generate): " SUPERADMIN_PASSWORD
+        echo ""
+        if [ -z "$SUPERADMIN_PASSWORD" ]; then
+            SUPERADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
+            PASSWORD_GENERATED=true
+            echo -e "${GREEN}✓ Password auto-generated (shown at end of install)${NC}"
+        else
+            while [ ${#SUPERADMIN_PASSWORD} -lt 8 ]; do
+                echo -e "${RED}Password must be at least 8 characters${NC}"
+                read -s -p "Superadmin password: " SUPERADMIN_PASSWORD
+                echo ""
+            done
+            echo -e "${GREEN}✓ Password set${NC}"
+        fi
+    fi
 
-    read -p "SMTP From domain (e.g., example.com): " SMTP_DOMAIN
+    # SMTP prompts (when auth mode includes OTP)
+    SMTP_HOST=""
+    SMTP_PORT=587
+    SMTP_USER=""
+    SMTP_PASSWORD=""
+    SMTP_DOMAIN=""
+    if [[ "$AUTH_MODE" == *"otp"* ]]; then
+        echo ""
+        echo -e "${YELLOW}SMTP Configuration (required for OTP emails):${NC}"
+        echo "  SendGrid: smtp.sendgrid.net:587, user: apikey"
+        echo "  Mailgun:  smtp.mailgun.org:587"
+        echo "  AWS SES:  email-smtp.<region>.amazonaws.com:587"
+        echo ""
+
+        read -p "SMTP Host: " SMTP_HOST
+        read -p "SMTP Port [587]: " SMTP_PORT_INPUT
+        SMTP_PORT=${SMTP_PORT_INPUT:-587}
+        read -p "SMTP Username: " SMTP_USER
+        read -s -p "SMTP Password/API Key: " SMTP_PASSWORD
+        echo ""
+
+        while [ -z "$SMTP_HOST" ] || [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASSWORD" ]; do
+            echo -e "${RED}SMTP configuration is required for OTP login${NC}"
+            read -p "SMTP Host: " SMTP_HOST
+            read -p "SMTP Username: " SMTP_USER
+            read -s -p "SMTP Password: " SMTP_PASSWORD
+            echo ""
+        done
+
+        read -p "SMTP From domain (e.g., example.com): " SMTP_DOMAIN
+    fi
 
     cat > .env << EOF
 # Security
@@ -198,6 +246,9 @@ DATABASE_NAME=sinas
 # Redis
 REDIS_URL=redis://redis:6379/0
 
+# Authentication
+AUTH_MODE=$AUTH_MODE
+
 # SMTP
 SMTP_HOST=$SMTP_HOST
 SMTP_PORT=$SMTP_PORT
@@ -207,6 +258,7 @@ SMTP_DOMAIN=$SMTP_DOMAIN
 
 # Admin
 SUPERADMIN_EMAIL=$SUPERADMIN_EMAIL
+SUPERADMIN_PASSWORD=$SUPERADMIN_PASSWORD
 
 # Domain & SSL
 DOMAIN=$DOMAIN
@@ -225,12 +277,15 @@ CLICKHOUSE_PASSWORD=
 CLICKHOUSE_DATABASE=sinas
 EOF
 
+    chmod 600 .env
     echo -e "${GREEN}✓ .env file created${NC}"
 fi
 
 # Load DOMAIN from .env for the completion message
 DOMAIN=$(grep "^DOMAIN=" .env 2>/dev/null | cut -d= -f2)
 SUPERADMIN_EMAIL=$(grep "^SUPERADMIN_EMAIL=" .env 2>/dev/null | cut -d= -f2)
+AUTH_MODE=$(grep "^AUTH_MODE=" .env 2>/dev/null | cut -d= -f2)
+AUTH_MODE=${AUTH_MODE:-otp}
 
 # Firewall (Linux only)
 if [[ "$OS_TYPE" == "linux" ]]; then
@@ -303,6 +358,12 @@ echo ""
 echo "4. Login:"
 echo "   https://${DOMAIN}/docs → POST /auth/login"
 echo "   Superadmin: ${SUPERADMIN_EMAIL}"
+echo "   Auth mode:  ${AUTH_MODE}"
+if [ "$PASSWORD_GENERATED" = true ] && [ -n "$SUPERADMIN_PASSWORD" ]; then
+    echo ""
+    echo -e "   ${YELLOW}Generated superadmin password: ${SUPERADMIN_PASSWORD}${NC}"
+    echo -e "   ${YELLOW}Save this now — also stored in ${INSTALL_DIR}/.env (chmod 600)${NC}"
+fi
 echo ""
 echo "5. Update:"
 echo "   curl -fsSL ${RAW_URL}/install.sh -o /tmp/sinas-install.sh && sudo bash /tmp/sinas-install.sh"
