@@ -929,8 +929,13 @@ class MessageService:
             yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": res[2]}
             tool_results[tc["id"]] = res
 
-        # Rebuild messages with tool results for LLM follow-up
-        # Persist tool results to tool_call_results store (background)
+        # Persist tool results to tool_call_results store (background,
+        # fire-and-forget). This store is an indexed cache for fast lookup
+        # — the source of truth is the tool-role rows in the `messages`
+        # table, which were committed synchronously above. `get_tool_result`
+        # falls back to reading the message row when the store hasn't
+        # caught up yet, so correctness doesn't depend on this task
+        # completing before the next LLM turn.
         async def _persist_results():
             try:
                 async with AsyncSessionLocal() as store_db:

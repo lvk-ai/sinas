@@ -4,9 +4,10 @@ import json
 import logging
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
+import httpx
 import jsonschema
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,81 @@ class FunctionExecutionError(Exception):
 
 class SchemaValidationError(Exception):
     pass
+
+
+async def _fire_callback(
+    *,
+    db: AsyncSession,
+    execution: "Execution",
+    callback_url: str,
+    user_id: str,
+    user_email: str,
+    status: str,  # "success" | "failure"
+    result: Any,
+    error: Optional[str],
+    trigger_id: str,
+    function_namespace: str,
+    function_name: str,
+) -> None:
+    """Fire-and-forget POST to the caller-supplied callback URL.
+
+    Authenticated with a freshly-minted user access token so the receiving
+    app can validate via the normal Sinas auth path. No retries — apps
+    fall back to polling `/executions/{id}/status` if they need to
+    reconcile.
+
+    Records `callback_status` and `callback_response_code` on the
+    Execution row for operator visibility.
+    """
+    from app.core.auth import create_access_token
+
+    # Short callback-only token (just long enough to be received and validated).
+    cb_token = create_access_token(user_id, user_email, expires_delta=timedelta(minutes=5))
+
+    payload = {
+        "execution_id": execution.execution_id,
+        "trigger_id": trigger_id,
+        "function": {"namespace": function_namespace, "name": function_name},
+        "status": status,
+        "started_at": execution.started_at.isoformat() if execution.started_at else None,
+        "finished_at": execution.completed_at.isoformat() if execution.completed_at else None,
+        "duration_ms": execution.duration_ms,
+        "result": result,
+        "error": error,
+    }
+
+    status_label = "failed"
+    response_code: Optional[int] = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                callback_url,
+                headers={
+                    "Authorization": f"Bearer {cb_token}",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps(payload, default=str),
+            )
+        response_code = resp.status_code
+        status_label = "sent" if 200 <= resp.status_code < 300 else "failed"
+    except httpx.HTTPError as e:
+        logger.warning(
+            "Callback POST failed for execution %s → %s: %s",
+            execution.execution_id, callback_url, e,
+        )
+    except Exception as e:
+        logger.warning(
+            "Unexpected callback error for execution %s → %s: %s",
+            execution.execution_id, callback_url, e,
+        )
+
+    try:
+        execution.callback_status = status_label
+        execution.callback_response_code = response_code
+        await db.commit()
+    except Exception:
+        # Don't let callback bookkeeping mask the underlying execution result.
+        logger.exception("Failed to persist callback status for %s", execution.execution_id)
 
 
 class FunctionExecutor:
@@ -147,6 +223,7 @@ class FunctionExecutor:
         trigger_id: str,
         user_id: str,
         chat_id: Optional[str] = None,
+        callback_url: Optional[str] = None,
     ) -> dict[str, Any]:
         """Execute a function with input validation and tracking."""
         async with AsyncSessionLocal() as db:
@@ -158,8 +235,22 @@ class FunctionExecutor:
             user = user_result.scalar_one_or_none()
             user_email = user.email if user else "unknown@unknown.com"
 
-            # Generate access token for function to make authenticated API calls
-            access_token = create_access_token(user_id, user_email)
+            # Load function early so we can size the access-token TTL to its
+            # configured timeout. (load_function is cached, so this is cheap.)
+            function = await self.load_function(db, function_namespace, function_name, user_id)
+            function_timeout = function.timeout or settings.function_timeout
+
+            # Per-execution access token. TTL = function timeout + buffer, so
+            # the token outlives the run (incl. downstream calls into apps that
+            # forward it back to Sinas) but not by much. Capped at the global
+            # ceiling. See ADR 2026-05-14-external-app-bulk-enqueue.md §2.2.
+            token_ttl = timedelta(
+                seconds=min(
+                    function_timeout + settings.execution_token_buffer_seconds,
+                    settings.max_execution_token_seconds,
+                )
+            )
+            access_token = create_access_token(user_id, user_email, expires_delta=token_ttl)
 
             # Check if execution already exists (e.g. created by enqueue_function)
             result = await db.execute(
@@ -187,8 +278,8 @@ class FunctionExecutor:
                 await clickhouse_logger.log_execution_start(execution_id, function_name, input_data)
 
             try:
-                # Load function definition
-                function = await self.load_function(db, function_namespace, function_name, user_id)
+                # `function` and `function_timeout` were loaded above (they
+                # parameterized the access-token TTL).
 
                 # Validate input
                 if function.input_schema:
@@ -196,9 +287,6 @@ class FunctionExecutor:
                     input_data = await self.validate_schema(input_data, function.input_schema)
 
                 start_time = time.time()
-
-                # Per-function timeout (falls back to global setting)
-                function_timeout = function.timeout or settings.function_timeout
 
                 # Route execution based on shared_pool setting
                 if function.shared_pool:
@@ -277,6 +365,27 @@ class FunctionExecutor:
                     execution_id, "completed", result, None, duration_ms
                 )
 
+                if callback_url:
+                    await _fire_callback(
+                        db=db,
+                        execution=execution,
+                        callback_url=callback_url,
+                        user_id=user_id,
+                        user_email=user_email,
+                        status="success",
+                        result=result,
+                        error=None,
+                        trigger_id=trigger_id,
+                        function_namespace=function_namespace,
+                        function_name=function_name,
+                    )
+
+                if execution.batch_id is not None:
+                    from app.services import batch_service
+                    await batch_service.on_execution_terminated(
+                        db=db, batch_id=execution.batch_id,
+                    )
+
                 return result
 
             except Exception as e:
@@ -292,6 +401,27 @@ class FunctionExecutor:
                 await clickhouse_logger.log_execution_end(
                     execution_id, "failed", None, str(e), None
                 )
+
+                if callback_url:
+                    await _fire_callback(
+                        db=db,
+                        execution=execution,
+                        callback_url=callback_url,
+                        user_id=user_id,
+                        user_email=user_email,
+                        status="failure",
+                        result=None,
+                        error=str(e),
+                        trigger_id=trigger_id,
+                        function_namespace=function_namespace,
+                        function_name=function_name,
+                    )
+
+                if execution.batch_id is not None:
+                    from app.services import batch_service
+                    await batch_service.on_execution_terminated(
+                        db=db, batch_id=execution.batch_id,
+                    )
 
                 raise FunctionExecutionError(f"Function execution failed: {e}")
 

@@ -34,6 +34,7 @@ class QueueService:
         user_id: str,
         chat_id: Optional[str] = None,
         delay: Optional[int] = None,
+        callback_url: Optional[str] = None,
     ) -> str:
         """
         Enqueue a function execution job.
@@ -77,6 +78,7 @@ class QueueService:
             "trigger_id": trigger_id,
             "user_id": user_id,
             "chat_id": chat_id,
+            "callback_url": callback_url,
         }
 
         # Enqueue with optional delay
@@ -191,8 +193,13 @@ class QueueService:
         agent: Optional[str] = None,
         trigger_type: Optional[str] = None,
         job_timeout: Optional[int] = None,
+        execution_id: Optional[str] = None,
     ) -> str:
-        """Enqueue an agent message processing job."""
+        """Enqueue an agent message processing job.
+
+        If `execution_id` is provided, the worker will update that Execution
+        row to COMPLETED/FAILED on terminal status (used by batch_service).
+        """
         pool = await get_arq_pool()
         redis = await get_redis()
 
@@ -232,6 +239,7 @@ class QueueService:
             user_token=user_token,
             content=content,
             channel_id=channel_id,
+            execution_id=execution_id,
             trace_context=inject_trace_context(),
             **enqueue_kwargs,
         )

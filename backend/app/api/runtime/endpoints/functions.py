@@ -6,15 +6,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, Optional
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
+from app.core.callback import CallbackURLError, validate_callback_url
 from app.core.database import get_db
 from app.core.permissions import check_permission
 from app.models.execution import TriggerType
 from app.models.function import Function
+from app.schemas.batch import FunctionBatchRequest, FunctionBatchResponse
 from app.schemas.function import (
     FunctionExecuteAsyncResponse,
     FunctionExecuteRequest,
     FunctionExecuteResponse,
 )
+from app.services import batch_service
 from app.services.queue_service import queue_service
 
 router = APIRouter()
@@ -116,6 +119,11 @@ async def execute_function_async(
 
     set_permission_used(request, permission)
 
+    try:
+        callback_url = validate_callback_url(body.callback_url)
+    except CallbackURLError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     execution_id = str(uuid.uuid4())
 
     await queue_service.enqueue_function(
@@ -124,10 +132,67 @@ async def execute_function_async(
         input_data=body.input,
         execution_id=execution_id,
         trigger_type=TriggerType.API.value,
-        trigger_id="runtime-api",
+        trigger_id=body.trigger_id or "runtime-api",
         user_id=user_id,
+        delay=body.delay_seconds,
+        callback_url=callback_url,
     )
 
     return FunctionExecuteAsyncResponse(
         execution_id=execution_id,
     )
+
+
+@router.post(
+    "/functions/{namespace}/{name}/execute/batch",
+    response_model=FunctionBatchResponse,
+    status_code=202,
+)
+async def execute_function_batch(
+    request: Request,
+    namespace: str,
+    name: str,
+    body: FunctionBatchRequest,
+    current_user_data: tuple = Depends(get_current_user_with_permissions),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submit N function executions as a single batch.
+
+    Each `inputs[i]` becomes one execution. Track aggregate progress via
+    `GET /batches/{batch_id}`. See ADR 2026-05-14-external-app-bulk-enqueue.md
+    §2.4.
+    """
+    user_id, permissions = current_user_data
+
+    function = await Function.get_by_name(db, namespace, name)
+    if not function:
+        raise HTTPException(status_code=404, detail="Function not found")
+
+    permission = f"sinas.functions/{namespace}/{name}.execute:own"
+    if not check_permission(permissions, permission):
+        set_permission_used(request, permission, has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to execute this function")
+    set_permission_used(request, permission)
+
+    try:
+        callback_url = validate_callback_url(body.callback_url)
+        batch_callback_url = validate_callback_url(body.batch_callback_url)
+    except CallbackURLError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        result = await batch_service.submit_function_batch(
+            db=db,
+            user_id=user_id,
+            namespace=namespace,
+            name=name,
+            inputs=body.inputs,
+            trigger_id_prefix=body.trigger_id_prefix,
+            delay_seconds=body.delay_seconds,
+            callback_url=callback_url,
+            batch_callback_url=batch_callback_url,
+        )
+    except batch_service.BatchError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return FunctionBatchResponse(**result)

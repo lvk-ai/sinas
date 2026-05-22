@@ -472,13 +472,39 @@ async def execute_single_tool(
                     agent_id=str(chat.agent_id) if chat and chat.agent_id else None,
                 )
             elif tool_name == "retrieve_tool_result":
+                from app.services.tool_result_store import list_chat_tool_call_ids
+
+                requested_id = arguments.get("tool_call_id", "")
                 stored = await get_tool_result(
                     db=db,
-                    tool_call_id=arguments.get("tool_call_id", ""),
+                    tool_call_id=requested_id,
                     user_id=user_id,
                     chat_id=chat_id,
                 )
-                result = stored if stored else {"error": "Tool result not found or expired"}
+                if stored:
+                    result = stored
+                else:
+                    # Help the agent self-correct instead of giving up. Most
+                    # "not found" hits are hallucinated ids — surface the
+                    # actual ids available so it picks a real one (or stops).
+                    available = (
+                        await list_chat_tool_call_ids(db, str(chat_id))
+                        if chat_id else []
+                    )
+                    result = {
+                        "error": (
+                            f"No tool result found for tool_call_id "
+                            f"'{requested_id}' in this chat. Do not invent "
+                            "tool_call_ids — only use values you saw in a "
+                            "prior compacted reference like "
+                            "'[Result from X (tool_call_id: Y). Use "
+                            "retrieve_tool_result(\"Y\")…]'. If you don't "
+                            "see such a reference, the result is still inline "
+                            "in the conversation; just re-read it from there."
+                        ),
+                        "requested_tool_call_id": requested_id,
+                        "available_tool_call_ids": available,
+                    }
 
             elif tool_name == "continue_execution":
                 result = await fn_executor.resume_execution(

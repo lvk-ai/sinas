@@ -3,12 +3,16 @@ import asyncio
 import json
 import logging
 import traceback
-from typing import Any
+import uuid as uuid_lib
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from opentelemetry import trace
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.telemetry import otel_attr
+from app.models.execution import Execution, ExecutionStatus
 from app.services.queue_service import JOB_STATUS_PREFIX, JOB_TTL
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,41 @@ async def _ping_loop(channel_id: str, ttl: int | None = None) -> None:
             await stream_relay.publish(channel_id, {"type": "ping"}, ttl=ttl)
         except Exception:
             pass  # Best-effort; don't let ping failures kill the loop
+
+
+async def _terminate_execution_row(
+    execution_id: str,
+    status: ExecutionStatus,
+    *,
+    output: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Mark a batch-child Execution terminal and fire batch-completion check.
+
+    Used by batch-initiated agent runs (where queue_service hands us an
+    execution_id). Non-batch agent runs pass no execution_id and this is a no-op.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.services import batch_service
+
+    async with AsyncSessionLocal() as db:
+        row = await db.execute(
+            select(Execution).where(Execution.execution_id == execution_id)
+        )
+        execution = row.scalar_one_or_none()
+        if not execution:
+            logger.warning("Execution %s not found when terminating agent batch child", execution_id)
+            return
+        execution.status = status
+        execution.completed_at = datetime.now(timezone.utc)
+        if output is not None:
+            execution.output_data = output
+        if error is not None:
+            execution.error = error
+        await db.commit()
+
+        if execution.batch_id is not None:
+            await batch_service.on_execution_terminated(db=db, batch_id=execution.batch_id)
 
 
 async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
@@ -49,6 +88,8 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     user_token = kwargs["user_token"]
     content = kwargs["content"]
     channel_id = kwargs["channel_id"]
+    # Optional — set by batch_service so the Execution row mirrors the job lifecycle.
+    execution_id = kwargs.get("execution_id")
 
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -142,6 +183,13 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                 ex=JOB_TTL,
             )
 
+            # Batch hook: update Execution row + check parent batch terminal status.
+            if execution_id:
+                final_output = {"final_message": "".join(_agent_output_parts)}
+                await _terminate_execution_row(
+                    execution_id, ExecutionStatus.COMPLETED, output=final_output,
+                )
+
             completed = True
             logger.info(f"Agent message job {job_id} completed")
 
@@ -158,6 +206,11 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                 json.dumps({**base_fields, "status": "failed", "error": str(e)}),
                 ex=JOB_TTL,
             )
+
+            if execution_id:
+                await _terminate_execution_row(
+                    execution_id, ExecutionStatus.FAILED, error=str(e),
+                )
 
             completed = True
             raise

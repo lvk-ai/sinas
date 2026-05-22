@@ -83,42 +83,67 @@ async def get_tool_result(
     user_id: str,
     chat_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Retrieve a tool result by tool_call_id. Security-scoped to user/chat."""
+    """Retrieve a tool result by tool_call_id.
+
+    The `messages` table is the source of truth — tool-role rows are
+    committed synchronously as part of the chat flow, before any
+    subsequent LLM call. Reading from messages is always race-free.
+
+    The `tool_call_results` table is a write-behind analytics cache (per-
+    user, longer-lived, lets you query across chats). It must NOT be
+    load-bearing for the runtime `retrieve_tool_result` path.
+    """
+    from app.models.chat import Message
     from app.models.tool_call_result import ToolCallResult
 
-    # Try chat-scoped first (more specific)
+    # 1. Primary: messages row, scoped to this chat. The chat scope is the
+    #    natural correctness boundary — the agent is asking about an id it
+    #    saw in its own conversation.
     if chat_id:
-        result = await db.execute(
+        msg = (
+            await db.execute(
+                select(Message).where(
+                    and_(
+                        Message.tool_call_id == tool_call_id,
+                        Message.chat_id == uuid.UUID(chat_id),
+                        Message.role == "tool",
+                    )
+                )
+            )
+        ).scalar_one_or_none()
+        if msg:
+            content = msg.content
+            try:
+                result_value: Any = (
+                    json.loads(content) if isinstance(content, str) else content
+                )
+            except (json.JSONDecodeError, TypeError):
+                result_value = {"raw": content}
+            return {
+                "tool_call_id": tool_call_id,
+                "tool_name": msg.name or "unknown",
+                "arguments": None,
+                "result": result_value,
+                "status_code": None,
+                "duration_ms": None,
+                "source": "messages",
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+
+    # 2. Fallback: user-scoped analytics cache (for the rare case an agent
+    #    legitimately wants to look up a result from another chat — e.g.,
+    #    agent-to-agent handoff). Owns enrichment fields (status_code,
+    #    duration_ms) that the messages row doesn't carry.
+    record = (
+        await db.execute(
             select(ToolCallResult).where(
                 and_(
                     ToolCallResult.tool_call_id == tool_call_id,
-                    ToolCallResult.chat_id == uuid.UUID(chat_id),
+                    ToolCallResult.user_id == uuid.UUID(user_id),
                 )
             )
         )
-        record = result.scalar_one_or_none()
-        if record:
-            return {
-                "tool_call_id": record.tool_call_id,
-                "tool_name": record.tool_name,
-                "arguments": record.arguments,
-                "result": record.result,
-                "status_code": record.status_code,
-                "duration_ms": record.duration_ms,
-                "source": record.source,
-                "created_at": record.created_at.isoformat(),
-            }
-
-    # Fall back to user-scoped
-    result = await db.execute(
-        select(ToolCallResult).where(
-            and_(
-                ToolCallResult.tool_call_id == tool_call_id,
-                ToolCallResult.user_id == uuid.UUID(user_id),
-            )
-        )
-    )
-    record = result.scalar_one_or_none()
+    ).scalar_one_or_none()
     if record:
         return {
             "tool_call_id": record.tool_call_id,
@@ -132,6 +157,30 @@ async def get_tool_result(
         }
 
     return None
+
+
+async def list_chat_tool_call_ids(
+    db: AsyncSession, chat_id: str, limit: int = 25
+) -> list[dict[str, str]]:
+    """Return recent tool_call_ids for a chat — used to build a helpful
+    error response when `get_tool_result` finds nothing (agent likely
+    hallucinated the id). Most recent first."""
+    from app.models.chat import Message
+
+    rows = (
+        await db.execute(
+            select(Message.tool_call_id, Message.name, Message.created_at)
+            .where(Message.chat_id == uuid.UUID(chat_id))
+            .where(Message.role == "tool")
+            .where(Message.tool_call_id.isnot(None))
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [
+        {"tool_call_id": tcid, "tool_name": name or "unknown"}
+        for tcid, name, _ in rows
+    ]
 
 
 async def ensure_partitions(db: AsyncSession) -> None:

@@ -59,5 +59,15 @@ class Execution(Base):
     # Link to the tool_call that triggered this execution (for execution tree)
     tool_call_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
 
+    # Async-callback delivery status (null = no callback configured).
+    # See runtime API /functions/.../execute/async with `callback_url`.
+    callback_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    callback_response_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Link to parent batch (null = not part of a batch submission).
+    batch_id: Mapped[Optional[uuid_lib.UUID]] = mapped_column(
+        ForeignKey("batches.id"), nullable=True, index=True
+    )
+
     # Relationships
     user: Mapped["User"] = relationship("User")

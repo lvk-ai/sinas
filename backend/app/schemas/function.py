@@ -132,6 +132,19 @@ class FunctionExecuteRequest(BaseModel):
     input: dict[str, Any] = {}
     timeout: Optional[int] = None  # Timeout in seconds (sync only)
 
+    # Async-only fields — ignored by the sync `/execute` endpoint.
+    trigger_id: Optional[str] = None
+    """App-supplied correlation id stored on the execution record. Defaults
+    to 'runtime-api' if omitted."""
+
+    delay_seconds: Optional[int] = None
+    """Delay before the worker picks up the job. None = enqueue immediately."""
+
+    callback_url: Optional[str] = None
+    """HTTPS URL Sinas POSTs to once the execution terminates. See the
+    runtime API docs for the callback body schema. Must match
+    `CALLBACK_URL_HOSTS` (env)."""
+
 
 class FunctionExecuteResponse(BaseModel):
     """Response from function execution."""

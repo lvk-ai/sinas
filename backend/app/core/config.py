@@ -50,6 +50,22 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15  # Short-lived access tokens
     refresh_token_expire_days: int = 30  # Long-lived refresh tokens
 
+    # Per-execution token TTL — the in-context access_token handed to functions
+    # is minted with `expires_delta = min(function.timeout + buffer, max)` so it
+    # outlives the execution but doesn't outlive it by much.
+    execution_token_buffer_seconds: int = 300  # 5 min headroom after function returns
+    max_execution_token_seconds: int = 86400  # 24 h hard cap
+
+    # Callback URL allowlist for /functions/{ns}/{name}/execute/async.
+    # - Unset / empty: callback feature disabled (request with callback_url → 400)
+    # - "*": permissive — any HTTPS non-private URL accepted
+    # - Comma-separated host list: exact-host allowlist (e.g. "grove.example.com,reports.example.com")
+    callback_url_hosts: Optional[str] = None
+
+    # Cap on batch-submission size (function and agent batches). Prevents
+    # accidental DoS-by-batch via the bulk-enqueue endpoints.
+    max_batch_size: int = 1000
+
     # OTP Configuration
     otp_expire_minutes: int = 10
     otp_max_attempts: int = 2  # Max verification attempts before OTP is invalidated
