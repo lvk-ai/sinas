@@ -47,7 +47,7 @@ Once running, open the console at `https://yourdomain.com:51245` and log in with
 cd /opt/sinas && docker compose pull && docker compose up -d
 ```
 
-See [DOCS.md](DOCS.md) for the full deployment and configuration reference.
+See [INSTALL.md](INSTALL.md) for the full deployment and configuration reference.
 
 ## Development
 
@@ -83,8 +83,7 @@ sinas/
 │       ├── components/   # Shared UI components
 │       └── lib/          # API client, auth, utilities
 ├── docker-compose.yml    # Production stack (pre-built images)
-├── docker-compose.dev.yml # Development stack (local builds + hot reload)
-└── config_examples/      # Declarative config examples
+└── docker-compose.dev.yml # Development stack (local builds + hot reload)
 ```
 
 ### Services
@@ -183,8 +182,7 @@ Contributions are welcome. By submitting a pull request, you agree to the [Contr
 
 ## Documentation
 
-- [DOCS.md](DOCS.md) — Deployment, configuration, and production reference
-- [INSTALL.md](INSTALL.md) — Development environment setup
+- [INSTALL.md](INSTALL.md) — Deployment and development setup
 - Interactive API docs at `/docs` (runtime) and `/api/v1/docs` (management)
 
 ## License

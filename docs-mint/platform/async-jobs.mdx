@@ -67,7 +67,7 @@ Content-Type: application/json
 {
   "execution_id": "exec_01HX...",
   "trigger_id": "my-app:run:01HX...",
-  "function": { "namespace": "grove", "name": "ingest_document" },
+  "function": { "namespace": "myapp", "name": "ingest_document" },
   "status": "success",      // "success" | "failure"
   "started_at": "2026-05-14T13:00:00Z",
   "finished_at": "2026-05-14T13:08:23Z",
@@ -106,11 +106,11 @@ from sinas import SinasClient
 
 client = SinasClient(base_url="https://sinas.example.com", token=user_bearer)
 result = client.functions.enqueue(
-    namespace="grove",
+    namespace="myapp",
     name="ingest_document",
     input={"doc_id": "01HX..."},
-    trigger_id=f"grove:run:{run_id}",
-    callback_url=f"https://grove.example.com/sinas/callbacks/{run_id}",
+    trigger_id=f"myapp:run:{run_id}",
+    callback_url=f"https://myapp.example.com/sinas/callbacks/{run_id}",
 )
 # result == {"execution_id": "...", "status": "queued"}
 ```
@@ -127,25 +127,25 @@ const client = new SinasClient({
 
 const { executionId } = await enqueueFunction(
   client,
-  'grove/ingest_document',
+  'myapp/ingest_document',
   { doc_id: '01HX...' },
   {
-    triggerId: `grove:run:${runId}`,
-    callbackUrl: `https://grove.example.com/sinas/callbacks/${runId}`,
+    triggerId: `myapp:run:${runId}`,
+    callbackUrl: `https://myapp.example.com/sinas/callbacks/${runId}`,
   },
 );
 ```
 
 ## Worked example
 
-Grove submits 50 documents for ingestion on behalf of a signed-in user.
+Your app submits 50 documents for ingestion on behalf of a signed-in user.
 
-1. Grove's backend, holding the user's bearer, calls `client.functions.enqueue(...)` once per document.
-2. Each `execution_id` lands in a queue. A Sinas worker dequeues and runs `grove/ingest_document` under the user's identity.
-3. The function calls Grove's `/api/v1/documents/{id}/mark-processed` with the per-execution access token. Grove's `SinasAuth` validates the token via Sinas's `/auth/me`, applies the user's permissions, persists the update.
-4. When the function finishes, Sinas POSTs the result to `callback_url`. Grove updates the run's progress and notifies the user.
+1. The app's backend, holding the user's bearer, calls `client.functions.enqueue(...)` once per document.
+2. Each `execution_id` lands in a queue. A Sinas worker dequeues and runs `myapp/ingest_document` under the user's identity.
+3. The function calls the app's `/api/v1/documents/{id}/mark-processed` with the per-execution access token. The app's `SinasAuth` validates the token via Sinas's `/auth/me`, applies the user's permissions, persists the update.
+4. When the function finishes, Sinas POSTs the result to `callback_url`. The app updates the run's progress and notifies the user.
 
-If `ingest_document` invokes a Sinas agent (`client.chats.invoke(...)`), the agent runs in-process under the same user; sub-agent fan-out is internal and doesn't re-cross the Grove boundary, so the function token's TTL never bites.
+If `ingest_document` invokes a Sinas agent (`client.chats.invoke(...)`), the agent runs in-process under the same user; sub-agent fan-out is internal and doesn't re-cross the app boundary, so the function token's TTL never bites.
 
 ## Batches
 
@@ -165,7 +165,7 @@ Authorization: Bearer <user-access-token>
     {"doc_id": "1"},
     {"doc_id": "2"}
   ],
-  "trigger_id_prefix": "grove:run:01HX",         // optional; per-child trigger_id becomes "{prefix}:{i}"
+  "trigger_id_prefix": "myapp:run:01HX",         // optional; per-child trigger_id becomes "{prefix}:{i}"
   "delay_seconds": 0,                            // optional
   "callback_url": "https://app/cb/per-exec",     // optional, fires per child
   "batch_callback_url": "https://app/cb/batch"   // optional, fires once when batch terminates
@@ -191,7 +191,7 @@ Authorization: Bearer <user-access-token>
     { "input_variables": {"company": "Acme"}, "message": "Synthesize..." },
     { "input_variables": {"company": "Beta"}, "message": "Synthesize..." }
   ],
-  "trigger_id_prefix": "grove:syn:01HX",
+  "trigger_id_prefix": "myapp:syn:01HX",
   "callback_url": "...",
   "batch_callback_url": "..."
 }
@@ -234,7 +234,7 @@ GET /batches/{batch_id}
 {
   "batch_id": "...",
   "kind": "function",                          // or "agent"
-  "target": {"namespace": "grove", "name": "ingest_document"},
+  "target": {"namespace": "myapp", "name": "ingest_document"},
   "user_id": "...",
   "total": 50,
   "completed": 32,
@@ -245,7 +245,7 @@ GET /batches/{batch_id}
   "status": "running",                         // queued | running | completed | failed | partial | cancelled
   "started_at": "...",
   "finished_at": null,
-  "trigger_id_prefix": "grove:run:01HX"
+  "trigger_id_prefix": "myapp:run:01HX"
 }
 ```
 
@@ -284,7 +284,7 @@ When the last child terminates, Sinas POSTs the batch summary once to
 {
   "batch_id": "...",
   "kind": "function",
-  "target": {"namespace": "grove", "name": "ingest_document"},
+  "target": {"namespace": "myapp", "name": "ingest_document"},
   "status": "partial",
   "total": 50,
   "completed": 49,
@@ -292,7 +292,7 @@ When the last child terminates, Sinas POSTs the batch summary once to
   "cancelled": 0,
   "started_at": "...",
   "finished_at": "...",
-  "trigger_id_prefix": "grove:run:01HX"
+  "trigger_id_prefix": "myapp:run:01HX"
 }
 ```
 
@@ -318,16 +318,16 @@ client = SinasClient(base_url=..., token=user_bearer)
 
 # Function batch
 batch = client.functions.submit_batch(
-    namespace="grove",
+    namespace="myapp",
     name="ingest_document",
     inputs=[{"doc_id": d.id} for d in docs],
-    trigger_id_prefix=f"grove:run:{run.id}",
-    batch_callback_url=f"https://grove.example.com/sinas/batch/{run.id}",
+    trigger_id_prefix=f"myapp:run:{run.id}",
+    batch_callback_url=f"https://myapp.example.com/sinas/batch/{run.id}",
 )
 
 # Agent batch
 batch = client.agents.submit_batch(
-    namespace="grove",
+    namespace="myapp",
     name="synthesize",
     inputs=[
         {"input_variables": {"company": c.name}, "message": f"Synthesize for {c.name}"}
@@ -358,11 +358,11 @@ const client = new SinasClient({ baseUrl, getAccessToken: () => userToken });
 
 const batch = await submitFunctionBatch(
   client,
-  'grove/ingest_document',
+  'myapp/ingest_document',
   docs.map((d) => ({ doc_id: d.id })),
   {
-    triggerIdPrefix: `grove:run:${runId}`,
-    batchCallbackUrl: `https://grove.example.com/sinas/batch/${runId}`,
+    triggerIdPrefix: `myapp:run:${runId}`,
+    batchCallbackUrl: `https://myapp.example.com/sinas/batch/${runId}`,
   },
 );
 

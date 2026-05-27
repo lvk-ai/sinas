@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     # Callback URL allowlist for /functions/{ns}/{name}/execute/async.
     # - Unset / empty: callback feature disabled (request with callback_url → 400)
     # - "*": permissive — any HTTPS non-private URL accepted
-    # - Comma-separated host list: exact-host allowlist (e.g. "grove.example.com,reports.example.com")
+    # - Comma-separated host list: exact-host allowlist (e.g. "app1.example.com,app2.example.com")
     callback_url_hosts: Optional[str] = None
 
     # Cap on batch-submission size (function and agent batches). Prevents
