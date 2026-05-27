@@ -343,7 +343,12 @@ class FunctionExecutor:
                     }
 
                 if exec_result.get("status") == "failed":
-                    raise FunctionExecutionError(exec_result.get("error", "Unknown error"))
+                    err = FunctionExecutionError(exec_result.get("error", "Unknown error"))
+                    # The container captured the function's real internal traceback.
+                    # Attach it so the except handler persists it instead of the
+                    # backend's own (useless) stack pointing at this raise.
+                    err.container_traceback = exec_result.get("traceback")
+                    raise err
 
                 result = exec_result.get("result")
                 duration_ms = exec_result.get("duration_ms", 0)
@@ -392,7 +397,10 @@ class FunctionExecutor:
                 # Update execution record with error
                 execution.status = ExecutionStatus.FAILED
                 execution.error = str(e)
-                execution.traceback = traceback.format_exc()
+                # Prefer the function's real traceback from the container; fall
+                # back to the backend stack for errors raised outside the function
+                # (schema validation, db, container plumbing, etc.).
+                execution.traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
                 execution.completed_at = datetime.utcnow()
 
                 await db.commit()
@@ -554,6 +562,7 @@ sys.exit(1)
             if result_data.get("status") == "failed":
                 execution.status = ExecutionStatus.FAILED
                 execution.error = result_data.get("error", "Unknown error")
+                execution.traceback = result_data.get("traceback")
                 execution.completed_at = datetime.utcnow()
                 await db.commit()
                 raise FunctionExecutionError(result_data.get("error", "Unknown error"))
