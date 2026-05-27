@@ -276,18 +276,35 @@ async def get_available_tools(
         )
         tools.extend(connector_tools)
 
-    # Add built-in retrieve_tool_result tool (always available)
+    # Add built-in retrieve_tool_result tool (always available).
+    # The description is deliberately strict: agents (especially Claude) tend
+    # to invent ids if the description is vague, then the result lookup
+    # fails. The only legitimate use is following an explicit placeholder
+    # the conversation history inserted to save context.
     tools.append({
         "type": "function",
         "function": {
             "name": "retrieve_tool_result",
-            "description": "Retrieve the full result of a previous tool call by its ID. Use this when you need to access data from an earlier tool call that is no longer shown inline.",
+            "description": (
+                "Look up the full result of an earlier tool call ONLY when "
+                "the conversation history contains a placeholder of the form "
+                "'[Result from <tool> (tool_call_id: <id>). Use "
+                "retrieve_tool_result(\"<id>\") to access full data.]'. "
+                "Pass the exact id from that placeholder. Do NOT call this "
+                "with a guessed or invented id. If you don't see such a "
+                "placeholder, the prior tool result is still inline in the "
+                "conversation — just re-read it from there."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "tool_call_id": {
                         "type": "string",
-                        "description": "The tool_call_id to look up",
+                        "description": (
+                            "The tool_call_id copied verbatim from a "
+                            "'[…tool_call_id: X…]' placeholder in the chat. "
+                            "Never invent this value."
+                        ),
                     }
                 },
                 "required": ["tool_call_id"],

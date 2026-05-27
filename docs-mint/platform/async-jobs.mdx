@@ -1,0 +1,377 @@
+---
+title: "Async jobs"
+description: "Queue functions for background execution and receive a callback when they finish"
+---
+
+
+Use the async runtime API when you want Sinas to run a function on behalf of a user *without* blocking your app's request. Submit the job, get an `execution_id` back, and either poll for status or have Sinas POST the result to a URL you provide.
+
+This is the right pattern when an app — like a custom UI or another service — needs to fan out work for a logged-in user. Every job is attributed to the user whose bearer token kicked it off, so audit trails remain intact.
+
+## When to use it
+
+- **Bulk workloads** — ingestion runs, batch enrichment, anything that fans into N function calls.
+- **Long jobs** — a function that legitimately runs minutes or longer; the client doesn't want to hold an open HTTP connection.
+- **Cross-app workflows** — a function on Sinas that calls back into your app's API as the same user (Sinas-issued tokens are accepted by any app that validates via Sinas auth).
+
+For sync execution where you want the result inline, use `POST /functions/{ns}/{name}/execute` instead.
+
+## Endpoint
+
+```http
+POST /functions/{namespace}/{name}/execute/async
+Authorization: Bearer <user-access-token>
+Content-Type: application/json
+
+{
+  "input": { ... },
+  "trigger_id": "my-app:run:01HX...",
+  "delay_seconds": 0,
+  "callback_url": "https://my-app.example.com/sinas/callbacks/01HX..."
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `input` | object | yes | Validated against the function's `input_schema`. |
+| `trigger_id` | string | no | App-supplied correlation id stored on the execution record. Defaults to `"runtime-api"`. |
+| `delay_seconds` | integer | no | Delay before the worker picks up the job. `null` = enqueue immediately. |
+| `callback_url` | string | no | HTTPS URL Sinas POSTs to once the execution terminates. See [Callbacks](#callbacks). |
+
+**Auth:** the bearer's `sub` *is* the job's user. There's no `user_id` override and no "act-as-user" mode — every queued job is attributable to the human (or human-equivalent account) whose token initiated it. Audit-log integrity depends on this.
+
+**Permission:** reuses the existing function-execute permissions — `sinas.functions/{ns}/{name}.execute:own` (or `:all`). No extra permission gates the queue path; anything you can execute synchronously, you can enqueue.
+
+### Response
+
+```http
+202 Accepted
+
+{
+  "execution_id": "exec_01HX...",
+  "status": "queued"
+}
+```
+
+Poll execution state via `GET /executions/{execution_id}` (returns the current `status`, `output_data`, `error`, etc.).
+
+## Callbacks
+
+If `callback_url` is set, Sinas fires a **single** HTTP POST to that URL when the execution terminates (success, failure, or timeout). Fire-and-forget — no retries.
+
+```http
+POST <callback_url>
+Authorization: Bearer <freshly-minted access token for the originating user>
+Content-Type: application/json
+
+{
+  "execution_id": "exec_01HX...",
+  "trigger_id": "my-app:run:01HX...",
+  "function": { "namespace": "myapp", "name": "ingest_document" },
+  "status": "success",      // "success" | "failure"
+  "started_at": "2026-05-14T13:00:00Z",
+  "finished_at": "2026-05-14T13:08:23Z",
+  "duration_ms": 503000,
+  "result": { ... },        // present on success
+  "error": null             // present on failure
+}
+```
+
+The callback carries a fresh Sinas-signed access token for the originating user. Apps validate it through the same auth path they already use for inbound function calls (Python SDK: `SinasAuth`; JS SDK: `client.auth.getMe()`).
+
+### Delivery semantics
+
+- **Fire-and-forget**: one POST attempt with a 10s timeout. No retry, no DLQ.
+- **No backpressure**: Sinas does not wait for callback success before marking the execution complete.
+- **Resilience fallback**: if the callback fails to deliver, poll `GET /executions/{execution_id}` to reconcile. The execution row records `callback_status` (`sent` / `failed`) and `callback_response_code` for operator visibility.
+
+### Allowlist policy
+
+Callback hosts are gated by the `CALLBACK_URL_HOSTS` environment variable:
+
+| Value | Meaning |
+|---|---|
+| unset / empty | Callbacks **disabled**. Any `callback_url` in a request returns `400`. |
+| `*` | Permissive — any HTTPS URL accepted (subject to SSRF guards). |
+| comma-separated host list | Exact-host allowlist. |
+
+SSRF guards always apply regardless of mode: the URL must use `https://` and resolve to a non-private address. Managed-service operators typically deploy with an explicit allowlist; self-hosted single-tenant operators flip to `*` once.
+
+## SDK helpers
+
+### Python
+
+```python
+from sinas import SinasClient
+
+client = SinasClient(base_url="https://sinas.example.com", token=user_bearer)
+result = client.functions.enqueue(
+    namespace="myapp",
+    name="ingest_document",
+    input={"doc_id": "01HX..."},
+    trigger_id=f"myapp:run:{run_id}",
+    callback_url=f"https://myapp.example.com/sinas/callbacks/{run_id}",
+)
+# result == {"execution_id": "...", "status": "queued"}
+```
+
+### JavaScript
+
+```ts
+import { SinasClient, enqueueFunction } from '@sinas/sdk';
+
+const client = new SinasClient({
+  baseUrl: 'https://sinas.example.com',
+  getAccessToken: () => userAccessToken,
+});
+
+const { executionId } = await enqueueFunction(
+  client,
+  'myapp/ingest_document',
+  { doc_id: '01HX...' },
+  {
+    triggerId: `myapp:run:${runId}`,
+    callbackUrl: `https://myapp.example.com/sinas/callbacks/${runId}`,
+  },
+);
+```
+
+## Worked example
+
+Your app submits 50 documents for ingestion on behalf of a signed-in user.
+
+1. The app's backend, holding the user's bearer, calls `client.functions.enqueue(...)` once per document.
+2. Each `execution_id` lands in a queue. A Sinas worker dequeues and runs `myapp/ingest_document` under the user's identity.
+3. The function calls the app's `/api/v1/documents/{id}/mark-processed` with the per-execution access token. The app's `SinasAuth` validates the token via Sinas's `/auth/me`, applies the user's permissions, persists the update.
+4. When the function finishes, Sinas POSTs the result to `callback_url`. The app updates the run's progress and notifies the user.
+
+If `ingest_document` invokes a Sinas agent (`client.chats.invoke(...)`), the agent runs in-process under the same user; sub-agent fan-out is internal and doesn't re-cross the app boundary, so the function token's TTL never bites.
+
+## Batches
+
+Submitting N executions one at a time works, but for genuine bulk workloads
+(50+ runs at once) you'd rather submit them as a single unit, store one id,
+and poll one aggregate. The `batches` API does that — for both functions
+and agents.
+
+### Submit — function batch
+
+```http
+POST /functions/{namespace}/{name}/execute/batch
+Authorization: Bearer <user-access-token>
+
+{
+  "inputs": [
+    {"doc_id": "1"},
+    {"doc_id": "2"}
+  ],
+  "trigger_id_prefix": "myapp:run:01HX",         // optional; per-child trigger_id becomes "{prefix}:{i}"
+  "delay_seconds": 0,                            // optional
+  "callback_url": "https://app/cb/per-exec",     // optional, fires per child
+  "batch_callback_url": "https://app/cb/batch"   // optional, fires once when batch terminates
+}
+
+→ 202
+{
+  "batch_id": "...",
+  "execution_ids": ["...", "..."],
+  "total": 2,
+  "status": "queued"
+}
+```
+
+### Submit — agent batch
+
+```http
+POST /agents/{namespace}/{name}/chats/batch
+Authorization: Bearer <user-access-token>
+
+{
+  "inputs": [
+    { "input_variables": {"company": "Acme"}, "message": "Synthesize..." },
+    { "input_variables": {"company": "Beta"}, "message": "Synthesize..." }
+  ],
+  "trigger_id_prefix": "myapp:syn:01HX",
+  "callback_url": "...",
+  "batch_callback_url": "..."
+}
+
+→ 202
+{
+  "batch_id": "...",
+  "execution_ids": [...],
+  "chat_ids": [...],
+  "total": 2,
+  "status": "queued"
+}
+```
+
+Each input creates a fresh chat with `agent.initial_messages` pre-populated
+(templated with `input_variables`) followed by `message`. Agent batches
+have an **approval policy**: if a child agent tries to call a tool that
+requires approval, the execution is marked `failed` with an error — bulk
+agent runs must use agents whose enabled tools don't require approval.
+
+Per-execution callback `result` for agent batches:
+
+```json
+"result": {
+  "chat_id": "...",
+  "final_message": "the assistant's last message text",
+  "final_message_role": "assistant",
+  "tool_calls": [...]
+}
+```
+
+Full transcript fetchable via `GET /chats/{chat_id}`.
+
+### Poll a batch
+
+```http
+GET /batches/{batch_id}
+
+→ 200
+{
+  "batch_id": "...",
+  "kind": "function",                          // or "agent"
+  "target": {"namespace": "myapp", "name": "ingest_document"},
+  "user_id": "...",
+  "total": 50,
+  "completed": 32,
+  "failed": 1,
+  "running": 5,
+  "queued": 12,
+  "cancelled": 0,
+  "status": "running",                         // queued | running | completed | failed | partial | cancelled
+  "started_at": "...",
+  "finished_at": null,
+  "trigger_id_prefix": "myapp:run:01HX"
+}
+```
+
+Terminal `status` values:
+- `completed` — all children completed successfully
+- `partial`  — all children terminal, ≥1 failed
+- `failed`   — all children failed
+- `cancelled` — batch cancelled before all children terminated
+
+### Drill in
+
+```http
+GET /batches/{batch_id}/executions?status=failed&limit=50
+→ 200
+{ "executions": [...] }
+```
+
+### Cancel
+
+```http
+POST /batches/{batch_id}/cancel
+→ 200
+{ "batch_id": "...", "status": "cancelled", "cancelled_children": 12 }
+```
+
+Children with status `pending` or `awaiting_input` become `cancelled`.
+Running children must complete naturally; their results still count
+toward the batch.
+
+### Batch callback
+
+When the last child terminates, Sinas POSTs the batch summary once to
+`batch_callback_url`:
+
+```json
+{
+  "batch_id": "...",
+  "kind": "function",
+  "target": {"namespace": "myapp", "name": "ingest_document"},
+  "status": "partial",
+  "total": 50,
+  "completed": 49,
+  "failed": 1,
+  "cancelled": 0,
+  "started_at": "...",
+  "finished_at": "...",
+  "trigger_id_prefix": "myapp:run:01HX"
+}
+```
+
+Same auth / SSRF / fire-and-forget semantics as the per-execution callback.
+Per-execution callbacks (`callback_url`) and the batch callback are
+independent — both can be set, both fire.
+
+### Limits
+
+- `MAX_BATCH_SIZE` (env) caps how many `inputs` a single batch can have
+  (default `1000`).
+- Single-target batches only: every child in a batch hits the same
+  function (or agent). For mixed targets, submit multiple batches.
+
+### SDK helpers
+
+**Python:**
+
+```python
+from sinas import SinasClient
+
+client = SinasClient(base_url=..., token=user_bearer)
+
+# Function batch
+batch = client.functions.submit_batch(
+    namespace="myapp",
+    name="ingest_document",
+    inputs=[{"doc_id": d.id} for d in docs],
+    trigger_id_prefix=f"myapp:run:{run.id}",
+    batch_callback_url=f"https://myapp.example.com/sinas/batch/{run.id}",
+)
+
+# Agent batch
+batch = client.agents.submit_batch(
+    namespace="myapp",
+    name="synthesize",
+    inputs=[
+        {"input_variables": {"company": c.name}, "message": f"Synthesize for {c.name}"}
+        for c in companies
+    ],
+    batch_callback_url="...",
+)
+
+# Poll
+status = client.batches.get(batch["batch_id"])
+print(f"{status['completed']} / {status['total']}")
+
+# Drill into failures
+failed = client.batches.list_executions(batch["batch_id"], status="FAILED")
+```
+
+**JavaScript:**
+
+```ts
+import {
+  SinasClient,
+  submitFunctionBatch,
+  submitAgentBatch,
+  getBatch,
+} from '@sinas/sdk';
+
+const client = new SinasClient({ baseUrl, getAccessToken: () => userToken });
+
+const batch = await submitFunctionBatch(
+  client,
+  'myapp/ingest_document',
+  docs.map((d) => ({ doc_id: d.id })),
+  {
+    triggerIdPrefix: `myapp:run:${runId}`,
+    batchCallbackUrl: `https://myapp.example.com/sinas/batch/${runId}`,
+  },
+);
+
+const status = await getBatch(client, batch.batchId);
+console.log(`${status.completed} / ${status.total}`);
+```
+
+## Related
+
+- [Functions](/build-resources/functions) — defining the code that runs.
+- [API Overview](/platform/api-overview) — runtime vs. management surfaces.
+- [RBAC](/platform/rbac) — how `sinas.functions/{ns}/{name}.execute` permissions resolve.

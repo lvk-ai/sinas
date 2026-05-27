@@ -60,9 +60,9 @@ Packages can declare typed variables that are prompted during installation. Vari
 ```yaml
 spec:
   variables:
-    - name: GROVE_URL
+    - name: APP_URL
       type: text
-      description: Base URL where Grove is reachable from containers
+      description: Base URL where the app is reachable from containers
       example: http://host.docker.internal:8080
       required: true
 
@@ -105,7 +105,7 @@ Use `${{ vars.NAME }}` anywhere in the package spec. Resolved by simple string r
 
 ```yaml
 connectors:
-  - baseUrl: "${{ vars.GROVE_URL }}"
+  - baseUrl: "${{ vars.APP_URL }}"
 
 agents:
   - llmProviderName: "${{ vars.PRIMARY_LLM }}"

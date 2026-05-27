@@ -1,6 +1,7 @@
 from .agent import Agent
 from .manifest import Manifest
 from .base import Base
+from .batch import Batch, BatchKind, BatchStatus
 from .chat import Chat, Message
 from .connector import Connector
 from .component import Component
@@ -34,6 +35,9 @@ __all__ = [
     "Webhook",
     "ScheduledJob",
     "Execution",
+    "Batch",
+    "BatchKind",
+    "BatchStatus",
     "Dependency",
     "Package",
     "User",

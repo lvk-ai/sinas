@@ -27,7 +27,8 @@
             "pages": [
               "platform/authentication",
               "platform/rbac",
-              "platform/api-overview"
+              "platform/api-overview",
+              "platform/async-jobs"
             ]
           },
           {

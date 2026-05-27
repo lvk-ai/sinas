@@ -36,6 +36,7 @@ export function Packages() {
   const { data: templates } = useQuery({ queryKey: ['templates'], queryFn: () => apiClient.listTemplates(), enabled: showCreateModal });
   const { data: schedules } = useQuery({ queryKey: ['schedules'], queryFn: () => apiClient.listSchedules(), enabled: showCreateModal });
   const { data: databaseTriggers } = useQuery({ queryKey: ['database-triggers'], queryFn: () => apiClient.listDatabaseTriggers(), enabled: showCreateModal });
+  const { data: connectors } = useQuery({ queryKey: ['connectors'], queryFn: () => apiClient.listConnectors(), enabled: showCreateModal });
 
   const previewMutation = useMutation({
     mutationFn: ({ source, variables }: { source: string; variables?: Record<string, any> }) =>
@@ -185,6 +186,7 @@ export function Packages() {
     { type: 'template', label: 'Templates', items: templates?.map((t: any) => ({ namespace: t.namespace, name: t.name })) || [] },
     { type: 'schedule', label: 'Schedules', items: schedules?.map((s: any) => ({ namespace: 'default', name: s.name })) || [] },
     { type: 'database_trigger', label: 'Database Triggers', items: databaseTriggers?.map((t: any) => ({ namespace: 'default', name: t.name })) || [] },
+    { type: 'connector', label: 'Connectors', items: connectors?.map((c: any) => ({ namespace: c.namespace, name: c.name })) || [] },
   ].filter(s => s.items.length > 0);
 
   return (

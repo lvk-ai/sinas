@@ -24,6 +24,7 @@ from app.models.pending_approval import PendingToolApproval
 from app.models.user import User
 from app.providers.factory import create_provider
 from app.schemas.agent import AgentResponse
+from app.schemas.batch import AgentBatchRequest, AgentBatchResponse
 from app.schemas.chat import (
     AgentChatCreateRequest,
     ChatResponse,
@@ -37,6 +38,8 @@ from app.schemas.chat import (
     ToolApprovalRequest,
     ToolApprovalResponse,
 )
+from app.services import batch_service
+from app.core.callback import CallbackURLError, validate_callback_url
 from app.services.message_service import MessageService, refresh_message_tokens
 from app.services.queue_service import queue_service
 from app.services.stream_relay import STREAM_TTL_KEEP_ALIVE, stream_relay
@@ -333,6 +336,63 @@ async def invoke_agent(
         chat_id=chat.id,
         session_key=request.session_key,
     )
+
+
+@router.post(
+    "/agents/{namespace}/{agent_name}/chats/batch",
+    response_model=AgentBatchResponse,
+    status_code=202,
+)
+async def submit_agent_batch(
+    namespace: str,
+    agent_name: str,
+    body: AgentBatchRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user_data: tuple = Depends(get_current_user_with_permissions),
+):
+    """Submit N agent invocations as a single batch. Each input creates a
+    fresh chat and a single user-message → assistant-reply turn.
+
+    Track aggregate progress via `GET /batches/{batch_id}`. See ADR
+    2026-05-14-external-app-bulk-enqueue.md §2.4.
+    """
+    user_id, permissions = current_user_data
+
+    agent = await Agent.get_by_name(db, namespace, agent_name)
+    if not agent or not agent.is_active:
+        raise HTTPException(404, f"Agent '{namespace}/{agent_name}' not found")
+
+    perm = f"sinas.agents/{namespace}/{agent_name}.chat:all"
+    if not check_permission(permissions, perm):
+        set_permission_used(http_request, perm, has_perm=False)
+        raise HTTPException(403, f"Not authorized to chat with agent '{namespace}/{agent_name}'")
+    set_permission_used(http_request, perm)
+
+    try:
+        callback_url = validate_callback_url(body.callback_url)
+        batch_callback_url = validate_callback_url(body.batch_callback_url)
+    except CallbackURLError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
+
+    try:
+        result = await batch_service.submit_agent_batch(
+            db=db,
+            user_id=user_id,
+            user_token=user_token,
+            namespace=namespace,
+            name=agent_name,
+            inputs=[item.model_dump() for item in body.inputs],
+            trigger_id_prefix=body.trigger_id_prefix,
+            callback_url=callback_url,
+            batch_callback_url=batch_callback_url,
+        )
+    except batch_service.BatchError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return AgentBatchResponse(**result)
 
 
 @router.post("/chats/{chat_id}/messages", response_model=MessageResponse)
