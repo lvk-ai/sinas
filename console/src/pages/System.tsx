@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
-import { useState } from 'react';
-import { Server, Plus, Minus, RefreshCw, AlertTriangle, RotateCcw, Box, X, AlertCircle, Info, RotateCw, Trash2, Loader2 } from 'lucide-react';
+import { useState, Fragment } from 'react';
+import { Server, Plus, Minus, RefreshCw, AlertTriangle, RotateCcw, Box, X, AlertCircle, Info, RotateCw, Trash2, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 
 function formatAge(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -45,6 +45,7 @@ export function System() {
   const queryClient = useQueryClient();
   const [jobStatusFilter, setJobStatusFilter] = useState<string>('');
   const [restartingContainer, setRestartingContainer] = useState<string | null>(null);
+  const [expandedJob, setExpandedJob] = useState<string | null>(null);
 
   const { data: systemHealth } = useQuery({
     queryKey: ['system-health'],
@@ -702,11 +703,23 @@ export function System() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.04]">
-                {jobs.map((job: any) => (
-                  <tr key={job.job_id} className="hover:bg-white/5">
+                {jobs.map((job: any) => {
+                  const isExpanded = expandedJob === job.job_id;
+                  return (
+                  <Fragment key={job.job_id}>
+                  <tr
+                    className="hover:bg-white/5 cursor-pointer"
+                    onClick={() => setExpandedJob(isExpanded ? null : job.job_id)}
+                    title="Click to view error & traceback"
+                  >
                     <td className="py-2 pr-4">
-                      <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getJobStatusColor(job.status)}`}>
-                        {job.status}
+                      <span className="inline-flex items-center gap-1.5">
+                        {isExpanded
+                          ? <ChevronDown className="w-3 h-3 text-gray-500 flex-shrink-0" />
+                          : <ChevronRight className="w-3 h-3 text-gray-500 flex-shrink-0" />}
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getJobStatusColor(job.status)}`}>
+                          {job.status}
+                        </span>
                       </span>
                     </td>
                     <td className="py-2 pr-4 text-sm text-gray-300">
@@ -737,7 +750,7 @@ export function System() {
                     <td className="py-2 text-right">
                       {(job.status === 'running' || job.status === 'queued') && (
                         <button
-                          onClick={() => cancelMutation.mutate(job.job_id)}
+                          onClick={(e) => { e.stopPropagation(); cancelMutation.mutate(job.job_id); }}
                           disabled={cancelMutation.isPending}
                           className="btn btn-secondary text-xs py-1 px-2 inline-flex items-center gap-1"
                           title="Cancel job"
@@ -748,7 +761,10 @@ export function System() {
                       )}
                     </td>
                   </tr>
-                ))}
+                  {isExpanded && <JobDetailRow jobId={job.job_id} colSpan={5} />}
+                  </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -822,5 +838,50 @@ export function System() {
         </div>
       )}
     </div>
+  );
+}
+
+// Expands a queue-job row to show the full error + traceback persisted on the
+// execution record. job_id == execution_id, so we look it up directly.
+function JobDetailRow({ jobId, colSpan }: { jobId: string; colSpan: number }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['execution-detail', jobId],
+    queryFn: () => apiClient.getExecution(jobId),
+    retry: false,
+  });
+
+  return (
+    <tr className="bg-[#0d0d0d]">
+      <td colSpan={colSpan} className="px-4 py-3">
+        {isLoading ? (
+          <p className="text-xs text-gray-500">Loading execution details…</p>
+        ) : isError ? (
+          <p className="text-xs text-gray-500">
+            No execution record stored for this job (it may not have started, or predates traceback capture).
+          </p>
+        ) : (
+          <div className="space-y-3 text-xs">
+            {data?.error && (
+              <div>
+                <p className="text-gray-500 mb-1">Error</p>
+                <pre className="text-red-400 whitespace-pre-wrap bg-red-900/10 border border-red-800/30 rounded p-2 overflow-x-auto">
+                  {data.error}
+                </pre>
+              </div>
+            )}
+            {data?.traceback ? (
+              <div>
+                <p className="text-gray-500 mb-1">Traceback</p>
+                <pre className="text-gray-300 font-mono whitespace-pre-wrap bg-[#161616] border border-white/[0.06] rounded p-2 max-h-96 overflow-auto">
+                  {data.traceback}
+                </pre>
+              </div>
+            ) : (
+              !data?.error && <p className="text-xs text-gray-500">No error detail recorded for this execution.</p>
+            )}
+          </div>
+        )}
+      </td>
+    </tr>
   );
 }

@@ -636,6 +636,15 @@ function ExecutionsTab({ initialTreeChatId, onClearTree }: { initialTreeChatId?:
                       </div>
                     )}
 
+                    {exec.traceback && (
+                      <div>
+                        <span className="text-gray-500 block mb-1">Traceback</span>
+                        <div className="bg-[#0d0d0d] rounded p-2 max-h-96 overflow-auto">
+                          <pre className="text-gray-300 font-mono whitespace-pre-wrap">{exec.traceback}</pre>
+                        </div>
+                      </div>
+                    )}
+
                     {exec.input_data && Object.keys(exec.input_data).length > 0 && (
                       <div>
                         <span className="text-gray-500 block mb-1">Input</span>
@@ -790,6 +799,14 @@ function ExecutionTree({ chatId, onBack }: { chatId: string; onBack: () => void 
                         <div>
                           <span className="text-gray-500 block mb-1">Error</span>
                           <pre className="text-red-400 text-[11px]">{exec.error}</pre>
+                        </div>
+                      )}
+                      {exec.traceback && (
+                        <div>
+                          <span className="text-gray-500 block mb-1">Traceback</span>
+                          <div className="bg-[#0d0d0d] rounded p-2 max-h-64 overflow-auto">
+                            <pre className="text-gray-300 font-mono whitespace-pre-wrap text-[11px]">{exec.traceback}</pre>
+                          </div>
                         </div>
                       )}
                     </div>
