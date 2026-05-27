@@ -8,6 +8,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import __version__
 from app.api.runtime import runtime_router
 from app.api.v1 import router as api_v1_router
 from app.core.auth import initialize_default_roles, initialize_superadmin, warn_if_users_lack_passwords
@@ -114,7 +115,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SINAS Runtime API",
     description="Execute AI agents, webhooks, and continue conversations",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
     docs_url=None,  # We'll create custom docs endpoint
     openapi_url=None,  # We'll create custom OpenAPI endpoint
@@ -141,7 +142,7 @@ _servers = [
 management_app = FastAPI(
     title="SINAS Management API",
     description="Manage agents, functions, webhooks, schedules, and configuration",
-    version="1.0.0",
+    version=__version__,
     docs_url="/docs",
     openapi_url="/openapi.json",
     servers=_servers,
@@ -157,7 +158,7 @@ app.mount("/api/v1", management_app)
 adapters_openai_app = FastAPI(
     title="SINAS OpenAI Adapter",
     description="OpenAI SDK-compatible API for SINAS agents and LLM providers",
-    version="1.0.0",
+    version=__version__,
     docs_url="/docs",
     openapi_url="/openapi.json",
     servers=_servers,

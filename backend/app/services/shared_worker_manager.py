@@ -837,7 +837,11 @@ sys.exit(1)
                     try:
                         stdout_result = json.loads(stdout_str)
                         if isinstance(stdout_result, dict) and stdout_result.get("error"):
-                            return {"status": "failed", "error": stdout_result["error"]}
+                            return {
+                                "status": "failed",
+                                "error": stdout_result["error"],
+                                "traceback": stdout_result.get("traceback"),
+                            }
                     except (json.JSONDecodeError, ValueError):
                         pass
                 error_msg = stderr_str or stdout_str or f"Function execution failed with exit code {exec_result.exit_code}"

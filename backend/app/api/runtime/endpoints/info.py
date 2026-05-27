@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app import __version__
 from app.core.config import settings
 from app.schemas.auth import InfoResponse
 
@@ -16,7 +17,7 @@ async def get_info() -> InfoResponse:
     """
     return InfoResponse(
         auth_mode=settings.auth_mode,  # type: ignore[arg-type]
-        version="1.0.0",
+        version=__version__,
         features={
             "clickhouse": bool(settings.clickhouse_host),
             "smtp": bool(settings.smtp_host),
