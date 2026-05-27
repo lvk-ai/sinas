@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sinas"
-version = "1.0.0"
+dynamic = ["version"]
 description = "SINAS - AI Agent Platform with LLM chat, webhooks, MCP tools, and function execution"
 authors = [
     {name = "Pulsr One"}
@@ -77,3 +77,6 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "app.__version__"}

@@ -3,6 +3,7 @@ name: Build & Push Docker Images
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 env:
@@ -51,8 +52,12 @@ jobs:
         with:
           images: ${{ env.IMAGE_PREFIX }}/${{ matrix.name }}
           tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable={{is_default_branch}}
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+          # latest=auto (default): applied only to non-prerelease semver tags,
+          # so v0.1.0 updates `latest` but v0.2.0-rc.1 does not.
 
       - name: Build and push
         uses: docker/build-push-action@v6
