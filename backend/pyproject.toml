@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sinas"
 dynamic = ["version"]
-description = "SINAS - AI Agent Platform with LLM chat, webhooks, MCP tools, and function execution"
+description = "Sinas - AI Agent Platform with LLM chat, webhooks, state management, files and function execution"
 authors = [
-    {name = "Pulsr One"}
+    {name = "Kjeld Oostra"}
 ]
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
