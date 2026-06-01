@@ -79,4 +79,5 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "app.__version__"}
+# Single source of truth: app/_version.py. Bump there only.
+version = {attr = "app._version.__version__"}

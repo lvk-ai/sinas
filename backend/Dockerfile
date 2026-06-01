@@ -12,8 +12,20 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only the files necessary for installing dependencies
+# Copy only the files needed to resolve the package metadata and install deps.
+# pyproject.toml uses setuptools dynamic version (`attr = "app._version.__version__"`),
+# so setuptools must be able to locate the `app` package and read `_version.py`
+# at install time. We copy the three minimal files that make that possible:
+#   - pyproject.toml         — declares the dynamic version attr
+#   - app/__init__.py        — marks `app` as a regular package (required for find)
+#   - app/_version.py        — the literal that the attr resolves to
+# Code edits to the rest of the app DO NOT invalidate this layer. A version
+# bump touches _version.py, which intentionally rebuilds the dep layer —
+# that's the cost of changing what gets installed, and it's bounded to once
+# per release rather than once per commit.
 COPY pyproject.toml /app/
+COPY app/__init__.py /app/app/__init__.py
+COPY app/_version.py /app/app/_version.py
 
 # Install dependencies
 RUN pip install --no-cache-dir -e .
