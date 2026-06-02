@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sinas"
 dynamic = ["version"]
-description = "SINAS - AI Agent Platform with LLM chat, webhooks, MCP tools, and function execution"
+description = "Sinas - AI Agent Platform with LLM chat, webhooks, state management, files and function execution"
 authors = [
-    {name = "Pulsr One"}
+    {name = "Kjeld Oostra"}
 ]
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -79,4 +79,5 @@ where = ["."]
 include = ["app*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "app.__version__"}
+# Single source of truth: app/_version.py. Bump there only.
+version = {attr = "app._version.__version__"}
