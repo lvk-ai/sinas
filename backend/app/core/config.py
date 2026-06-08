@@ -87,6 +87,19 @@ class Settings(BaseSettings):
     smtp_server_host: str = "0.0.0.0"
     smtp_server_port: int = 2525  # Port for incoming email SMTP server
 
+    # Executor selection — see `app/services/executor/` for the abstraction.
+    # - sandbox_executor: backend for untrusted code (per-function untrusted
+    #   functions and agent codeExecution). Must isolate per execution.
+    #     "docker_pool"      — long-lived Docker container pool (current default)
+    #     "docker_ephemeral" — Docker `run --rm` per execution (planned, step 3)
+    #     "k8s_pod"          — k8s Pod per execution (planned, step 5)
+    #     "disabled"         — sandbox features rejected; deploy is trusted-only
+    # - trusted_executor: backend for admin-approved code (Function.shared_pool=True).
+    #     "docker_shared" — dedicated long-lived Docker workers (current default)
+    #     "inprocess"     — run inside queue-worker process (planned, step 4)
+    sandbox_executor: str = "docker_pool"
+    trusted_executor: str = "docker_shared"
+
     # Function execution (always uses Docker for isolation)
     function_timeout: int = 300  # 5 minutes (max execution time)
     max_function_memory: int = 512  # MB (Docker memory limit)

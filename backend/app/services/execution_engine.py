@@ -5,7 +5,7 @@ import logging
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 import jsonschema
@@ -17,7 +17,6 @@ from app.core.database import AsyncSessionLocal
 from app.models.execution import Execution, ExecutionStatus
 from app.models.function import Function
 from app.services.clickhouse_logger import clickhouse_logger
-
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ async def _fire_callback(
     user_email: str,
     status: str,  # "success" | "failure"
     result: Any,
-    error: Optional[str],
+    error: str | None,
     trigger_id: str,
     function_namespace: str,
     function_name: str,
@@ -72,7 +71,7 @@ async def _fire_callback(
     }
 
     status_label = "failed"
-    response_code: Optional[int] = None
+    response_code: int | None = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -108,25 +107,39 @@ async def _fire_callback(
 class FunctionExecutor:
     def __init__(self):
         self.functions_cache: dict[str, Function] = {}
-        self._container_pool = None
+        # Executor selection is delegated to `app.services.executor.factory`,
+        # which resolves the configured impls from settings. We cache the
+        # resolved handles per-instance to avoid the factory call per
+        # execution. The sandbox handle is `None` when sandbox execution is
+        # disabled in this deployment; trusted is always required (it backs
+        # the admin-approved Function.shared_pool path).
+        self._sandbox_executor = None
+        self._sandbox_executor_resolved = False
+        self._trusted_executor = None
 
     @property
-    def container_pool(self):
-        """Lazy load container pool (replaces per-user containers)."""
-        if self._container_pool is None:
-            from app.services.container_pool import container_pool
+    def sandbox_executor(self):
+        """Resolved SandboxExecutor for untrusted code (or None if disabled).
 
-            self._container_pool = container_pool
-        return self._container_pool
+        Untrusted Function execution + agent `codeExecution` route here. A
+        `None` value means the deploy explicitly disabled the sandbox; callers
+        must surface a clear error rather than silently fall back to trusted.
+        """
+        if not self._sandbox_executor_resolved:
+            from app.services.executor import get_sandbox_executor
+
+            self._sandbox_executor = get_sandbox_executor()
+            self._sandbox_executor_resolved = True
+        return self._sandbox_executor
 
     @property
-    def worker_manager(self):
-        """Lazy load shared worker manager."""
-        if not hasattr(self, "_worker_manager") or self._worker_manager is None:
-            from app.services.shared_worker_manager import shared_worker_manager
+    def trusted_executor(self):
+        """Resolved TrustedExecutor for admin-approved `Function.shared_pool` code."""
+        if self._trusted_executor is None:
+            from app.services.executor import get_trusted_executor
 
-            self._worker_manager = shared_worker_manager
-        return self._worker_manager
+            self._trusted_executor = get_trusted_executor()
+        return self._trusted_executor
 
     async def validate_schema(self, data: Any, schema: dict[str, Any]) -> Any:
         """
@@ -151,9 +164,9 @@ class FunctionExecutor:
         user_email: str,
         access_token: str,
         trigger_type: str,
-        chat_id: Optional[str],
+        chat_id: str | None,
         db: AsyncSession,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> dict[str, Any]:
         """
         Execute function in shared worker pool (separate worker containers).
@@ -162,7 +175,7 @@ class FunctionExecutor:
         Workers are separate containers from backend but shared across users.
         No per-user isolation - functions must be trusted.
         """
-        exec_result = await self.worker_manager.execute_function(
+        exec_result = await self.trusted_executor.execute(
             user_id=user_id,
             user_email=user_email,
             access_token=access_token,
@@ -222,8 +235,8 @@ class FunctionExecutor:
         trigger_type: str,
         trigger_id: str,
         user_id: str,
-        chat_id: Optional[str] = None,
-        callback_url: Optional[str] = None,
+        chat_id: str | None = None,
+        callback_url: str | None = None,
     ) -> dict[str, Any]:
         """Execute a function with input validation and tracking."""
         async with AsyncSessionLocal() as db:
@@ -313,8 +326,17 @@ class FunctionExecutor:
                     print(
                         f"⏱️  [TIMING] Executing {function_namespace}/{function_name} in sandbox container"
                     )
+                    sandbox = self.sandbox_executor
+                    if sandbox is None:
+                        raise FunctionExecutionError(
+                            f"Sandbox execution is disabled on this deployment "
+                            f"(sandbox_executor='disabled'); cannot run "
+                            f"untrusted function '{function_namespace}/{function_name}'. "
+                            f"Either set Function.shared_pool=True for admin-approved "
+                            f"functions, or enable a sandbox executor."
+                        )
                     container_start = time.time()
-                    exec_result = await self.container_pool.execute_function(
+                    exec_result = await sandbox.execute(
                         user_id=user_id,
                         user_email=user_email,
                         access_token=access_token,
@@ -594,7 +616,7 @@ sys.exit(1)
         trigger_type: str,
         trigger_id: str,
         user_id: str,
-        chat_id: Optional[str] = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Enqueue a function for execution via the job queue.
