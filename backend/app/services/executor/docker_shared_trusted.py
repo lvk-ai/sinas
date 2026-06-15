@@ -14,6 +14,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.executor.base import ExecutionResult
+
 
 class DockerSharedTrustedExecutor:
     """Adapts `app.services.shared_worker_manager.shared_worker_manager` to `TrustedExecutor`."""
@@ -32,21 +34,40 @@ class DockerSharedTrustedExecutor:
         chat_id: str | None,
         db: AsyncSession,
         timeout: int,
-    ) -> dict[str, Any]:
+    ) -> ExecutionResult:
         # Lazy import so the Docker SDK is not imported by callers that
         # only need the abstraction.
         from app.services.shared_worker_manager import shared_worker_manager
 
-        return await shared_worker_manager.execute_function(
-            user_id=user_id,
-            user_email=user_email,
-            access_token=access_token,
-            function_namespace=function_namespace,
-            function_name=function_name,
-            input_data=input_data,
+        return ExecutionResult.from_wire(
+            await shared_worker_manager.execute_function(
+                user_id=user_id,
+                user_email=user_email,
+                access_token=access_token,
+                function_namespace=function_namespace,
+                function_name=function_name,
+                input_data=input_data,
+                execution_id=execution_id,
+                trigger_type=trigger_type,
+                chat_id=chat_id,
+                db=db,
+                timeout=timeout,
+            )
+        )
+
+    async def resume(
+        self,
+        *,
+        handle: str,
+        resume_value: Any,
+        execution_id: str,
+        timeout: int,
+    ) -> ExecutionResult:
+        from app.services.executor._docker_resume import docker_resume
+
+        return await docker_resume(
+            handle=handle,
+            resume_value=resume_value,
             execution_id=execution_id,
-            trigger_type=trigger_type,
-            chat_id=chat_id,
-            db=db,
             timeout=timeout,
         )

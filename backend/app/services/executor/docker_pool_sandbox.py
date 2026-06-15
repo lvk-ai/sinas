@@ -15,6 +15,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.executor.base import ExecutionResult
+
 
 class DockerPoolSandboxExecutor:
     """Adapts `app.services.container_pool.container_pool` to `SandboxExecutor`."""
@@ -33,22 +35,43 @@ class DockerPoolSandboxExecutor:
         chat_id: str | None,
         db: AsyncSession,
         timeout: int,
-    ) -> dict[str, Any]:
+    ) -> ExecutionResult:
         # Imported lazily so `from app.services.executor import ...` does
         # not pull the Docker SDK into modules that only need the
         # Protocol types.
         from app.services.container_pool import container_pool
 
-        return await container_pool.execute_function(
-            user_id=user_id,
-            user_email=user_email,
-            access_token=access_token,
-            function_namespace=function_namespace,
-            function_name=function_name,
-            input_data=input_data,
+        return ExecutionResult.from_wire(
+            await container_pool.execute_function(
+                user_id=user_id,
+                user_email=user_email,
+                access_token=access_token,
+                function_namespace=function_namespace,
+                function_name=function_name,
+                input_data=input_data,
+                execution_id=execution_id,
+                trigger_type=trigger_type,
+                chat_id=chat_id,
+                db=db,
+                timeout=timeout,
+            )
+        )
+
+    async def resume(
+        self,
+        *,
+        handle: str,
+        resume_value: Any,
+        execution_id: str,
+        timeout: int,
+    ) -> ExecutionResult:
+        # Untrusted code can't actually reach input() (sandbox mode raises),
+        # so this is here to satisfy the Protocol; it works regardless.
+        from app.services.executor._docker_resume import docker_resume
+
+        return await docker_resume(
+            handle=handle,
+            resume_value=resume_value,
             execution_id=execution_id,
-            trigger_type=trigger_type,
-            chat_id=chat_id,
-            db=db,
             timeout=timeout,
         )

@@ -17,6 +17,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.execution import Execution, ExecutionStatus
 from app.models.function import Function
 from app.services.clickhouse_logger import clickhouse_logger
+from app.services.executor.base import ExecutionResult, ResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,7 @@ class FunctionExecutor:
         chat_id: str | None,
         db: AsyncSession,
         timeout: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> ExecutionResult:
         """
         Execute function in shared worker pool (separate worker containers).
 
@@ -301,6 +302,10 @@ class FunctionExecutor:
 
                 start_time = time.time()
 
+                # Executor role — drives where an awaiting-input execution is
+                # resumed (persisted as a "role:handle" prefix in container_id).
+                role = "trusted" if function.shared_pool else "sandbox"
+
                 # Route execution based on shared_pool setting
                 if function.shared_pool:
                     # Execute in shared worker container pool
@@ -352,11 +357,14 @@ class FunctionExecutor:
                     container_elapsed = time.time() - container_start
                     print(f"⏱️  [TIMING] Sandbox container execution completed in {container_elapsed:.3f}s")
 
-                # Handle awaiting_input from shared containers
-                if exec_result.get("status") == "awaiting_input":
+                # Handle awaiting_input (only the trusted/shared path can pause;
+                # sandbox mode raises on input()).
+                if exec_result.status is ResultStatus.AWAITING_INPUT:
                     execution.status = ExecutionStatus.AWAITING_INPUT
-                    execution.input_prompt = exec_result.get("prompt")
-                    execution.container_id = exec_result.get("container_name")
+                    execution.input_prompt = exec_result.prompt
+                    # "role:handle" — role picks the executor at resume time;
+                    # handle is the executor's opaque resume token.
+                    execution.container_id = f"{role}:{exec_result.handle}"
                     await db.commit()
                     return {
                         "status": "awaiting_input",
@@ -364,16 +372,16 @@ class FunctionExecutor:
                         "prompt": execution.input_prompt,
                     }
 
-                if exec_result.get("status") == "failed":
-                    err = FunctionExecutionError(exec_result.get("error", "Unknown error"))
+                if exec_result.status is ResultStatus.FAILED:
+                    err = FunctionExecutionError(exec_result.error or "Unknown error")
                     # The container captured the function's real internal traceback.
                     # Attach it so the except handler persists it instead of the
                     # backend's own (useless) stack pointing at this raise.
-                    err.container_traceback = exec_result.get("traceback")
+                    err.container_traceback = exec_result.traceback
                     raise err
 
-                result = exec_result.get("result")
-                duration_ms = exec_result.get("duration_ms", 0)
+                result = exec_result.result
+                duration_ms = exec_result.duration_ms
 
                 # Validate output
                 if function.output_schema:
@@ -461,10 +469,11 @@ class FunctionExecutor:
         resume_value: Any,
     ) -> dict[str, Any]:
         """
-        Resume a paused execution by writing the resume value directly
-        to the container where the function is waiting on input().
+        Resume a paused (AWAITING_INPUT) execution with a human-provided value.
 
-        Bypasses the queue — the function thread is already running.
+        Routing and persistence live here; the actual resume mechanism is
+        delegated to the executor that produced the pause, via the opaque
+        handle stored on the execution. Bypasses the queue.
         """
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -480,100 +489,40 @@ class FunctionExecutor:
                     f"Execution {execution_id} is not awaiting input (status={execution.status})"
                 )
 
-            container_id = execution.container_id
-            if not container_id:
+            if not execution.container_id:
                 raise FunctionExecutionError(
-                    f"Execution {execution_id} has no container_id — cannot resume"
+                    f"Execution {execution_id} has no resume handle — cannot resume"
                 )
 
-            # Write resume file into the container
-            import docker
+            # container_id holds "role:handle". Treat a bare value (no ":") as a
+            # trusted handle, for executions paused before this format existed.
+            role, sep, handle = execution.container_id.partition(":")
+            if not sep:
+                role, handle = "trusted", execution.container_id
 
-            client = docker.from_env()
-            try:
-                container = client.containers.get(container_id)
-            except docker.errors.NotFound:
-                # Container gone — mark execution as failed
+            executor = self.sandbox_executor if role == "sandbox" else self.trusted_executor
+            if executor is None:
                 execution.status = ExecutionStatus.FAILED
-                execution.error = "Container no longer available (restarted?)"
+                execution.error = "Sandbox execution is disabled; cannot resume this execution."
                 execution.completed_at = datetime.utcnow()
                 await db.commit()
-                raise FunctionExecutionError(
-                    f"Container {container_id} not found — execution cannot be resumed"
-                )
-
-            # Write resume data into the container via stdin pipe
-            resume_payload = json.dumps({"value": resume_value}).encode("utf-8")
-            resume_file = f"/tmp/exec_resume_{execution_id}.json"
-
-            api = container.client.api
-            exec_id = api.exec_create(
-                container.id,
-                [
-                    "python3", "-c",
-                    f'import sys; open("{resume_file}","wb").write(sys.stdin.buffer.read())',
-                ],
-                stdin=True,
-                stdout=True,
-                stderr=True,
-            )["Id"]
-            sock = api.exec_start(exec_id, socket=True)
-            sock._sock.sendall(resume_payload)
-            import socket as _sock_mod
-            sock._sock.shutdown(_sock_mod.SHUT_WR)
-            sock.read()
-            sock.close()
+                raise FunctionExecutionError(execution.error)
 
             execution.status = ExecutionStatus.RUNNING
             await db.commit()
 
-            # Poll for result from the container
-            result_file = f"/tmp/exec_result_{execution_id}.json"
-            function_timeout = settings.function_timeout
-
-            exec_result = await asyncio.to_thread(
-                container.exec_run,
-                cmd=[
-                    "python3",
-                    "-c",
-                    f"""
-import sys, json, time, os
-max_wait = {function_timeout}
-start = time.time()
-while time.time() - start < max_wait:
-    try:
-        with open("{result_file}", "r") as f:
-            result = json.load(f)
-            print(json.dumps(result))
-            sys.exit(0)
-    except FileNotFoundError:
-        time.sleep(0.1)
-        continue
-print(json.dumps({{"error": "Resume timeout after {function_timeout}s"}}))
-sys.exit(1)
-""",
-                ],
-                demux=True,
+            res = await executor.resume(
+                handle=handle,
+                resume_value=resume_value,
+                execution_id=execution_id,
+                timeout=settings.function_timeout,
             )
 
-            stdout, stderr = exec_result.output
-            stdout_str = stdout.decode() if stdout else ""
-
-            if exec_result.exit_code != 0:
-                stderr_str = stderr.decode() if stderr else ""
-                error_msg = stderr_str or stdout_str or f"Exit code {exec_result.exit_code}"
-                execution.status = ExecutionStatus.FAILED
-                execution.error = error_msg
-                execution.completed_at = datetime.utcnow()
-                await db.commit()
-                raise FunctionExecutionError(f"Resume failed: {error_msg}")
-
-            result_data = json.loads(stdout_str)
-
-            # Handle another awaiting_input (multiple input() calls)
-            if result_data.get("status") == "awaiting_input":
+            # Another input() call — stay paused, keep the (re-stamped) handle.
+            if res.status is ResultStatus.AWAITING_INPUT:
                 execution.status = ExecutionStatus.AWAITING_INPUT
-                execution.input_prompt = result_data.get("prompt")
+                execution.input_prompt = res.prompt
+                execution.container_id = f"{role}:{res.handle}"
                 await db.commit()
                 return {
                     "status": "awaiting_input",
@@ -581,31 +530,27 @@ sys.exit(1)
                     "prompt": execution.input_prompt,
                 }
 
-            if result_data.get("status") == "failed":
+            if res.status is ResultStatus.FAILED:
                 execution.status = ExecutionStatus.FAILED
-                execution.error = result_data.get("error", "Unknown error")
-                execution.traceback = result_data.get("traceback")
+                execution.error = res.error or "Unknown error"
+                execution.traceback = res.traceback
                 execution.completed_at = datetime.utcnow()
                 await db.commit()
-                raise FunctionExecutionError(result_data.get("error", "Unknown error"))
+                raise FunctionExecutionError(res.error or "Unknown error")
 
             # Completed
-            output = result_data.get("result")
-            duration_ms = result_data.get("duration_ms", 0)
-
             execution.status = ExecutionStatus.COMPLETED
-            execution.output_data = output
+            execution.output_data = res.result
             execution.completed_at = datetime.utcnow()
-            execution.duration_ms = duration_ms
+            execution.duration_ms = res.duration_ms
             execution.container_id = None
-
             await db.commit()
 
             await clickhouse_logger.log_execution_end(
-                execution_id, "completed", output, None, duration_ms
+                execution_id, "completed", res.result, None, res.duration_ms
             )
 
-            return output
+            return res.result
 
     async def enqueue_function(
         self,
