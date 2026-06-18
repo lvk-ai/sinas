@@ -302,18 +302,32 @@ class FunctionExecutor:
                     print(
                         f"⏱️  [TIMING] Executing {function_namespace}/{function_name} in shared pool"
                     )
-                    exec_result = await self._execute_in_shared_pool(
-                        function=function,
-                        input_data=input_data,
-                        execution_id=execution_id,
-                        user_id=user_id,
-                        user_email=user_email,
-                        access_token=access_token,
-                        trigger_type=trigger_type,
-                        chat_id=chat_id,
-                        db=db,
-                        timeout=function_timeout,
+                    # Depth-aware admission: reserve worker slots for nested
+                    # calls so a parent waiting on a child can't starve the pool
+                    # (the nested-execution deadlock). Opt-in via
+                    # settings.shared_pool_reserve; nested calls (depth > 0)
+                    # bypass the gate.
+                    from app.services.shared_admission import (
+                        SharedPoolSaturated,
+                        shared_pool_admission,
                     )
+
+                    try:
+                        async with shared_pool_admission(depth, execution_id):
+                            exec_result = await self._execute_in_shared_pool(
+                                function=function,
+                                input_data=input_data,
+                                execution_id=execution_id,
+                                user_id=user_id,
+                                user_email=user_email,
+                                access_token=access_token,
+                                trigger_type=trigger_type,
+                                chat_id=chat_id,
+                                db=db,
+                                timeout=function_timeout,
+                            )
+                    except SharedPoolSaturated as e:
+                        raise FunctionExecutionError(str(e))
                     elapsed = time.time() - start_time
                     print(f"⏱️  [TIMING] Shared pool execution completed in {elapsed:.3f}s")
                 else:

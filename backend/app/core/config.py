@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     # silently exhausting the shared worker pool and deadlocking. 0 disables the
     # check. Keep <= the shared worker count so a full chain fits the pool.
     max_execution_depth: int = 8
+    # Reserve N shared-worker slots that only NESTED executions (depth > 0) may
+    # use, so a parent blocked on a child never starves the pool (the nested-
+    # call deadlock). 0 = disabled (no admission control; default — no behaviour
+    # change). For full single-chain safety set this to max_execution_depth - 1
+    # AND keep default_worker_count >= max_execution_depth. A smaller value still
+    # breaks the common contention case while throttling top-level work less.
+    shared_pool_reserve: int = 0
     max_function_memory: int = 512  # MB (Docker memory limit)
     max_function_cpu: float = 1.0  # CPU cores (1.0 = 1 full core, 0.5 = half core)
     max_function_storage: str = "1g"  # Disk storage limit (e.g., "500m", "1g")
