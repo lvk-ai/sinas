@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 VALID_AUTH_MODES = {"otp", "password", "password+otp"}
@@ -91,9 +91,10 @@ class Settings(BaseSettings):
     function_timeout: int = 300  # 5 minutes (max execution time)
     # Max nesting depth for execution chains (a function/agent invoking another
     # execution). A nested call exceeding this is rejected fast instead of
-    # silently exhausting the shared worker pool and deadlocking. 0 disables the
-    # check. Keep <= the shared worker count so a full chain fits the pool.
-    max_execution_depth: int = 8
+    # silently exhausting the shared worker pool and deadlocking. Defaults to
+    # `default_worker_count` (None = auto) so a full chain always fits the pool
+    # (depth <= workers); set an explicit value to override, or 0 to disable.
+    max_execution_depth: Optional[int] = None
     # Reserve N shared-worker slots that only NESTED executions (depth > 0) may
     # use, so a parent blocked on a child never starves the pool (the nested-
     # call deadlock). 0 = disabled (no admission control; default — no behaviour
@@ -171,6 +172,15 @@ class Settings(BaseSettings):
                 f"AUTH_MODE must be one of {sorted(VALID_AUTH_MODES)}, got {v!r}"
             )
         return normalized
+
+    @model_validator(mode="after")
+    def _default_max_execution_depth(self):
+        # Default the nesting cap to the worker count so a single chain always
+        # fits the pool (depth <= workers). Explicit values — including 0, which
+        # disables the check — are left untouched.
+        if self.max_execution_depth is None:
+            self.max_execution_depth = self.default_worker_count
+        return self
 
     # Domain (for generating external URLs, e.g., temp file URLs)
     domain: Optional[str] = None  # FQDN like "app.example.com"; localhost or None = no external URLs
