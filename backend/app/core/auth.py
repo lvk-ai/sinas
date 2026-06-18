@@ -288,7 +288,12 @@ async def get_user_permissions(db: AsyncSession, user_id: str) -> dict[str, bool
     return all_permissions
 
 
-def create_access_token(user_id: str, email: str, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    user_id: str,
+    email: str,
+    expires_delta: Optional[timedelta] = None,
+    execution_depth: Optional[int] = None,
+) -> str:
     """
     Create JWT access token (short-lived, no permissions in payload).
 
@@ -316,9 +321,39 @@ def create_access_token(user_id: str, email: str, expires_delta: Optional[timede
         "iat": int(now.timestamp()),  # Issued at (best practice)
         "exp": int(expire.timestamp()),
     }
+    if execution_depth is not None:
+        # Nesting depth of the execution this token belongs to. A nested call
+        # (a function/agent invoking another execution) reads this to compute
+        # its own depth and is rejected past settings.max_execution_depth.
+        # Absent on real user/app tokens (treated as top-level callers).
+        to_encode["execution_depth"] = execution_depth
 
     encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
     return encoded_jwt
+
+
+def get_execution_depth_from_request(request) -> Optional[int]:
+    """Read the `execution_depth` claim from the request's bearer token.
+
+    Returns the *caller* execution's depth, or None when the caller is not an
+    execution (a real user/app token carries no such claim). Best-effort: any
+    decode failure returns None, i.e. the caller is treated as top-level.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header[7:].strip()
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except Exception:
+        return None
+    depth = payload.get("execution_depth")
+    if depth is None:
+        return None
+    try:
+        return int(depth)
+    except (TypeError, ValueError):
+        return None
 
 
 async def create_refresh_token(db: AsyncSession, user_id: str) -> tuple[str, "RefreshToken"]:

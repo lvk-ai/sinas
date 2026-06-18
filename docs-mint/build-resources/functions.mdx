@@ -91,6 +91,10 @@ In sandbox containers (`shared_pool=false`), calling `input()` raises a `Runtime
 
 **Execution:** Functions run in pre-warmed Docker containers from a managed pool. Input is validated before execution, output is validated after. All executions are logged with status, duration, input/output, and any errors.
 
+<Note>
+**Nested executions are depth-limited.** A function can invoke other functions or agents (e.g. by calling the Sinas API with its execution token). Such chains are bounded by `MAX_EXECUTION_DEPTH` (defaults to the shared worker count): a call past the limit is rejected immediately rather than silently exhausting the shared worker pool and deadlocking. Keep `shared_pool` functions shallow, or raise `SHARED_POOL_RESERVE` / scale workers if you intentionally nest deeply. See [environment variables](/getting-started/environment-variables).
+</Note>
+
 **Endpoints:**
 
 ```
