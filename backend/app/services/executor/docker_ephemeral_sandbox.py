@@ -30,67 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 class DockerEphemeralSandboxExecutor:
-    """Per-execution ephemeral Docker sandbox. Implements SandboxExecutor."""
+    """Per-execution ephemeral Docker sandbox. Implements SandboxExecutor.
 
-    def __init__(self) -> None:
-        self._network_ready = False
-
-    def _ensure_network(self, client) -> str:
-        import docker
-
-        name = settings.sandbox_network
-        if self._network_ready:
-            return name
-        try:
-            client.networks.get(name)
-        except docker.errors.NotFound:
-            client.networks.create(name, driver="bridge", labels={"sinas.type": "sandbox"})
-        self._network_ready = True
-        return name
-
-    def _run_config(self, image: str, name: str, network: str) -> dict[str, Any]:
-        # Mirrors container_pool._do_create_container hardening, minus the
-        # unless-stopped restart policy (this container is single-use).
-        return {
-            "image": image,
-            "name": name,
-            "detach": True,
-            "network": network,
-            "mem_limit": f"{settings.max_function_memory}m",
-            "nano_cpus": int(settings.max_function_cpu * 1_000_000_000),
-            "cap_drop": ["ALL"],
-            "cap_add": ["CHOWN", "SETUID", "SETGID"],
-            "security_opt": ["no-new-privileges:true"],
-            "pids_limit": 256,
-            "extra_hosts": {"host.docker.internal": "host-gateway"},
-            "tmpfs": {"/tmp": "size=100m,mode=1777"},
-            "environment": {
-                "PYTHONUNBUFFERED": "1",
-                "SANDBOX_CONTAINER": "true",
-                "SINAS_CONTAINER_MODE": "sandbox",
-            },
-            "labels": {"sinas.type": "sandbox-executor", "sinas.ephemeral": "true"},
-        }
-
-    def _create_container(self, client, config: dict[str, Any]):
-        # Remove a stale container squatting on this name (e.g. a crashed prior
-        # run of the same execution_id), then create. Apply the storage limit,
-        # falling back if the storage driver doesn't support storage-opt.
-        import docker
-
-        try:
-            stale = client.containers.get(config["name"])
-            stale.remove(force=True)
-        except docker.errors.NotFound:
-            pass
-        try:
-            return client.containers.run(
-                **config, storage_opt={"size": settings.max_function_storage}
-            )
-        except Exception as e:
-            if "storage-opt" in str(e).lower() or "storage driver" in str(e).lower():
-                return client.containers.run(**config)
-            raise
+    Container lifecycle (resolve baked image + create + remove) lives in
+    `executor._ephemeral_runtime` and is shared with the agent codeExecution
+    path; this class supplies the function-execution IPC.
+    """
 
     async def execute(
         self,
@@ -107,10 +52,11 @@ class DockerEphemeralSandboxExecutor:
         db: AsyncSession,
         timeout: int,
     ) -> ExecutionResult:
-        import docker
-
         from app.models.function import Function
-        from app.services.sandbox_image import current_sandbox_image
+        from app.services.executor._ephemeral_runtime import (
+            create_ephemeral_container,
+            remove_ephemeral_container,
+        )
 
         result = await db.execute(
             select(Function).where(
@@ -125,18 +71,11 @@ class DockerEphemeralSandboxExecutor:
                 f"Function {function_namespace}/{function_name} not found"
             )
 
-        image = await current_sandbox_image(db)
-        client = await asyncio.to_thread(docker.from_env)
-        network = await asyncio.to_thread(self._ensure_network, client)
-        name = f"sinas-sbx-{execution_id}"
         effective_timeout = timeout or settings.function_timeout
-
-        config = self._run_config(image, name, network)
-        container = await asyncio.to_thread(self._create_container, client, config)
+        client, container, name = await create_ephemeral_container(
+            db, execution_id=execution_id
+        )
         try:
-            # Daemon warmup — match the pool's post-create settle.
-            await asyncio.sleep(1)
-
             payload = {
                 "action": "execute_inline",
                 "function_code": function.code,
@@ -222,10 +161,7 @@ sys.exit(1)
                 )
             return ExecutionResult.from_wire(json.loads(stdout_str))
         finally:
-            try:
-                await asyncio.to_thread(container.remove, force=True)
-            except Exception as e:
-                logger.warning("Failed to remove ephemeral sandbox %s: %s", name, e)
+            await remove_ephemeral_container(container, name)
 
     async def resume(
         self,

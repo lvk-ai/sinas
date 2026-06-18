@@ -146,9 +146,11 @@ instead of reinstalling into pool containers.
 
 ## Next steps (if accepted)
 
-1. `sandbox_image.py`: dependency hash + `build_sandbox_image` + DB tag pointer + GC.
-2. `DockerEphemeralSandboxExecutor` + factory wiring.
-3. Build triggers on dependency mutation / `reload_packages`.
-4. Route `code_execution.py` through the sandbox seam.
-5. No-op sandbox-pool init in ephemeral mode.
-6. Opt-in setting + docs; validate on a compose stack; then consider flipping the default.
+1. ✅ `sandbox_image.py`: dependency hash + `build_sandbox_image` + Redis tag cache/lock + GC + self-correcting resolver.
+2. ✅ `DockerEphemeralSandboxExecutor` + factory wiring.
+3. ✅ Build triggers (reload endpoint + scheduler warm-build); correctness is self-correcting regardless.
+4. ✅ Route `code_execution.py` (agent codeExecution) through a shared ephemeral lifecycle (`executor/_ephemeral_runtime.py`), used by both the function executor and the code path.
+5. ✅ No-op sandbox-pool init in ephemeral mode (scheduler).
+6. ⬜ Docs (the `SANDBOX_EXECUTOR` env var); **runtime validation on a compose stack** (the gate before flipping the default).
+
+Unit coverage: `tests/unit/test_executor_result.py` covers the `from_wire` wire→typed translation (the contract boundary). The container IPC paths require a live Docker daemon to exercise.
