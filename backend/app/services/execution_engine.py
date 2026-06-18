@@ -224,8 +224,14 @@ class FunctionExecutor:
         user_id: str,
         chat_id: Optional[str] = None,
         callback_url: Optional[str] = None,
+        depth: int = 0,
     ) -> dict[str, Any]:
-        """Execute a function with input validation and tracking."""
+        """Execute a function with input validation and tracking.
+
+        `depth` is this execution's nesting depth (0 = top-level). It is
+        embedded in the per-execution access token so a nested call can
+        compute its own depth and be bounded by settings.max_execution_depth.
+        """
         async with AsyncSessionLocal() as db:
             # Get user info for context
             from app.core.auth import create_access_token
@@ -250,7 +256,9 @@ class FunctionExecutor:
                     settings.max_execution_token_seconds,
                 )
             )
-            access_token = create_access_token(user_id, user_email, expires_delta=token_ttl)
+            access_token = create_access_token(
+                user_id, user_email, expires_delta=token_ttl, execution_depth=depth
+            )
 
             # Check if execution already exists (e.g. created by enqueue_function)
             result = await db.execute(

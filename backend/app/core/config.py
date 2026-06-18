@@ -89,6 +89,11 @@ class Settings(BaseSettings):
 
     # Function execution (always uses Docker for isolation)
     function_timeout: int = 300  # 5 minutes (max execution time)
+    # Max nesting depth for execution chains (a function/agent invoking another
+    # execution). A nested call exceeding this is rejected fast instead of
+    # silently exhausting the shared worker pool and deadlocking. 0 disables the
+    # check. Keep <= the shared worker count so a full chain fits the pool.
+    max_execution_depth: int = 8
     max_function_memory: int = 512  # MB (Docker memory limit)
     max_function_cpu: float = 1.0  # CPU cores (1.0 = 1 full core, 0.5 = half core)
     max_function_storage: str = "1g"  # Disk storage limit (e.g., "500m", "1g")
