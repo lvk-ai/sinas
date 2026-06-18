@@ -242,7 +242,20 @@ async def main() -> None:
 
     # --- Sandbox containers ---
     async with AsyncSessionLocal() as db:
-        await container_pool.initialize(db)
+        if settings.sandbox_executor == "docker_pool":
+            await container_pool.initialize(db)
+        elif settings.sandbox_executor == "docker_ephemeral":
+            # No warm pool — untrusted code runs in a fresh container per
+            # execution. Pre-build the baked sandbox image so the first
+            # execution doesn't pay the build (it self-corrects otherwise).
+            from app.services.sandbox_image import build_sandbox_image
+
+            try:
+                await build_sandbox_image(db)
+            except Exception as e:
+                logger.warning(
+                    "Sandbox image pre-build failed (will build on demand): %s", e
+                )
 
     # --- Shared containers ---
     await shared_worker_manager.initialize()

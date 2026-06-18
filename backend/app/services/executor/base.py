@@ -71,7 +71,9 @@ class ExecutionResult:
                 prompt=d.get("prompt"),
                 handle=d.get("container_name"),
             )
-        if status == "failed":
+        # Explicit failure, or a status-less error envelope (e.g. the poll
+        # script's own "Execution timeout" output) — never treat as success.
+        if status == "failed" or (status != "completed" and d.get("error")):
             return cls(
                 ResultStatus.FAILED,
                 error=d.get("error", "Unknown error"),

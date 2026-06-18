@@ -34,10 +34,11 @@ def get_sandbox_executor() -> SandboxExecutor | None:
         return DockerPoolSandboxExecutor()
 
     if mode == "docker_ephemeral":
-        raise NotImplementedError(
-            "sandbox_executor='docker_ephemeral' is planned for step 3 of the "
-            "executor refactor; not yet implemented."
+        from app.services.executor.docker_ephemeral_sandbox import (
+            DockerEphemeralSandboxExecutor,
         )
+
+        return DockerEphemeralSandboxExecutor()
 
     if mode == "k8s_pod":
         raise NotImplementedError(
