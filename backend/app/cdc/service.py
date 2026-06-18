@@ -113,6 +113,38 @@ class CDCManager:
         else:
             logger.warning(f"Unknown CDC action: {action}")
 
+    async def reload(self):
+        """Reconcile poll tasks against the active triggers in the DB.
+
+        Starts a poll task for every active trigger that isn't already running,
+        and prunes finished tasks (a deleted/deactivated trigger's loop stops
+        itself). Config *updates* are picked up by the running loop's per-cycle
+        re-query, so reload only needs to handle add/remove.
+
+        Used to pick up triggers created via config apply / Package install,
+        which don't emit a per-trigger notification.
+        """
+        from app.models.database_trigger import DatabaseTrigger
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(DatabaseTrigger.id).where(DatabaseTrigger.is_active == True)
+            )
+            active_ids = {str(row[0]) for row in result.all()}
+
+        # Drop finished tasks (triggers that were deleted/deactivated).
+        for tid in [t for t, task in self._poll_tasks.items() if task.done()]:
+            del self._poll_tasks[tid]
+
+        started = 0
+        for tid in active_ids:
+            if tid not in self._poll_tasks:
+                self._start_poll_task(tid)
+                started += 1
+        logger.info(
+            f"CDC reload: {len(active_ids)} active trigger(s), started {started} new poll task(s)"
+        )
+
     def _start_poll_task(self, trigger_id: str):
         """Start a background poll loop task for one trigger."""
         task = asyncio.create_task(self._run_poll_loop(trigger_id))
@@ -312,12 +344,15 @@ async def _listen_for_trigger_changes(manager: CDCManager, stop_event: asyncio.E
             try:
                 payload = json.loads(msg["data"])
                 action = payload["action"]
-                trigger_id = payload["trigger_id"]
+                trigger_id = payload.get("trigger_id", "")
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Invalid CDC message: {e}")
                 continue
 
-            await manager.handle_trigger_change(action, trigger_id)
+            if action == "reload":
+                await manager.reload()
+            else:
+                await manager.handle_trigger_change(action, trigger_id)
     finally:
         await pubsub.unsubscribe(CDC_CHANNEL)
         await pubsub.aclose()
