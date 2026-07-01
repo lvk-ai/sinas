@@ -14,17 +14,24 @@ class OpenAIProvider(BaseLLMProvider):
         super().__init__(api_key, base_url)
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    async def complete(
+    def _prepare_params(
         self,
-        messages: list[dict[str, Any]],
+        *,
         model: str,
-        tools: Optional[list[dict[str, Any]]] = None,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        **kwargs,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: Optional[int],
+        tools: Optional[list[dict[str, Any]]],
+        kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        """Generate a completion using OpenAI API."""
-        params = {
+        """
+        Build the chat-completions request payload.
+
+        Extracted as a hook so subclasses (e.g. Azure) can adjust parameter
+        names or strip params unsupported by certain deployments without
+        re-implementing complete()/stream().
+        """
+        params: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
@@ -39,6 +46,27 @@ class OpenAIProvider(BaseLLMProvider):
 
         # Add any additional kwargs
         params.update(kwargs)
+
+        return params
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        tools: Optional[list[dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Generate a completion using OpenAI API."""
+        params = self._prepare_params(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            kwargs=kwargs,
+        )
 
         response = await self.client.chat.completions.create(**params)
 
@@ -66,22 +94,15 @@ class OpenAIProvider(BaseLLMProvider):
         **kwargs,
     ) -> AsyncIterator[dict[str, Any]]:
         """Generate a streaming completion using OpenAI API."""
-        params = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": True,
-        }
-
-        if max_tokens:
-            params["max_tokens"] = max_tokens
-
-        if tools:
-            params["tools"] = tools
-            params["tool_choice"] = "auto"
-
-        # Add any additional kwargs
-        params.update(kwargs)
+        params = self._prepare_params(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            kwargs=kwargs,
+        )
+        params["stream"] = True
 
         stream = await self.client.chat.completions.create(**params)
 
