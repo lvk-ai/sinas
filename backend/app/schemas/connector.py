@@ -19,11 +19,25 @@ class OperationConfig(BaseModel):
 
 
 class ConnectorAuth(BaseModel):
-    type: str = Field(default="none", pattern=r"^(bearer|basic|api_key|sinas_token|none)$")
+    type: str = Field(
+        default="none",
+        pattern=r"^(bearer|basic|api_key|sinas_token|oauth2_client_credentials|none)$",
+    )
     secret: Optional[str] = None
     header: Optional[str] = None
     position: Optional[str] = Field(default=None, pattern=r"^(header|query)$")
     param_name: Optional[str] = None
+
+    # OAuth 2.0 client-credentials grant (type="oauth2_client_credentials").
+    # `secret` holds the name of the Secret containing the client secret.
+    token_url: Optional[str] = None
+    client_id: Optional[str] = None
+    scopes: Optional[list[str]] = None
+    # How to present client credentials to the token endpoint:
+    # "basic" = HTTP Basic (client_secret_basic), "body" = form fields (client_secret_post).
+    client_auth_method: Optional[str] = Field(default=None, pattern=r"^(basic|body)$")
+    # Extra params sent with the token request (e.g. {"audience": "..."}).
+    token_params: Optional[dict[str, str]] = None
 
 
 class ConnectorRetry(BaseModel):
