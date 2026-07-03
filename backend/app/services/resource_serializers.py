@@ -173,6 +173,12 @@ def serialize_connector(conn) -> dict:
             "header": auth.get("header"),
             "position": auth.get("position"),
             "paramName": auth.get("param_name"),
+            "tokenUrl": auth.get("token_url"),
+            "clientId": auth.get("client_id"),
+            "scopes": auth.get("scopes"),
+            "clientAuthMethod": auth.get("client_auth_method"),
+            "authorizeUrl": auth.get("authorize_url"),
+            "tokenParams": auth.get("token_params"),
         }),
         "headers": conn.headers if conn.headers else None,
         "retry": _remove_none_values({

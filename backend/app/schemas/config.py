@@ -367,6 +367,13 @@ class ConnectorAuthConfig(BaseModel):
     header: Optional[str] = None
     position: Optional[str] = None
     paramName: Optional[str] = None
+    # OAuth 2.0 (client-credentials and authorization-code) fields.
+    tokenUrl: Optional[str] = None
+    clientId: Optional[str] = None
+    scopes: Optional[list[str]] = None
+    clientAuthMethod: Optional[str] = None
+    authorizeUrl: Optional[str] = None
+    tokenParams: Optional[dict[str, str]] = None
 
 
 class ConnectorRetryConfig(BaseModel):
