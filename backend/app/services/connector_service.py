@@ -485,10 +485,24 @@ class ConnectorService:
         )
         return result.scalar_one_or_none()
 
+    def _token_still_valid(self, row: ConnectorOAuthToken) -> bool:
+        """True if the stored access token is safe to use now (skew-aware)."""
+        if row.expires_at is None:
+            # No expiry known — assume the stored token is usable.
+            return bool(row.encrypted_access_token)
+        skew = timedelta(seconds=OAUTH_TOKEN_TTL_SKEW)
+        return row.expires_at - skew > datetime.now(timezone.utc)
+
     async def _get_authorization_code_token(
         self, db: AsyncSession, connector_id: Any, auth_config: dict[str, Any], user_id: Optional[str]
     ) -> Optional[str]:
-        """Return a valid access token for this user, refreshing if it has (nearly) expired."""
+        """Return a valid access token for this user, refreshing if it has (nearly) expired.
+
+        The common case (a still-valid token) takes NO lock and reads on the caller's
+        session, so concurrent executions never serialize. Only an actual refresh takes a
+        short row lock (see _refresh_authorization_code_token) to keep concurrent refreshers
+        of the same (connector, user) from racing on a rotating refresh token.
+        """
         if not connector_id or not user_id:
             logger.warning("oauth2_authorization_code auth requires a connector and user context")
             return None
@@ -498,43 +512,74 @@ class ConnectorService:
             logger.warning(f"No OAuth token stored for connector {connector_id} user {user_id}")
             return None
 
-        # Still valid (with skew)? Use it.
-        if row.expires_at is not None:
-            skew = timedelta(seconds=OAUTH_TOKEN_TTL_SKEW)
-            if row.expires_at - skew > datetime.now(timezone.utc):
-                return encryption_service.decrypt(row.encrypted_access_token)
-        elif row.encrypted_access_token:
-            # No expiry known — assume the stored token is usable.
+        if self._token_still_valid(row):
             return encryption_service.decrypt(row.encrypted_access_token)
 
-        # Expired (or expiring): try to refresh.
         if not row.encrypted_refresh_token:
             logger.warning(f"OAuth token for connector {connector_id} expired and has no refresh token")
             return None
 
-        token_url = auth_config.get("token_url")
-        client_id = auth_config.get("client_id")
-        secret_name = auth_config.get("secret")
-        client_secret = await self._resolve_secret_value(db, secret_name, user_id) if secret_name else None
-        if not token_url or not client_id or client_secret is None:
-            logger.warning("OAuth refresh requires token_url, client_id, and secret")
-            return None
+        return await self._refresh_authorization_code_token(connector_id, auth_config, user_id)
 
-        refresh_token = encryption_service.decrypt(row.encrypted_refresh_token)
-        payload = await self._post_token_request(
-            token_url,
-            {"grant_type": "refresh_token", "refresh_token": refresh_token},
-            client_id,
-            client_secret,
-            auth_config.get("client_auth_method") or "body",
-        )
-        if not payload or not payload.get("access_token"):
-            logger.warning(f"OAuth refresh failed for connector {connector_id} user {user_id}")
-            return None
+    async def _refresh_authorization_code_token(
+        self, connector_id: Any, auth_config: dict[str, Any], user_id: str
+    ) -> Optional[str]:
+        """Refresh a per-user token under a row lock, in its own short-lived transaction.
 
-        self._store_token_fields(row, payload)
-        await db.flush()
-        return encryption_service.decrypt(row.encrypted_access_token)
+        `SELECT ... FOR UPDATE` on the single (connector, user) row serializes concurrent
+        refreshers across processes/containers. We re-check validity under the lock so a
+        request that lost the race uses the winner's freshly-stored token instead of
+        issuing a second (refresh-token-rotating) refresh. The lock is held only for the
+        token POST and released on commit — it does not span the caller's execution.
+        """
+        from app.core.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(ConnectorOAuthToken)
+                    .where(
+                        and_(
+                            ConnectorOAuthToken.connector_id == connector_id,
+                            ConnectorOAuthToken.user_id == user_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    return None
+
+                # Double-checked locking: a sibling request may have just refreshed.
+                if self._token_still_valid(row):
+                    return encryption_service.decrypt(row.encrypted_access_token)
+                if not row.encrypted_refresh_token:
+                    return None
+
+                token_url = auth_config.get("token_url")
+                client_id = auth_config.get("client_id")
+                secret_name = auth_config.get("secret")
+                client_secret = (
+                    await self._resolve_secret_value(session, secret_name, user_id) if secret_name else None
+                )
+                if not token_url or not client_id or client_secret is None:
+                    logger.warning("OAuth refresh requires token_url, client_id, and secret")
+                    return None
+
+                refresh_token = encryption_service.decrypt(row.encrypted_refresh_token)
+                payload = await self._post_token_request(
+                    token_url,
+                    {"grant_type": "refresh_token", "refresh_token": refresh_token},
+                    client_id,
+                    client_secret,
+                    auth_config.get("client_auth_method") or "body",
+                )
+                if not payload or not payload.get("access_token"):
+                    logger.warning(f"OAuth refresh failed for connector {connector_id} user {user_id}")
+                    return None
+
+                self._store_token_fields(row, payload)
+                return payload["access_token"]
 
     def _render_path(self, path_template: str, parameters: dict[str, Any]) -> str:
         """Render Jinja2 path template with parameters."""
