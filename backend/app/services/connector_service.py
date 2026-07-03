@@ -71,7 +71,7 @@ class ConnectorService:
             raise ValueError(f"Operation '{operation_name}' not found on connector '{connector.namespace}/{connector.name}'")
 
         # Resolve auth (private secrets override shared for this user)
-        auth_headers = await self._resolve_auth(db, connector.auth, user_token, user_id)
+        auth_headers, auth_query = await self._resolve_auth(db, connector.auth, user_token, user_id)
 
         # Build request
         method = operation["method"]
@@ -95,6 +95,10 @@ class ConnectorService:
             json_body = non_path_params
         elif mapping == "path_and_query":
             query_params = non_path_params
+
+        # Auth may contribute query params (e.g. an api_key with position="query")
+        if auth_query:
+            query_params = {**(query_params or {}), **auth_query}
 
         # Execute with retry, respecting concurrency limit
         retry_config = connector.retry or {}
@@ -156,46 +160,53 @@ class ConnectorService:
     async def _resolve_auth(
         self, db: AsyncSession, auth_config: dict[str, Any], user_token: Optional[str],
         user_id: Optional[str] = None,
-    ) -> dict[str, str]:
-        """Resolve auth config to HTTP headers. Private secrets override shared."""
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Resolve auth config into (headers, query_params). Private secrets override shared.
+
+        Most auth types contribute a header; an api_key with position="query" contributes
+        a query parameter instead. The query dict is empty for all other types.
+        """
         auth_type = auth_config.get("type", "none")
 
         if auth_type == "none":
-            return {}
+            return {}, {}
 
         if auth_type == "sinas_token":
             if not user_token:
                 logger.warning("sinas_token auth requested but no user token available")
-                return {}
-            return {"Authorization": f"Bearer {user_token}"}
+                return {}, {}
+            return {"Authorization": f"Bearer {user_token}"}, {}
 
         if auth_type == "oauth2_client_credentials":
             token = await self._get_client_credentials_token(db, auth_config, user_id)
             if not token:
-                return {}
-            return {"Authorization": f"Bearer {token}"}
+                return {}, {}
+            return {"Authorization": f"Bearer {token}"}, {}
 
         # All other types require a secret
         secret_name = auth_config.get("secret")
         if not secret_name:
             logger.warning(f"Auth type '{auth_type}' requires a secret but none configured")
-            return {}
+            return {}, {}
 
         secret_value = await self._resolve_secret_value(db, secret_name, user_id)
         if secret_value is None:
             logger.warning(f"Secret '{secret_name}' not found for connector auth")
-            return {}
+            return {}, {}
 
         if auth_type == "bearer":
-            return {"Authorization": f"Bearer {secret_value}"}
+            return {"Authorization": f"Bearer {secret_value}"}, {}
         elif auth_type == "basic":
             encoded = base64.b64encode(secret_value.encode()).decode()
-            return {"Authorization": f"Basic {encoded}"}
+            return {"Authorization": f"Basic {encoded}"}, {}
         elif auth_type == "api_key":
-            header_name = auth_config.get("header", "X-Api-Key")
-            return {header_name: secret_value}
+            if auth_config.get("position") == "query":
+                param_name = auth_config.get("param_name") or "api_key"
+                return {}, {param_name: secret_value}
+            header_name = auth_config.get("header") or "X-Api-Key"
+            return {header_name: secret_value}, {}
 
-        return {}
+        return {}, {}
 
     async def _resolve_secret_value(
         self, db: AsyncSession, secret_name: str, user_id: Optional[str] = None
