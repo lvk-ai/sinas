@@ -150,7 +150,17 @@ export function ConnectorEditor() {
         if (slug) updates.name = slug;
       }
       if (data.spec_description && !formData.description) updates.description = data.spec_description;
-      if (Object.keys(updates).length > 0) setFormData(prev => ({ ...prev, ...updates }));
+      const hasAuthSuggestion = !!data.suggested_auth;
+      if (Object.keys(updates).length > 0 || hasAuthSuggestion) {
+        setFormData(prev => {
+          const next = { ...prev, ...updates };
+          // Prefill auth from the spec's securitySchemes, but never clobber a chosen type.
+          if (hasAuthSuggestion && prev.auth.type === 'none') {
+            next.auth = { ...prev.auth, ...data.suggested_auth };
+          }
+          return next;
+        });
+      }
     },
   });
 
