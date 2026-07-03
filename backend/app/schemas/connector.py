@@ -131,3 +131,5 @@ class OpenAPIImportResponse(BaseModel):
     spec_title: Optional[str] = None
     spec_description: Optional[str] = None
     spec_base_url: Optional[str] = None
+    # Auth derived from the spec's securitySchemes (minus secrets); None if not mappable.
+    suggested_auth: Optional[dict[str, Any]] = None

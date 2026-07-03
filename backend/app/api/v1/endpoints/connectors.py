@@ -25,7 +25,7 @@ from app.schemas.connector import (
     OpenAPIImportResponse,
     OperationConfig,
 )
-from app.services.connector_openapi import extract_operations, parse_openapi_spec
+from app.services.connector_openapi import extract_auth, extract_operations, parse_openapi_spec
 from app.services.connector_service import connector_service
 from app.services.package_service import detach_if_package_managed
 
@@ -106,6 +106,7 @@ async def parse_openapi_standalone(
         spec_title=spec_title,
         spec_description=spec_description,
         spec_base_url=spec_base_url,
+        suggested_auth=extract_auth(spec),
     )
 
 
