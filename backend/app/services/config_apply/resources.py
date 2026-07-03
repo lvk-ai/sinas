@@ -71,6 +71,12 @@ async def apply_connectors(
                 "header": conn_config.auth.header,
                 "position": conn_config.auth.position,
                 "param_name": conn_config.auth.paramName,
+                "token_url": conn_config.auth.tokenUrl,
+                "client_id": conn_config.auth.clientId,
+                "scopes": conn_config.auth.scopes,
+                "client_auth_method": conn_config.auth.clientAuthMethod,
+                "authorize_url": conn_config.auth.authorizeUrl,
+                "token_params": conn_config.auth.tokenParams,
             }
             # Remove None values from auth
             auth = {k: v for k, v in auth.items() if v is not None}
