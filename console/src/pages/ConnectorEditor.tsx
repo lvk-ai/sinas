@@ -17,10 +17,11 @@ const AUTH_TYPES = [
   { value: 'basic', label: 'Basic Auth' },
   { value: 'api_key', label: 'API Key' },
   { value: 'oauth2_client_credentials', label: 'OAuth 2.0 (Client Credentials)' },
+  { value: 'oauth2_authorization_code', label: 'OAuth 2.0 (Authorization Code)' },
   { value: 'sinas_token', label: 'Sinas Token' },
 ];
 // Auth types that resolve a stored Secret (for OAuth this is the client secret).
-const SECRET_AUTH_TYPES = ['bearer', 'basic', 'api_key', 'oauth2_client_credentials'];
+const SECRET_AUTH_TYPES = ['bearer', 'basic', 'api_key', 'oauth2_client_credentials', 'oauth2_authorization_code'];
 const methodColors: Record<string, string> = {
   GET: 'bg-green-900/30 text-green-400',
   POST: 'bg-blue-900/30 text-blue-400',
@@ -56,7 +57,7 @@ export function ConnectorEditor() {
     namespace: 'default', name: '', description: '', base_url: '',
     auth: {
       type: 'none' as string, secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key',
-      token_url: '', client_id: '', scopes: [] as string[], client_auth_method: 'body',
+      token_url: '', client_id: '', scopes: [] as string[], client_auth_method: 'body', authorize_url: '',
     },
     headers: {} as Record<string, string>,
     retry: { max_attempts: 1, backoff: 'none' },
@@ -105,7 +106,7 @@ export function ConnectorEditor() {
         base_url: connector.base_url,
         auth: {
           type: 'none', secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key',
-          token_url: '', client_id: '', scopes: [], client_auth_method: 'body', ...connector.auth,
+          token_url: '', client_id: '', scopes: [], client_auth_method: 'body', authorize_url: '', ...connector.auth,
         },
         headers: connector.headers || {},
         retry: { max_attempts: 1, backoff: 'none', ...connector.retry },
@@ -163,6 +164,39 @@ export function ConnectorEditor() {
   const handleSave = () => {
     saveMutation.mutate(formData);
   };
+
+  // OAuth (authorization-code) per-user connection status
+  const isAuthCode = formData.auth.type === 'oauth2_authorization_code';
+  const { data: oauthStatus, refetch: refetchOAuthStatus } = useQuery({
+    queryKey: ['connector-oauth-status', namespace, name],
+    queryFn: () => apiClient.getConnectorOAuthStatus(namespace!, name!),
+    enabled: !isNew && isAuthCode,
+    retry: false,
+  });
+
+  // Refresh status when the popup reports back that authorization finished.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'connector-oauth') {
+        if (e.data.status === 'success') showSuccess('Account connected');
+        refetchOAuthStatus();
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [refetchOAuthStatus, showSuccess]);
+
+  const connectMutation = useMutation({
+    mutationFn: () => apiClient.beginConnectorOAuth(formData.namespace, formData.name),
+    onSuccess: (data: { authorize_url: string }) => {
+      window.open(data.authorize_url, 'connector-oauth', 'width=600,height=760');
+    },
+  });
+
+  const disconnectMutation = useMutation({
+    mutationFn: () => apiClient.disconnectConnectorOAuth(formData.namespace, formData.name),
+    onSuccess: () => { showSuccess('Account disconnected'); refetchOAuthStatus(); },
+  });
 
   const addOperation = () => {
     const ops = [...formData.operations, emptyOp()];
@@ -393,6 +427,74 @@ export function ConnectorEditor() {
             <p className="text-xs text-gray-500">
               The client secret is exchanged for a short-lived access token, cached until shortly before it expires, and sent as a Bearer token.
             </p>
+          </div>
+        )}
+        {isAuthCode && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Authorize URL</label>
+                <input type="text" value={formData.auth.authorize_url} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, authorize_url: e.target.value } })}
+                  className="input w-full font-mono" placeholder="https://provider.com/oauth/authorize" />
+              </div>
+              <div>
+                <label className="label">Token URL</label>
+                <input type="text" value={formData.auth.token_url} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, token_url: e.target.value } })}
+                  className="input w-full font-mono" placeholder="https://provider.com/oauth/token" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Client ID</label>
+                <input type="text" value={formData.auth.client_id} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, client_id: e.target.value } })}
+                  className="input w-full font-mono" />
+              </div>
+              <div>
+                <label className="label">Client Auth Method</label>
+                <select value={formData.auth.client_auth_method} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, client_auth_method: e.target.value } })}
+                  className="input w-full">
+                  <option value="body">Request Body (client_secret_post)</option>
+                  <option value="basic">HTTP Basic (client_secret_basic)</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="label">Scopes</label>
+              <input type="text"
+                value={(formData.auth.scopes || []).join(' ')}
+                onChange={e => setFormData({ ...formData, auth: { ...formData.auth, scopes: e.target.value.split(/\s+/).filter(Boolean) } })}
+                className="input w-full font-mono" placeholder="openid email profile (space-separated)" />
+            </div>
+            <p className="text-xs text-gray-500">
+              Each user authorizes their own account; tokens are stored per-user and refreshed automatically.
+              Register this redirect URI with the provider: <span className="font-mono text-gray-400">https://&lt;your-domain&gt;/auth/connectors/oauth/callback</span>
+            </p>
+            {isNew ? (
+              <p className="text-xs text-yellow-500/80">Save the connector before connecting an account.</p>
+            ) : (
+              <div className="flex items-center gap-3 pt-1">
+                {oauthStatus?.connected ? (
+                  <>
+                    <span className="text-sm text-green-400">
+                      Connected{oauthStatus.expires_at ? ` · expires ${new Date(oauthStatus.expires_at).toLocaleString()}` : ''}
+                    </span>
+                    <button onClick={() => connectMutation.mutate()} disabled={connectMutation.isPending} className="btn btn-secondary btn-sm">
+                      Reconnect
+                    </button>
+                    <button onClick={() => disconnectMutation.mutate()} disabled={disconnectMutation.isPending} className="btn btn-secondary btn-sm text-red-400">
+                      Disconnect
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm text-gray-500">Not connected</span>
+                    <button onClick={() => connectMutation.mutate()} disabled={connectMutation.isPending} className="btn btn-primary btn-sm">
+                      {connectMutation.isPending ? 'Opening...' : 'Connect Account'}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
         {formData.auth.type === 'sinas_token' && (

@@ -4,6 +4,7 @@ from .base import Base
 from .batch import Batch, BatchKind, BatchStatus
 from .chat import Chat, Message
 from .connector import Connector
+from .connector_oauth_token import ConnectorOAuthToken
 from .component import Component
 from .component_share import ComponentShare
 from .database_connection import DatabaseConnection
@@ -55,6 +56,7 @@ __all__ = [
     "Component",
     "ComponentShare",
     "Connector",
+    "ConnectorOAuthToken",
     "LLMProvider",
     "DatabaseConnection",
     "DatabaseTrigger",

@@ -575,6 +575,20 @@ class APIClient {
     return response.data;
   }
 
+  async beginConnectorOAuth(namespace: string, name: string): Promise<{ authorize_url: string }> {
+    const response = await this.configClient.post(`/connectors/${namespace}/${name}/oauth/authorize`);
+    return response.data;
+  }
+
+  async getConnectorOAuthStatus(namespace: string, name: string): Promise<{ connected: boolean; expires_at: string | null; scope: string | null }> {
+    const response = await this.configClient.get(`/connectors/${namespace}/${name}/oauth/status`);
+    return response.data;
+  }
+
+  async disconnectConnectorOAuth(namespace: string, name: string): Promise<void> {
+    await this.configClient.delete(`/connectors/${namespace}/${name}/oauth/token`);
+  }
+
   // Store management (admin CRUD)
   async listStores(params?: { namespace?: string }): Promise<any[]> {
     const response = await this.configClient.get('/stores', { params });
