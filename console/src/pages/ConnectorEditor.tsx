@@ -16,8 +16,11 @@ const AUTH_TYPES = [
   { value: 'bearer', label: 'Bearer Token' },
   { value: 'basic', label: 'Basic Auth' },
   { value: 'api_key', label: 'API Key' },
+  { value: 'oauth2_client_credentials', label: 'OAuth 2.0 (Client Credentials)' },
   { value: 'sinas_token', label: 'Sinas Token' },
 ];
+// Auth types that resolve a stored Secret (for OAuth this is the client secret).
+const SECRET_AUTH_TYPES = ['bearer', 'basic', 'api_key', 'oauth2_client_credentials'];
 const methodColors: Record<string, string> = {
   GET: 'bg-green-900/30 text-green-400',
   POST: 'bg-blue-900/30 text-blue-400',
@@ -51,7 +54,10 @@ export function ConnectorEditor() {
 
   const [formData, setFormData] = useState({
     namespace: 'default', name: '', description: '', base_url: '',
-    auth: { type: 'none' as string, secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key' },
+    auth: {
+      type: 'none' as string, secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key',
+      token_url: '', client_id: '', scopes: [] as string[], client_auth_method: 'body',
+    },
     headers: {} as Record<string, string>,
     retry: { max_attempts: 1, backoff: 'none' },
     timeout_seconds: 30,
@@ -97,7 +103,10 @@ export function ConnectorEditor() {
         name: connector.name,
         description: connector.description || '',
         base_url: connector.base_url,
-        auth: { type: 'none', secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key', ...connector.auth },
+        auth: {
+          type: 'none', secret: '', header: 'X-Api-Key', position: 'header', param_name: 'api_key',
+          token_url: '', client_id: '', scopes: [], client_auth_method: 'body', ...connector.auth,
+        },
         headers: connector.headers || {},
         retry: { max_attempts: 1, backoff: 'none', ...connector.retry },
         timeout_seconds: connector.timeout_seconds,
@@ -314,9 +323,9 @@ export function ConnectorEditor() {
               {AUTH_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
             </select>
           </div>
-          {['bearer', 'basic', 'api_key'].includes(formData.auth.type) && (
+          {SECRET_AUTH_TYPES.includes(formData.auth.type) && (
             <div>
-              <label className="label">Secret</label>
+              <label className="label">{formData.auth.type === 'oauth2_client_credentials' ? 'Client Secret' : 'Secret'}</label>
               <select value={formData.auth.secret} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, secret: e.target.value } })}
                 className="input w-full">
                 <option value="">Select a secret...</option>
@@ -328,11 +337,6 @@ export function ConnectorEditor() {
         {formData.auth.type === 'api_key' && (
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="label">Header Name</label>
-              <input type="text" value={formData.auth.header} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, header: e.target.value } })}
-                className="input w-full" />
-            </div>
-            <div>
               <label className="label">Position</label>
               <select value={formData.auth.position} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, position: e.target.value } })}
                 className="input w-full">
@@ -340,6 +344,55 @@ export function ConnectorEditor() {
                 <option value="query">Query Parameter</option>
               </select>
             </div>
+            {formData.auth.position === 'query' ? (
+              <div>
+                <label className="label">Query Param Name</label>
+                <input type="text" value={formData.auth.param_name} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, param_name: e.target.value } })}
+                  className="input w-full" placeholder="api_key" />
+              </div>
+            ) : (
+              <div>
+                <label className="label">Header Name</label>
+                <input type="text" value={formData.auth.header} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, header: e.target.value } })}
+                  className="input w-full" placeholder="X-Api-Key" />
+              </div>
+            )}
+          </div>
+        )}
+        {formData.auth.type === 'oauth2_client_credentials' && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Token URL</label>
+                <input type="text" value={formData.auth.token_url} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, token_url: e.target.value } })}
+                  className="input w-full font-mono" placeholder="https://idp.example.com/oauth/token" />
+              </div>
+              <div>
+                <label className="label">Client ID</label>
+                <input type="text" value={formData.auth.client_id} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, client_id: e.target.value } })}
+                  className="input w-full font-mono" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Scopes</label>
+                <input type="text"
+                  value={(formData.auth.scopes || []).join(' ')}
+                  onChange={e => setFormData({ ...formData, auth: { ...formData.auth, scopes: e.target.value.split(/\s+/).filter(Boolean) } })}
+                  className="input w-full font-mono" placeholder="read write (space-separated)" />
+              </div>
+              <div>
+                <label className="label">Client Auth Method</label>
+                <select value={formData.auth.client_auth_method} onChange={e => setFormData({ ...formData, auth: { ...formData.auth, client_auth_method: e.target.value } })}
+                  className="input w-full">
+                  <option value="body">Request Body (client_secret_post)</option>
+                  <option value="basic">HTTP Basic (client_secret_basic)</option>
+                </select>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">
+              The client secret is exchanged for a short-lived access token, cached until shortly before it expires, and sent as a Bearer token.
+            </p>
           </div>
         )}
         {formData.auth.type === 'sinas_token' && (
