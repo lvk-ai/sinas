@@ -1,6 +1,7 @@
 """Authentication endpoints."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -359,3 +360,66 @@ async def check_permissions(
         result = any(check.has_permission for check in checks)
 
     return PermissionCheckResponse(result=result, logic=check_request.logic, checks=checks)
+
+
+def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
+    """Render a tiny page that notifies the opener window and closes itself.
+
+    The connector OAuth flow is opened in a popup; this signals the console (via
+    postMessage) whether the connection succeeded, then closes. No secrets are sent.
+    """
+    status_word = "success" if ok else "error"
+    safe = message.replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Connector authorization</title></head>
+<body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center">
+<p style="font-size:15px">{safe}</p>
+<p style="font-size:13px;color:#888">You can close this window.</p>
+</div>
+<script>
+  try {{ window.opener && window.opener.postMessage(
+    {{ type: "connector-oauth", status: "{status_word}" }}, "*"); }} catch (e) {{}}
+  setTimeout(function () {{ window.close(); }}, 1200);
+</script>
+</body></html>"""
+    return HTMLResponse(content=html, status_code=200 if ok else 400)
+
+
+@router.get("/connectors/oauth/callback", include_in_schema=False)
+async def connector_oauth_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public OAuth redirect target. Exchanges the code for tokens for the initiating user.
+
+    Unauthenticated by design (the provider won't send our bearer). The initiating user and
+    connector are recovered from the single-use `state` minted at /connectors/.../oauth/authorize.
+    """
+    from app.core.oauth_state import consume_state
+    from app.models.connector import Connector
+    from app.services.connector_service import connector_service
+
+    if error:
+        return _oauth_result_page(False, f"Authorization was denied: {error_description or error}")
+
+    ctx = await consume_state(state)
+    if ctx is None:
+        return _oauth_result_page(False, "This authorization link has expired or was already used.")
+    if not code:
+        return _oauth_result_page(False, "No authorization code was returned by the provider.")
+
+    connector = await Connector.get_by_name(db, ctx["namespace"], ctx["name"])
+    if connector is None or (connector.auth or {}).get("type") != "oauth2_authorization_code":
+        return _oauth_result_page(False, "Connector is no longer configured for OAuth.")
+
+    ok = await connector_service.exchange_authorization_code(
+        db=db, connector=connector, user_id=ctx["user_id"], code=code, code_verifier=ctx["code_verifier"],
+    )
+    if not ok:
+        return _oauth_result_page(False, "Failed to exchange the authorization code for a token.")
+    return _oauth_result_page(True, f"Connected {connector.namespace}/{connector.name}.")

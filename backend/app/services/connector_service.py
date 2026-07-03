@@ -4,15 +4,19 @@ import base64
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import httpx
 from jinja2 import Template
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.encryption import encryption_service
 from app.models.connector import Connector
+from app.models.connector_oauth_token import ConnectorOAuthToken
 from app.models.secret import Secret
 
 logger = logging.getLogger(__name__)
@@ -71,7 +75,9 @@ class ConnectorService:
             raise ValueError(f"Operation '{operation_name}' not found on connector '{connector.namespace}/{connector.name}'")
 
         # Resolve auth (private secrets override shared for this user)
-        auth_headers, auth_query = await self._resolve_auth(db, connector.auth, user_token, user_id)
+        auth_headers, auth_query = await self._resolve_auth(
+            db, connector.auth, user_token, user_id, connector_id=connector.id
+        )
 
         # Build request
         method = operation["method"]
@@ -159,7 +165,7 @@ class ConnectorService:
 
     async def _resolve_auth(
         self, db: AsyncSession, auth_config: dict[str, Any], user_token: Optional[str],
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None, connector_id: Optional[Any] = None,
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Resolve auth config into (headers, query_params). Private secrets override shared.
 
@@ -179,6 +185,12 @@ class ConnectorService:
 
         if auth_type == "oauth2_client_credentials":
             token = await self._get_client_credentials_token(db, auth_config, user_id)
+            if not token:
+                return {}, {}
+            return {"Authorization": f"Bearer {token}"}, {}
+
+        if auth_type == "oauth2_authorization_code":
+            token = await self._get_authorization_code_token(db, connector_id, auth_config, user_id)
             if not token:
                 return {}, {}
             return {"Authorization": f"Bearer {token}"}, {}
@@ -328,6 +340,201 @@ class ConnectorService:
                 f"Obtained OAuth client-credentials token from {token_url} (ttl={ttl}s)"
             )
             return access_token
+
+    # ------------------------------------------------------------------
+    # OAuth 2.0 authorization-code grant (per-user tokens)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def oauth_redirect_uri() -> str:
+        """Public callback URL the provider redirects the browser back to.
+
+        Must exactly match the redirect URI registered with the OAuth provider.
+        """
+        domain = settings.domain
+        path = "/auth/connectors/oauth/callback"
+        if not domain or domain.lower() in ("localhost", "127.0.0.1"):
+            return f"http://localhost:{settings.backend_port}{path}"
+        return f"https://{domain}{path}"
+
+    def build_authorize_url(
+        self, auth_config: dict[str, Any], state: str, code_challenge: str
+    ) -> Optional[str]:
+        """Build the provider authorization URL to redirect the user's browser to."""
+        authorize_url = auth_config.get("authorize_url")
+        client_id = auth_config.get("client_id")
+        if not authorize_url or not client_id:
+            return None
+        scopes = auth_config.get("scopes") or []
+        scope_str = " ".join(scopes) if isinstance(scopes, list) else str(scopes)
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": self.oauth_redirect_uri(),
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        if scope_str:
+            params["scope"] = scope_str
+        sep = "&" if "?" in authorize_url else "?"
+        return f"{authorize_url}{sep}{urlencode(params)}"
+
+    async def _post_token_request(
+        self, token_url: str, data: dict[str, str], client_id: str,
+        client_secret: str, client_auth_method: str,
+    ) -> Optional[dict[str, Any]]:
+        """POST a token request (code exchange or refresh) and return the parsed JSON."""
+        headers = {"Accept": "application/json"}
+        if client_auth_method == "basic":
+            encoded = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            headers["Authorization"] = f"Basic {encoded}"
+        else:  # "body" — client_secret_post
+            data = {**data, "client_id": client_id, "client_secret": client_secret}
+
+        try:
+            async with self._semaphore:
+                client = self._get_client()
+                resp = await client.post(token_url, data=data, headers=headers, timeout=30.0)
+        except Exception as e:
+            logger.error(f"OAuth token request to {token_url} failed: {e}")
+            return None
+
+        if resp.status_code != 200:
+            logger.error(
+                f"OAuth token endpoint {token_url} returned {resp.status_code}: {resp.text[:200]}"
+            )
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            logger.error(f"OAuth token endpoint {token_url} returned a non-JSON body")
+            return None
+
+    def _store_token_fields(self, row: ConnectorOAuthToken, payload: dict[str, Any]) -> None:
+        """Copy a token-endpoint payload onto a ConnectorOAuthToken row (encrypting tokens)."""
+        row.encrypted_access_token = encryption_service.encrypt(payload["access_token"])
+        # Providers may omit refresh_token on refresh; keep the existing one if so.
+        new_refresh = payload.get("refresh_token")
+        if new_refresh:
+            row.encrypted_refresh_token = encryption_service.encrypt(new_refresh)
+        if payload.get("scope"):
+            row.scope = payload["scope"]
+        if payload.get("token_type"):
+            row.token_type = payload["token_type"]
+        expires_in = payload.get("expires_in")
+        try:
+            ttl = int(expires_in) if expires_in is not None else None
+        except (TypeError, ValueError):
+            ttl = None
+        row.expires_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=ttl) if ttl is not None else None
+        )
+
+    async def exchange_authorization_code(
+        self, db: AsyncSession, connector: Connector, user_id: str, code: str, code_verifier: str
+    ) -> bool:
+        """Exchange an authorization code for tokens and persist them for this user."""
+        auth_config = connector.auth or {}
+        token_url = auth_config.get("token_url")
+        client_id = auth_config.get("client_id")
+        secret_name = auth_config.get("secret")
+        if not token_url or not client_id or not secret_name:
+            logger.warning("oauth2_authorization_code requires token_url, client_id, and secret")
+            return False
+
+        client_secret = await self._resolve_secret_value(db, secret_name, user_id)
+        if client_secret is None:
+            logger.warning(f"OAuth client secret '{secret_name}' not found")
+            return False
+
+        payload = await self._post_token_request(
+            token_url,
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": self.oauth_redirect_uri(),
+                "code_verifier": code_verifier,
+            },
+            client_id,
+            client_secret,
+            auth_config.get("client_auth_method") or "body",
+        )
+        if not payload or not payload.get("access_token"):
+            return False
+
+        row = await self._get_token_row(db, connector.id, user_id)
+        if row is None:
+            row = ConnectorOAuthToken(connector_id=connector.id, user_id=user_id, encrypted_access_token="")
+            db.add(row)
+        self._store_token_fields(row, payload)
+        await db.flush()
+        logger.info(f"Stored OAuth token for connector {connector.namespace}/{connector.name} user={user_id}")
+        return True
+
+    async def _get_token_row(
+        self, db: AsyncSession, connector_id: Any, user_id: str
+    ) -> Optional[ConnectorOAuthToken]:
+        result = await db.execute(
+            select(ConnectorOAuthToken).where(
+                and_(
+                    ConnectorOAuthToken.connector_id == connector_id,
+                    ConnectorOAuthToken.user_id == user_id,
+                )
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_authorization_code_token(
+        self, db: AsyncSession, connector_id: Any, auth_config: dict[str, Any], user_id: Optional[str]
+    ) -> Optional[str]:
+        """Return a valid access token for this user, refreshing if it has (nearly) expired."""
+        if not connector_id or not user_id:
+            logger.warning("oauth2_authorization_code auth requires a connector and user context")
+            return None
+
+        row = await self._get_token_row(db, connector_id, user_id)
+        if row is None:
+            logger.warning(f"No OAuth token stored for connector {connector_id} user {user_id}")
+            return None
+
+        # Still valid (with skew)? Use it.
+        if row.expires_at is not None:
+            skew = timedelta(seconds=OAUTH_TOKEN_TTL_SKEW)
+            if row.expires_at - skew > datetime.now(timezone.utc):
+                return encryption_service.decrypt(row.encrypted_access_token)
+        elif row.encrypted_access_token:
+            # No expiry known — assume the stored token is usable.
+            return encryption_service.decrypt(row.encrypted_access_token)
+
+        # Expired (or expiring): try to refresh.
+        if not row.encrypted_refresh_token:
+            logger.warning(f"OAuth token for connector {connector_id} expired and has no refresh token")
+            return None
+
+        token_url = auth_config.get("token_url")
+        client_id = auth_config.get("client_id")
+        secret_name = auth_config.get("secret")
+        client_secret = await self._resolve_secret_value(db, secret_name, user_id) if secret_name else None
+        if not token_url or not client_id or client_secret is None:
+            logger.warning("OAuth refresh requires token_url, client_id, and secret")
+            return None
+
+        refresh_token = encryption_service.decrypt(row.encrypted_refresh_token)
+        payload = await self._post_token_request(
+            token_url,
+            {"grant_type": "refresh_token", "refresh_token": refresh_token},
+            client_id,
+            client_secret,
+            auth_config.get("client_auth_method") or "body",
+        )
+        if not payload or not payload.get("access_token"):
+            logger.warning(f"OAuth refresh failed for connector {connector_id} user {user_id}")
+            return None
+
+        self._store_token_fields(row, payload)
+        await db.flush()
+        return encryption_service.decrypt(row.encrypted_access_token)
 
     def _render_path(self, path_template: str, parameters: dict[str, Any]) -> str:
         """Render Jinja2 path template with parameters."""

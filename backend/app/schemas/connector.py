@@ -21,18 +21,22 @@ class OperationConfig(BaseModel):
 class ConnectorAuth(BaseModel):
     type: str = Field(
         default="none",
-        pattern=r"^(bearer|basic|api_key|sinas_token|oauth2_client_credentials|none)$",
+        pattern=r"^(bearer|basic|api_key|sinas_token|oauth2_client_credentials|oauth2_authorization_code|none)$",
     )
     secret: Optional[str] = None
     header: Optional[str] = None
     position: Optional[str] = Field(default=None, pattern=r"^(header|query)$")
     param_name: Optional[str] = None
 
-    # OAuth 2.0 client-credentials grant (type="oauth2_client_credentials").
+    # OAuth 2.0 grants (client-credentials and authorization-code).
     # `secret` holds the name of the Secret containing the client secret.
     token_url: Optional[str] = None
     client_id: Optional[str] = None
     scopes: Optional[list[str]] = None
+    # Authorization-code grant only (type="oauth2_authorization_code"): the provider's
+    # authorization endpoint the user's browser is redirected to. Tokens are stored
+    # per-user (see ConnectorOAuthToken) rather than shared.
+    authorize_url: Optional[str] = None
     # How to present client credentials to the token endpoint:
     # "basic" = HTTP Basic (client_secret_basic), "body" = form fields (client_secret_post).
     client_auth_method: Optional[str] = Field(default=None, pattern=r"^(basic|body)$")
@@ -98,6 +102,18 @@ class ConnectorTestResponse(BaseModel):
     headers: dict[str, str]
     body: Any
     elapsed_ms: float
+
+
+class OAuthAuthorizeResponse(BaseModel):
+    """Where to redirect the user's browser to begin the authorization-code flow."""
+    authorize_url: str
+
+
+class OAuthStatusResponse(BaseModel):
+    """Whether the current user has a stored OAuth token for a connector."""
+    connected: bool
+    expires_at: Optional[datetime] = None
+    scope: Optional[str] = None
 
 
 class OpenAPIImportRequest(BaseModel):

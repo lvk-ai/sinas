@@ -4,19 +4,23 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
 from app.core.database import get_db
+from app.core.oauth_state import generate_pkce_pair, store_state
 from app.core.permissions import check_permission
 from app.models.connector import Connector
+from app.models.connector_oauth_token import ConnectorOAuthToken
 from app.schemas.connector import (
     ConnectorCreate,
     ConnectorResponse,
     ConnectorTestRequest,
     ConnectorTestResponse,
     ConnectorUpdate,
+    OAuthAuthorizeResponse,
+    OAuthStatusResponse,
     OpenAPIImportRequest,
     OpenAPIImportResponse,
     OperationConfig,
@@ -338,6 +342,81 @@ async def import_openapi(
         operations=parsed_ops,
         warnings=warnings,
         applied=applied,
+    )
+
+
+@router.post("/{namespace}/{name}/oauth/authorize", response_model=OAuthAuthorizeResponse)
+async def begin_oauth_authorization(
+    request: Request,
+    namespace: str,
+    name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Begin the per-user OAuth authorization-code flow; returns the provider URL to open."""
+    user_id, permissions = current_user_data
+    connector = await Connector.get_with_permissions(
+        db=db, user_id=user_id, permissions=permissions, action="read",
+        namespace=namespace, name=name,
+    )
+    set_permission_used(request, f"sinas.connectors/{namespace}/{name}.read")
+
+    if (connector.auth or {}).get("type") != "oauth2_authorization_code":
+        raise HTTPException(status_code=400, detail="Connector is not configured for OAuth authorization-code auth")
+
+    verifier, challenge = generate_pkce_pair()
+    state = await store_state(
+        user_id=str(user_id), namespace=namespace, name=name, code_verifier=verifier
+    )
+    url = connector_service.build_authorize_url(connector.auth, state, challenge)
+    if not url:
+        raise HTTPException(status_code=400, detail="Connector OAuth config is incomplete (authorize_url/client_id)")
+    return OAuthAuthorizeResponse(authorize_url=url)
+
+
+@router.get("/{namespace}/{name}/oauth/status", response_model=OAuthStatusResponse)
+async def oauth_status(
+    request: Request,
+    namespace: str,
+    name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Report whether the current user has a stored OAuth token for this connector."""
+    user_id, permissions = current_user_data
+    connector = await Connector.get_with_permissions(
+        db=db, user_id=user_id, permissions=permissions, action="read",
+        namespace=namespace, name=name,
+    )
+    result = await db.execute(
+        select(ConnectorOAuthToken).where(
+            and_(ConnectorOAuthToken.connector_id == connector.id, ConnectorOAuthToken.user_id == user_id)
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        return OAuthStatusResponse(connected=False)
+    return OAuthStatusResponse(connected=True, expires_at=row.expires_at, scope=row.scope)
+
+
+@router.delete("/{namespace}/{name}/oauth/token", status_code=status.HTTP_204_NO_CONTENT)
+async def disconnect_oauth(
+    request: Request,
+    namespace: str,
+    name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Delete the current user's stored OAuth token for this connector."""
+    user_id, permissions = current_user_data
+    connector = await Connector.get_with_permissions(
+        db=db, user_id=user_id, permissions=permissions, action="read",
+        namespace=namespace, name=name,
+    )
+    await db.execute(
+        delete(ConnectorOAuthToken).where(
+            and_(ConnectorOAuthToken.connector_id == connector.id, ConnectorOAuthToken.user_id == user_id)
+        )
     )
 
 
