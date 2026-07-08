@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.encryption import EncryptionService
 
 from .anthropic_provider import AnthropicProvider
+from .azure_openai_provider import AzureOpenAIProvider
 from .base import BaseLLMProvider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
@@ -69,6 +70,17 @@ async def create_provider(
 
     if provider_type == "openai":
         return OpenAIProvider(api_key=api_key, base_url=base_url)
+    elif provider_type in ("azure", "azure_openai"):
+        config = provider_config.config or {}
+        return AzureOpenAIProvider(
+            api_key=api_key,
+            azure_endpoint=base_url,
+            api_version=config.get("api_version"),
+            azure_deployment=config.get("azure_deployment"),
+            max_tokens_param=config.get("max_tokens_param"),
+            drop_params=config.get("drop_params"),
+            extra_params=config.get("extra_params"),
+        )
     elif provider_type == "mistral":
         return MistralProvider(api_key=api_key, base_url=base_url)
     elif provider_type == "anthropic":
