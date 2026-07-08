@@ -255,6 +255,24 @@ class ConfigApplyService:
 
             if not dry_run and self.auto_commit:
                 await self.db.commit()
+                # Notify the CDC worker so database triggers created/updated via
+                # config apply (e.g. a Package install) are picked up without a
+                # restart — the REST endpoint notifies per-trigger, this path
+                # did not. One reconcile signal; the worker diffs running poll
+                # tasks against active triggers. Best-effort: never fail the
+                # apply on a notify error.
+                try:
+                    import json
+
+                    from app.core.redis import get_redis
+
+                    redis = await get_redis()
+                    await redis.publish(
+                        "sinas:cdc:triggers",
+                        json.dumps({"action": "reload", "trigger_id": ""}),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify CDC after config apply: {e}")
 
             return ConfigApplyResponse(
                 success=True,

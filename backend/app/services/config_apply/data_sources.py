@@ -43,6 +43,9 @@ async def apply_llm_providers(
                     "type": provider_config.type,
                     "endpoint": provider_config.endpoint,
                     "models": sorted(provider_config.models),
+                    "default_model": provider_config.defaultModel,
+                    "is_default": provider_config.isDefault,
+                    "config": provider_config.config,
                     "is_active": provider_config.isActive,
                 }
             )
@@ -64,9 +67,22 @@ async def apply_llm_providers(
                 if not dry_run:
                     existing.provider_type = provider_config.type
                     existing.api_endpoint = provider_config.endpoint
-                    existing.config = existing.config or {}
-                    existing.config["models"] = provider_config.models
+                    existing.default_model = provider_config.defaultModel
+                    # Merge managed keys into the existing config, preserving any
+                    # keys set out-of-band. Assign a new dict so SQLAlchemy flags
+                    # the JSON column as dirty.
+                    merged_config = dict(existing.config or {})
+                    merged_config["models"] = provider_config.models
+                    merged_config.update(provider_config.config or {})
+                    existing.config = merged_config
                     existing.is_active = provider_config.isActive
+                    if provider_config.isDefault:
+                        await db.execute(
+                            LLMProvider.__table__.update()
+                            .where(LLMProvider.name != provider_config.name)
+                            .values(is_default=False)
+                        )
+                    existing.is_default = provider_config.isDefault
                     if provider_config.apiKey:
                         existing.api_key = EncryptionService.encrypt(provider_config.apiKey)
                     existing.config_checksum = config_hash
@@ -81,12 +97,21 @@ async def apply_llm_providers(
                     if provider_config.apiKey:
                         encrypted_key = EncryptionService.encrypt(provider_config.apiKey)
 
+                    if provider_config.isDefault:
+                        await db.execute(
+                            LLMProvider.__table__.update()
+                            .where(LLMProvider.name != provider_config.name)
+                            .values(is_default=False)
+                        )
+
                     new_provider = LLMProvider(
                         name=provider_config.name,
                         provider_type=provider_config.type,
                         api_key=encrypted_key,
                         api_endpoint=provider_config.endpoint,
-                        config={"models": provider_config.models},
+                        default_model=provider_config.defaultModel,
+                        config={"models": provider_config.models, **(provider_config.config or {})},
+                        is_default=provider_config.isDefault,
                         is_active=provider_config.isActive,
                         managed_by=managed_by,
                         config_name=config_name,

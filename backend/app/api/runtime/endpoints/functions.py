@@ -5,10 +5,37 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any, Optional
 
-from app.core.auth import get_current_user_with_permissions, set_permission_used
+from app.core.auth import (
+    get_current_user_with_permissions,
+    get_execution_depth_from_request,
+    set_permission_used,
+)
 from app.core.callback import CallbackURLError, validate_callback_url
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import check_permission
+
+
+def _resolve_child_depth(request: Request) -> int:
+    """Depth of the execution this request is about to create.
+
+    Top-level (real user/app token) → 0; a call made from inside a running
+    execution → caller depth + 1. Rejects past settings.max_execution_depth so
+    runaway / over-nested chains fail fast instead of exhausting the worker pool.
+    """
+    caller_depth = get_execution_depth_from_request(request)
+    depth = 0 if caller_depth is None else caller_depth + 1
+    if settings.max_execution_depth and depth > settings.max_execution_depth:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Maximum execution nesting depth ({settings.max_execution_depth}) exceeded. "
+                "A function or agent invoked another execution too deeply — usually unintended "
+                "recursion or over-nested shared_pool calls. Flatten the chain, or raise "
+                "MAX_EXECUTION_DEPTH (and the shared worker pool) if this nesting is intended."
+            ),
+        )
+    return depth
 from app.models.execution import TriggerType
 from app.models.function import Function
 from app.schemas.batch import FunctionBatchRequest, FunctionBatchResponse
@@ -54,6 +81,7 @@ async def execute_function(
 
     set_permission_used(request, permission)
 
+    depth = _resolve_child_depth(request)
     execution_id = str(uuid.uuid4())
 
     try:
@@ -66,6 +94,7 @@ async def execute_function(
             trigger_id="runtime-api",
             user_id=user_id,
             timeout=body.timeout,
+            depth=depth,
         )
 
         return FunctionExecuteResponse(
@@ -124,6 +153,7 @@ async def execute_function_async(
     except CallbackURLError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    depth = _resolve_child_depth(request)
     execution_id = str(uuid.uuid4())
 
     await queue_service.enqueue_function(
@@ -136,6 +166,7 @@ async def execute_function_async(
         user_id=user_id,
         delay=body.delay_seconds,
         callback_url=callback_url,
+        depth=depth,
     )
 
     return FunctionExecuteAsyncResponse(
@@ -180,6 +211,8 @@ async def execute_function_batch(
     except CallbackURLError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    depth = _resolve_child_depth(request)
+
     try:
         result = await batch_service.submit_function_batch(
             db=db,
@@ -191,6 +224,7 @@ async def execute_function_batch(
             delay_seconds=body.delay_seconds,
             callback_url=callback_url,
             batch_callback_url=batch_callback_url,
+            depth=depth,
         )
     except batch_service.BatchError as e:
         raise HTTPException(status_code=400, detail=str(e))

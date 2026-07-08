@@ -60,6 +60,7 @@ async def submit_function_batch(
     delay_seconds: Optional[int] = None,
     callback_url: Optional[str] = None,
     batch_callback_url: Optional[str] = None,
+    depth: int = 0,
 ) -> dict[str, Any]:
     """Create a batch of function executions. Returns batch_id + execution_ids."""
     if not inputs:
@@ -124,6 +125,7 @@ async def submit_function_batch(
             user_id=user_id,
             delay=delay_seconds,
             callback_url=callback_url,
+            depth=depth,
         )
 
     return {
