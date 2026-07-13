@@ -41,10 +41,9 @@ def get_sandbox_executor() -> SandboxExecutor | None:
         return DockerEphemeralSandboxExecutor()
 
     if mode == "k8s_pod":
-        raise NotImplementedError(
-            "sandbox_executor='k8s_pod' is planned for step 5 of the executor "
-            "refactor; not yet implemented."
-        )
+        from app.services.executor.k8s_pod_sandbox import K8sPodSandboxExecutor
+
+        return K8sPodSandboxExecutor()
 
     if mode == "disabled":
         return None
@@ -65,10 +64,9 @@ def get_trusted_executor() -> TrustedExecutor:
         return DockerSharedTrustedExecutor()
 
     if mode == "inprocess":
-        raise NotImplementedError(
-            "trusted_executor='inprocess' is planned for step 4 of the executor "
-            "refactor; not yet implemented."
-        )
+        from app.services.executor.inprocess_trusted import InProcessTrustedExecutor
+
+        return InProcessTrustedExecutor()
 
     raise ValueError(f"Unknown trusted_executor mode: {mode!r}")
 

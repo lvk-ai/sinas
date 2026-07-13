@@ -226,25 +226,28 @@ async def function_worker_startup(ctx: dict) -> None:
 
     # Discover shared worker containers (created by scheduler).
     # Retry a few times — the scheduler may still be starting up.
-    from app.services.shared_worker_manager import shared_worker_manager
+    # Skipped for non-Docker executors (k8s / single-container).
+    if settings.trusted_executor == "docker_shared":
+        from app.services.shared_worker_manager import shared_worker_manager
 
-    for attempt in range(10):
-        await shared_worker_manager._discover_existing_workers()
-        if shared_worker_manager.workers:
-            break
-        if attempt < 9:
-            print(f"⏳ No shared containers found, waiting for scheduler... ({attempt + 1}/10)")
-            await asyncio.sleep(3)
+        for attempt in range(10):
+            await shared_worker_manager._discover_existing_workers()
+            if shared_worker_manager.workers:
+                break
+            if attempt < 9:
+                print(f"⏳ No shared containers found, waiting for scheduler... ({attempt + 1}/10)")
+                await asyncio.sleep(3)
 
-    shared_worker_manager._initialized = True
-    print(f"✅ Discovered {len(shared_worker_manager.workers)} shared containers")
+        shared_worker_manager._initialized = True
+        print(f"✅ Discovered {len(shared_worker_manager.workers)} shared containers")
 
     # Discover existing sandbox containers (created by backend leader)
-    from app.services.container_pool import container_pool
+    if settings.sandbox_executor == "docker_pool":
+        from app.services.container_pool import container_pool
 
-    await container_pool._discover_existing_containers()
-    container_pool._initialized = True
-    print(f"✅ Discovered {len(container_pool.idle)} sandbox containers")
+        await container_pool._discover_existing_containers()
+        container_pool._initialized = True
+        print(f"✅ Discovered {len(container_pool.idle)} sandbox containers")
 
     # Start heartbeat
     worker_id = str(uuid.uuid4())
@@ -281,11 +284,12 @@ async def agent_worker_startup(ctx: dict) -> None:
     from app.core.database import AsyncSessionLocal  # noqa: F401
 
     # Discover sandbox containers (needed for code execution tool)
-    from app.services.container_pool import container_pool
+    if settings.sandbox_executor == "docker_pool":
+        from app.services.container_pool import container_pool
 
-    await container_pool._discover_existing_containers()
-    container_pool._initialized = True
-    print(f"✅ Agent worker discovered {len(container_pool.idle)} sandbox containers")
+        await container_pool._discover_existing_containers()
+        container_pool._initialized = True
+        print(f"✅ Agent worker discovered {len(container_pool.idle)} sandbox containers")
 
     # Start heartbeat
     worker_id = str(uuid.uuid4())

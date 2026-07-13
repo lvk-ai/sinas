@@ -91,6 +91,7 @@ async def execute(
     Routes to the configured sandbox executor:
     - docker_pool: a reusable container from the warm pool.
     - docker_ephemeral: a fresh single-use container from the baked image.
+    - k8s_pod: a fresh single-use Kubernetes pod.
 
     Returns:
         {"stdout": str, "stderr": str, "result": any, "duration_ms": int}
@@ -129,6 +130,39 @@ async def execute(
             "duration_ms": int((time.time() - start_time) * 1000),
             "error": str(exc),
         }
+
+    if settings.sandbox_executor == "disabled":
+        return _error(
+            RuntimeError(
+                "Code execution is disabled on this deployment (SANDBOX_EXECUTOR=disabled)."
+            )
+        )
+
+    # k8s: a fresh single-use pod per execution (no pool).
+    if settings.sandbox_executor == "k8s_pod":
+        from app.core.database import AsyncSessionLocal
+        from app.services.executor._k8s_runtime import (
+            create_sandbox_pod,
+            delete_sandbox_pod,
+            run_payload_in_pod,
+        )
+
+        try:
+            async with AsyncSessionLocal() as db:
+                name, namespace = await create_sandbox_pod(
+                    db, execution_id=execution_id
+                )
+            try:
+                wire = await run_payload_in_pod(
+                    name, namespace, payload, effective_timeout
+                )
+                return _shape_code_result(
+                    wire, int((time.time() - start_time) * 1000)
+                )
+            finally:
+                await delete_sandbox_pod(name, namespace)
+        except Exception as e:
+            return _error(e)
 
     # Ephemeral: a fresh single-use container from the baked image (no pool).
     if settings.sandbox_executor == "docker_ephemeral":
@@ -263,6 +297,13 @@ sys.exit(1)
             "duration_ms": duration_ms,
         }
 
+    return _shape_code_result(result_data, duration_ms)
+
+
+def _shape_code_result(
+    result_data: dict[str, Any], duration_ms: int
+) -> dict[str, Any]:
+    """Map a wire result dict to the code-execution tool's result shape."""
     if result_data.get("status") == "failed":
         return {
             "stdout": result_data.get("stdout", ""),

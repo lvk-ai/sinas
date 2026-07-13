@@ -258,7 +258,8 @@ async def main() -> None:
                 )
 
     # --- Shared containers ---
-    await shared_worker_manager.initialize()
+    if settings.trusted_executor == "docker_shared":
+        await shared_worker_manager.initialize()
 
     # --- APScheduler ---
     await scheduler.start()

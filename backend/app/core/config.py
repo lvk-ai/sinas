@@ -91,14 +91,23 @@ class Settings(BaseSettings):
     # - sandbox_executor: backend for untrusted code (per-function untrusted
     #   functions and agent codeExecution). Must isolate per execution.
     #     "docker_pool"      — long-lived Docker container pool (current default)
-    #     "docker_ephemeral" — Docker `run --rm` per execution (planned, step 3)
-    #     "k8s_pod"          — k8s Pod per execution (planned, step 5)
+    #     "docker_ephemeral" — single-use Docker container per execution
+    #     "k8s_pod"          — single-use k8s Pod per execution (for k8s deploys)
     #     "disabled"         — sandbox features rejected; deploy is trusted-only
     # - trusted_executor: backend for admin-approved code (Function.shared_pool=True).
     #     "docker_shared" — dedicated long-lived Docker workers (current default)
-    #     "inprocess"     — run inside queue-worker process (planned, step 4)
+    #     "inprocess"     — run inside the calling process; no Docker socket needed
     sandbox_executor: str = "docker_pool"
     trusted_executor: str = "docker_shared"
+
+    # k8s_pod sandbox executor (only read when sandbox_executor="k8s_pod").
+    # Runs in-cluster: credentials come from the pod's ServiceAccount, which
+    # needs create/get/delete + exec on pods in `k8s_sandbox_namespace`.
+    k8s_sandbox_namespace: str = ""  # "" = this pod's namespace (POD_NAMESPACE env or serviceaccount file)
+    k8s_sandbox_image: str = ""  # "" = function_container_image; must be pullable by the cluster
+    k8s_sandbox_service_account: str = ""  # SA for sandbox pods; "" = namespace default
+    k8s_sandbox_pod_ready_timeout: int = 120  # seconds to wait for a sandbox pod to become Ready
+    k8s_sandbox_install_dependencies: bool = True  # pip install Dependency specs into each pod (skip if baked into k8s_sandbox_image)
 
     # Function execution (always uses Docker for isolation)
     function_timeout: int = 300  # 5 minutes (max execution time)

@@ -26,13 +26,34 @@ class SharedWorkerManager:
     """
 
     def __init__(self):
-        self.client = docker.from_env()
+        # Docker client and networks are resolved lazily so this module can be
+        # imported (and the singleton constructed) in socket-free deployments
+        # (trusted_executor != "docker_shared", e.g. k8s or single-container).
+        self._client = None
         self.workers: dict[str, dict[str, Any]] = {}  # worker_id -> worker_info
         self.next_worker_index = 0  # For round-robin load balancing
         self._lock = asyncio.Lock()
         self._initialized = False
-        self.docker_network = self._detect_network()
-        self.sandbox_network = self._ensure_sandbox_network()
+        self._docker_network: Optional[str] = None
+        self._sandbox_network: Optional[str] = None
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
+
+    @property
+    def docker_network(self) -> str:
+        if self._docker_network is None:
+            self._docker_network = self._detect_network()
+        return self._docker_network
+
+    @property
+    def sandbox_network(self) -> str:
+        if self._sandbox_network is None:
+            self._sandbox_network = self._ensure_sandbox_network()
+        return self._sandbox_network
 
     def _detect_network(self) -> str:
         """Auto-detect Docker network if set to 'auto', otherwise use configured value."""
