@@ -27,6 +27,8 @@ spec:
           command: ["python", "-m", "arq", "app.queue.worker.WorkerSettings"]
           env:
             {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: QUEUE_FUNCTION_CONCURRENCY
+              value: {{ .Values.queueWorker.concurrency | quote }}
           volumeMounts:
             {{- include "sinas.fileStorageMount" . | nindent 12 }}
           resources:
@@ -63,6 +65,8 @@ spec:
           command: ["python", "-m", "arq", "app.queue.worker.AgentWorkerSettings"]
           env:
             {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: QUEUE_AGENT_CONCURRENCY
+              value: {{ .Values.queueAgent.concurrency | quote }}
           volumeMounts:
             {{- include "sinas.fileStorageMount" . | nindent 12 }}
           resources:

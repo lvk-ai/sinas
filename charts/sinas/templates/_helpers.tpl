@@ -112,6 +112,9 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
       key: clickhouse-password
 - name: BACKEND_PORT
   value: "8000"
+{{- with .Values.extraEnv }}
+{{ toYaml . }}
+{{- end }}
 {{- end }}
 
 {{/*

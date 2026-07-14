@@ -118,6 +118,10 @@ backend:
 ## Queue worker
 queueWorker:
   replicas: 1
+  ## Max concurrent function executions per worker (QUEUE_FUNCTION_CONCURRENCY).
+  ## Total burst envelope per release ≈ replicas × concurrency × per-execution
+  ## memory, bounded by resources.limits.memory — size them together.
+  concurrency: 10
   resources:
     requests:
       cpu: "200m"
@@ -129,6 +133,8 @@ queueWorker:
 ## Queue agent worker
 queueAgent:
   replicas: 1
+  ## Max concurrent agent jobs per worker (QUEUE_AGENT_CONCURRENCY).
+  concurrency: 5
   resources:
     requests:
       cpu: "200m"
@@ -176,3 +182,12 @@ smtp:
   password: ""
   domain: ""
   ipv4: ""
+
+## Extra environment variables appended to every sinas service (backend,
+## queue workers, scheduler, cdc-worker). Any backend Settings knob
+## (app/core/config.py) can be set here without a chart change, e.g.:
+##   - name: MAX_FUNCTION_MEMORY
+##     value: "256"
+##   - name: FUNCTION_TIMEOUT
+##     value: "120"
+extraEnv: []
