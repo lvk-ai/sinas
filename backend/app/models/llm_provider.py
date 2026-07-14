@@ -22,7 +22,9 @@ class LLMProvider(Base):
 
     # API configuration (encrypted in database)
     api_key: Mapped[Optional[str]] = mapped_column(Text)  # Encrypted with ENCRYPTION_KEY
-    api_endpoint: Mapped[Optional[str]] = mapped_column(String(500))  # For custom endpoints
+    # For custom endpoints. For provider_type "azure" this is the azure_endpoint
+    # (e.g. https://<resource>.openai.azure.com/ or a gateway URL).
+    api_endpoint: Mapped[Optional[str]] = mapped_column(String(500))
     default_model: Mapped[Optional[str]] = mapped_column(
         String(100)
     )  # Default model if not specified
@@ -30,6 +32,12 @@ class LLMProvider(Base):
     # Additional configuration (rate limits, organization_id, etc.)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     # Example: {"max_tokens": 128000, "organization_id": "org-..."}
+    # Azure ("azure"/"azure_openai") reads from config:
+    #   {"api_version": "2024-10-21",        # Azure API version
+    #    "azure_deployment": "<deployment>", # optional: pin one deployment
+    #    "max_tokens_param": "max_completion_tokens",  # token-limit param name
+    #    "drop_params": ["temperature"],     # strip per-deployment (reasoning models)
+    #    "extra_params": {"reasoning_effort": "medium"}}  # merged into requests
 
     # Default provider for new assistants
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

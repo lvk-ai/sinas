@@ -50,10 +50,16 @@ class LLMProviderConfig(BaseModel):
     """LLM provider configuration"""
 
     name: str
-    type: str  # openai, ollama, anthropic, etc.
+    type: str  # openai, azure, ollama, anthropic, etc.
     apiKey: Optional[str] = None
     endpoint: Optional[str] = None
     models: list[str] = Field(default_factory=list)
+    defaultModel: Optional[str] = None
+    isDefault: bool = False
+    # Passthrough for provider-specific config (merged into the DB `config`
+    # column, not overwritten). For Azure: api_version, azure_deployment,
+    # max_tokens_param, drop_params, extra_params.
+    config: dict[str, Any] = Field(default_factory=dict)
     isActive: bool = True
 
 
