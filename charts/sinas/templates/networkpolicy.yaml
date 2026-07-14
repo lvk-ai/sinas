@@ -50,6 +50,18 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+    ## Kubernetes API server — required by the k8s_pod executor (create/exec/
+    ## delete sandbox pods). The apiserver ClusterIP/endpoint is cluster-
+    ## specific (usually an RFC1918 address), so allow the API ports to any
+    ## destination rather than pinning a CIDR. Sandbox pods get NO such rule.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
     ## External internet — except RFC1918 (blocks cross-namespace pod IPs).
     - to:
         - ipBlock:
