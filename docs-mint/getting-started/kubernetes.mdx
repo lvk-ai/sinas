@@ -1,0 +1,105 @@
+---
+title: "Deploy on Kubernetes"
+description: "Run Sinas on any Kubernetes cluster with the bundled Helm chart"
+---
+
+Sinas ships a Helm chart at [`charts/sinas`](https://github.com/sinas-platform/sinas/tree/main/charts/sinas)
+that deploys the full platform — backend, queue workers, scheduler, CDC
+worker, console — plus bundled PostgreSQL, Redis, and ClickHouse.
+
+Untrusted code (untrusted functions and agent code execution) runs in
+**ephemeral hardened Pods**: one pod per execution, created through the
+Kubernetes API and deleted afterwards. No Docker socket, no privileged
+Docker-in-Docker. Admin-approved (`shared_pool`) functions run in-process in
+the queue workers.
+
+This works on any conformant cluster — kind, k3s, Scaleway Kapsule, GKE,
+**AWS EKS** (EKS nodes run containerd and have no Docker socket, which is
+exactly why the pod-based executor exists).
+
+## Install
+
+```bash
+helm install sinas ./charts/sinas \
+  --namespace sinas --create-namespace \
+  --set domain=sinas.example.com \
+  --set ingress.className=nginx \
+  --set secrets.secretKey=$(openssl rand -hex 32) \
+  --set secrets.encryptionKey=$(python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())") \
+  --set postgres.password=$(openssl rand -hex 16) \
+  --set clickhouse.password=$(openssl rand -hex 16) \
+  --set superadminEmail=you@example.com
+```
+
+The backend runs database migrations on startup; first boot takes a minute.
+Watch sandbox pods appear during executions:
+
+```bash
+kubectl get pods -n sinas -l sinas.type=sandbox-executor -w
+```
+
+## How sandbox pods are secured
+
+Each execution pod is created with the same hardening as the Docker sandbox:
+
+- all capabilities dropped (`CHOWN`/`SETUID`/`SETGID` added back), no
+  privilege escalation, `RuntimeDefault` seccomp profile
+- memory / CPU / ephemeral-storage limits from `MAX_FUNCTION_*`
+- in-memory `/tmp` (100Mi), single-use, deleted after the execution,
+  `activeDeadlineSeconds` as a leak backstop
+- **no ServiceAccount token** — sandbox pods cannot talk to the Kubernetes API
+- a NetworkPolicy that allows DNS and internet egress only: sandbox pods can
+  never reach cluster-internal services (PostgreSQL, Redis, other namespaces)
+
+The services themselves use a ServiceAccount whose Role is limited to
+`pods` + `pods/exec` in the release namespace — that is the entire privilege
+surface replacing the Docker socket.
+
+<Note>
+NetworkPolicies require a CNI that enforces them (Cilium, Calico, kindnetd on
+recent kind, VPC CNI with a policy engine on EKS). Without enforcement the
+deployment still works, but sandbox pods are not network-isolated.
+</Note>
+
+## Executor image and cold-start latency
+
+Sandbox pods run `executor.image`. By default, platform dependencies (the
+admin-managed package list) are `pip install`ed into each pod at creation,
+which adds seconds to every sandbox execution. For production, bake them in:
+
+```dockerfile
+FROM ghcr.io/sinas-platform/sinas/executor:latest
+RUN pip install --no-cache-dir <your dependency list>
+```
+
+```yaml
+executor:
+  image: registry.example.com/sinas-executor-baked:v1
+  installDependencies: false
+```
+
+## Key values
+
+| Value | Default | Description |
+|---|---|---|
+| `domain` | — | Hostname for console + API (one shared hostname) |
+| `ingress.enabled` | `true` | Create a standard `Ingress`; disable to bring your own routing |
+| `ingress.className` | — | e.g. `nginx`, `traefik`, `alb` |
+| `executor.sandbox` | `k8s_pod` | Sandbox executor; `disabled` for trusted-only deployments |
+| `executor.trusted` | `inprocess` | Trusted executor |
+| `executor.image` | ghcr executor | Image for sandbox pods |
+| `executor.installDependencies` | `true` | Per-pod `pip install` (set `false` with a baked image) |
+| `registry.username/password` | — | Pull secret for private registries (also attached to sandbox pods) |
+| `fileStorage.storageClass` | _(emptyDir)_ | RWX storage class for shared file storage on multi-node clusters |
+| `networkPolicy.enabled` | `true` | Namespace isolation + sandbox lockdown |
+| `networkPolicy.ingressNamespace` | _(any)_ | Restrict which namespace may reach backend/console |
+
+## Limitations
+
+- `input()` / human-in-the-loop pauses are unavailable: sandbox pods are
+  single-use (sandbox mode has always rejected `input()`), and the
+  `inprocess` trusted executor is run-to-completion. Durable pause/resume is
+  tracked in [issue #79](https://github.com/sinas-platform/sinas/issues/79).
+- The bundled datastores are convenience-grade. For production, point
+  `DATABASE_URL`-family settings at managed services (e.g. RDS, ElastiCache)
+  and disable the bundled StatefulSets.

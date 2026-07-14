@@ -1,6 +1,6 @@
 # ADR: Ephemeral sandbox execution with a baked package image
 
-- **Status:** Proposed
+- **Status:** Accepted (runtime-validated on compose 2026-07-13: warm image build, function execution, agent codeExecution, no leftover containers)
 - **Date:** 2026-06-17
 - **Authors:** Kjeld Oostra
 - **Related code:**
