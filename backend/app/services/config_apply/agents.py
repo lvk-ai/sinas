@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
+from app.models.llm_provider import LLMProvider
 
 from app.services.config_apply.normalizers import (
     normalize_collection_references,
@@ -19,6 +20,41 @@ from app.services.config_apply.normalizers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_llm_provider_id(
+    db: AsyncSession,
+    provider_name: str | None,
+    llm_provider_ids: dict[str, str],
+    agent_label: str,
+) -> str | None:
+    """
+    Resolve an agent's ``llmProviderName`` to a provider id.
+
+    Prefers config-declared providers, then falls back to a provider that
+    already exists in the DB (e.g. created via the API/console). Returns ``None``
+    only when no provider name is set. Raises ``ValueError`` when a name IS set
+    but cannot be resolved, so we fail loudly instead of silently routing the
+    agent to the default provider.
+    """
+    if not provider_name:
+        return None
+
+    provider_id = llm_provider_ids.get(provider_name)
+    if provider_id:
+        return provider_id
+
+    result = await db.execute(
+        select(LLMProvider.id).where(LLMProvider.name == provider_name)
+    )
+    existing_id = result.scalar_one_or_none()
+    if existing_id:
+        return str(existing_id)
+
+    raise ValueError(
+        f"Agent '{agent_label}' references LLM provider '{provider_name}', "
+        "which is neither declared in config nor present in the database"
+    )
 
 
 async def apply_agents(
@@ -138,13 +174,14 @@ async def apply_agents(
                     continue
 
                 if not dry_run:
-                    # Get LLM provider ID (None if not specified = use default)
-                    llm_provider_id = None
-                    if agent_config.llmProviderName:
-                        llm_provider_id = llm_provider_ids.get(
-                            agent_config.llmProviderName
-                        )
-                    existing.llm_provider_id = llm_provider_id
+                    # Resolve LLM provider (None if not specified = use default;
+                    # fails loudly if a named provider can't be resolved).
+                    existing.llm_provider_id = await _resolve_llm_provider_id(
+                        db,
+                        agent_config.llmProviderName,
+                        llm_provider_ids,
+                        f"{agent_config.namespace}/{agent_config.name}",
+                    )
 
                     existing.description = agent_config.description
                     existing.model = agent_config.model
@@ -186,12 +223,14 @@ async def apply_agents(
 
             else:
                 if not dry_run:
-                    # Get LLM provider ID (None if not specified = use default)
-                    llm_provider_id = None
-                    if agent_config.llmProviderName:
-                        llm_provider_id = llm_provider_ids.get(
-                            agent_config.llmProviderName
-                        )
+                    # Resolve LLM provider (None if not specified = use default;
+                    # fails loudly if a named provider can't be resolved).
+                    llm_provider_id = await _resolve_llm_provider_id(
+                        db,
+                        agent_config.llmProviderName,
+                        llm_provider_ids,
+                        f"{agent_config.namespace}/{agent_config.name}",
+                    )
 
                     if agent_config.isDefault:
                         await db.execute(

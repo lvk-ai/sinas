@@ -64,6 +64,8 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `FUNCTION_CONTAINER_IDLE_TIMEOUT` | `3600` | Idle container cleanup (seconds) |
 | `ALLOW_PACKAGE_INSTALLATION` | `true` | Allow `pip install` in functions |
 | `ALLOWED_PACKAGES` | _(all)_ | Comma-separated package whitelist |
+| `MAX_EXECUTION_DEPTH` | _(= workers)_ | Max nesting depth for execution chains (a function/agent invoking another execution). A deeper call is rejected fast instead of deadlocking the shared pool. Defaults to `DEFAULT_WORKER_COUNT`; `0` disables. |
+| `SHARED_POOL_RESERVE` | `0` | Shared-worker slots reserved for nested calls so a parent waiting on a child can't starve the pool. `0` = off. For full single-chain safety set to `MAX_EXECUTION_DEPTH - 1`. |
 
 ## Executors
 
@@ -126,6 +128,7 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `QUEUE_AGENT_REPLICAS` | `2` | Agent queue worker replicas |
 | `QUEUE_FUNCTION_CONCURRENCY` | `10` | Concurrent functions per worker |
 | `QUEUE_AGENT_CONCURRENCY` | `5` | Concurrent agent jobs per worker |
+| `DEFAULT_WORKER_COUNT` | `4` | Shared (trusted) worker containers for `shared_pool` functions. Also the default ceiling for `MAX_EXECUTION_DEPTH`. |
 
 ## Resource Limits (Docker)
 

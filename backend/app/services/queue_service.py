@@ -35,6 +35,7 @@ class QueueService:
         chat_id: Optional[str] = None,
         delay: Optional[int] = None,
         callback_url: Optional[str] = None,
+        depth: int = 0,
     ) -> str:
         """
         Enqueue a function execution job.
@@ -79,6 +80,7 @@ class QueueService:
             "user_id": user_id,
             "chat_id": chat_id,
             "callback_url": callback_url,
+            "depth": depth,
         }
 
         # Enqueue with optional delay
@@ -126,6 +128,7 @@ class QueueService:
         user_id: str,
         chat_id: Optional[str] = None,
         timeout: Optional[int] = None,
+        depth: int = 0,
     ) -> Any:
         """
         Enqueue a function job and wait for its result.
@@ -152,6 +155,7 @@ class QueueService:
                 trigger_id=trigger_id,
                 user_id=user_id,
                 chat_id=chat_id,
+                depth=depth,
             )
 
             # Wait for result with timeout

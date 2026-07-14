@@ -303,14 +303,15 @@ class ContentConverter:
 
         Args:
             content: Universal content format
-            provider_type: "openai", "mistral", "ollama", or "anthropic"
+            provider_type: "openai", "azure", "mistral", "ollama", or "anthropic"
 
         Returns:
             Provider-specific content format
         """
         provider_type = provider_type.lower()
 
-        if provider_type == "openai":
+        if provider_type in ("openai", "azure", "azure_openai"):
+            # Azure OpenAI uses the same content format as OpenAI.
             return ContentConverter.to_openai(content)
         elif provider_type == "anthropic":
             return ContentConverter.to_anthropic(content)

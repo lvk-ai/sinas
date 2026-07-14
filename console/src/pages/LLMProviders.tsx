@@ -244,6 +244,7 @@ export function LLMProviders() {
                   required
                 >
                   <option value="openai">OpenAI</option>
+                  <option value="azure">Azure OpenAI</option>
                   <option value="anthropic">Anthropic (Claude)</option>
                   <option value="mistral">Mistral AI</option>
                   <option value="ollama">Ollama</option>
@@ -316,7 +317,11 @@ export function LLMProviders() {
                   className="input resize-none font-mono text-xs"
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  Provider-specific configuration as JSON
+                  Provider-specific configuration as JSON. For Azure OpenAI set the
+                  API Endpoint to your azure_endpoint and add{' '}
+                  <code>{'{"api_version": "2024-10-21"}'}</code>. For reasoning
+                  deployments (gpt-5/o-series) also add{' '}
+                  <code>{'"drop_params": ["temperature"]'}</code>.
                 </p>
               </div>
 
@@ -416,6 +421,7 @@ export function LLMProviders() {
                   required
                 >
                   <option value="openai">OpenAI</option>
+                  <option value="azure">Azure OpenAI</option>
                   <option value="anthropic">Anthropic (Claude)</option>
                   <option value="mistral">Mistral AI</option>
                   <option value="ollama">Ollama</option>

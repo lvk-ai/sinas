@@ -54,6 +54,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     user_id = kwargs["user_id"]
     chat_id = kwargs.get("chat_id")
     callback_url = kwargs.get("callback_url")
+    depth = kwargs.get("depth", 0)
 
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -120,6 +121,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
             user_id=user_id,
             chat_id=chat_id,
             callback_url=callback_url,
+            depth=depth,
         )
 
         # Store result
