@@ -24,6 +24,7 @@ from app.models.secret import Secret
 from app.models.skill import Skill
 from app.models.store import Store
 
+from app.schemas.config import CONNECTOR_AUTH_FIELD_MAP
 from app.services.config_apply.normalizers import normalize_store_references, should_skip_existing
 
 logger = logging.getLogger(__name__)
@@ -65,18 +66,10 @@ async def apply_connectors(
                     "response_mapping": op.responseMapping,
                 })
 
+            # Map camelCase config keys → snake_case stored keys via the single field map.
             auth = {
-                "type": conn_config.auth.type,
-                "secret": conn_config.auth.secret,
-                "header": conn_config.auth.header,
-                "position": conn_config.auth.position,
-                "param_name": conn_config.auth.paramName,
-                "token_url": conn_config.auth.tokenUrl,
-                "client_id": conn_config.auth.clientId,
-                "scopes": conn_config.auth.scopes,
-                "client_auth_method": conn_config.auth.clientAuthMethod,
-                "authorize_url": conn_config.auth.authorizeUrl,
-                "token_params": conn_config.auth.tokenParams,
+                snake: getattr(conn_config.auth, camel)
+                for camel, snake in CONNECTOR_AUTH_FIELD_MAP
             }
             # Remove None values from auth
             auth = {k: v for k, v in auth.items() if v is not None}
