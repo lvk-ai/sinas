@@ -1,6 +1,7 @@
 """Connector service — executes HTTP operations in-process."""
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
@@ -20,6 +21,15 @@ from app.models.connector_oauth_token import ConnectorOAuthToken
 from app.models.secret import Secret
 
 logger = logging.getLogger(__name__)
+
+
+class ConnectorAuthError(Exception):
+    """Raised when a connector's auth cannot be resolved and the request must NOT be sent.
+
+    Distinct from a transport/HTTP error: this means we deliberately refuse to send an
+    unauthenticated request (e.g. an OAuth user token is missing or expired). The message
+    is safe to surface to the caller and usually tells them to reconnect their account.
+    """
 
 # Connection pool limits
 MAX_CONNECTIONS = 200          # Total across all hosts
@@ -41,6 +51,10 @@ class ConnectorService:
         self._oauth_tokens: dict[str, tuple[str, float]] = {}
         # Per-cache-key locks to avoid stampeding the token endpoint on concurrent misses
         self._oauth_locks: dict[str, asyncio.Lock] = {}
+        # Per-(connector, user) locks: single-flight the authorization-code refresh within
+        # this process so a fan-out of concurrent calls doesn't open N DB sessions all
+        # blocking on the same row lock (pool exhaustion). See _refresh_authorization_code_token.
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get or create the shared httpx client with connection pooling."""
@@ -186,13 +200,21 @@ class ConnectorService:
         if auth_type == "oauth2_client_credentials":
             token = await self._get_client_credentials_token(db, auth_config, user_id)
             if not token:
-                return {}, {}
+                # Fail closed: sending the request unauthenticated would surface the
+                # provider's raw 401 as a "successful" result. Make the failure explicit.
+                raise ConnectorAuthError(
+                    "Could not obtain an OAuth token for this connector. "
+                    "Check the connector's token URL, client ID, and client secret."
+                )
             return {"Authorization": f"Bearer {token}"}, {}
 
         if auth_type == "oauth2_authorization_code":
             token = await self._get_authorization_code_token(db, connector_id, auth_config, user_id)
             if not token:
-                return {}, {}
+                raise ConnectorAuthError(
+                    "This connector is not connected for your account, or its authorization "
+                    "has expired. Reconnect the connector and try again."
+                )
             return {"Authorization": f"Bearer {token}"}, {}
 
         # All other types require a secret
@@ -212,7 +234,10 @@ class ConnectorService:
             encoded = base64.b64encode(secret_value.encode()).decode()
             return {"Authorization": f"Basic {encoded}"}, {}
         elif auth_type == "api_key":
-            if auth_config.get("position") == "query":
+            # Header is the default and the historical behavior; only an explicit
+            # position="query" sends the key as a query parameter. (Case-insensitive so a
+            # stray "Query" doesn't silently fall back to header.)
+            if str(auth_config.get("position") or "header").lower() == "query":
                 param_name = auth_config.get("param_name") or "api_key"
                 return {}, {param_name: secret_value}
             header_name = auth_config.get("header") or "X-Api-Key"
@@ -267,10 +292,25 @@ class ConnectorService:
         scopes = auth_config.get("scopes") or []
         scope_str = " ".join(scopes) if isinstance(scopes, list) else str(scopes)
         client_auth_method = auth_config.get("client_auth_method") or "body"
+        token_params = auth_config.get("token_params")
 
-        # Distinct creds/scope/endpoint get distinct cache entries. user_id is included
-        # because a private secret override yields a different (per-user) token.
-        cache_key = f"{user_id or 'shared'}|{token_url}|{client_id}|{scope_str}"
+        # Distinct creds/scope/endpoint/extra-params get distinct cache entries — anything
+        # that changes the minted token must be in the key or two connectors would alias
+        # each other's tokens (e.g. same client_id but different `audience` in token_params,
+        # or a secret rotated to a different Secret name). user_id is included because a
+        # private secret override yields a different (per-user) token.
+        token_params_key = json.dumps(token_params, sort_keys=True) if isinstance(token_params, dict) else ""
+        cache_key = "|".join(
+            [
+                user_id or "shared",
+                token_url,
+                client_id,
+                scope_str,
+                client_auth_method,
+                secret_name,
+                token_params_key,
+            ]
+        )
 
         # Fast path: a still-valid cached token.
         cached = self._oauth_tokens.get(cache_key)
@@ -422,14 +462,22 @@ class ConnectorService:
             row.scope = payload["scope"]
         if payload.get("token_type"):
             row.token_type = payload["token_type"]
+
         expires_in = payload.get("expires_in")
         try:
             ttl = int(expires_in) if expires_in is not None else None
         except (TypeError, ValueError):
             ttl = None
-        row.expires_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=ttl) if ttl is not None else None
-        )
+
+        if ttl is not None:
+            row.expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+        elif row.encrypted_refresh_token:
+            # No expiry given but we CAN refresh: assume a conservative lifetime so the
+            # token is proactively refreshed, rather than trusted forever and then failing
+            # with a dead bearer that never triggers a refresh (RFC 6749 lets refresh
+            # responses omit expires_in). Never overwrite a known expiry with None here.
+            row.expires_at = datetime.now(timezone.utc) + timedelta(seconds=OAUTH_DEFAULT_TTL)
+        # else: no expiry and no way to refresh — leave expires_at as-is (best effort).
 
     async def exchange_authorization_code(
         self, db: AsyncSession, connector: Connector, user_id: str, code: str, code_verifier: str
@@ -526,15 +574,19 @@ class ConnectorService:
     ) -> Optional[str]:
         """Refresh a per-user token under a row lock, in its own short-lived transaction.
 
-        `SELECT ... FOR UPDATE` on the single (connector, user) row serializes concurrent
-        refreshers across processes/containers. We re-check validity under the lock so a
-        request that lost the race uses the winner's freshly-stored token instead of
-        issuing a second (refresh-token-rotating) refresh. The lock is held only for the
-        token POST and released on commit — it does not span the caller's execution.
+        Two layers of serialization:
+        - A process-local asyncio lock keyed by (connector, user) single-flights the refresh
+          within this process, so a fan-out of concurrent calls doesn't each open a DB
+          session and block on the row lock (which would pin N pool connections for up to
+          the token POST's 30s timeout). Losers wait on the asyncio lock — holding no DB
+          connection — then the double-check below returns the winner's freshly-stored token.
+        - `SELECT ... FOR UPDATE` on the single (connector, user) row then serializes across
+          processes/containers so a rotating refresh token isn't spent twice.
         """
         from app.core.database import AsyncSessionLocal
 
-        async with AsyncSessionLocal() as session:
+        lock = self._refresh_locks.setdefault(f"{connector_id}|{user_id}", asyncio.Lock())
+        async with lock, AsyncSessionLocal() as session:
             async with session.begin():
                 result = await session.execute(
                     select(ConnectorOAuthToken)

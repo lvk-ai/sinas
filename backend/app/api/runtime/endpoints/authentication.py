@@ -1,5 +1,9 @@
 """Authentication endpoints."""
 
+import html as html_lib
+import json
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select
@@ -367,9 +371,19 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
 
     The connector OAuth flow is opened in a popup; this signals the console (via
     postMessage) whether the connection succeeded, then closes. No secrets are sent.
+    The message is targeted at the console's own origin (not "*") so it can't be read by
+    an unrelated opener, and the console-side listener validates event.origin in turn.
     """
     status_word = "success" if ok else "error"
-    safe = message.replace("<", "&lt;").replace(">", "&gt;")
+    safe = html_lib.escape(message)
+    # Target the app's own origin. settings.domain drives both the console and this
+    # callback, so the console window is same-origin with this page in real deployments.
+    domain = (settings.domain or "").strip()
+    if not domain or domain.lower() in ("localhost", "127.0.0.1"):
+        target_origin = f"http://localhost:{settings.backend_port}"
+    else:
+        target_origin = f"https://{domain}"
+    target_origin_js = json.dumps(target_origin)
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Connector authorization</title></head>
 <body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -379,7 +393,7 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
 </div>
 <script>
   try {{ window.opener && window.opener.postMessage(
-    {{ type: "connector-oauth", status: "{status_word}" }}, "*"); }} catch (e) {{}}
+    {{ type: "connector-oauth", status: "{status_word}" }}, {target_origin_js}); }} catch (e) {{}}
   setTimeout(function () {{ window.close(); }}, 1200);
 </script>
 </body></html>"""
@@ -400,7 +414,7 @@ async def connector_oauth_callback(
     Unauthenticated by design (the provider won't send our bearer). The initiating user and
     connector are recovered from the single-use `state` minted at /connectors/.../oauth/authorize.
     """
-    from app.core.oauth_state import consume_state
+    from app.core.oauth_state import BIND_COOKIE_NAME, consume_state
     from app.models.connector import Connector
     from app.services.connector_service import connector_service
 
@@ -410,6 +424,22 @@ async def connector_oauth_callback(
     ctx = await consume_state(state)
     if ctx is None:
         return _oauth_result_page(False, "This authorization link has expired or was already used.")
+
+    # Browser-binding check: the flow must be completed by the same browser that started
+    # it. The nonce was set as an HttpOnly cookie by the authenticated begin endpoint;
+    # require it to match the one stored with the state. This defeats OAuth account-linking
+    # (an attacker minting a state and having a victim complete it). Constant-time compare.
+    cookie_nonce = request.cookies.get(BIND_COOKIE_NAME) or ""
+    expected_nonce = ctx.get("browser_nonce") or ""
+    if not expected_nonce or not secrets.compare_digest(cookie_nonce, expected_nonce):
+        resp = _oauth_result_page(
+            False,
+            "This authorization could not be verified for your session. "
+            "Please start the connection again from the connector page.",
+        )
+        resp.delete_cookie(BIND_COOKIE_NAME, path="/")
+        return resp
+
     if not code:
         return _oauth_result_page(False, "No authorization code was returned by the provider.")
 
@@ -420,6 +450,10 @@ async def connector_oauth_callback(
     ok = await connector_service.exchange_authorization_code(
         db=db, connector=connector, user_id=ctx["user_id"], code=code, code_verifier=ctx["code_verifier"],
     )
-    if not ok:
-        return _oauth_result_page(False, "Failed to exchange the authorization code for a token.")
-    return _oauth_result_page(True, f"Connected {connector.namespace}/{connector.name}.")
+    result = _oauth_result_page(
+        ok,
+        f"Connected {connector.namespace}/{connector.name}." if ok
+        else "Failed to exchange the authorization code for a token.",
+    )
+    result.delete_cookie(BIND_COOKIE_NAME, path="/")
+    return result

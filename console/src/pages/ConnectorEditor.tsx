@@ -22,6 +22,35 @@ const AUTH_TYPES = [
 ];
 // Auth types that resolve a stored Secret (for OAuth this is the client secret).
 const SECRET_AUTH_TYPES = ['bearer', 'basic', 'api_key', 'oauth2_client_credentials', 'oauth2_authorization_code'];
+
+// Keep only the auth fields that matter for the chosen type. The editor carries a full
+// set of auth defaults in state for convenience, but persisting them all would write
+// empty OAuth fields (tokenUrl:"", scopes:[], clientAuthMethod:"body", ...) onto every
+// connector — polluting config export / GitOps diffs for non-OAuth connectors.
+function pruneAuthForSave(auth: any): Record<string, any> {
+  const type = auth?.type || 'none';
+  const out: Record<string, any> = { type };
+  if (type === 'none' || type === 'sinas_token') return out;
+  if (auth.secret) out.secret = auth.secret;
+  if (type === 'bearer' || type === 'basic') return out;
+  if (type === 'api_key') {
+    const position = auth.position === 'query' ? 'query' : 'header';
+    out.position = position;
+    if (position === 'query') out.param_name = auth.param_name || 'api_key';
+    else out.header = auth.header || 'X-Api-Key';
+    return out;
+  }
+  if (type === 'oauth2_client_credentials' || type === 'oauth2_authorization_code') {
+    if (auth.token_url) out.token_url = auth.token_url;
+    if (auth.client_id) out.client_id = auth.client_id;
+    if (auth.scopes?.length) out.scopes = auth.scopes;
+    if (auth.client_auth_method) out.client_auth_method = auth.client_auth_method;
+    if (auth.token_params && Object.keys(auth.token_params).length) out.token_params = auth.token_params;
+    if (type === 'oauth2_authorization_code' && auth.authorize_url) out.authorize_url = auth.authorize_url;
+    return out;
+  }
+  return out;
+}
 const methodColors: Record<string, string> = {
   GET: 'bg-green-900/30 text-green-400',
   POST: 'bg-blue-900/30 text-blue-400',
@@ -51,7 +80,7 @@ export function ConnectorEditor() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const isNew = namespace === 'new' && name === 'new';
-  const { showSuccess } = useToast();
+  const { showSuccess, showError } = useToast();
 
   const [formData, setFormData] = useState({
     namespace: 'default', name: '', description: '', base_url: '',
@@ -172,7 +201,7 @@ export function ConnectorEditor() {
   });
 
   const handleSave = () => {
-    saveMutation.mutate(formData);
+    saveMutation.mutate({ ...formData, auth: pruneAuthForSave(formData.auth) });
   };
 
   // OAuth (authorization-code) per-user connection status
@@ -187,25 +216,46 @@ export function ConnectorEditor() {
   // Refresh status when the popup reports back that authorization finished.
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
+      // Only trust messages from our own origin (the callback page posts to it).
+      if (e.origin !== window.location.origin) return;
       if (e.data?.type === 'connector-oauth') {
         if (e.data.status === 'success') showSuccess('Account connected');
+        else if (e.data.status === 'error') showError('Authorization was not completed');
         refetchOAuthStatus();
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [refetchOAuthStatus, showSuccess]);
+  }, [refetchOAuthStatus, showSuccess, showError]);
 
   const connectMutation = useMutation({
     mutationFn: () => apiClient.beginConnectorOAuth(formData.namespace, formData.name),
-    onSuccess: (data: { authorize_url: string }) => {
-      window.open(data.authorize_url, 'connector-oauth', 'width=600,height=760');
-    },
   });
+
+  // Open the popup synchronously in the click handler (a popup opened later, from the
+  // mutation's async onSuccess, is outside the user-gesture window and gets blocked).
+  // We pre-open a blank window now and point it at the provider once the URL arrives.
+  const handleConnect = () => {
+    const popup = window.open('', 'connector-oauth', 'width=600,height=760');
+    if (!popup) {
+      showError('Please allow popups for this site, then click Connect again.');
+      return;
+    }
+    connectMutation.mutate(undefined, {
+      onSuccess: (data: { authorize_url: string }) => {
+        popup.location.href = data.authorize_url;
+      },
+      onError: (err: any) => {
+        popup.close();
+        showError(err?.response?.data?.detail || 'Could not start the connection.');
+      },
+    });
+  };
 
   const disconnectMutation = useMutation({
     mutationFn: () => apiClient.disconnectConnectorOAuth(formData.namespace, formData.name),
     onSuccess: () => { showSuccess('Account disconnected'); refetchOAuthStatus(); },
+    onError: (err: any) => showError(err?.response?.data?.detail || 'Could not disconnect the account.'),
   });
 
   const addOperation = () => {
@@ -488,7 +538,7 @@ export function ConnectorEditor() {
                     <span className="text-sm text-green-400">
                       Connected{oauthStatus.expires_at ? ` · expires ${new Date(oauthStatus.expires_at).toLocaleString()}` : ''}
                     </span>
-                    <button onClick={() => connectMutation.mutate()} disabled={connectMutation.isPending} className="btn btn-secondary btn-sm">
+                    <button onClick={handleConnect} disabled={connectMutation.isPending} className="btn btn-secondary btn-sm">
                       Reconnect
                     </button>
                     <button onClick={() => disconnectMutation.mutate()} disabled={disconnectMutation.isPending} className="btn btn-secondary btn-sm text-red-400">
@@ -498,7 +548,7 @@ export function ConnectorEditor() {
                 ) : (
                   <>
                     <span className="text-sm text-gray-500">Not connected</span>
-                    <button onClick={() => connectMutation.mutate()} disabled={connectMutation.isPending} className="btn btn-primary btn-sm">
+                    <button onClick={handleConnect} disabled={connectMutation.isPending} className="btn btn-primary btn-sm">
                       {connectMutation.isPending ? 'Opening...' : 'Connect Account'}
                     </button>
                   </>
