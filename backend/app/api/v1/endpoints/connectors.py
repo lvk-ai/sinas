@@ -3,13 +3,18 @@ import ipaddress
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
 from app.core.database import get_db
-from app.core.oauth_state import generate_pkce_pair, store_state
+from app.core.oauth_state import (
+    BIND_COOKIE_NAME,
+    generate_browser_nonce,
+    generate_pkce_pair,
+    store_state,
+)
 from app.core.permissions import check_permission
 from app.models.connector import Connector
 from app.models.connector_oauth_token import ConnectorOAuthToken
@@ -26,7 +31,7 @@ from app.schemas.connector import (
     OperationConfig,
 )
 from app.services.connector_openapi import extract_auth, extract_operations, parse_openapi_spec
-from app.services.connector_service import connector_service
+from app.services.connector_service import ConnectorAuthError, connector_service
 from app.services.package_service import detach_if_package_managed
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
@@ -349,6 +354,7 @@ async def import_openapi(
 @router.post("/{namespace}/{name}/oauth/authorize", response_model=OAuthAuthorizeResponse)
 async def begin_oauth_authorization(
     request: Request,
+    response: Response,
     namespace: str,
     name: str,
     db: AsyncSession = Depends(get_db),
@@ -366,12 +372,26 @@ async def begin_oauth_authorization(
         raise HTTPException(status_code=400, detail="Connector is not configured for OAuth authorization-code auth")
 
     verifier, challenge = generate_pkce_pair()
+    # Bind this flow to the initiating browser: the nonce is stored with the state AND set
+    # as an HttpOnly cookie here; the callback requires the two to match. This is what stops
+    # an attacker minting a state and having a victim complete it under the attacker's account.
+    browser_nonce = generate_browser_nonce()
     state = await store_state(
-        user_id=str(user_id), namespace=namespace, name=name, code_verifier=verifier
+        user_id=str(user_id), namespace=namespace, name=name,
+        code_verifier=verifier, browser_nonce=browser_nonce,
     )
     url = connector_service.build_authorize_url(connector.auth, state, challenge)
     if not url:
         raise HTTPException(status_code=400, detail="Connector OAuth config is incomplete (authorize_url/client_id)")
+    response.set_cookie(
+        key=BIND_COOKIE_NAME,
+        value=browser_nonce,
+        max_age=600,  # matches STATE_TTL_SECONDS
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",  # sent on the provider's top-level GET redirect back to the callback
+        path="/",
+    )
     return OAuthAuthorizeResponse(authorize_url=url)
 
 
@@ -454,6 +474,7 @@ async def test_operation(
             operation_name=operation_name,
             parameters=test_data.parameters,
             user_token=user_token,
+            user_id=user_id,
         )
         return ConnectorTestResponse(
             status_code=result["status_code"],
@@ -461,6 +482,8 @@ async def test_operation(
             body=result.get("body"),
             elapsed_ms=result.get("elapsed_ms", 0),
         )
+    except ConnectorAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
