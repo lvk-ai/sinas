@@ -332,36 +332,13 @@ class ConnectorService:
             data = {"grant_type": "client_credentials"}
             if scope_str:
                 data["scope"] = scope_str
-            extra = auth_config.get("token_params")
-            if isinstance(extra, dict):
-                data.update({k: str(v) for k, v in extra.items()})
+            if isinstance(token_params, dict):
+                data.update({k: str(v) for k, v in token_params.items()})
 
-            headers = {"Accept": "application/json"}
-            if client_auth_method == "basic":
-                encoded = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-                headers["Authorization"] = f"Basic {encoded}"
-            else:  # "body" — client_secret_post
-                data["client_id"] = client_id
-                data["client_secret"] = client_secret
-
-            try:
-                async with self._semaphore:
-                    client = self._get_client()
-                    resp = await client.post(token_url, data=data, headers=headers, timeout=30.0)
-            except Exception as e:
-                logger.error(f"OAuth token request to {token_url} failed: {e}")
-                return None
-
-            if resp.status_code != 200:
-                logger.error(
-                    f"OAuth token endpoint {token_url} returned {resp.status_code}: {resp.text[:200]}"
-                )
-                return None
-
-            try:
-                payload = resp.json()
-            except Exception:
-                logger.error(f"OAuth token endpoint {token_url} returned a non-JSON body")
+            payload = await self._post_token_request(
+                token_url, data, client_id, client_secret, client_auth_method
+            )
+            if not payload:
                 return None
 
             access_token = payload.get("access_token")
@@ -369,10 +346,8 @@ class ConnectorService:
                 logger.error(f"OAuth token endpoint {token_url} response missing access_token")
                 return None
 
-            expires_in = payload.get("expires_in")
-            try:
-                ttl = int(expires_in) if expires_in is not None else OAUTH_DEFAULT_TTL
-            except (TypeError, ValueError):
+            ttl = self._parse_expires_in(payload.get("expires_in"))
+            if ttl is None:
                 ttl = OAUTH_DEFAULT_TTL
             expires_at = time.monotonic() + max(ttl - OAUTH_TOKEN_TTL_SKEW, 1)
             self._oauth_tokens[cache_key] = (access_token, expires_at)
@@ -391,11 +366,7 @@ class ConnectorService:
 
         Must exactly match the redirect URI registered with the OAuth provider.
         """
-        domain = settings.domain
-        path = "/auth/connectors/oauth/callback"
-        if not domain or domain.lower() in ("localhost", "127.0.0.1"):
-            return f"http://localhost:{settings.backend_port}{path}"
-        return f"https://{domain}{path}"
+        return f"{settings.public_base_url}/auth/connectors/oauth/callback"
 
     def build_authorize_url(
         self, auth_config: dict[str, Any], state: str, code_challenge: str
@@ -451,6 +422,16 @@ class ConnectorService:
             logger.error(f"OAuth token endpoint {token_url} returned a non-JSON body")
             return None
 
+    @staticmethod
+    def _parse_expires_in(expires_in: Any) -> Optional[int]:
+        """Coerce a token response's `expires_in` to an int, or None if absent/invalid."""
+        if expires_in is None:
+            return None
+        try:
+            return int(expires_in)
+        except (TypeError, ValueError):
+            return None
+
     def _store_token_fields(self, row: ConnectorOAuthToken, payload: dict[str, Any]) -> None:
         """Copy a token-endpoint payload onto a ConnectorOAuthToken row (encrypting tokens)."""
         row.encrypted_access_token = encryption_service.encrypt(payload["access_token"])
@@ -463,11 +444,7 @@ class ConnectorService:
         if payload.get("token_type"):
             row.token_type = payload["token_type"]
 
-        expires_in = payload.get("expires_in")
-        try:
-            ttl = int(expires_in) if expires_in is not None else None
-        except (TypeError, ValueError):
-            ttl = None
+        ttl = self._parse_expires_in(payload.get("expires_in"))
 
         if ttl is not None:
             row.expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)

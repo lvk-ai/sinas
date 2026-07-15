@@ -185,6 +185,19 @@ class Settings(BaseSettings):
     # Domain (for generating external URLs, e.g., temp file URLs)
     domain: Optional[str] = None  # FQDN like "app.example.com"; localhost or None = no external URLs
 
+    @property
+    def public_base_url(self) -> str:
+        """External origin the browser reaches this app at ('scheme://host', no trailing slash).
+
+        Single source of truth for public URLs the browser must hit exactly (OAuth
+        redirect/callback, postMessage target origin). Falls back to the backend port for
+        local dev when no external domain is configured.
+        """
+        domain = (self.domain or "").strip()
+        if not domain or domain.lower() in ("localhost", "127.0.0.1"):
+            return f"http://localhost:{self.backend_port}"
+        return f"https://{domain}"
+
     # Component builder
     builder_url: str = "http://sinas-builder:3000"  # URL for esbuild compilation service
 

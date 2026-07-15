@@ -376,14 +376,10 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
     """
     status_word = "success" if ok else "error"
     safe = html_lib.escape(message)
-    # Target the app's own origin. settings.domain drives both the console and this
-    # callback, so the console window is same-origin with this page in real deployments.
-    domain = (settings.domain or "").strip()
-    if not domain or domain.lower() in ("localhost", "127.0.0.1"):
-        target_origin = f"http://localhost:{settings.backend_port}"
-    else:
-        target_origin = f"https://{domain}"
-    target_origin_js = json.dumps(target_origin)
+    # Target the app's own origin (not "*"). settings.public_base_url drives both the
+    # console and this callback, so the console window is same-origin with this page in
+    # real deployments; the console-side listener validates event.origin in turn.
+    target_origin_js = json.dumps(settings.public_base_url)
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Connector authorization</title></head>
 <body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
