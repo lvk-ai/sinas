@@ -2,6 +2,7 @@
 
 import html as html_lib
 import json
+import logging
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -66,6 +67,7 @@ async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str, AuthUse
     return access_token, refresh_token_plain, user_resp
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -376,10 +378,10 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
     """
     status_word = "success" if ok else "error"
     safe = html_lib.escape(message)
-    # Target the app's own origin (not "*"). settings.public_base_url drives both the
-    # console and this callback, so the console window is same-origin with this page in
-    # real deployments; the console-side listener validates event.origin in turn.
-    target_origin_js = json.dumps(settings.public_base_url)
+    # The message carries no secret (just a status flag), and the console/API can be on
+    # different origins in local dev, so we post to "*". Spoofing is prevented on the
+    # RECEIVER side: the console validates event.origin against the API origin before
+    # trusting the message (see ConnectorEditor's message listener).
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Connector authorization</title></head>
 <body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -389,7 +391,7 @@ def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
 </div>
 <script>
   try {{ window.opener && window.opener.postMessage(
-    {{ type: "connector-oauth", status: "{status_word}" }}, {target_origin_js}); }} catch (e) {{}}
+    {{ type: "connector-oauth", status: "{status_word}" }}, "*"); }} catch (e) {{}}
   setTimeout(function () {{ window.close(); }}, 1200);
 </script>
 </body></html>"""
@@ -425,9 +427,12 @@ async def connector_oauth_callback(
     # it. The nonce was set as an HttpOnly cookie by the authenticated begin endpoint;
     # require it to match the one stored with the state. This defeats OAuth account-linking
     # (an attacker minting a state and having a victim complete it). Constant-time compare.
+    # Skippable only in split-origin local dev (see settings.oauth_bind_browser_session),
+    # where the cookie can't round-trip cross-origin.
     cookie_nonce = request.cookies.get(BIND_COOKIE_NAME) or ""
     expected_nonce = ctx.get("browser_nonce") or ""
-    if not expected_nonce or not secrets.compare_digest(cookie_nonce, expected_nonce):
+    binding_ok = bool(expected_nonce) and secrets.compare_digest(cookie_nonce, expected_nonce)
+    if settings.oauth_bind_browser_session and not binding_ok:
         resp = _oauth_result_page(
             False,
             "This authorization could not be verified for your session. "
@@ -435,6 +440,11 @@ async def connector_oauth_callback(
         )
         resp.delete_cookie(BIND_COOKIE_NAME, path="/")
         return resp
+    if not binding_ok:
+        logger.warning(
+            "OAuth browser-binding check skipped (oauth_bind_browser_session=false) — "
+            "acceptable only for local single-user dev, never production."
+        )
 
     if not code:
         return _oauth_result_page(False, "No authorization code was returned by the provider.")

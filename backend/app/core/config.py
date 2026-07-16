@@ -185,6 +185,15 @@ class Settings(BaseSettings):
     # Domain (for generating external URLs, e.g., temp file URLs)
     domain: Optional[str] = None  # FQDN like "app.example.com"; localhost or None = no external URLs
 
+    # OAuth authorization-code: bind the consent flow to the browser that started it
+    # (an HttpOnly nonce cookie set by the authenticated begin call, checked at the
+    # callback) to prevent account-linking/login-CSRF. Requires the console and API to be
+    # same-site (they are in a normal single-domain deployment). MUST stay True in any
+    # multi-user/production deployment. Set False ONLY for local dev where the console and
+    # API run on different origins (e.g. console :51245 + API :8000) so the cookie can't
+    # round-trip — disabling it there just removes the extra CSRF check for local testing.
+    oauth_bind_browser_session: bool = True
+
     @property
     def public_base_url(self) -> str:
         """External origin the browser reaches this app at ('scheme://host', no trailing slash).
