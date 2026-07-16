@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient, getApiErrorMessage } from '../lib/api';
+import { apiClient, getApiErrorMessage, API_BASE_URL } from '../lib/api';
 import { useToast } from '../lib/toast-context';
 import {
   Save, ArrowLeft, Plus, Trash2, Play, X, ChevronDown, ChevronRight,
@@ -215,9 +215,12 @@ export function ConnectorEditor() {
 
   // Refresh status when the popup reports back that authorization finished.
   useEffect(() => {
+    // The callback page is served by the API (which may be a different origin than the
+    // console in local dev). Trust the message only from the API origin or our own.
+    let apiOrigin = window.location.origin;
+    try { apiOrigin = new URL(API_BASE_URL, window.location.origin).origin; } catch { /* keep default */ }
     const onMessage = (e: MessageEvent) => {
-      // Only trust messages from our own origin (the callback page posts to it).
-      if (e.origin !== window.location.origin) return;
+      if (e.origin !== window.location.origin && e.origin !== apiOrigin) return;
       if (e.data?.type === 'connector-oauth') {
         if (e.data.status === 'success') showSuccess('Account connected');
         else if (e.data.status === 'error') showError('Authorization was not completed');
