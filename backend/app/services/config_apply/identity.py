@@ -8,7 +8,7 @@ from typing import Any, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.user import Role, RolePermission, User, UserRole
+from app.models.user import Role, RolePermission, User, UserIdentity, UserRole
 from app.schemas.config import ResourceChange
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,11 @@ async def apply_users(
                 {
                     "email": user_config.email,
                     "roles": sorted(user_config.roles),
+                    "customFields": user_config.customFields,
+                    "identities": sorted(
+                        ([i.provider, i.subject, i.metadata] for i in user_config.identities),
+                        key=lambda x: (x[0], x[1]),
+                    ),
                 }
             )
 
@@ -162,6 +167,7 @@ async def apply_users(
                     continue
 
                 if not dry_run:
+                    existing.custom_fields = user_config.customFields
                     existing.config_checksum = config_hash
                     existing.updated_at = datetime.utcnow()
 
@@ -172,6 +178,7 @@ async def apply_users(
                 if not dry_run:
                     new_user = User(
                         email=user_config.email,
+                        custom_fields=user_config.customFields,
                         managed_by=managed_by,
                         config_name=config_name,
                         config_checksum=config_hash,
@@ -191,8 +198,67 @@ async def apply_users(
                     role_ids, warnings,
                 )
 
+            # Apply external identities (declarative: config is the full set)
+            if not dry_run:
+                await apply_user_identities(
+                    db, user_ids[user_config.email], user_config.identities, warnings
+                )
+
         except Exception as e:
             errors.append(f"Error applying user '{user_config.email}': {str(e)}")
+
+
+async def apply_user_identities(
+    db: AsyncSession,
+    user_id: str,
+    identities: list,
+    warnings: list[str],
+) -> None:
+    """
+    Apply external identities to a config-managed user. The config is the
+    full desired set: identities not in the config are removed, new ones are
+    added, and metadata is refreshed on existing ones.
+    """
+    result = await db.execute(select(UserIdentity).where(UserIdentity.user_id == user_id))
+    existing_by_key = {(i.provider, i.subject): i for i in result.scalars().all()}
+    desired_keys = {(i.provider, i.subject) for i in identities}
+
+    # Remove identities no longer in config
+    for key, identity in existing_by_key.items():
+        if key not in desired_keys:
+            await db.delete(identity)
+
+    for identity_config in identities:
+        key = (identity_config.provider, identity_config.subject)
+        existing = existing_by_key.get(key)
+
+        if existing:
+            existing.identity_metadata = identity_config.metadata
+            existing.last_synced_at = datetime.utcnow()
+            continue
+
+        # Guard: identity may be linked to a different user
+        stmt = select(UserIdentity).where(
+            UserIdentity.provider == identity_config.provider,
+            UserIdentity.subject == identity_config.subject,
+        )
+        conflict = (await db.execute(stmt)).scalar_one_or_none()
+        if conflict:
+            warnings.append(
+                f"Identity '{identity_config.provider}:{identity_config.subject}' "
+                f"is already linked to another user. Skipping."
+            )
+            continue
+
+        db.add(
+            UserIdentity(
+                user_id=user_id,
+                provider=identity_config.provider,
+                subject=identity_config.subject,
+                identity_metadata=identity_config.metadata,
+                last_synced_at=datetime.utcnow(),
+            )
+        )
 
 
 async def apply_user_roles(

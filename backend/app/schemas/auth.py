@@ -1,9 +1,11 @@
 """Authentication schemas."""
 import uuid
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
+
+from app.schemas.user import UserIdentityInput
 
 
 class LoginRequest(BaseModel):
@@ -135,6 +137,8 @@ class LogoutRequest(BaseModel):
 
 class CreateUserRequest(BaseModel):
     email: EmailStr
+    custom_fields: Optional[dict[str, Any]] = None
+    identities: list[UserIdentityInput] = Field(default_factory=list)
 
 
 class PermissionCheckRequest(BaseModel):
