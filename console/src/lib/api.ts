@@ -1293,3 +1293,30 @@ class APIClient {
 
 
 export const apiClient = new APIClient();
+
+/**
+ * Extract a human-readable string from an API error.
+ *
+ * FastAPI returns `detail` as a plain string for HTTPExceptions but as an ARRAY of
+ * `{loc, msg, ...}` objects for 422 validation errors. Rendering that array directly
+ * as a React child throws (React error #31), so every place that surfaces an API error
+ * must funnel through here to guarantee a string.
+ */
+export function getApiErrorMessage(err: any, fallback = 'Something went wrong'): string {
+  const detail = err?.response?.data?.detail ?? err?.response?.data?.message;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((e: any) => {
+        const loc = Array.isArray(e?.loc)
+          ? e.loc.filter((p: any) => p !== 'body').join('.')
+          : '';
+        const msg = typeof e?.msg === 'string' ? e.msg : '';
+        return loc && msg ? `${loc}: ${msg}` : msg || loc;
+      })
+      .filter(Boolean);
+    if (msgs.length) return msgs.join('; ');
+  }
+  if (detail && typeof detail === 'object' && typeof detail.msg === 'string') return detail.msg;
+  return err?.message || fallback;
+}

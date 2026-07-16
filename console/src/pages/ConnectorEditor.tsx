@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient } from '../lib/api';
+import { apiClient, getApiErrorMessage } from '../lib/api';
 import { useToast } from '../lib/toast-context';
 import {
   Save, ArrowLeft, Plus, Trash2, Play, X, ChevronDown, ChevronRight,
@@ -197,7 +197,7 @@ export function ConnectorEditor() {
     mutationFn: ({ op, params }: { op: string; params: any }) =>
       apiClient.testConnectorOperation(formData.namespace, formData.name, op, params),
     onSuccess: (data: any) => setTestResult(data),
-    onError: (err: any) => setTestResult({ error: err?.response?.data?.detail || 'Request failed' }),
+    onError: (err: any) => setTestResult({ error: getApiErrorMessage(err, 'Request failed') }),
   });
 
   const handleSave = () => {
@@ -247,7 +247,7 @@ export function ConnectorEditor() {
       },
       onError: (err: any) => {
         popup.close();
-        showError(err?.response?.data?.detail || 'Could not start the connection.');
+        showError(getApiErrorMessage(err, 'Could not start the connection.'));
       },
     });
   };
@@ -255,7 +255,7 @@ export function ConnectorEditor() {
   const disconnectMutation = useMutation({
     mutationFn: () => apiClient.disconnectConnectorOAuth(formData.namespace, formData.name),
     onSuccess: () => { showSuccess('Account disconnected'); refetchOAuthStatus(); },
-    onError: (err: any) => showError(err?.response?.data?.detail || 'Could not disconnect the account.'),
+    onError: (err: any) => showError(getApiErrorMessage(err, 'Could not disconnect the account.')),
   });
 
   const addOperation = () => {
@@ -362,7 +362,7 @@ export function ConnectorEditor() {
       {saveMutation.isError && (
         <div className="p-3 bg-red-900/20 border border-red-800 rounded-lg">
           <p className="text-sm text-red-400">
-            {(saveMutation.error as any)?.response?.data?.detail || 'Failed to save'}
+            {getApiErrorMessage(saveMutation.error, 'Failed to save')}
           </p>
         </div>
       )}
@@ -729,7 +729,7 @@ export function ConnectorEditor() {
                 )}
                 {importParseMutation.isError && (
                   <div className="p-3 bg-red-900/20 border border-red-800 rounded-lg">
-                    <p className="text-sm text-red-400">{(importParseMutation.error as any)?.response?.data?.detail || 'Failed to parse spec'}</p>
+                    <p className="text-sm text-red-400">{getApiErrorMessage(importParseMutation.error, 'Failed to parse spec')}</p>
                   </div>
                 )}
                 <div className="flex justify-end gap-2">
