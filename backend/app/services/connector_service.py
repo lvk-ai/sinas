@@ -108,13 +108,21 @@ class ConnectorService:
         non_path_params = {k: v for k, v in parameters.items() if k not in path_param_names}
 
         if mapping == "json":
-            json_body = non_path_params
+            json_body = non_path_params or None
         elif mapping == "query":
             query_params = non_path_params
         elif mapping == "path_and_json":
-            json_body = non_path_params
+            json_body = non_path_params or None
         elif mapping == "path_and_query":
             query_params = non_path_params
+
+        # A GET/HEAD must not carry a request body. Even an empty `{}` makes httpx set
+        # Content-Type/Content-Length, which strict gateways (e.g. the Google Frontend in
+        # front of the Spotify API) reject as a malformed request. If a GET operation
+        # mapped params to the body, send them as query params instead.
+        if method.upper() in ("GET", "HEAD") and json_body is not None:
+            query_params = {**(query_params or {}), **json_body}
+            json_body = None
 
         # Auth may contribute query params (e.g. an api_key with position="query")
         if auth_query:
