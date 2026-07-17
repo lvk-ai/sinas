@@ -575,6 +575,20 @@ class APIClient {
     return response.data;
   }
 
+  async beginConnectorOAuth(namespace: string, name: string): Promise<{ authorize_url: string }> {
+    const response = await this.configClient.post(`/connectors/${namespace}/${name}/oauth/authorize`);
+    return response.data;
+  }
+
+  async getConnectorOAuthStatus(namespace: string, name: string): Promise<{ connected: boolean; expires_at: string | null; scope: string | null }> {
+    const response = await this.configClient.get(`/connectors/${namespace}/${name}/oauth/status`);
+    return response.data;
+  }
+
+  async disconnectConnectorOAuth(namespace: string, name: string): Promise<void> {
+    await this.configClient.delete(`/connectors/${namespace}/${name}/oauth/token`);
+  }
+
   // Store management (admin CRUD)
   async listStores(params?: { namespace?: string }): Promise<any[]> {
     const response = await this.configClient.get('/stores', { params });
@@ -1279,3 +1293,30 @@ class APIClient {
 
 
 export const apiClient = new APIClient();
+
+/**
+ * Extract a human-readable string from an API error.
+ *
+ * FastAPI returns `detail` as a plain string for HTTPExceptions but as an ARRAY of
+ * `{loc, msg, ...}` objects for 422 validation errors. Rendering that array directly
+ * as a React child throws (React error #31), so every place that surfaces an API error
+ * must funnel through here to guarantee a string.
+ */
+export function getApiErrorMessage(err: any, fallback = 'Something went wrong'): string {
+  const detail = err?.response?.data?.detail ?? err?.response?.data?.message;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((e: any) => {
+        const loc = Array.isArray(e?.loc)
+          ? e.loc.filter((p: any) => p !== 'body').join('.')
+          : '';
+        const msg = typeof e?.msg === 'string' ? e.msg : '';
+        return loc && msg ? `${loc}: ${msg}` : msg || loc;
+      })
+      .filter(Boolean);
+    if (msgs.length) return msgs.join('; ');
+  }
+  if (detail && typeof detail === 'object' && typeof detail.msg === 'string') return detail.msg;
+  return err?.message || fallback;
+}

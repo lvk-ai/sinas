@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient } from '../lib/api';
+import { apiClient, getApiErrorMessage } from '../lib/api';
 import { Plus, Trash2, Edit2, KeyRound, X, Eye, EyeOff } from 'lucide-react';
 
 interface Secret {
@@ -256,7 +256,7 @@ export function Secrets() {
               {saveMutation.isError && (
                 <div className="p-3 bg-red-900/20 border border-red-800 rounded-lg">
                   <p className="text-sm text-red-400">
-                    {(saveMutation.error as any)?.response?.data?.detail || 'Failed to save secret'}
+                    {getApiErrorMessage(saveMutation.error, 'Failed to save secret')}
                   </p>
                 </div>
               )}
