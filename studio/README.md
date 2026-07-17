@@ -151,6 +151,16 @@ Ordered by value to Studio:
    recognition.
 5. **Permissions on `/auth/me`** — lets Studio adapt UI to the caller's role
    instead of discovering by 403.
+6. **Record admission failures as executions** — found during live testing:
+   when a webhook fires but the platform can't run the function (e.g.
+   "No workers available"), the caller gets a 500 and **no execution row is
+   written**. Studio's Runs rail honestly shows "no runs recorded", but the
+   workflow silently swallowed a real event. Failed admission should create
+   a failed execution so it's visible after the fact.
+7. **`@sinas/cli install` can't pass variables** — `install` reads
+   `opts.variables` but registers no `--variables`/`--set` option, so any
+   package with required variables (like studio-runtime's `WORKSPACE_URL`)
+   can't be installed via the CLI. Needs a `--set KEY=VALUE` flag.
 
 ## 8. Repository layout & delivery
 
