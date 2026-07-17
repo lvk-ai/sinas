@@ -294,7 +294,18 @@ class MessageService:
         )
 
         # Create LLM provider
-        llm_provider = await create_provider(provider_name, final_model, self.db)
+        llm_provider = await create_provider(
+            provider_name,
+            final_model,
+            self.db,
+            usage_context={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "message_id": user_message.id,
+                "agent": f"{agent.namespace}/{agent.name}" if agent else None,
+                "source": "chat",
+            },
+        )
 
         # If no model specified, use the provider's default model
         if not final_model:
@@ -394,6 +405,11 @@ class MessageService:
             **llm_kwargs,
         )
         end_time = datetime.now(UTC)
+
+        _usage = response.get("usage") or {}
+        if _usage.get("total_tokens"):
+            _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
+            _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
 
         await self._log_request(
             user_id=user_id,
@@ -583,6 +599,7 @@ class MessageService:
         """Stream LLM response."""
         full_content = ""
         tool_calls_list = []
+        stream_usage = None
 
         clean_tools = strip_tool_metadata(tools)
 
@@ -593,6 +610,9 @@ class MessageService:
             temperature=final_temperature,
             max_tokens=max_tokens,
         ):
+            if chunk.get("usage"):
+                stream_usage = chunk["usage"]
+
             if chunk.get("content"):
                 if isinstance(chunk["content"], str):
                     full_content += chunk["content"]
@@ -652,6 +672,9 @@ class MessageService:
                 otel_attr("user_id"): user_id,
                 otel_attr("labels"): _labels,
             })
+            if stream_usage and stream_usage.get("total_tokens"):
+                _s.set_attribute("gen_ai.usage.input_tokens", stream_usage.get("prompt_tokens", 0))
+                _s.set_attribute("gen_ai.usage.output_tokens", stream_usage.get("completion_tokens", 0))
             _s.end()
         except Exception:
             pass
@@ -1000,7 +1023,22 @@ class MessageService:
                 message_dict["name"] = msg.name
             updated_messages.append(message_dict)
 
-        llm_provider = await create_provider(provider, model, self.db)
+        _agent_label = (
+            f"{chat.agent_namespace}/{chat.agent_name}"
+            if chat and chat.agent_namespace and chat.agent_name
+            else None
+        )
+        llm_provider = await create_provider(
+            provider,
+            model,
+            self.db,
+            usage_context={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "agent": _agent_label,
+                "source": "chat",
+            },
+        )
 
         clean_tools = strip_tool_metadata(tools)
 

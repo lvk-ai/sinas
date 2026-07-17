@@ -35,7 +35,9 @@ class AzureOpenAIProvider(OpenAIProvider):
       ``max_completion_tokens``; set ``max_tokens`` for legacy deployments.
     - ``drop_params``: list of parameter names to strip before sending. Set
       ``["temperature"]`` for reasoning deployments (gpt-5/o-series) that only
-      accept the default temperature.
+      accept the default temperature. Streaming requests include
+      ``stream_options`` (for token usage); add it here for gateways or API
+      versions that reject it.
     - ``extra_params``: dict of defaults merged into every request, e.g.
       ``{"reasoning_effort": "medium"}``. Caller-supplied kwargs take precedence.
 

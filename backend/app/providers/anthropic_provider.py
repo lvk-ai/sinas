@@ -101,6 +101,11 @@ class AnthropicProvider(BaseLLMProvider):
         current_tool_calls = {}
         current_content = ""
 
+        # Token usage arrives in message_start (input) and message_delta
+        # (cumulative output); emitted on the final chunk.
+        input_tokens = 0
+        output_tokens = 0
+
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
                 chunk_data = {
@@ -109,7 +114,13 @@ class AnthropicProvider(BaseLLMProvider):
                     "finish_reason": None,
                 }
 
-                if event.type == "content_block_start":
+                if event.type == "message_start":
+                    usage = getattr(event.message, "usage", None)
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(usage, "output_tokens", 0) or 0
+
+                elif event.type == "content_block_start":
                     if event.content_block.type == "text":
                         pass  # Text will come in content_block_delta
                     elif event.content_block.type == "tool_use":
@@ -161,9 +172,20 @@ class AnthropicProvider(BaseLLMProvider):
                 elif event.type == "message_delta":
                     if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                         chunk_data["finish_reason"] = event.delta.stop_reason
+                    usage = getattr(event, "usage", None)
+                    if usage:
+                        if getattr(usage, "output_tokens", None) is not None:
+                            output_tokens = usage.output_tokens
+                        if getattr(usage, "input_tokens", None) is not None:
+                            input_tokens = usage.input_tokens
 
                 elif event.type == "message_stop":
                     chunk_data["finish_reason"] = chunk_data["finish_reason"] or "stop"
+                    chunk_data["usage"] = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    }
 
                 yield chunk_data
 

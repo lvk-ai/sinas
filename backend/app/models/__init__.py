@@ -12,6 +12,7 @@ from .execution import Execution
 from .file import Collection, ContentFilterEvaluation, File, FileVersion
 from .function import Function, FunctionVersion
 from .llm_provider import LLMProvider
+from .llm_usage import LLMUsage
 
 from .dependency import Dependency
 from .package import Package
@@ -56,6 +57,7 @@ __all__ = [
     "ComponentShare",
     "Connector",
     "LLMProvider",
+    "LLMUsage",
     "DatabaseConnection",
     "DatabaseTrigger",
     "Query",
