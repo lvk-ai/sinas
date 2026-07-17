@@ -94,6 +94,10 @@ class OpenAIProvider(BaseLLMProvider):
         **kwargs,
     ) -> AsyncIterator[dict[str, Any]]:
         """Generate a streaming completion using OpenAI API."""
+        # Ask for token usage on the final chunk. Routed through kwargs so
+        # subclasses can strip it via their param handling (e.g. Azure
+        # drop_params) for gateways that reject stream_options.
+        kwargs.setdefault("stream_options", {"include_usage": True})
         params = self._prepare_params(
             model=model,
             messages=messages,
@@ -107,6 +111,19 @@ class OpenAIProvider(BaseLLMProvider):
         stream = await self.client.chat.completions.create(**params)
 
         async for chunk in stream:
+            usage = self.extract_usage(chunk) if getattr(chunk, "usage", None) else None
+
+            if not chunk.choices:
+                # With include_usage the final chunk has no choices, only usage
+                if usage:
+                    yield {
+                        "content": None,
+                        "tool_calls": None,
+                        "finish_reason": None,
+                        "usage": usage,
+                    }
+                continue
+
             delta = chunk.choices[0].delta
 
             result = {
@@ -114,6 +131,9 @@ class OpenAIProvider(BaseLLMProvider):
                 "tool_calls": None,
                 "finish_reason": chunk.choices[0].finish_reason,
             }
+
+            if usage:
+                result["usage"] = usage
 
             if delta.tool_calls:
                 result["tool_calls"] = self.format_tool_calls(delta.tool_calls)

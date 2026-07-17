@@ -70,7 +70,11 @@ class BaseLLMProvider(ABC):
             **kwargs: Additional provider-specific parameters
 
         Yields:
-            Dict chunks with incremental completion data
+            Dict chunks with incremental completion data. Chunks carry
+            'content', 'tool_calls' and 'finish_reason' keys. A chunk near
+            the end of the stream (typically the last one) additionally
+            carries a 'usage' key with the same shape as extract_usage();
+            consumers must treat 'usage' as optional per chunk.
         """
         pass
 
