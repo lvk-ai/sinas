@@ -6,6 +6,7 @@ import { Connect } from './screens/Connect';
 import { Projects } from './screens/Projects';
 import { ProjectHome } from './screens/ProjectHome';
 import { AssistantEditor } from './screens/AssistantEditor';
+import { NewWorkflow, ScheduleWorkflow, WebhookWorkflow } from './screens/WorkflowEditor';
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
@@ -49,7 +50,7 @@ function Shell() {
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <BrowserRouter basename="/studio">
         <Routes>
           <Route path="/connect" element={<Connect />} />
           <Route element={<Shell />}>
@@ -57,6 +58,9 @@ export default function App() {
             <Route path="projects" element={<Projects />} />
             <Route path="projects/:ns/:name" element={<ProjectHome />} />
             <Route path="projects/:pns/:pname/assistants/:ans/:aname" element={<AssistantEditor />} />
+            <Route path="projects/:pns/:pname/workflows/new" element={<NewWorkflow />} />
+            <Route path="projects/:pns/:pname/workflows/schedule/:name" element={<ScheduleWorkflow />} />
+            <Route path="projects/:pns/:pname/workflows/webhook/*" element={<WebhookWorkflow />} />
           </Route>
           <Route path="*" element={<Navigate to="/projects" replace />} />
         </Routes>

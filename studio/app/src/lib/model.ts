@@ -109,6 +109,56 @@ export function triggersForAgent(agent: Agent, schedules: Schedule[], webhooks: 
   return { scheduleHits, webhookHits };
 }
 
+// ---- Adapters (see studio/README.md §5) ----
+
+/** An adapter is recognizable by the reserved parameter it must declare. */
+export function isAdapter(fn: { input_schema?: Record<string, any> }): boolean {
+  return !!fn.input_schema?.properties?.studio_agent;
+}
+
+/** The trigger payload fields an adapter accepts (its schema minus reserved params). */
+export function adapterPayloadFields(fn: { input_schema?: Record<string, any> }): string[] {
+  return Object.keys(fn.input_schema?.properties ?? {}).filter((k) => !k.startsWith('studio_'));
+}
+
+// ---- Schedule presets (friendly cron) ----
+
+export type SchedulePreset = 'hourly' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
+
+export const SCHEDULE_PRESETS: Array<{ value: SchedulePreset; label: string }> = [
+  { value: 'hourly', label: 'Every hour' },
+  { value: 'daily', label: 'Every day' },
+  { value: 'weekdays', label: 'Every weekday' },
+  { value: 'weekly', label: 'Every Monday' },
+  { value: 'monthly', label: 'Monthly (1st)' },
+];
+
+export function cronFromPreset(preset: SchedulePreset, time: string): string {
+  const [h = 9, m = 0] = time.split(':').map((n) => parseInt(n, 10));
+  switch (preset) {
+    case 'hourly': return `${m || 0} * * * *`;
+    case 'daily': return `${m || 0} ${h} * * *`;
+    case 'weekdays': return `${m || 0} ${h} * * 1-5`;
+    case 'weekly': return `${m || 0} ${h} * * 1`;
+    case 'monthly': return `${m || 0} ${h} 1 * *`;
+  }
+}
+
+export function presetFromCron(cron: string): { preset: SchedulePreset; time: string } | null {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  const [min, hour, dom, month, dow] = parts;
+  if (!/^\d+$/.test(min)) return null;
+  const time = /^\d+$/.test(hour) ? `${hour.padStart(2, '0')}:${min.padStart(2, '0')}` : `09:${min.padStart(2, '0')}`;
+  if (hour === '*' && dom === '*' && dow === '*') return { preset: 'hourly', time };
+  if (!/^\d+$/.test(hour) || month !== '*') return null;
+  if (dow === '1-5' && dom === '*') return { preset: 'weekdays', time };
+  if (dow === '1' && dom === '*') return { preset: 'weekly', time };
+  if (dom === '1' && dow === '*') return { preset: 'monthly', time };
+  if (dom === '*' && dow === '*') return { preset: 'daily', time };
+  return null;
+}
+
 /** Members of a project, grouped the way the project home displays them. */
 export function projectMembers(manifest: Manifest) {
   const byType = (types: string[]) =>

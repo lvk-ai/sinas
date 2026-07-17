@@ -115,6 +115,7 @@ export interface Schedule {
   description: string | null;
   cron_expression: string;
   timezone: string;
+  content: string | null;
   is_active: boolean;
   last_run: string | null;
   next_run: string | null;
@@ -133,6 +134,26 @@ export interface Webhook {
 }
 
 export interface InstalledPackage { id: string; name: string; version: string }
+
+export interface SinasFunction {
+  id: string;
+  namespace: string;
+  name: string;
+  description: string | null;
+  input_schema: Record<string, any>;
+}
+
+export interface Execution {
+  execution_id: string;
+  function_name: string;
+  status: string;
+  trigger_type: string | null;
+  trigger_id: string | null;
+  error: string | null;
+  started_at: string | null;
+  created_at?: string;
+  duration_ms: number | null;
+}
 
 export interface Chat { id: string; title: string }
 

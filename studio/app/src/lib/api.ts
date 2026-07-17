@@ -9,7 +9,9 @@ import type {
   Chat,
   Collection,
   Connector,
+  Execution,
   InstalledPackage,
+  SinasFunction,
   InstanceInfo,
   LoginResponse,
   Manifest,
@@ -87,7 +89,7 @@ async function request<T>(
       return request<T>(path, { ...opts, retried: true });
     }
     clearConnection();
-    window.location.assign('/connect');
+    window.location.assign(`${import.meta.env.BASE_URL}connect`);
     throw new ApiError(401, 'Session expired');
   }
 
@@ -160,9 +162,40 @@ export const api = {
     request<Store>('/api/v1/stores', { method: 'POST', body: data }),
   listSecrets: () => request<Secret[]>('/api/v1/secrets'),
 
-  // Workflows (read-only in this iteration)
+  // Workflows
   listSchedules: () => request<Schedule[]>('/api/v1/schedules'),
+  createSchedule: (data: {
+    name: string;
+    schedule_type: 'function' | 'agent';
+    target_namespace: string;
+    target_name: string;
+    description?: string;
+    cron_expression: string;
+    timezone?: string;
+    content?: string;
+  }) => request<Schedule>('/api/v1/schedules', { method: 'POST', body: data }),
+  updateSchedule: (name: string, data: Partial<{ description: string; cron_expression: string; content: string; is_active: boolean; target_namespace: string; target_name: string }>) =>
+    request<Schedule>(`/api/v1/schedules/${encodeURIComponent(name)}`, { method: 'PATCH', body: data }),
   listWebhooks: () => request<Webhook[]>('/api/v1/webhooks'),
+  createWebhook: (data: {
+    path: string;
+    function_namespace: string;
+    function_name: string;
+    http_method?: string;
+    description?: string;
+    default_values?: Record<string, any>;
+    requires_auth?: boolean;
+  }) => request<Webhook>('/api/v1/webhooks', { method: 'POST', body: data }),
+  updateWebhook: (path: string, data: Partial<{ description: string; default_values: Record<string, any>; is_active: boolean; requires_auth: boolean }>) =>
+    request<Webhook>(`/api/v1/webhooks/${path}`, { method: 'PUT', body: data }),
+
+  listFunctions: () => request<SinasFunction[]>('/api/v1/functions'),
+  listExecutions: (params: { trigger_type?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.trigger_type) qs.set('trigger_type', params.trigger_type);
+    qs.set('limit', String(params.limit ?? 50));
+    return request<Execution[]>(`/executions?${qs}`);
+  },
 
   // Companion package detection
   listPackages: () => request<InstalledPackage[]>('/api/v1/packages'),

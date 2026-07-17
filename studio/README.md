@@ -166,7 +166,37 @@ studio/
 └── design/            # branch-only; dropped before merge
 ```
 
-Built and shipped as its own image alongside `console` (see
-`.github/workflows/build-images.yml` and docker-compose when wired). It is a
-separate deployment with its own URL and a connect-to-workspace flow — 
-standalone is a deployment property, not a repo property.
+**Distribution (settled):** Studio ships OSS in this repo, on the platform's
+release train — in-repo bundling makes version skew structurally impossible
+for self-hosters. Default serving is **bundled**: the app builds with base
+`/studio/` and is served from the workspace's own origin (same-origin, no
+CORS, no extra service). When served this way it detects the workspace via
+`GET /info` on its own origin, skips the workspace step, and tucks
+"connect to a different workspace" behind an unobtrusive link. A standalone
+deployment (own domain) and a future managed/hosted Studio are distribution
+options built from the same code; the managed variant handles version skew
+via `/info` version detection + graceful degradation, and is a roadmap item,
+not an architecture decision.
+
+## 9. Local development & testing
+
+Against a local Sinas (backend on `http://localhost:8000`, CORS is open):
+
+```bash
+cd studio/app && npm install && npm run dev
+# open http://localhost:5180/studio/ → enter http://localhost:8000 as the workspace
+```
+
+Install the companion package (admin credentials; the workspace URL variable
+must be reachable *from function sandboxes* — for local Docker that is
+http://host.docker.internal:8000):
+
+```bash
+mkdir -p /tmp/studio-pkg && cp studio/packages/studio-runtime.yaml /tmp/studio-pkg/sinas-package.yaml
+cd /tmp/studio-pkg && npx @sinas/cli login && npx @sinas/cli validate && npx @sinas/cli install
+```
+
+Still to wire for the bundled deployment: building `studio/app/dist` into the
+console image needs the console Docker build context widened to the repo root
+(today it is `./console`, which cannot see `studio/`) plus one nginx
+`location /studio/` block with an SPA fallback.

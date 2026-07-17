@@ -204,8 +204,7 @@ export function ProjectHome() {
         <div className="rows">
           {members.workflows.length === 0 && (
             <p style={{ padding: '10px 20px 16px', margin: 0, fontSize: 13, color: 'var(--muted)' }}>
-              No workflows on this project yet. The workflow editor arrives in the next iteration — schedules and
-              webhooks created in the admin console appear here once added to the project.
+              No workflows on this project yet.
             </p>
           )}
           {members.workflows.map((ref) => {
@@ -213,8 +212,18 @@ export function ProjectHome() {
             const schedule = kind === 'schedule' ? schedules?.find((s) => s.name === ref.name) : undefined;
             const webhook = kind === 'webhook' ? webhooks?.find((w) => w.path === ref.name) : undefined;
             const exists = !!(schedule || webhook);
+            const href = schedule
+              ? `/projects/${project.namespace}/${project.name}/workflows/schedule/${encodeURIComponent(schedule.name)}`
+              : webhook
+                ? `/projects/${project.namespace}/${project.name}/workflows/webhook/${webhook.path}`
+                : undefined;
             return (
-              <div key={`${ref.type}:${ref.name}`} className="row">
+              <Link
+                key={`${ref.type}:${ref.name}`}
+                to={href ?? '#'}
+                className="row"
+                style={{ color: 'inherit', textDecoration: 'none', pointerEvents: href ? undefined : 'none' }}
+              >
                 <span className="row-logo" style={{ background: 'var(--warn-soft)', color: 'var(--warn)' }}>
                   {kind === 'schedule' ? <Clock size={15} /> : <WebhookIcon size={15} />}
                 </span>
@@ -239,9 +248,12 @@ export function ProjectHome() {
                   {schedule && <span className={schedule.is_active ? 'pill pill-good' : 'pill'}>{schedule.is_active ? 'On' : 'Off'}</span>}
                   {webhook && <span className={webhook.is_active ? 'pill pill-good' : 'pill'}>{webhook.is_active ? 'On' : 'Off'}</span>}
                 </span>
-              </div>
+              </Link>
             );
           })}
+          <Link className="add-row" to={`/projects/${project.namespace}/${project.name}/workflows/new`} style={{ textDecoration: 'none' }}>
+            <Plus size={15} /> Add a workflow
+          </Link>
         </div>
       </section>
 
