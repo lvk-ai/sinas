@@ -38,6 +38,9 @@ class LLMUsage(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Prompt-cache portions of prompt_tokens (0 for providers without caching)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     streamed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
