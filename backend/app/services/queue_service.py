@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 # Redis key prefixes
 JOB_STATUS_PREFIX = "sinas:job:status:"
+AGENT_QUEUE = "sinas:queue:agents"
+# Dedicated queue for delegated (agent-to-agent) jobs — see issue #90.
+SUB_AGENT_QUEUE = "sinas:queue:agents:sub"
 JOB_RESULT_PREFIX = "sinas:job:result:"
 JOB_DONE_CHANNEL_PREFIX = "sinas:job:done:"
 DLQ_KEY = "sinas:queue:dlq"
@@ -198,21 +201,34 @@ class QueueService:
         trigger_type: Optional[str] = None,
         job_timeout: Optional[int] = None,
         execution_id: Optional[str] = None,
+        depth: int = 0,
+        pending_delegation_id: Optional[str] = None,
+        parent_tool_call_id: Optional[str] = None,
     ) -> str:
         """Enqueue an agent message processing job.
 
         If `execution_id` is provided, the worker will update that Execution
         row to COMPLETED/FAILED on terminal status (used by batch_service).
+
+        `depth` is the agent-to-agent delegation depth (0 = user-initiated).
+        Delegated jobs (depth > 0) go to the dedicated sub-agent queue so
+        parents waiting on children can never starve them of worker slots
+        (issue #90). `pending_delegation_id`/`parent_tool_call_id` are set for
+        suspend-mode delegations: on terminal status the worker reports the
+        result back to the suspended parent.
         """
         pool = await get_arq_pool()
         redis = await get_redis()
 
         job_id = str(uuid.uuid4())
 
+        use_sub_queue = depth > 0 and settings.agent_subagent_queue
+        queue_label = "agents:sub" if use_sub_queue else "agents"
+
         status_data: dict[str, Any] = {
             "status": "queued",
             "channel_id": channel_id,
-            "queue": "agents",
+            "queue": queue_label,
             "type": "message",
             "chat_id": chat_id,
             "enqueued_at": time.time(),
@@ -230,7 +246,7 @@ class QueueService:
 
         enqueue_kwargs: dict[str, Any] = {
             "_job_id": job_id,
-            "_queue_name": "sinas:queue:agents",
+            "_queue_name": SUB_AGENT_QUEUE if use_sub_queue else AGENT_QUEUE,
         }
         if job_timeout is not None:
             enqueue_kwargs["_job_timeout"] = job_timeout
@@ -244,11 +260,17 @@ class QueueService:
             content=content,
             channel_id=channel_id,
             execution_id=execution_id,
+            depth=depth,
+            pending_delegation_id=pending_delegation_id,
+            parent_tool_call_id=parent_tool_call_id,
             trace_context=inject_trace_context(),
             **enqueue_kwargs,
         )
 
-        logger.info(f"Enqueued agent message job {job_id} for chat {chat_id}")
+        logger.info(
+            f"Enqueued agent message job {job_id} for chat {chat_id} "
+            f"(queue={queue_label}, depth={depth})"
+        )
         return job_id
 
     async def enqueue_agent_resume(
@@ -308,6 +330,67 @@ class QueueService:
         logger.info(f"Enqueued agent resume job {job_id} for chat {chat_id}")
         return job_id
 
+    async def enqueue_agent_delegate_resume(
+        self,
+        chat_id: str,
+        user_id: str,
+        user_token: str,
+        channel_id: str,
+        conversation_context: dict[str, Any],
+        job_timeout: Optional[int] = None,
+    ) -> str:
+        """Enqueue continuation of a parent suspended on delegations (issue #90).
+
+        Fired by the last finishing child. Routed by the parent's own
+        delegation depth, so a suspended sub-agent resumes on the sub-agent
+        queue and a top-level parent on the main queue.
+        """
+        pool = await get_arq_pool()
+        redis = await get_redis()
+
+        job_id = str(uuid.uuid4())
+        depth = conversation_context.get("delegation_depth", 0)
+        use_sub_queue = depth > 0 and settings.agent_subagent_queue
+        queue_label = "agents:sub" if use_sub_queue else "agents"
+
+        status_data: dict[str, Any] = {
+            "status": "queued",
+            "channel_id": channel_id,
+            "queue": queue_label,
+            "type": "delegate_resume",
+            "chat_id": chat_id,
+            "enqueued_at": time.time(),
+        }
+        await redis.set(
+            f"{JOB_STATUS_PREFIX}{job_id}",
+            json.dumps(status_data),
+            ex=JOB_TTL,
+        )
+
+        enqueue_kwargs: dict[str, Any] = {
+            "_job_id": job_id,
+            "_queue_name": SUB_AGENT_QUEUE if use_sub_queue else AGENT_QUEUE,
+        }
+        if job_timeout is not None:
+            enqueue_kwargs["_job_timeout"] = job_timeout
+
+        await pool.enqueue_job(
+            "execute_agent_delegate_resume_job",
+            job_id=job_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_token=user_token,
+            channel_id=channel_id,
+            conversation_context=conversation_context,
+            trace_context=inject_trace_context(),
+            **enqueue_kwargs,
+        )
+
+        logger.info(
+            f"Enqueued delegate-resume job {job_id} for chat {chat_id} (queue={queue_label})"
+        )
+        return job_id
+
 
     async def get_queue_stats(self) -> dict[str, Any]:
         """Get aggregate queue statistics."""
@@ -315,7 +398,8 @@ class QueueService:
 
         # Queue depths (arq uses sorted sets)
         functions_pending = await redis.zcard("sinas:queue:functions")
-        agents_pending = await redis.zcard("sinas:queue:agents")
+        agents_pending = await redis.zcard(AGENT_QUEUE)
+        sub_agents_pending = await redis.zcard(SUB_AGENT_QUEUE)
 
         # DLQ size
         dlq_size = await redis.llen(DLQ_KEY)
@@ -343,6 +427,7 @@ class QueueService:
             "queues": {
                 "functions": {"pending": functions_pending},
                 "agents": {"pending": agents_pending},
+                "agents:sub": {"pending": sub_agents_pending},
             },
             "jobs": {
                 "queued": status_counts.get("queued", 0),
