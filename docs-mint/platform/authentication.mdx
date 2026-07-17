@@ -78,4 +78,35 @@ DELETE /api/v1/api-keys/{id}      # Revoke key
 
 API keys can be used via `Authorization: Bearer <key>` or `X-API-Key: <key>` headers. Keys can have optional expiration dates.
 
+## Token Exchange (bring your own auth)
+
+If your application already authenticates users itself, you don't need to run a second Sinas login flow. Your backend exchanges its knowledge of "who is logged in" for Sinas tokens:
+
+1. An admin links your application's user ids to Sinas users as [external identities](/admin/users-roles#external-identities) — or you let the exchange auto-provision them.
+2. Your backend calls the exchange endpoint with an API key holding the `sinas.auth.exchange:all` permission:
+
+```json
+POST /auth/token/exchange
+X-API-Key: <exchange key>
+{
+  "provider": "acme-app",
+  "subject": "usr_8f3a2",
+  "email": "jane@acme.com",
+  "metadata": {"name": "Jane"},
+  "custom_fields": {"plan": "enterprise"},
+  "auto_provision": true
+}
+```
+
+3. The response contains a normal Sinas access + refresh token pair for that user, which your frontend uses against the runtime API. All ownership scoping (`:own`), permissions, and audit logging apply as if the user had logged in directly.
+
+Behavior details:
+
+- The user is resolved by `(provider, subject)`. If unknown and `email` is given, an existing user with that email is matched and the identity is linked to them.
+- With `auto_provision: true`, unknown users are created and assigned the `TOKEN_EXCHANGE_DEFAULT_ROLE` (default `GuestUsers`). `email` is required to provision.
+- `metadata` is stored on the identity and refreshed on every exchange. `custom_fields` is shallow-merged into the user's custom fields (partner keys win, admin-set keys survive).
+- `provisioned: true` in the response indicates the exchange created the user.
+
+The exchange endpoint trusts the caller to assert identities — treat keys with `sinas.auth.exchange:all` like any other admin credential.
+
 ---

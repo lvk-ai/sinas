@@ -141,6 +141,36 @@ class CreateUserRequest(BaseModel):
     identities: list[UserIdentityInput] = Field(default_factory=list)
 
 
+class TokenExchangeRequest(BaseModel):
+    """
+    Exchange an external identity for Sinas tokens. Called by a trusted
+    partner backend (authenticated with an API key holding
+    sinas.auth.exchange:all) after it has authenticated the user itself.
+    """
+
+    provider: str = Field(..., min_length=1, max_length=255)
+    subject: str = Field(..., min_length=1, max_length=255)
+    # Required for auto-provisioning and used as a linking fallback when the
+    # identity is not yet known but a user with this email exists
+    email: Optional[EmailStr] = None
+    # Snapshot of provider claims; stored on the identity, refreshed each exchange
+    metadata: Optional[dict[str, Any]] = None
+    # Shallow-merged into the user's custom_fields on each exchange
+    custom_fields: Optional[dict[str, Any]] = None
+    # Create the user (with the configured default role) if unknown
+    auto_provision: bool = False
+
+
+class TokenExchangeResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: "AuthUserResponse"
+    # True when this exchange created the user
+    provisioned: bool = False
+
+
 class PermissionCheckRequest(BaseModel):
     """Request to check if user has permission(s)."""
 

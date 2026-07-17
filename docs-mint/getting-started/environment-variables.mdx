@@ -20,6 +20,7 @@ description: "All configuration options"
 |---|---|---|
 | `AUTH_MODE` | `otp` | One of `otp`, `password`, `password+otp`. See [Authentication](/platform/authentication) for the differences. |
 | `SUPERADMIN_PASSWORD` | _(none)_ | Seed password for the superadmin. Only used when `AUTH_MODE` includes `password`. Setting this and restarting acts as a password-reset escape hatch. |
+| `TOKEN_EXCHANGE_DEFAULT_ROLE` | `GuestUsers` | Role assigned to users auto-provisioned via `POST /auth/token/exchange`. See [Token Exchange](/platform/authentication#token-exchange-bring-your-own-auth). |
 
 ## SMTP
 

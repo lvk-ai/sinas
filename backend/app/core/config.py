@@ -163,6 +163,9 @@ class Settings(BaseSettings):
     # password+otp: both required (password + email-OTP as liveness check)
     auth_mode: str = "otp"
 
+    # Role assigned to users auto-provisioned via POST /auth/token/exchange
+    token_exchange_default_role: str = "GuestUsers"
+
     @field_validator("auth_mode")
     @classmethod
     def _validate_auth_mode(cls, v: str) -> str:
