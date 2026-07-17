@@ -206,7 +206,19 @@ mkdir -p /tmp/studio-pkg && cp studio/packages/studio-runtime.yaml /tmp/studio-p
 cd /tmp/studio-pkg && npx @sinas/cli login && npx @sinas/cli validate && npx @sinas/cli install
 ```
 
-Still to wire for the bundled deployment: building `studio/app/dist` into the
-console image needs the console Docker build context widened to the repo root
-(today it is `./console`, which cannot see `studio/`) plus one nginx
-`location /studio/` block with an SPA fallback.
+**Bundled deployment (wired):** the console image builds Studio in its own
+stage and serves it at `/studio/`:
+
+- `console/Dockerfile` builds with the **repo root** as context
+  (`docker build -f console/Dockerfile .`) so it can see `studio/app`; the
+  root `.dockerignore` allowlists only `console/` and `studio/app/`.
+- `console/nginx.conf` serves `/studio/` with its own SPA fallback
+  (`/studio` 301-redirects to `/studio/`).
+- The production `Caddyfile` routes `{$DOMAIN}/studio*` to the console
+  container **on the main domain** — same origin as the API, which is what
+  makes the workspace auto-detect via `GET /info` work.
+- `docker-compose.dev.yml` and the CI image matrix use the widened context.
+
+On the dev compose (no Caddy), bundled Studio is at
+`http://localhost:51245/studio/` — cross-origin to the backend, so it falls
+back to the standalone connect flow, which is correct.
