@@ -15,6 +15,7 @@ import {
   type SchedulePreset,
 } from '../lib/model';
 import type { Agent, Execution, Manifest } from '../lib/types';
+import { SetupStudioLink } from '../components/SetupStudio';
 
 // ---------- shared bits ----------
 
@@ -569,10 +570,18 @@ export function NewWorkflow() {
             <WebhookIcon size={16} style={{ color: 'var(--warn)', marginBottom: 6 }} />
             <div style={{ fontWeight: 650, color: 'var(--ink)', fontSize: 13.5 }}>A web request</div>
             <div style={{ fontSize: 12, color: 'var(--faint)' }}>
-              {adapters.length ? 'A form or another tool calls a URL' : 'Needs Studio setup — ask your admin'}
+              {adapters.length ? 'A form or another tool calls a URL' : 'Needs Studio setup'}
             </div>
           </button>
         </div>
+        {adapters.length === 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+            <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>
+              Webhook workflows need the studio-runtime package in this workspace.
+            </span>
+            <SetupStudioLink />
+          </div>
+        )}
       </div>
 
       {kind && (

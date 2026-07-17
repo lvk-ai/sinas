@@ -4,6 +4,7 @@
 *
 !console
 !studio/app
+!studio/packages
 console/node_modules
 console/dist
 studio/app/node_modules

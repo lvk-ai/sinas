@@ -24,7 +24,7 @@ import type {
   Webhook,
 } from './types';
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
     super(message);
@@ -197,8 +197,13 @@ export const api = {
     return request<Execution[]>(`/executions?${qs}`);
   },
 
-  // Companion package detection
+  // Companion package detection + in-app setup (see components/SetupStudio.tsx)
   listPackages: () => request<InstalledPackage[]>('/api/v1/packages'),
+  installPackage: (yamlContent: string, variables: Record<string, string>) =>
+    request<unknown>('/api/v1/packages/install', {
+      method: 'POST',
+      body: { source: yamlContent, variables },
+    }),
 
   // One-shot agent invocation (used for studio/copilot AI assist)
   invokeAgent: (ns: string, name: string, data: { message: string; session_key?: string }) =>

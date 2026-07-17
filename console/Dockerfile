@@ -44,12 +44,15 @@ RUN npm run build
 # Stage 2: Build Studio (served under /studio/, see studio/README.md §8)
 FROM node:20-alpine AS studio-builder
 
-WORKDIR /studio
+# Mirror the repo layout: the app imports ../../packages/studio-runtime.yaml
+# (relative to studio/app) so setup installs a version-matched package.
+WORKDIR /src/studio/app
 
 COPY studio/app/package.json studio/app/package-lock.json ./
 RUN npm ci
 
 COPY studio/app/ ./
+COPY studio/packages/ /src/studio/packages/
 RUN npm run build
 
 # Stage 3: Serve with Nginx
@@ -57,7 +60,7 @@ FROM nginx:alpine
 
 # Copy built files from builders
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY --from=studio-builder /studio/dist /usr/share/nginx/html/studio
+COPY --from=studio-builder /src/studio/app/dist /usr/share/nginx/html/studio
 
 # Copy nginx configuration
 COPY console/nginx.conf /etc/nginx/conf.d/default.conf

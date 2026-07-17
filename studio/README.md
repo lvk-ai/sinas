@@ -161,6 +161,11 @@ Ordered by value to Studio:
    `opts.variables` but registers no `--variables`/`--set` option, so any
    package with required variables (like studio-runtime's `WORKSPACE_URL`)
    can't be installed via the CLI. Needs a `--set KEY=VALUE` flag.
+8. **Package uninstall breaks on function version history** — found during
+   live testing: `PackageService.uninstall` bulk-deletes managed functions
+   without first removing their `function_versions` rows, so uninstalling
+   any package containing a function that has version history 500s on the
+   foreign key. Delete versions first (or cascade).
 
 ## 8. Repository layout & delivery
 

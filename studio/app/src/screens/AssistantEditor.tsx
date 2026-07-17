@@ -29,11 +29,7 @@ import {
 import type { AgentUpdate } from '../lib/types';
 import { TestChat } from '../components/TestChat';
 
-/** True while the companion package (studio/copilot agent) is installed. */
-function useCopilotAvailable(): boolean {
-  const { data: packages } = useQuery({ queryKey: ['packages'], queryFn: api.listPackages, retry: false });
-  return (packages ?? []).some((p) => p.name === 'studio-runtime');
-}
+import { SetupStudioLink, useStudioRuntimeInstalled } from '../components/SetupStudio';
 
 function Popover({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   return (
@@ -62,7 +58,7 @@ export function AssistantEditor() {
   const secrets = useQuery({ queryKey: ['secrets'], queryFn: api.listSecrets, retry: false }).data;
   const schedules = useQuery({ queryKey: ['schedules'], queryFn: api.listSchedules }).data ?? [];
   const webhooks = useQuery({ queryKey: ['webhooks'], queryFn: api.listWebhooks }).data ?? [];
-  const copilotAvailable = useCopilotAvailable();
+  const copilotAvailable = useStudioRuntimeInstalled();
 
   const patch = useMutation({
     mutationFn: (update: AgentUpdate) => api.updateAgent(ans!, aname!, update),
@@ -278,6 +274,7 @@ export function AssistantEditor() {
                   {assistBusy ? <Loader2 size={13} className="spin" /> : <Sparkles size={13} style={{ color: 'var(--accent)' }} />}
                   Improve with AI
                 </button>
+                {!copilotAvailable && <SetupStudioLink />}
                 {assistError && <span style={{ fontSize: 12, color: 'var(--bad)' }}>{assistError}</span>}
                 <span style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--faint)' }}>
                   Changes apply immediately — try them in the test chat →
