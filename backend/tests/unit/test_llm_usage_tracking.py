@@ -277,6 +277,12 @@ async def test_anthropic_stream_emits_usage_on_message_stop():
     out = [c async for c in provider.stream(messages=[{"role": "user", "content": "x"}], model="m")]
 
     final = out[-1]
-    assert final["usage"] == {"prompt_tokens": 12, "completion_tokens": 9, "total_tokens": 21}
+    assert final["usage"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 9,
+        "total_tokens": 21,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
     # stop_reason from message_delta still surfaces
     assert any(c["finish_reason"] == "end_turn" for c in out)

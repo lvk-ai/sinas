@@ -90,7 +90,12 @@ async def create_provider(
     elif provider_type == "mistral":
         provider = MistralProvider(api_key=api_key, base_url=base_url)
     elif provider_type == "anthropic":
-        provider = AnthropicProvider(api_key=api_key, base_url=base_url)
+        config = provider_config.config or {}
+        provider = AnthropicProvider(
+            api_key=api_key,
+            base_url=base_url,
+            enable_prompt_caching=config.get("prompt_caching", True),
+        )
     elif provider_type == "ollama":
         provider = OllamaProvider(base_url=base_url or "http://localhost:11434")
     else:
