@@ -342,6 +342,7 @@ class WorkerSettings:
 
 # Import agent jobs for combined worker
 from app.queue.agent_jobs import (
+    execute_agent_delegate_resume_job,
     execute_agent_message_job,
     execute_agent_resume_job,
 )
@@ -350,11 +351,39 @@ from app.queue.agent_jobs import (
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
-    functions = [execute_agent_message_job, execute_agent_resume_job]
+    functions = [
+        execute_agent_message_job,
+        execute_agent_resume_job,
+        execute_agent_delegate_resume_job,
+    ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:agents"
     max_jobs = settings.queue_agent_concurrency
     job_timeout = settings.agent_job_timeout  # Default timeout, can be overridden per-job
+    max_tries = 1  # No retry for agent conversations (side effects)
+
+
+class SubAgentWorkerSettings:
+    """arq worker settings for DELEGATED agent jobs (issue #90).
+
+    Same job handlers as AgentWorkerSettings, different queue: agent-to-agent
+    calls (depth > 0) land here so parents blocked on children can never
+    starve them of worker slots. Run as its own process:
+
+        python -m arq app.queue.worker.SubAgentWorkerSettings
+    """
+
+    functions = [
+        execute_agent_message_job,
+        execute_agent_resume_job,
+        execute_agent_delegate_resume_job,
+    ]
+    on_startup = agent_worker_startup
+    on_shutdown = shutdown
+    redis_settings = get_redis_settings()
+    queue_name = "sinas:queue:agents:sub"
+    max_jobs = settings.queue_agent_sub_concurrency
+    job_timeout = settings.agent_job_timeout
     max_tries = 1  # No retry for agent conversations (side effects)

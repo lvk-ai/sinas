@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     queue_function_concurrency: int = 10
     queue_agent_concurrency: int = 5
+    queue_agent_sub_concurrency: int = 5  # concurrency of the sub-agent queue worker
     queue_default_timeout: int = 300
     queue_max_retries: int = 3
     queue_retry_delay: int = 10
@@ -149,6 +150,24 @@ class Settings(BaseSettings):
     # Agent job settings
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)
+
+    # Agent-to-agent delegation (call_agent_* tools). See issue #90.
+    # - agent_delegate_timeout: how long a parent waits for a sub-agent result.
+    #   Must be < agent_job_timeout in "block" mode, since the parent's own job
+    #   clock keeps running while it waits.
+    # - agent_subagent_queue: route delegated (depth > 0) agent jobs to the
+    #   dedicated sub-agent queue so children never compete with top-level
+    #   parents for worker slots. Requires the sub-agent worker process
+    #   (SubAgentWorkerSettings); disable to restore single-queue routing.
+    # - agent_max_delegation_depth: reject delegation chains deeper than this.
+    # - agent_delegate_mode: "block" (parent holds its worker slot while
+    #   awaiting the child) or "suspend" (parent job ends at delegation and a
+    #   resume job continues the conversation when the children finish —
+    #   frees the slot, at the cost of a brief stream gap between jobs).
+    agent_delegate_timeout: int = 600
+    agent_subagent_queue: bool = True
+    agent_max_delegation_depth: int = 5
+    agent_delegate_mode: str = "block"
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
