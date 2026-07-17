@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import {
+  avatarStyle,
   cronToEnglish,
   initials,
   inputRowsToSchema,
@@ -141,7 +142,7 @@ export function AssistantEditor() {
         <Link to={`/projects/${pns}/${pname}`} style={{ color: 'var(--muted)', display: 'flex' }}>
           <ArrowLeft size={17} />
         </Link>
-        <span className="row-logo" style={{ width: 28, height: 28, fontSize: 11, background: 'var(--accent-soft)', color: 'var(--accent-ink)' }}>
+        <span className="row-logo" style={{ width: 28, height: 28, fontSize: 11, ...avatarStyle(agent.name) }}>
           {initials(agent.name)}
         </span>
         <span style={{ fontWeight: 700, color: 'var(--ink)', fontSize: 15 }}>{prettyName(agent.name)}</span>

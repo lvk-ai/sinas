@@ -61,6 +61,11 @@ spec:
     - namespace: studio
       name: ask-agent
       description: "Generic trigger adapter: forwards a webhook payload to an assistant. Configure via default_values on the webhook (studio_agent, studio_message_template, studio_input_map)."
+      # Trusted, admin-installed code -> shared pool: pre-warmed workers (low
+      # webhook latency) and context['secrets'] for future signature checks.
+      # Note: shared workers still run on the isolated sandbox network, so the
+      # callback must use WORKSPACE_URL, not internal service names.
+      sharedPool: true
       timeout: 115
       code: |
         def handler(input_data, context):

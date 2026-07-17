@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/schibsted-grotesk": "^5.2.8",
     "@tanstack/react-query": "^5.90.5",
     "lucide-react": "^0.548.0",
     "react": "^19.1.1",

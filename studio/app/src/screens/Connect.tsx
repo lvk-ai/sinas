@@ -92,10 +92,11 @@ export function Connect() {
   return (
     <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 20 }}>
       <div className="card" style={{ width: '100%', maxWidth: 420, padding: 28 }}>
-        <h1 style={{ fontSize: 20, marginBottom: 4 }}>
-          Sinas <span style={{ color: 'var(--accent)' }}>Studio</span>
-        </h1>
-        <p style={{ color: 'var(--muted)', fontSize: 13.5, margin: '0 0 20px' }}>
+        <div className="wordmark" style={{ marginBottom: 6 }}>
+          <span className="wm-name" style={{ fontSize: 22 }}>sinas</span>
+          <span className="wm-app">Studio</span>
+        </div>
+        <p style={{ color: 'var(--muted)', fontSize: 13.5, margin: '0 0 22px' }}>
           Build assistants and automations on your Sinas workspace.
         </p>
 

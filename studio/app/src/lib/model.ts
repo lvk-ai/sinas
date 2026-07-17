@@ -24,6 +24,18 @@ export function prettyName(name: string): string {
   return bare.replaceAll(/[-_]/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
 
+/** Deterministic identity gradient for an assistant, from its name. */
+export function avatarStyle(name: string): React.CSSProperties {
+  let hash = 0;
+  for (const ch of name) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  const hue = hash % 360;
+  return {
+    background: `linear-gradient(135deg, hsl(${hue} 62% 52%), hsl(${(hue + 40) % 360} 68% 40%))`,
+    color: '#fff',
+    boxShadow: 'inset 0 1px 0 rgba(255,255,255,.25), 0 1px 3px rgba(27,22,19,.2)',
+  };
+}
+
 export function initials(name: string): string {
   const words = prettyName(name).split(' ').filter(Boolean);
   return ((words[0]?.[0] ?? '') + (words[1]?.[0] ?? '')).toUpperCase() || '?';

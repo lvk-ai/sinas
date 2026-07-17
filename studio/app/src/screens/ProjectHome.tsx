@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Bot, Clock, Loader2, Plus, Webhook as WebhookIcon, X, Zap } from 'lucide-react';
 import { api } from '../lib/api';
-import { cronToEnglish, initials, kebab, prettyName, projectMembers } from '../lib/model';
+import { avatarStyle, cronToEnglish, initials, kebab, prettyName, projectMembers } from '../lib/model';
 import type { Manifest, ManifestResourceRef } from '../lib/types';
 
 function AddAssistantModal({ project, onClose }: { project: Manifest; onClose: () => void }) {
@@ -83,7 +83,7 @@ function AddAssistantModal({ project, onClose }: { project: Manifest; onClose: (
                   addMember.mutate({ type: 'agent', namespace: a.namespace, name: a.name }, { onSuccess: onClose })
                 }
               >
-                <span className="row-logo" style={{ width: 28, height: 28, fontSize: 11, background: 'var(--accent-soft)', color: 'var(--accent-ink)' }}>
+                <span className="row-logo" style={{ width: 28, height: 28, fontSize: 11, ...avatarStyle(a.name) }}>
                   {initials(a.name)}
                 </span>
                 <span style={{ flex: 1, minWidth: 0 }}>
@@ -173,7 +173,7 @@ export function ProjectHome() {
                 className="row"
                 style={{ color: 'inherit', textDecoration: 'none' }}
               >
-                <span className="row-logo" style={{ background: 'var(--accent-soft)', color: 'var(--accent-ink)' }}>
+                <span className="row-logo" style={agent ? avatarStyle(agent.name) : undefined}>
                   {agent ? initials(agent.name) : <Bot size={15} />}
                 </span>
                 <span className="row-main">

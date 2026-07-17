@@ -22,8 +22,9 @@ function Shell() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <Link to="/projects" style={{ fontWeight: 800, fontSize: 15, color: 'var(--ink)' }}>
-          Sinas <span style={{ color: 'var(--accent)' }}>Studio</span>
+        <Link to="/projects" className="wordmark">
+          <span className="wm-name">sinas</span>
+          <span className="wm-app">Studio</span>
         </Link>
         <span style={{ fontSize: 12, color: 'var(--faint)' }}>{host}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>

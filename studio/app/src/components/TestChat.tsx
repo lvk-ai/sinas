@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Loader2, RotateCcw, Send } from 'lucide-react';
 import { api } from '../lib/api';
-import { initials, schemaToInputRows } from '../lib/model';
+import { avatarStyle, initials, schemaToInputRows } from '../lib/model';
 import type { Agent, Message } from '../lib/types';
 import { messageText } from '../lib/types';
 
@@ -139,7 +139,7 @@ export function TestChat({ agent }: { agent: Agent }) {
             if (!text && m.tool_calls?.length) return null; // pure tool-call turns render via their tool results
             return (
               <div key={m.id} className="msg-bot">
-                <div className="bot-avatar">{initials(agent.name)}</div>
+                <div className="bot-avatar" style={avatarStyle(agent.name)}>{initials(agent.name)}</div>
                 <div className="bot-bubble">
                   <div className="bot-text">{text}</div>
                 </div>
