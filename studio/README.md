@@ -170,10 +170,9 @@ platform; extract to its own repo only if that ever changes):
 ```
 studio/
 ├── README.md          # this contract
-├── app/               # the web app (to be scaffolded)
-├── packages/
-│   └── studio-runtime.yaml
-└── design/            # branch-only; dropped before merge
+├── app/               # the web app
+└── packages/
+    └── studio-runtime.yaml
 ```
 
 **Distribution (settled):** Studio ships OSS in this repo, on the platform's
