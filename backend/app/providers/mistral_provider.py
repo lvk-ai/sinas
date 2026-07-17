@@ -102,7 +102,17 @@ class MistralProvider(BaseLLMProvider):
         tool_calls_buffer = {}
 
         async for chunk in stream:
+            # Mistral includes usage on the final stream chunk
+            usage = self.extract_usage(chunk) if getattr(chunk, "usage", None) else None
+
             if not chunk.choices:
+                if usage:
+                    yield {
+                        "content": None,
+                        "tool_calls": None,
+                        "finish_reason": None,
+                        "usage": usage,
+                    }
                 continue
 
             delta = chunk.choices[0].delta
@@ -112,6 +122,9 @@ class MistralProvider(BaseLLMProvider):
                 "tool_calls": None,
                 "finish_reason": chunk.choices[0].finish_reason,
             }
+
+            if usage:
+                chunk_data["usage"] = usage
 
             if delta.tool_calls:
                 # Buffer tool calls
