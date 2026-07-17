@@ -234,10 +234,15 @@ class CDCManager:
                         )
                     else:
                         # Regular poll: cast text bookmark to the column's native
-                        # type so comparison and ordering work correctly.
+                        # type so comparison and ordering work correctly. The
+                        # bookmark (last_poll_value) is always stored as text, so
+                        # bind it as text ($1::text) before casting to the column
+                        # type — otherwise asyncpg infers the native type from the
+                        # cast target and rejects the str for bigint/timestamptz/
+                        # uuid poll columns.
                         rows = await conn.fetch(
                             f'SELECT * FROM "{schema}"."{table}" '
-                            f"WHERE \"{poll_col}\" > $1::{col_type} "
+                            f'WHERE "{poll_col}" > $1::text::{col_type} '
                             f'ORDER BY "{poll_col}" ASC '
                             f"LIMIT $2",
                             last_value,
