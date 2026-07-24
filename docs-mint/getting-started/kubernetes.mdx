@@ -78,6 +78,26 @@ executor:
   installDependencies: false
 ```
 
+## Advanced: per-client node scheduling
+
+These aren't exposed as values in the bundled `charts/sinas` chart — they're
+env vars for operators building their own multi-tenant deployment tooling
+around the k8s_pod executor (e.g. a chart that provisions one release per
+customer). Sinas doesn't decide scheduling policy itself; it just applies
+whatever it's given, so the same knobs work whether you want every
+customer's sandbox pods spread across dedicated nodes or packed together on
+shared ones — that choice lives entirely in your own tooling, not here.
+
+| Setting | Default | Description |
+|---|---|---|
+| `K8S_RELEASE_NAME` | _(empty)_ | Stamped as the `app.kubernetes.io/instance` label on sandbox pods, so your own affinity rules have something to match on. No label if unset. |
+| `K8S_SANDBOX_NODE_SELECTOR` | `{}` | JSON-encoded `nodeSelector` applied verbatim to sandbox pods. |
+| `K8S_SANDBOX_TOLERATIONS` | `[]` | JSON-encoded list of `toleration` objects applied verbatim. |
+| `K8S_SANDBOX_AFFINITY` | `{}` | JSON-encoded K8s `affinity` object (`podAffinity` to pack a customer's sandbox pods onto the same node as their other workloads, `podAntiAffinity` to spread them across dedicated nodes, `nodeAffinity`, or any combination) applied verbatim. |
+
+All four are no-ops by default, matching the behavior described above with
+no scheduling constraint at all.
+
 ## Key values
 
 | Value | Default | Description |
