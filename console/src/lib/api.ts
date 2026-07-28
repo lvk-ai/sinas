@@ -80,11 +80,14 @@ import type {
 } from '../types';
 
 // Auto-detect API base URL based on environment
+// VITE_API_URL overrides (useful for pointing a dev console at any backend)
 // Local: http://localhost:8000
 // Production: https://yourdomain.com (same domain as console, port 443)
-export const API_BASE_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:8000'
-  : `${window.location.protocol}//${window.location.hostname}`;
+export const API_BASE_URL = import.meta.env.VITE_API_URL
+  ? import.meta.env.VITE_API_URL
+  : window.location.hostname === 'localhost'
+    ? 'http://localhost:8000'
+    : `${window.location.protocol}//${window.location.hostname}`;
 
 /**
  * Build a component render URL using a signed render token.
@@ -453,6 +456,20 @@ class APIClient {
 
   async deleteUser(userId: string): Promise<void> {
     await this.configClient.delete(`/users/${userId}`);
+  }
+
+  async getUserByIdentity(provider: string, subject: string): Promise<any> {
+    const response = await this.configClient.get('/users/by-identity', { params: { provider, subject } });
+    return response.data;
+  }
+
+  async addUserIdentity(userId: string, data: { provider: string; subject: string; metadata?: Record<string, any> }): Promise<any> {
+    const response = await this.configClient.post(`/users/${userId}/identities`, data);
+    return response.data;
+  }
+
+  async removeUserIdentity(userId: string, provider: string, subject: string): Promise<void> {
+    await this.configClient.delete(`/users/${userId}/identities`, { params: { provider, subject } });
   }
 
   // Request Logs
