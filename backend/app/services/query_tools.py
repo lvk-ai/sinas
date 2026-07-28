@@ -10,6 +10,7 @@ from app.core.permissions import check_permission
 from app.models.query import Query
 from app.services.database_pool import DatabasePoolManager
 from app.services.template_renderer import render_function_parameters
+from app.services.user_context import load_user_context, query_param_context
 
 logger = logging.getLogger(__name__)
 
@@ -223,10 +224,11 @@ class QueryToolConverter:
         if locked_params:
             final_input.update(locked_params)
 
-        # Inject context variables
-        final_input["user_id"] = str(user_id)
-        if user_email:
-            final_input["user_email"] = user_email
+        # Inject context variables (user_id, user_email, user_custom_<field>)
+        user_ctx = await load_user_context(db, user_id)
+        if user_email and not user_ctx.get("email"):
+            user_ctx["email"] = user_email
+        final_input.update(query_param_context(user_ctx))
 
         start_time = time.time()
         try:
