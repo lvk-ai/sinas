@@ -153,3 +153,31 @@ spec:
     assert user["email"] == email3
     assert user["custom_fields"] == {"team": "platform"}
     ctx.client.delete(f"/api/v1/users/{user['id']}", headers=ctx.admin_headers())
+
+
+def test_10_auth_me_includes_custom_fields(ctx):
+    # /auth/me is the "userinfo" surface for external services holding a
+    # Sinas token — custom fields must be readable there without admin perms
+    r = ctx.client.get("/auth/me", headers=ctx.admin_headers())
+    assert r.status_code == 200, r.text
+    me = r.json()
+    previous = me.get("custom_fields")
+
+    r = ctx.client.patch(
+        f"/api/v1/users/{me['id']}",
+        headers=ctx.admin_headers(),
+        json={"custom_fields": {"plan": "enterprise", "seats": 5}},
+    )
+    assert r.status_code == 200, r.text
+
+    try:
+        r = ctx.client.get("/auth/me", headers=ctx.admin_headers())
+        assert r.status_code == 200, r.text
+        fields = r.json().get("custom_fields")
+        assert fields == {"plan": "enterprise", "seats": 5}, fields
+    finally:
+        ctx.client.patch(
+            f"/api/v1/users/{me['id']}",
+            headers=ctx.admin_headers(),
+            json={"custom_fields": previous or {}},
+        )

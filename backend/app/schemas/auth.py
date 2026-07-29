@@ -86,6 +86,9 @@ class AuthUserResponse(BaseModel):
     last_login_at: Optional[datetime]
     created_at: datetime
     roles: list[str] = []
+    # Org-specific profile data — lets external services using Sinas tokens
+    # read the user's fields via /auth/me (Sinas's "userinfo" endpoint)
+    custom_fields: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True
