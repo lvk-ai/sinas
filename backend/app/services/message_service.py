@@ -31,6 +31,7 @@ from app.services.query_tools import QueryToolConverter
 from app.services.skill_tools import SkillToolConverter
 from app.services.state_tools import StateTools
 from app.services.template_renderer import render_template
+from app.services.user_context import load_user_context, merge_user_template_context
 from app.services.tool_discovery import (
     get_available_tools,
     strip_tool_metadata,
@@ -266,6 +267,13 @@ class MessageService:
         final_template_variables = template_variables
         if final_template_variables is None and chat.chat_metadata:
             final_template_variables = chat.chat_metadata.get("agent_input")
+
+        # Always expose the platform-provided user context as {{user.*}}
+        # (overrides any caller-supplied "user" variable — not spoofable)
+        user_ctx = await load_user_context(self.db, user_id)
+        final_template_variables = merge_user_template_context(
+            final_template_variables, user_ctx
+        )
 
         # Build conversation history
         messages = await build_conversation_history(

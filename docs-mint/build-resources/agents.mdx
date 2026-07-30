@@ -157,3 +157,16 @@ curl -X POST https://yourdomain.com/agents/default/default/chats \
   }
 }
 ```
+
+**User context in templates** — the calling user is always available as the `user` variable in system prompts and in function/query/connector parameter templates:
+
+```jinja
+You are assisting {{user.email}} from the {{user.custom_fields.department}} department.
+Answer in the user's language: {{user.custom_fields.locale}}.
+```
+
+- `user.id` — user UUID
+- `user.email` — user email
+- `user.custom_fields` — the user's [custom fields](/admin/users-roles#custom-fields)
+
+The `user` variable is platform-provided and overrides any same-named agent input variable, so locked parameters like `{{user.custom_fields.region}}` cannot be spoofed by the caller.
