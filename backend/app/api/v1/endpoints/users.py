@@ -17,12 +17,51 @@ from app.core.auth import (
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import check_permission
-from app.models.user import Role, User, UserRole
+from app.models.user import Role, User, UserIdentity, UserRole
 from app.schemas import UserResponse, UserUpdate
 from app.schemas.auth import AdminCreateResetLinkResponse, CreateUserRequest
-from app.schemas.user import UserWithRolesResponse
+from app.schemas.user import UserIdentityInput, UserIdentityResponse, UserWithRolesResponse
+from app.services.user_identity import (
+    IdentityConflictError,
+    get_user_by_identity,
+    link_user_identity,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+async def _user_with_roles_response(db: AsyncSession, user: User) -> UserWithRolesResponse:
+    """Build the full user response with role names and identities."""
+    roles_result = await db.execute(
+        select(Role.name)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user.id, UserRole.active == True)
+    )
+    identities_result = await db.execute(
+        select(UserIdentity).where(UserIdentity.user_id == user.id)
+    )
+    return UserWithRolesResponse(
+        id=user.id,
+        email=user.email,
+        last_login_at=user.last_login_at,
+        created_at=user.created_at,
+        roles=list(roles_result.scalars().all()),
+        custom_fields=user.custom_fields,
+        identities=_identity_responses(list(identities_result.scalars().all())),
+    )
+
+
+def _identity_responses(identities: list[UserIdentity]) -> list[UserIdentityResponse]:
+    return [
+        UserIdentityResponse(
+            provider=i.provider,
+            subject=i.subject,
+            metadata=i.identity_metadata,
+            last_synced_at=i.last_synced_at,
+            created_at=i.created_at,
+        )
+        for i in identities
+    ]
 
 
 @router.get("", response_model=list[UserWithRolesResponse])
@@ -44,7 +83,7 @@ async def list_users(
 
     set_permission_used(request, "sinas.users.read:all")
 
-    query = select(User)
+    query = select(User).options(selectinload(User.identities))
     if search:
         query = query.where(User.email.ilike(f"%{search}%"))
     query = query.order_by(User.created_at.desc()).offset(skip).limit(limit)
@@ -72,6 +111,8 @@ async def list_users(
             last_login_at=u.last_login_at,
             created_at=u.created_at,
             roles=roles_by_user.get(u.id, []),
+            custom_fields=u.custom_fields,
+            identities=_identity_responses(u.identities),
         )
         for u in users
     ]
@@ -114,9 +155,18 @@ async def create_user(
         )
 
     # Create new user
-    user = User(email=normalized_email)
+    user = User(email=normalized_email, custom_fields=user_request.custom_fields)
     db.add(user)
     await db.flush()
+
+    # Link external identities
+    for identity in user_request.identities:
+        try:
+            await link_user_identity(
+                db, user, identity.provider, identity.subject, identity.metadata
+            )
+        except IdentityConflictError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
     # Check if already has roles
     memberships_result = await db.execute(select(UserRole).where(UserRole.user_id == user.id))
@@ -134,6 +184,30 @@ async def create_user(
             await db.refresh(user)
 
     return UserResponse.model_validate(user)
+
+
+@router.get("/by-identity", response_model=UserWithRolesResponse)
+async def get_user_by_external_identity(
+    request: Request,
+    provider: str = Query(..., min_length=1),
+    subject: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Look up a user by external identity (provider + subject). Admin only."""
+    _, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.users.read:all"):
+        set_permission_used(request, "sinas.users.read:all", has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to look up users")
+
+    set_permission_used(request, "sinas.users.read:all")
+
+    user = await get_user_by_identity(db, provider, subject)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await _user_with_roles_response(db, user)
 
 
 @router.get("/{user_id}", response_model=UserWithRolesResponse)
@@ -157,26 +231,7 @@ async def get_user(
 
     set_permission_used(request, "sinas.users.read")
 
-    # Get user's roles
-    memberships_result = await db.execute(
-        select(UserRole).where(UserRole.user_id == user_id, UserRole.active == True)
-    )
-    memberships = memberships_result.scalars().all()
-
-    role_names = []
-    for membership in memberships:
-        role_result = await db.execute(select(Role).where(Role.id == membership.role_id))
-        role = role_result.scalar_one_or_none()
-        if role:
-            role_names.append(role.name)
-
-    return UserWithRolesResponse(
-        id=user.id,
-        email=user.email,
-        last_login_at=user.last_login_at,
-        created_at=user.created_at,
-        roles=role_names,
-    )
+    return await _user_with_roles_response(db, user)
 
 
 @router.patch("/{user_id}", response_model=UserResponse)
@@ -201,13 +256,90 @@ async def update_user(
 
     set_permission_used(request, "sinas.users.update")
 
-    # Update fields (currently no updatable fields)
-    # Future: Add updatable fields like display_name, etc.
+    if user_data.custom_fields is not None:
+        user.custom_fields = user_data.custom_fields
 
     await db.flush()
     await db.refresh(user)
 
     return user
+
+
+@router.post(
+    "/{user_id}/identities",
+    response_model=UserIdentityResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_user_identity(
+    request: Request,
+    user_id: uuid.UUID,
+    identity_data: UserIdentityInput,
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Link an external identity to a user. Admin only."""
+    _, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.users.update:all"):
+        set_permission_used(request, "sinas.users.update:all", has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to manage identities")
+
+    set_permission_used(request, "sinas.users.update:all")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        identity = await link_user_identity(
+            db, user, identity_data.provider, identity_data.subject, identity_data.metadata
+        )
+    except IdentityConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    return UserIdentityResponse(
+        provider=identity.provider,
+        subject=identity.subject,
+        metadata=identity.identity_metadata,
+        last_synced_at=identity.last_synced_at,
+        created_at=identity.created_at,
+    )
+
+
+@router.delete("/{user_id}/identities", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_user_identity(
+    request: Request,
+    user_id: uuid.UUID,
+    provider: str = Query(..., min_length=1),
+    subject: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+    current_user_data=Depends(get_current_user_with_permissions),
+):
+    """Unlink an external identity from a user. Admin only."""
+    _, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.users.update:all"):
+        set_permission_used(request, "sinas.users.update:all", has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to manage identities")
+
+    set_permission_used(request, "sinas.users.update:all")
+
+    result = await db.execute(
+        select(UserIdentity).where(
+            UserIdentity.user_id == user_id,
+            UserIdentity.provider == provider,
+            UserIdentity.subject == subject,
+        )
+    )
+    identity = result.scalar_one_or_none()
+    if not identity:
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+    await db.delete(identity)
+    await db.flush()
+
+    return None
 
 
 @router.post("/{user_id}/password-reset", response_model=AdminCreateResetLinkResponse)

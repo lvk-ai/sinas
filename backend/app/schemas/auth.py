@@ -1,9 +1,11 @@
 """Authentication schemas."""
 import uuid
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
+
+from app.schemas.user import UserIdentityInput
 
 
 class LoginRequest(BaseModel):
@@ -84,6 +86,9 @@ class AuthUserResponse(BaseModel):
     last_login_at: Optional[datetime]
     created_at: datetime
     roles: list[str] = []
+    # Org-specific profile data — lets external services using Sinas tokens
+    # read the user's fields via /auth/me (Sinas's "userinfo" endpoint)
+    custom_fields: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -135,6 +140,8 @@ class LogoutRequest(BaseModel):
 
 class CreateUserRequest(BaseModel):
     email: EmailStr
+    custom_fields: Optional[dict[str, Any]] = None
+    identities: list[UserIdentityInput] = Field(default_factory=list)
 
 
 class PermissionCheckRequest(BaseModel):
