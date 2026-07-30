@@ -230,6 +230,41 @@ services:
     deploy:
       replicas: ${QUEUE_AGENT_REPLICAS:-2}
 
+  # Dedicated worker for DELEGATED agent jobs (agent-to-agent calls). Keeps
+  # sub-agents on their own slot pool so parents waiting on children can't
+  # starve them (issue #90). Disable routing with AGENT_SUBAGENT_QUEUE=false.
+  queue-agent-sub:
+    image: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - file_storage:/var/sinas/files
+    env_file:
+      - .env
+    environment:
+      DATABASE_USER: ${DATABASE_USER:-postgres}
+      DATABASE_HOST: pgbouncer
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:-sinas}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-sinas}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env file}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env file}
+      DOCKER_NETWORK: ${DOCKER_NETWORK:-auto}
+      FUNCTION_CONTAINER_IMAGE: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/executor:${IMAGE_TAG:-latest}
+    depends_on:
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+    command: python -m arq app.queue.worker.SubAgentWorkerSettings
+    deploy:
+      replicas: ${QUEUE_AGENT_SUB_REPLICAS:-2}
+
   scheduler:
     image: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/backend:${IMAGE_TAG:-latest}
     restart: unless-stopped

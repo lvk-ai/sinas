@@ -121,6 +121,10 @@ class OllamaProvider(BaseLLMProvider):
                             "finish_reason": "stop" if done else None,
                         }
 
+                        if done:
+                            # Final chunk carries prompt_eval_count/eval_count
+                            result["usage"] = self.extract_usage(data)
+
                         if tool_calls_data:
                             result["tool_calls"] = self.format_tool_calls(tool_calls_data)
 

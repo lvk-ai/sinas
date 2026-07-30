@@ -1,8 +1,14 @@
 """Authentication endpoints."""
 
+import html as html_lib
+import json
+import logging
+import secrets
 import uuid
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +49,13 @@ from app.schemas.auth import (
     RefreshRequest,
     RefreshResponse,
     ResetPasswordRequest,
+    TokenExchangeRequest,
+    TokenExchangeResponse,
+)
+from app.services.user_identity import (
+    IdentityConflictError,
+    get_user_by_identity,
+    link_user_identity,
 )
 
 
@@ -68,6 +81,7 @@ async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str, AuthUse
     return access_token, refresh_token_plain, user_resp
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -176,6 +190,91 @@ async def verify_otp(request: OTPVerifyRequest, http_request: Request, db: Async
         token_type="bearer",
         expires_in=settings.access_token_expire_minutes * 60,
         user=user_resp,
+    )
+
+
+@router.post("/token/exchange", response_model=TokenExchangeResponse)
+async def token_exchange(
+    request: Request,
+    exchange: TokenExchangeRequest,
+    current_user_data=Depends(get_current_user_with_permissions),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Exchange an external identity for Sinas tokens (RFC 8693 shape).
+
+    A trusted partner backend — authenticated with an API key holding
+    sinas.auth.exchange:all — asserts that it has authenticated the user
+    identified by (provider, subject) and receives a Sinas access + refresh
+    token pair for that user. With auto_provision, unknown users are created
+    with the configured default role.
+
+    The caller is trusted to assert identities: guard the exchange permission
+    like any other admin credential.
+    """
+    _, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.auth.exchange:all"):
+        set_permission_used(request, "sinas.auth.exchange:all", has_perm=False)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to exchange tokens",
+        )
+
+    set_permission_used(request, "sinas.auth.exchange:all")
+
+    provisioned = False
+    user = await get_user_by_identity(db, exchange.provider, exchange.subject)
+
+    # Fallback: link the identity to an existing user matched by email
+    if not user and exchange.email:
+        user = await get_user_by_email(db, exchange.email)
+
+    if not user:
+        if not exchange.auto_provision:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No user linked to this identity",
+            )
+        if not exchange.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="email is required to auto-provision a user",
+            )
+
+        user = User(
+            email=normalize_email(exchange.email),
+            custom_fields=exchange.custom_fields,
+        )
+        db.add(user)
+        await db.flush()
+
+        default_role = await Role.get_by_name(db, settings.token_exchange_default_role)
+        if default_role:
+            db.add(UserRole(role_id=default_role.id, user_id=user.id, active=True))
+        provisioned = True
+    elif exchange.custom_fields:
+        # Shallow merge: partner-provided keys win, admin-set keys survive
+        user.custom_fields = {**(user.custom_fields or {}), **exchange.custom_fields}
+
+    try:
+        await link_user_identity(
+            db, user, exchange.provider, exchange.subject, exchange.metadata
+        )
+    except IdentityConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    user.last_login_at = datetime.now(UTC)
+
+    access_token, refresh_token, user_resp = await _issue_tokens(db, user)
+
+    return TokenExchangeResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        user=user_resp,
+        provisioned=provisioned,
     )
 
 
@@ -370,3 +469,100 @@ async def check_permissions(
         result = any(check.has_permission for check in checks)
 
     return PermissionCheckResponse(result=result, logic=check_request.logic, checks=checks)
+
+
+def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
+    """Render a tiny page that notifies the opener window and closes itself.
+
+    The connector OAuth flow is opened in a popup; this signals the console (via
+    postMessage) whether the connection succeeded, then closes. No secrets are sent.
+    The message is targeted at the console's own origin (not "*") so it can't be read by
+    an unrelated opener, and the console-side listener validates event.origin in turn.
+    """
+    status_word = "success" if ok else "error"
+    safe = html_lib.escape(message)
+    # The message carries no secret (just a status flag), and the console/API can be on
+    # different origins in local dev, so we post to "*". Spoofing is prevented on the
+    # RECEIVER side: the console validates event.origin against the API origin before
+    # trusting the message (see ConnectorEditor's message listener).
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Connector authorization</title></head>
+<body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center">
+<p style="font-size:15px">{safe}</p>
+<p style="font-size:13px;color:#888">You can close this window.</p>
+</div>
+<script>
+  try {{ window.opener && window.opener.postMessage(
+    {{ type: "connector-oauth", status: "{status_word}" }}, "*"); }} catch (e) {{}}
+  setTimeout(function () {{ window.close(); }}, 1200);
+</script>
+</body></html>"""
+    return HTMLResponse(content=html, status_code=200 if ok else 400)
+
+
+@router.get("/connectors/oauth/callback", include_in_schema=False)
+async def connector_oauth_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public OAuth redirect target. Exchanges the code for tokens for the initiating user.
+
+    Unauthenticated by design (the provider won't send our bearer). The initiating user and
+    connector are recovered from the single-use `state` minted at /connectors/.../oauth/authorize.
+    """
+    from app.core.oauth_state import BIND_COOKIE_NAME, consume_state
+    from app.models.connector import Connector
+    from app.services.connector_service import connector_service
+
+    if error:
+        return _oauth_result_page(False, f"Authorization was denied: {error_description or error}")
+
+    ctx = await consume_state(state)
+    if ctx is None:
+        return _oauth_result_page(False, "This authorization link has expired or was already used.")
+
+    # Browser-binding check: the flow must be completed by the same browser that started
+    # it. The nonce was set as an HttpOnly cookie by the authenticated begin endpoint;
+    # require it to match the one stored with the state. This defeats OAuth account-linking
+    # (an attacker minting a state and having a victim complete it). Constant-time compare.
+    # Skippable only in split-origin local dev (see settings.oauth_bind_browser_session),
+    # where the cookie can't round-trip cross-origin.
+    cookie_nonce = request.cookies.get(BIND_COOKIE_NAME) or ""
+    expected_nonce = ctx.get("browser_nonce") or ""
+    binding_ok = bool(expected_nonce) and secrets.compare_digest(cookie_nonce, expected_nonce)
+    if settings.oauth_bind_browser_session and not binding_ok:
+        resp = _oauth_result_page(
+            False,
+            "This authorization could not be verified for your session. "
+            "Please start the connection again from the connector page.",
+        )
+        resp.delete_cookie(BIND_COOKIE_NAME, path="/")
+        return resp
+    if not binding_ok:
+        logger.warning(
+            "OAuth browser-binding check skipped (oauth_bind_browser_session=false) — "
+            "acceptable only for local single-user dev, never production."
+        )
+
+    if not code:
+        return _oauth_result_page(False, "No authorization code was returned by the provider.")
+
+    connector = await Connector.get_by_name(db, ctx["namespace"], ctx["name"])
+    if connector is None or (connector.auth or {}).get("type") != "oauth2_authorization_code":
+        return _oauth_result_page(False, "Connector is no longer configured for OAuth.")
+
+    ok = await connector_service.exchange_authorization_code(
+        db=db, connector=connector, user_id=ctx["user_id"], code=code, code_verifier=ctx["code_verifier"],
+    )
+    result = _oauth_result_page(
+        ok,
+        f"Connected {connector.namespace}/{connector.name}." if ok
+        else "Failed to exchange the authorization code for a token.",
+    )
+    result.delete_cookie(BIND_COOKIE_NAME, path="/")
+    return result

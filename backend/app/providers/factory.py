@@ -1,5 +1,5 @@
 """Factory for creating LLM provider instances."""
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,12 +12,14 @@ from .base import BaseLLMProvider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .openai_provider import OpenAIProvider
+from .tracking import UsageTrackingProvider
 
 
 async def create_provider(
     provider_name: Optional[str] = None,
     model: Optional[str] = None,
     db: Optional[AsyncSession] = None,
+    usage_context: Optional[dict[str, Any]] = None,
 ) -> BaseLLMProvider:
     """
     Create an LLM provider instance from database configuration.
@@ -26,9 +28,13 @@ async def create_provider(
         provider_name: Name of provider (openai, ollama). If None, uses default provider from DB
         model: Model name (used to auto-detect provider if provider_name not given)
         db: Database session (optional - if not provided, falls back to empty config)
+        usage_context: Attribution for token-usage records (user_id, chat_id,
+            message_id, agent, source). Calls are recorded even without it,
+            just unattributed.
 
     Returns:
-        BaseLLMProvider instance
+        BaseLLMProvider instance, wrapped in UsageTrackingProvider so every
+        complete()/stream() call is recorded in the llm_usage table
 
     Raises:
         ValueError: If provider is unknown or not found
@@ -69,10 +75,10 @@ async def create_provider(
     base_url = provider_config.api_endpoint or None
 
     if provider_type == "openai":
-        return OpenAIProvider(api_key=api_key, base_url=base_url)
+        provider = OpenAIProvider(api_key=api_key, base_url=base_url)
     elif provider_type in ("azure", "azure_openai"):
         config = provider_config.config or {}
-        return AzureOpenAIProvider(
+        provider = AzureOpenAIProvider(
             api_key=api_key,
             azure_endpoint=base_url,
             api_version=config.get("api_version"),
@@ -82,10 +88,22 @@ async def create_provider(
             extra_params=config.get("extra_params"),
         )
     elif provider_type == "mistral":
-        return MistralProvider(api_key=api_key, base_url=base_url)
+        provider = MistralProvider(api_key=api_key, base_url=base_url)
     elif provider_type == "anthropic":
-        return AnthropicProvider(api_key=api_key, base_url=base_url)
+        config = provider_config.config or {}
+        provider = AnthropicProvider(
+            api_key=api_key,
+            base_url=base_url,
+            enable_prompt_caching=config.get("prompt_caching", True),
+        )
     elif provider_type == "ollama":
-        return OllamaProvider(base_url=base_url or "http://localhost:11434")
+        provider = OllamaProvider(base_url=base_url or "http://localhost:11434")
     else:
         raise ValueError(f"Unknown provider type: {provider_type}")
+
+    return UsageTrackingProvider(
+        inner=provider,
+        provider_name=provider_config.name,
+        provider_type=provider_type,
+        context=usage_context,
+    )

@@ -1,21 +1,68 @@
 ---
 title: "Users & Roles"
-description: "User management and role assignments"
+description: "User management, external identities, custom fields, and role assignments"
 ---
 
 
-**Users** are identified by email. They can be created via the management API, declarative config, or the console. Authentication is via OTP (email one-time password).
+**Users** are identified by email, internal id, or a linked external identity. They can be created via the management API, declarative config, or the console. Authentication is via OTP (email one-time password) or password, depending on `AUTH_MODE`.
 
 **Roles** group permissions together. Users can belong to multiple roles. All permissions across all of a user's roles are combined.
 
 **User endpoints:**
 
 ```
-GET    /api/v1/users                    # List users (admin)
-POST   /api/v1/users                    # Create user (admin)
-GET    /api/v1/users/{id}              # Get user
-PATCH  /api/v1/users/{id}              # Update user
-DELETE /api/v1/users/{id}              # Delete user (admin)
+GET    /api/v1/users                        # List users (admin)
+POST   /api/v1/users                        # Create user (admin)
+GET    /api/v1/users/by-identity            # Look up user by external identity (admin)
+GET    /api/v1/users/{id}                   # Get user
+PATCH  /api/v1/users/{id}                   # Update user (custom_fields)
+DELETE /api/v1/users/{id}                   # Delete user (admin)
+POST   /api/v1/users/{id}/identities        # Link external identity (admin)
+DELETE /api/v1/users/{id}/identities        # Unlink external identity (admin)
 ```
+
+## External identities
+
+If your application or organization already has its own auth system or identity provider, link those identities to Sinas users. An identity is a `(provider, subject)` pair — e.g. provider `acme-app` with your application's stable user id as subject. A user can hold multiple identities.
+
+```json
+POST /api/v1/users/{id}/identities
+{ "provider": "acme-app", "subject": "usr_8f3a2", "metadata": {"plan": "enterprise"} }
+```
+
+Look up users by identity with `GET /api/v1/users/by-identity?provider=acme-app&subject=usr_8f3a2`.
+
+Use stable identifiers as subjects (an internal user id, an OIDC `sub` claim) — not email addresses, which can change at the provider.
+
+## Custom fields
+
+Attach org-specific profile data to users with the free-form `custom_fields` object:
+
+```json
+PATCH /api/v1/users/{id}
+{ "custom_fields": {"department": "marketing", "locale": "nl-NL"} }
+```
+
+`custom_fields` is owned by Sinas admins and is never overwritten by identity sync (identity `metadata` is, on every sync).
+
+Custom fields are also returned by `GET /auth/me`, so an external service holding a user's Sinas token can read them without admin permissions — treat `/auth/me` as Sinas's userinfo endpoint. Don't store values in custom fields that the user themselves shouldn't see.
+
+## Declarative config
+
+Users, identities, and custom fields can be provisioned via YAML:
+
+```yaml
+users:
+  - email: jane@acme.com
+    roles: [Users]
+    customFields:
+      department: marketing
+      locale: nl-NL
+    identities:
+      - provider: acme-app
+        subject: usr_8f3a2
+```
+
+For config-managed users the `identities` list is the full desired set: identities removed from the config are unlinked on apply.
 
 **Role endpoints:** See [Managing Roles](#managing-roles).

@@ -58,6 +58,17 @@ services:
     environment:
       FUNCTION_CONTAINER_IMAGE: sinas-executor
 
+  queue-agent-sub:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - file_storage:/var/sinas/files
+    environment:
+      FUNCTION_CONTAINER_IMAGE: sinas-executor
+
   scheduler:
     build:
       context: ./backend

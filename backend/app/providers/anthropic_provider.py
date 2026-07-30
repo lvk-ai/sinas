@@ -10,9 +10,15 @@ from .base import BaseLLMProvider
 class AnthropicProvider(BaseLLMProvider):
     """Anthropic (Claude) API provider."""
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        enable_prompt_caching: bool = True,
+    ):
         super().__init__(api_key, base_url)
         self.client = AsyncAnthropic(api_key=api_key, base_url=base_url)
+        self.enable_prompt_caching = enable_prompt_caching
 
     async def complete(
         self,
@@ -40,6 +46,9 @@ class AnthropicProvider(BaseLLMProvider):
         if tools:
             # Convert OpenAI tool format to Anthropic format
             params["tools"] = self._convert_tools_to_anthropic(tools)
+
+        if self.enable_prompt_caching:
+            self._apply_cache_control(params)
 
         response = await self.client.messages.create(**params)
 
@@ -97,9 +106,19 @@ class AnthropicProvider(BaseLLMProvider):
         if tools:
             params["tools"] = self._convert_tools_to_anthropic(tools)
 
+        if self.enable_prompt_caching:
+            self._apply_cache_control(params)
+
         # Track tool calls being built across chunks
         current_tool_calls = {}
         current_content = ""
+
+        # Token usage arrives in message_start (input + cache counts) and
+        # message_delta (cumulative output); emitted on the final chunk.
+        input_tokens = 0
+        output_tokens = 0
+        cache_read_tokens = 0
+        cache_write_tokens = 0
 
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
@@ -109,7 +128,15 @@ class AnthropicProvider(BaseLLMProvider):
                     "finish_reason": None,
                 }
 
-                if event.type == "content_block_start":
+                if event.type == "message_start":
+                    usage = getattr(event.message, "usage", None)
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(usage, "output_tokens", 0) or 0
+                        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                        cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+
+                elif event.type == "content_block_start":
                     if event.content_block.type == "text":
                         pass  # Text will come in content_block_delta
                     elif event.content_block.type == "tool_use":
@@ -161,11 +188,69 @@ class AnthropicProvider(BaseLLMProvider):
                 elif event.type == "message_delta":
                     if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                         chunk_data["finish_reason"] = event.delta.stop_reason
+                    usage = getattr(event, "usage", None)
+                    if usage:
+                        if getattr(usage, "output_tokens", None) is not None:
+                            output_tokens = usage.output_tokens
+                        if getattr(usage, "input_tokens", None) is not None:
+                            input_tokens = usage.input_tokens
 
                 elif event.type == "message_stop":
                     chunk_data["finish_reason"] = chunk_data["finish_reason"] or "stop"
+                    # input_tokens excludes cache reads/writes; prompt_tokens
+                    # includes them (see extract_usage).
+                    prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
+                    chunk_data["usage"] = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": prompt_tokens + output_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                    }
 
                 yield chunk_data
+
+    def _apply_cache_control(self, params: dict[str, Any]) -> None:
+        """Mark prompt-cache breakpoints on the request (in place).
+
+        Anthropic caches the request prefix up to each ``cache_control``
+        marker (prefix order: tools, then system, then messages). Three
+        breakpoints (of max 4 allowed): the last tool and the system prompt
+        cover the static per-agent part; the last message gives a rolling
+        breakpoint so each call in a tool loop reuses the previous call's
+        cache. Prefixes shorter than the model's cacheable minimum are
+        silently not cached — the markers are harmless then.
+        """
+        cache_control = {"type": "ephemeral"}
+
+        tools = params.get("tools")
+        if tools:
+            tools[-1]["cache_control"] = cache_control
+
+        system = params.get("system")
+        if isinstance(system, str) and system:
+            params["system"] = [
+                {"type": "text", "text": system, "cache_control": cache_control}
+            ]
+
+        messages = params.get("messages")
+        if messages:
+            last = messages[-1]
+            content = last.get("content")
+            if isinstance(content, str):
+                if content:
+                    last["content"] = [
+                        {"type": "text", "text": content, "cache_control": cache_control}
+                    ]
+            elif isinstance(content, list) and content:
+                last_block = content[-1]
+                if isinstance(last_block, dict):
+                    # Copy instead of mutating: the block list may be shared
+                    # with the caller's message objects.
+                    last["content"] = [
+                        *content[:-1],
+                        {**last_block, "cache_control": cache_control},
+                    ]
 
     def _convert_messages_to_anthropic(
         self, messages: list[dict[str, Any]]
@@ -368,11 +453,29 @@ class AnthropicProvider(BaseLLMProvider):
         return tool_calls
 
     def extract_usage(self, response: Any) -> dict[str, int]:
-        """Extract token usage from Anthropic response."""
+        """Extract token usage from Anthropic response.
+
+        Anthropic's input_tokens EXCLUDES tokens read from or written to the
+        prompt cache; prompt_tokens here includes them (matching OpenAI
+        semantics), with the cache portions also reported separately.
+        """
         if hasattr(response, "usage") and response.usage:
+            usage = response.usage
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            prompt_tokens = (usage.input_tokens or 0) + cache_read + cache_write
+            completion_tokens = usage.output_tokens or 0
             return {
-                "prompt_tokens": response.usage.input_tokens or 0,
-                "completion_tokens": response.usage.output_tokens or 0,
-                "total_tokens": (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
             }
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
 import { useAuth } from '../lib/auth-context';
-import { Users as UsersIcon, UserPlus, Edit2, Trash2, Shield, UserMinus, Plus, Lock, Search, AlertTriangle, ChevronLeft, ChevronRight, X, KeyRound, Copy, Check } from 'lucide-react';
+import { Users as UsersIcon, UserPlus, Edit2, Trash2, Shield, UserMinus, Plus, Lock, Search, AlertTriangle, ChevronLeft, ChevronRight, X, KeyRound, Copy, Check, Fingerprint, Link2 } from 'lucide-react';
 import { Permissions as PermissionsTab } from './Permissions';
 import type { AdminCreateResetLinkResponse } from '../types';
 
@@ -76,6 +76,7 @@ function UsersTab() {
   const passwordEnabled = authMode === 'password' || authMode === 'password+otp';
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingUser, setEditingUser] = useState<any>(null);
+  const [profileUser, setProfileUser] = useState<any>(null);
   const [deletingUser, setDeletingUser] = useState<any>(null);
   const [resetUser, setResetUser] = useState<any>(null);
   const [resetResult, setResetResult] = useState<AdminCreateResetLinkResponse | null>(null);
@@ -176,6 +177,20 @@ function UsersTab() {
                     <td className="py-3 px-4">
                       <div className="text-sm text-gray-100">{user.email}</div>
                       <div className="text-xs text-gray-600 font-mono select-all">{user.id}</div>
+                      {user.identities && user.identities.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {user.identities.map((identity: any) => (
+                            <span
+                              key={`${identity.provider}:${identity.subject}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-purple-900/30 text-purple-300"
+                              title={`${identity.provider} · ${identity.subject}`}
+                            >
+                              <Link2 className="w-2.5 h-2.5" />
+                              {identity.provider}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </td>
                     <td className="py-3 px-4">
                       {user.roles && user.roles.length > 0 ? (
@@ -208,6 +223,13 @@ function UsersTab() {
                           title="Edit roles"
                         >
                           <Edit2 className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => setProfileUser(user)}
+                          className="text-gray-400 hover:text-gray-200 p-1"
+                          title="Custom fields & identities"
+                        >
+                          <Fingerprint className="w-4 h-4" />
                         </button>
                         {passwordEnabled && (
                           <button
@@ -266,6 +288,7 @@ function UsersTab() {
 
       {showCreateModal && <CreateUserModal onClose={() => setShowCreateModal(false)} />}
       {editingUser && <EditUserRolesModal user={editingUser} allRoles={roles || []} onClose={() => setEditingUser(null)} />}
+      {profileUser && <UserProfileModal user={profileUser} onClose={() => setProfileUser(null)} />}
       {deletingUser && (
         <ConfirmDeleteModal
           title="Delete User"
@@ -496,6 +519,241 @@ function ConfirmDeleteModal({
             >
               {isPending ? 'Deleting...' : 'Delete'}
             </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/** Modal for a user's custom fields and external identities */
+function UserProfileModal({ user, onClose }: { user: any; onClose: () => void }) {
+  const queryClient = useQueryClient();
+
+  // Fetch fresh detail (list rows may be stale)
+  const { data: detail } = useQuery({
+    queryKey: ['user', user.id],
+    queryFn: () => apiClient.getUser(user.id),
+    retry: false,
+  });
+
+  const [fields, setFields] = useState<{ key: string; value: string }[] | null>(null);
+  const [fieldsError, setFieldsError] = useState<string | null>(null);
+  const [newIdentity, setNewIdentity] = useState({ provider: '', subject: '' });
+
+  // Initialize the editor once the detail arrives
+  useEffect(() => {
+    if (detail && fields === null) {
+      setFields(
+        Object.entries(detail.custom_fields || {}).map(([key, value]) => ({
+          key,
+          value: typeof value === 'string' ? value : JSON.stringify(value),
+        }))
+      );
+    }
+  }, [detail, fields]);
+
+  const saveFieldsMutation = useMutation({
+    mutationFn: (custom_fields: Record<string, any>) => apiClient.updateUser(user.id, { custom_fields }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+      queryClient.invalidateQueries({ queryKey: ['user', user.id] });
+    },
+  });
+
+  const addIdentityMutation = useMutation({
+    mutationFn: (data: { provider: string; subject: string }) => apiClient.addUserIdentity(user.id, data),
+    onSuccess: () => {
+      setNewIdentity({ provider: '', subject: '' });
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+      queryClient.invalidateQueries({ queryKey: ['user', user.id] });
+    },
+  });
+
+  const removeIdentityMutation = useMutation({
+    mutationFn: ({ provider, subject }: { provider: string; subject: string }) =>
+      apiClient.removeUserIdentity(user.id, provider, subject),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+      queryClient.invalidateQueries({ queryKey: ['user', user.id] });
+    },
+  });
+
+  const saveFields = () => {
+    setFieldsError(null);
+    const result: Record<string, any> = {};
+    for (const { key, value } of fields || []) {
+      const trimmed = key.trim();
+      if (!trimmed) continue;
+      if (trimmed in result) {
+        setFieldsError(`Duplicate key: ${trimmed}`);
+        return;
+      }
+      // Parse numbers/booleans/objects; anything unparseable stays a string
+      try {
+        result[trimmed] = JSON.parse(value);
+      } catch {
+        result[trimmed] = value;
+      }
+    }
+    saveFieldsMutation.mutate(result);
+  };
+
+  const identities = detail?.identities || [];
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50" onClick={onClose} />
+      <div className="fixed inset-0 flex items-center justify-center z-50 p-4 pointer-events-none">
+        <div className="bg-[#161616] rounded-lg max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto pointer-events-auto">
+          <div className="flex items-start justify-between mb-1">
+            <h2 className="text-xl font-semibold text-gray-100">Custom Fields & Identities</h2>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-200">
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <p className="text-sm text-gray-400 mb-6">{user.email}</p>
+
+          {/* Custom fields */}
+          <div className="mb-8">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-medium text-gray-300">Custom fields</h3>
+              <button
+                onClick={() => setFields([...(fields || []), { key: '', value: '' }])}
+                className="btn btn-secondary btn-sm"
+              >
+                <Plus className="w-3.5 h-3.5 mr-1" />
+                Add field
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              Available to agents as <code className="text-gray-400">{'{{user.custom_fields.<key>}}'}</code>, to
+              functions via <code className="text-gray-400">context.user_custom_fields</code>, and to queries as{' '}
+              <code className="text-gray-400">{':user_custom_<key>'}</code>.
+            </p>
+
+            {fields === null ? (
+              <div className="text-center py-4">
+                <div className="inline-block animate-spin rounded-full h-5 w-5 border-b-2 border-primary-600"></div>
+              </div>
+            ) : fields.length === 0 ? (
+              <p className="text-sm text-gray-500 py-2">No custom fields set</p>
+            ) : (
+              <div className="space-y-2">
+                {fields.map((field, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      type="text"
+                      value={field.key}
+                      onChange={(e) => setFields(fields.map((f, j) => (j === i ? { ...f, key: e.target.value } : f)))}
+                      placeholder="key"
+                      className="input flex-1 font-mono text-sm"
+                    />
+                    <input
+                      type="text"
+                      value={field.value}
+                      onChange={(e) => setFields(fields.map((f, j) => (j === i ? { ...f, value: e.target.value } : f)))}
+                      placeholder="value"
+                      className="input flex-[2] font-mono text-sm"
+                    />
+                    <button
+                      onClick={() => setFields(fields.filter((_, j) => j !== i))}
+                      className="text-gray-500 hover:text-red-400 p-2"
+                      title="Remove field"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {(fieldsError || saveFieldsMutation.isError) && (
+              <div className="mt-3 p-3 bg-red-900/20 border border-red-800/30 rounded text-sm text-red-300">
+                {fieldsError || (saveFieldsMutation.error as any)?.response?.data?.detail || 'Failed to save fields'}
+              </div>
+            )}
+            {fields !== null && (
+              <div className="flex justify-end mt-3">
+                <button onClick={saveFields} disabled={saveFieldsMutation.isPending} className="btn btn-primary btn-sm">
+                  {saveFieldsMutation.isPending ? 'Saving...' : saveFieldsMutation.isSuccess ? 'Saved' : 'Save fields'}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* External identities */}
+          <div>
+            <h3 className="text-sm font-medium text-gray-300 mb-2">External identities</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Links this user to an external auth system for token exchange. The subject is the stable user id
+              in the external system (not an email).
+            </p>
+
+            {identities.length > 0 ? (
+              <div className="space-y-2 mb-4">
+                {identities.map((identity: any) => (
+                  <div
+                    key={`${identity.provider}:${identity.subject}`}
+                    className="flex items-center justify-between p-3 bg-[#0d0d0d] rounded"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Link2 className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+                        <span className="text-sm text-gray-100">{identity.provider}</span>
+                      </div>
+                      <p className="text-xs text-gray-500 font-mono truncate select-all">{identity.subject}</p>
+                    </div>
+                    <button
+                      onClick={() =>
+                        confirm(`Unlink ${identity.provider} identity?`) &&
+                        removeIdentityMutation.mutate({ provider: identity.provider, subject: identity.subject })
+                      }
+                      className="text-gray-500 hover:text-red-400 p-1 flex-shrink-0"
+                      disabled={removeIdentityMutation.isPending}
+                      title="Unlink identity"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500 py-2 mb-4">No external identities linked</p>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                addIdentityMutation.mutate(newIdentity);
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={newIdentity.provider}
+                onChange={(e) => setNewIdentity({ ...newIdentity, provider: e.target.value })}
+                placeholder="provider (e.g. acme-app)"
+                required
+                className="input flex-1 text-sm"
+              />
+              <input
+                type="text"
+                value={newIdentity.subject}
+                onChange={(e) => setNewIdentity({ ...newIdentity, subject: e.target.value })}
+                placeholder="subject (external user id)"
+                required
+                className="input flex-[2] text-sm font-mono"
+              />
+              <button type="submit" disabled={addIdentityMutation.isPending} className="btn btn-primary btn-sm flex-shrink-0">
+                {addIdentityMutation.isPending ? 'Linking...' : 'Link'}
+              </button>
+            </form>
+            {addIdentityMutation.isError && (
+              <div className="mt-3 p-3 bg-red-900/20 border border-red-800/30 rounded text-sm text-red-300">
+                {(addIdentityMutation.error as any)?.response?.data?.detail || 'Failed to link identity'}
+              </div>
+            )}
           </div>
         </div>
       </div>
