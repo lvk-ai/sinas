@@ -227,6 +227,12 @@ class Settings(BaseSettings):
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)
 
+    # Tool results above this many characters are truncated (structure-aware,
+    # see services/tool_execution.truncate_tool_result) before they enter the
+    # LLM context. ~12K tokens: large enough for realistic listings on a
+    # 200K-context model, small enough that one call can't crowd the window.
+    tool_result_max_size: int = 50000
+
     # Agent-to-agent delegation (call_agent_* tools). See issue #90.
     # - agent_delegate_timeout: how long a parent waits for a sub-agent result.
     #   Must be < agent_job_timeout in "block" mode, since the parent's own job
