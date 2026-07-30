@@ -10,6 +10,7 @@ from app.core.auth import get_current_user_with_permissions, set_permission_used
 from app.core.database import get_db
 from app.core.permissions import check_permission
 from app.models import Chat, Message, User
+from app.models.llm_usage import LLMUsage
 from app.services.message_service import strip_base64_data
 
 router = APIRouter(prefix="/messages", tags=["messages"])
@@ -219,11 +220,33 @@ async def get_message_stats(
     role_rows = (await db.execute(role_q)).all()
     role_distribution = {r.role: r.count for r in role_rows}
 
+    # LLM token usage over the same window (same read:all / read:own scoping).
+    usage_filter = LLMUsage.created_at >= since
+    if not has_all:
+        usage_filter = and_(usage_filter, LLMUsage.user_id == user_id)
+    usage_q = select(
+        func.coalesce(func.sum(LLMUsage.prompt_tokens), 0),
+        func.coalesce(func.sum(LLMUsage.completion_tokens), 0),
+        func.coalesce(func.sum(LLMUsage.total_tokens), 0),
+        func.coalesce(func.sum(LLMUsage.cache_read_tokens), 0),
+        func.coalesce(func.sum(LLMUsage.cache_write_tokens), 0),
+        func.count(),
+    ).where(usage_filter)
+    u_prompt, u_completion, u_total, u_cache_read, u_cache_write, u_calls = (
+        await db.execute(usage_q)
+    ).one()
+
     return {
         "total_messages": total,
         "tool_calls": tool_calls,
         "activity_by_day": activity_by_day,
         "agent_usage": agent_usage,
         "role_distribution": role_distribution,
+        "llm_prompt_tokens": int(u_prompt),
+        "llm_completion_tokens": int(u_completion),
+        "llm_total_tokens": int(u_total),
+        "llm_cache_read_tokens": int(u_cache_read),
+        "llm_cache_write_tokens": int(u_cache_write),
+        "llm_calls": u_calls,
         "days": days,
     }

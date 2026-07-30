@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
 import { useAuth } from '../lib/auth-context';
-import { MessageSquare, Bot, Code, TrendingUp, Zap, CheckCircle, X, Brain, ArrowRight } from 'lucide-react';
+import { MessageSquare, Bot, Code, TrendingUp, Zap, CheckCircle, X, Brain, ArrowRight, Coins } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { useState } from 'react';
@@ -79,11 +79,26 @@ export function Dashboard() {
 
   const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#6366f1'];
 
-  const stats = [
+  // Compact token counts: 1234 -> "1.2K", 3400000 -> "3.4M".
+  const formatTokens = (n: number): string => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return `${n}`;
+  };
+  const cacheTokens = (messageStats?.llm_cache_read_tokens || 0) + (messageStats?.llm_cache_write_tokens || 0);
+
+  const stats: Array<{ name: string; value: number | string; icon: any; color: string; subtitle?: string }> = [
     { name: 'Messages (7d)', value: messageStats?.total_messages || 0, icon: MessageSquare, color: 'blue' },
     { name: 'Active Agents', value: agents?.filter((a) => a.is_active).length || 0, icon: Bot, color: 'purple' },
     { name: 'Functions', value: functions?.length || 0, icon: Code, color: 'green' },
     { name: 'Tool Calls', value: messageStats?.tool_calls || 0, icon: Zap, color: 'orange' },
+    {
+      name: 'Tokens (7d)',
+      value: formatTokens(messageStats?.llm_total_tokens || 0),
+      icon: Coins,
+      color: 'cyan',
+      subtitle: cacheTokens > 0 ? `${formatTokens(cacheTokens)} cached` : undefined,
+    },
   ];
 
   const getColorClasses = (color: string) => {
@@ -92,6 +107,7 @@ export function Dashboard() {
       purple: { bg: 'bg-purple-900/20', text: 'text-purple-400', icon: 'text-purple-400' },
       green: { bg: 'bg-green-900/20', text: 'text-green-400', icon: 'text-green-600' },
       orange: { bg: 'bg-orange-900/20', text: 'text-orange-400', icon: 'text-orange-400' },
+      cyan: { bg: 'bg-cyan-900/20', text: 'text-cyan-400', icon: 'text-cyan-400' },
     };
     return colors[color] || colors.blue;
   };
@@ -177,7 +193,7 @@ export function Dashboard() {
       )}
 
       {/* Key Stats */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         {stats.map((stat) => {
           const Icon = stat.icon;
           const colors = getColorClasses(stat.color);
@@ -187,6 +203,9 @@ export function Dashboard() {
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-gray-400 truncate">{stat.name}</p>
                   <p className="text-2xl font-bold text-gray-100 mt-2">{stat.value}</p>
+                  {stat.subtitle && (
+                    <p className="text-xs text-gray-500 mt-1 truncate">{stat.subtitle}</p>
+                  )}
                 </div>
                 <div className={`p-3 ${colors.bg} rounded-lg flex-shrink-0`}>
                   <Icon className={`w-6 h-6 ${colors.icon}`} />
