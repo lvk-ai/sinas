@@ -1,0 +1,193 @@
+## Image — the sinas backend image (also used by workers, scheduler, cdc).
+image:
+  registry: ghcr.io/sinas-platform/sinas
+  tag: latest
+  pullPolicy: IfNotPresent
+
+## Routing
+domain: ""
+
+## Ingress — standard networking.k8s.io/v1. For Gateway API (HTTPRoute) or
+## provider-specific routing, disable this and bring your own route objects.
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""  # existing TLS secret; leave empty when using cert-manager annotations
+
+## Secrets (required — provide via --set or a secrets values file)
+secrets:
+  secretKey: ""
+  encryptionKey: ""
+
+## Superadmin
+superadminEmail: ""
+
+## Executor — how sinas runs user/agent code.
+##
+## sandbox: untrusted code (untrusted Functions + agent codeExecution).
+##   "k8s_pod"  — one ephemeral hardened Pod per execution (default).
+##   "disabled" — reject sandbox executions (trusted-only deployment).
+## trusted: admin-approved code (Function.shared_pool=true).
+##   "inprocess" — runs inside the queue-worker process (default).
+##                 Note: shares the worker's credentials; approve shared_pool
+##                 functions accordingly.
+executor:
+  sandbox: "k8s_pod"
+  trusted: "inprocess"
+  ## Image for sandbox pods. Must be pullable by the cluster. Extra packages
+  ## (Dependency table) are pip-installed into each pod at create time; bake
+  ## them into a custom image and set installDependencies: false to skip that
+  ## cold-start cost.
+  image: "ghcr.io/sinas-platform/sinas/executor:latest"
+  installDependencies: true
+  podReadyTimeout: 120
+
+## Pull secret for private registries (applies to sinas images AND sandbox
+## pods, via their ServiceAccounts). Leave username empty for public images.
+registry:
+  server: "ghcr.io"
+  username: ""
+  password: ""
+
+## PostgreSQL
+postgres:
+  user: postgres
+  database: sinas
+  password: ""
+  storage: 5Gi
+
+## Redis
+redis:
+  maxmemory: "256mb"
+  storage: 1Gi
+
+## ClickHouse
+clickhouse:
+  user: default
+  password: ""
+  database: sinas
+  storage: 5Gi
+  memoryLimit: "1Gi"
+
+## PGBouncer
+pgbouncer:
+  poolMode: transaction
+  maxClientConn: 1000
+  defaultPoolSize: 50
+  minPoolSize: 10
+  reservePoolSize: 10
+
+## File storage — shared volume for uploaded files (/var/sinas/files).
+## Mounted into backend, queue-worker, queue-agent, scheduler.
+## Use an RWX storage class on multi-node clusters.
+fileStorage:
+  size: 5Gi
+  storageClass: ""
+
+## Network policy — namespace isolation + locked-down sandbox pods.
+## ingressNamespace: the namespace your ingress controller runs in (allowed to
+## reach backend/console). Leave empty to allow ingress from any namespace.
+networkPolicy:
+  enabled: true
+  ingressNamespace: ""
+
+## Builder (Node.js esbuild server)
+builder:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+## Backend (FastAPI)
+backend:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+
+## Queue worker
+queueWorker:
+  replicas: 1
+  ## Max concurrent function executions per worker (QUEUE_FUNCTION_CONCURRENCY).
+  ## Total burst envelope per release ≈ replicas × concurrency × per-execution
+  ## memory, bounded by resources.limits.memory — size them together.
+  concurrency: 10
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+## Queue agent worker
+queueAgent:
+  replicas: 1
+  ## Max concurrent agent jobs per worker (QUEUE_AGENT_CONCURRENCY).
+  concurrency: 5
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+## Scheduler
+scheduler:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+## CDC worker
+cdcWorker:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+## Console (React SPA)
+console:
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+## SMTP
+## smtp.ipv4: forces smtp.host to resolve to this IPv4 (avoids ENETUNREACH on IPv6-less pods).
+smtp:
+  host: ""
+  port: 587
+  user: ""
+  password: ""
+  domain: ""
+  ipv4: ""
+
+## Extra environment variables appended to every sinas service (backend,
+## queue workers, scheduler, cdc-worker). Any backend Settings knob
+## (app/core/config.py) can be set here without a chart change, e.g.:
+##   - name: MAX_FUNCTION_MEMORY
+##     value: "256"
+##   - name: FUNCTION_TIMEOUT
+##     value: "120"
+extraEnv: []

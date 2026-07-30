@@ -5,7 +5,7 @@ import logging
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 import jsonschema
@@ -17,7 +17,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.execution import Execution, ExecutionStatus
 from app.models.function import Function
 from app.services.clickhouse_logger import clickhouse_logger
-
+from app.services.executor.base import ExecutionResult, ResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ async def _fire_callback(
     user_email: str,
     status: str,  # "success" | "failure"
     result: Any,
-    error: Optional[str],
+    error: str | None,
     trigger_id: str,
     function_namespace: str,
     function_name: str,
@@ -72,7 +72,7 @@ async def _fire_callback(
     }
 
     status_label = "failed"
-    response_code: Optional[int] = None
+    response_code: int | None = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -108,25 +108,39 @@ async def _fire_callback(
 class FunctionExecutor:
     def __init__(self):
         self.functions_cache: dict[str, Function] = {}
-        self._container_pool = None
+        # Executor selection is delegated to `app.services.executor.factory`,
+        # which resolves the configured impls from settings. We cache the
+        # resolved handles per-instance to avoid the factory call per
+        # execution. The sandbox handle is `None` when sandbox execution is
+        # disabled in this deployment; trusted is always required (it backs
+        # the admin-approved Function.shared_pool path).
+        self._sandbox_executor = None
+        self._sandbox_executor_resolved = False
+        self._trusted_executor = None
 
     @property
-    def container_pool(self):
-        """Lazy load container pool (replaces per-user containers)."""
-        if self._container_pool is None:
-            from app.services.container_pool import container_pool
+    def sandbox_executor(self):
+        """Resolved SandboxExecutor for untrusted code (or None if disabled).
 
-            self._container_pool = container_pool
-        return self._container_pool
+        Untrusted Function execution + agent `codeExecution` route here. A
+        `None` value means the deploy explicitly disabled the sandbox; callers
+        must surface a clear error rather than silently fall back to trusted.
+        """
+        if not self._sandbox_executor_resolved:
+            from app.services.executor import get_sandbox_executor
+
+            self._sandbox_executor = get_sandbox_executor()
+            self._sandbox_executor_resolved = True
+        return self._sandbox_executor
 
     @property
-    def worker_manager(self):
-        """Lazy load shared worker manager."""
-        if not hasattr(self, "_worker_manager") or self._worker_manager is None:
-            from app.services.shared_worker_manager import shared_worker_manager
+    def trusted_executor(self):
+        """Resolved TrustedExecutor for admin-approved `Function.shared_pool` code."""
+        if self._trusted_executor is None:
+            from app.services.executor import get_trusted_executor
 
-            self._worker_manager = shared_worker_manager
-        return self._worker_manager
+            self._trusted_executor = get_trusted_executor()
+        return self._trusted_executor
 
     async def validate_schema(self, data: Any, schema: dict[str, Any]) -> Any:
         """
@@ -151,11 +165,11 @@ class FunctionExecutor:
         user_email: str,
         access_token: str,
         trigger_type: str,
-        chat_id: Optional[str],
+        chat_id: str | None,
         db: AsyncSession,
-        timeout: Optional[int] = None,
-        user_custom_fields: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+        timeout: int | None = None,
+        user_custom_fields: dict[str, Any] | None = None,
+    ) -> ExecutionResult:
         """
         Execute function in shared worker pool (separate worker containers).
 
@@ -163,7 +177,7 @@ class FunctionExecutor:
         Workers are separate containers from backend but shared across users.
         No per-user isolation - functions must be trusted.
         """
-        exec_result = await self.worker_manager.execute_function(
+        exec_result = await self.trusted_executor.execute(
             user_id=user_id,
             user_email=user_email,
             user_custom_fields=user_custom_fields,
@@ -224,8 +238,8 @@ class FunctionExecutor:
         trigger_type: str,
         trigger_id: str,
         user_id: str,
-        chat_id: Optional[str] = None,
-        callback_url: Optional[str] = None,
+        chat_id: str | None = None,
+        callback_url: str | None = None,
         depth: int = 0,
     ) -> dict[str, Any]:
         """Execute a function with input validation and tracking.
@@ -299,6 +313,10 @@ class FunctionExecutor:
 
                 start_time = time.time()
 
+                # Executor role — drives where an awaiting-input execution is
+                # resumed (persisted as a "role:handle" prefix in container_id).
+                role = "trusted" if function.shared_pool else "sandbox"
+
                 # Route execution based on shared_pool setting
                 if function.shared_pool:
                     # Execute in shared worker container pool
@@ -339,8 +357,17 @@ class FunctionExecutor:
                     print(
                         f"⏱️  [TIMING] Executing {function_namespace}/{function_name} in sandbox container"
                     )
+                    sandbox = self.sandbox_executor
+                    if sandbox is None:
+                        raise FunctionExecutionError(
+                            f"Sandbox execution is disabled on this deployment "
+                            f"(sandbox_executor='disabled'); cannot run "
+                            f"untrusted function '{function_namespace}/{function_name}'. "
+                            f"Either set Function.shared_pool=True for admin-approved "
+                            f"functions, or enable a sandbox executor."
+                        )
                     container_start = time.time()
-                    exec_result = await self.container_pool.execute_function(
+                    exec_result = await sandbox.execute(
                         user_id=user_id,
                         user_email=user_email,
                         user_custom_fields=user_custom_fields,
@@ -357,11 +384,14 @@ class FunctionExecutor:
                     container_elapsed = time.time() - container_start
                     print(f"⏱️  [TIMING] Sandbox container execution completed in {container_elapsed:.3f}s")
 
-                # Handle awaiting_input from shared containers
-                if exec_result.get("status") == "awaiting_input":
+                # Handle awaiting_input (only the trusted/shared path can pause;
+                # sandbox mode raises on input()).
+                if exec_result.status is ResultStatus.AWAITING_INPUT:
                     execution.status = ExecutionStatus.AWAITING_INPUT
-                    execution.input_prompt = exec_result.get("prompt")
-                    execution.container_id = exec_result.get("container_name")
+                    execution.input_prompt = exec_result.prompt
+                    # "role:handle" — role picks the executor at resume time;
+                    # handle is the executor's opaque resume token.
+                    execution.container_id = f"{role}:{exec_result.handle}"
                     await db.commit()
                     return {
                         "status": "awaiting_input",
@@ -369,16 +399,16 @@ class FunctionExecutor:
                         "prompt": execution.input_prompt,
                     }
 
-                if exec_result.get("status") == "failed":
-                    err = FunctionExecutionError(exec_result.get("error", "Unknown error"))
+                if exec_result.status is ResultStatus.FAILED:
+                    err = FunctionExecutionError(exec_result.error or "Unknown error")
                     # The container captured the function's real internal traceback.
                     # Attach it so the except handler persists it instead of the
                     # backend's own (useless) stack pointing at this raise.
-                    err.container_traceback = exec_result.get("traceback")
+                    err.container_traceback = exec_result.traceback
                     raise err
 
-                result = exec_result.get("result")
-                duration_ms = exec_result.get("duration_ms", 0)
+                result = exec_result.result
+                duration_ms = exec_result.duration_ms
 
                 # Validate output
                 if function.output_schema:
@@ -466,10 +496,11 @@ class FunctionExecutor:
         resume_value: Any,
     ) -> dict[str, Any]:
         """
-        Resume a paused execution by writing the resume value directly
-        to the container where the function is waiting on input().
+        Resume a paused (AWAITING_INPUT) execution with a human-provided value.
 
-        Bypasses the queue — the function thread is already running.
+        Routing and persistence live here; the actual resume mechanism is
+        delegated to the executor that produced the pause, via the opaque
+        handle stored on the execution. Bypasses the queue.
         """
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -485,100 +516,40 @@ class FunctionExecutor:
                     f"Execution {execution_id} is not awaiting input (status={execution.status})"
                 )
 
-            container_id = execution.container_id
-            if not container_id:
+            if not execution.container_id:
                 raise FunctionExecutionError(
-                    f"Execution {execution_id} has no container_id — cannot resume"
+                    f"Execution {execution_id} has no resume handle — cannot resume"
                 )
 
-            # Write resume file into the container
-            import docker
+            # container_id holds "role:handle". Treat a bare value (no ":") as a
+            # trusted handle, for executions paused before this format existed.
+            role, sep, handle = execution.container_id.partition(":")
+            if not sep:
+                role, handle = "trusted", execution.container_id
 
-            client = docker.from_env()
-            try:
-                container = client.containers.get(container_id)
-            except docker.errors.NotFound:
-                # Container gone — mark execution as failed
+            executor = self.sandbox_executor if role == "sandbox" else self.trusted_executor
+            if executor is None:
                 execution.status = ExecutionStatus.FAILED
-                execution.error = "Container no longer available (restarted?)"
+                execution.error = "Sandbox execution is disabled; cannot resume this execution."
                 execution.completed_at = datetime.utcnow()
                 await db.commit()
-                raise FunctionExecutionError(
-                    f"Container {container_id} not found — execution cannot be resumed"
-                )
-
-            # Write resume data into the container via stdin pipe
-            resume_payload = json.dumps({"value": resume_value}).encode("utf-8")
-            resume_file = f"/tmp/exec_resume_{execution_id}.json"
-
-            api = container.client.api
-            exec_id = api.exec_create(
-                container.id,
-                [
-                    "python3", "-c",
-                    f'import sys; open("{resume_file}","wb").write(sys.stdin.buffer.read())',
-                ],
-                stdin=True,
-                stdout=True,
-                stderr=True,
-            )["Id"]
-            sock = api.exec_start(exec_id, socket=True)
-            sock._sock.sendall(resume_payload)
-            import socket as _sock_mod
-            sock._sock.shutdown(_sock_mod.SHUT_WR)
-            sock.read()
-            sock.close()
+                raise FunctionExecutionError(execution.error)
 
             execution.status = ExecutionStatus.RUNNING
             await db.commit()
 
-            # Poll for result from the container
-            result_file = f"/tmp/exec_result_{execution_id}.json"
-            function_timeout = settings.function_timeout
-
-            exec_result = await asyncio.to_thread(
-                container.exec_run,
-                cmd=[
-                    "python3",
-                    "-c",
-                    f"""
-import sys, json, time, os
-max_wait = {function_timeout}
-start = time.time()
-while time.time() - start < max_wait:
-    try:
-        with open("{result_file}", "r") as f:
-            result = json.load(f)
-            print(json.dumps(result))
-            sys.exit(0)
-    except FileNotFoundError:
-        time.sleep(0.1)
-        continue
-print(json.dumps({{"error": "Resume timeout after {function_timeout}s"}}))
-sys.exit(1)
-""",
-                ],
-                demux=True,
+            res = await executor.resume(
+                handle=handle,
+                resume_value=resume_value,
+                execution_id=execution_id,
+                timeout=settings.function_timeout,
             )
 
-            stdout, stderr = exec_result.output
-            stdout_str = stdout.decode() if stdout else ""
-
-            if exec_result.exit_code != 0:
-                stderr_str = stderr.decode() if stderr else ""
-                error_msg = stderr_str or stdout_str or f"Exit code {exec_result.exit_code}"
-                execution.status = ExecutionStatus.FAILED
-                execution.error = error_msg
-                execution.completed_at = datetime.utcnow()
-                await db.commit()
-                raise FunctionExecutionError(f"Resume failed: {error_msg}")
-
-            result_data = json.loads(stdout_str)
-
-            # Handle another awaiting_input (multiple input() calls)
-            if result_data.get("status") == "awaiting_input":
+            # Another input() call — stay paused, keep the (re-stamped) handle.
+            if res.status is ResultStatus.AWAITING_INPUT:
                 execution.status = ExecutionStatus.AWAITING_INPUT
-                execution.input_prompt = result_data.get("prompt")
+                execution.input_prompt = res.prompt
+                execution.container_id = f"{role}:{res.handle}"
                 await db.commit()
                 return {
                     "status": "awaiting_input",
@@ -586,31 +557,27 @@ sys.exit(1)
                     "prompt": execution.input_prompt,
                 }
 
-            if result_data.get("status") == "failed":
+            if res.status is ResultStatus.FAILED:
                 execution.status = ExecutionStatus.FAILED
-                execution.error = result_data.get("error", "Unknown error")
-                execution.traceback = result_data.get("traceback")
+                execution.error = res.error or "Unknown error"
+                execution.traceback = res.traceback
                 execution.completed_at = datetime.utcnow()
                 await db.commit()
-                raise FunctionExecutionError(result_data.get("error", "Unknown error"))
+                raise FunctionExecutionError(res.error or "Unknown error")
 
             # Completed
-            output = result_data.get("result")
-            duration_ms = result_data.get("duration_ms", 0)
-
             execution.status = ExecutionStatus.COMPLETED
-            execution.output_data = output
+            execution.output_data = res.result
             execution.completed_at = datetime.utcnow()
-            execution.duration_ms = duration_ms
+            execution.duration_ms = res.duration_ms
             execution.container_id = None
-
             await db.commit()
 
             await clickhouse_logger.log_execution_end(
-                execution_id, "completed", output, None, duration_ms
+                execution_id, "completed", res.result, None, res.duration_ms
             )
 
-            return output
+            return res.result
 
     async def enqueue_function(
         self,
@@ -621,7 +588,7 @@ sys.exit(1)
         trigger_type: str,
         trigger_id: str,
         user_id: str,
-        chat_id: Optional[str] = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Enqueue a function for execution via the job queue.

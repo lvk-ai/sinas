@@ -1,7 +1,8 @@
+import json
 import os
 from typing import Optional
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 VALID_AUTH_MODES = {"otp", "password", "password+otp"}
@@ -86,6 +87,81 @@ class Settings(BaseSettings):
     # SMTP Server Configuration (for receiving emails)
     smtp_server_host: str = "0.0.0.0"
     smtp_server_port: int = 2525  # Port for incoming email SMTP server
+
+    # Executor selection — see `app/services/executor/` for the abstraction.
+    # - sandbox_executor: backend for untrusted code (per-function untrusted
+    #   functions and agent codeExecution). Must isolate per execution.
+    #     "docker_pool"      — long-lived Docker container pool (current default)
+    #     "docker_ephemeral" — single-use Docker container per execution
+    #     "k8s_pod"          — single-use k8s Pod per execution (for k8s deploys)
+    #     "disabled"         — sandbox features rejected; deploy is trusted-only
+    # - trusted_executor: backend for admin-approved code (Function.shared_pool=True).
+    #     "docker_shared" — dedicated long-lived Docker workers (current default)
+    #     "inprocess"     — run inside the calling process; no Docker socket needed
+    sandbox_executor: str = "docker_pool"
+    trusted_executor: str = "docker_shared"
+
+    # k8s_pod sandbox executor (only read when sandbox_executor="k8s_pod").
+    # Runs in-cluster: credentials come from the pod's ServiceAccount, which
+    # needs create/get/delete + exec on pods in `k8s_sandbox_namespace`.
+    k8s_sandbox_namespace: str = ""  # "" = this pod's namespace (POD_NAMESPACE env or serviceaccount file)
+    k8s_sandbox_image: str = ""  # "" = function_container_image; must be pullable by the cluster
+    k8s_sandbox_service_account: str = ""  # SA for sandbox pods; "" = namespace default
+    k8s_sandbox_pod_ready_timeout: int = 120  # seconds to wait for a sandbox pod to become Ready
+    k8s_sandbox_install_dependencies: bool = True  # pip install Dependency specs into each pod (skip if baked into k8s_sandbox_image)
+
+    # Scheduling for sandbox pods — deliberately dumb/generic so the actual
+    # policy (spread one-client-per-node vs. pack many clients per node,
+    # etc.) lives entirely in the Helm chart's values, not in app code. This
+    # app only applies whatever it's handed:
+    #   - k8s_release_name: stamped as app.kubernetes.io/instance on the pod,
+    #     so chart-authored affinity rules (either direction) have something
+    #     to match on. "" = no label.
+    #   - k8s_sandbox_node_selector / k8s_sandbox_tolerations: verbatim
+    #     nodeSelector / tolerations, JSON-encoded.
+    #   - k8s_sandbox_affinity: a verbatim K8s `affinity` object (podAffinity
+    #     to pack onto the same node as other pods matching a label,
+    #     podAntiAffinity to spread, nodeAffinity, or any combination),
+    #     JSON-encoded. The chart decides which shape to send — e.g. required
+    #     podAntiAffinity for a paid/isolated plan, required podAffinity
+    #     keyed on a shared "plan=free" label to force free-tier clients onto
+    #     the same node, or "{}" for no constraint. Changing that policy is a
+    #     chart values change, not an app change.
+    # All empty/no-op by default — matches today's behavior on generic
+    # clusters with no per-client scheduling policy.
+    k8s_release_name: str = ""
+    k8s_sandbox_node_selector: str = "{}"  # JSON object, e.g. {"role": "shared"}
+    k8s_sandbox_tolerations: str = "[]"  # JSON list of Toleration dicts
+    k8s_sandbox_affinity: str = "{}"  # JSON k8s Affinity object (podAffinity/podAntiAffinity/nodeAffinity)
+
+    @field_validator("k8s_sandbox_node_selector", "k8s_sandbox_affinity")
+    @classmethod
+    def _validate_k8s_json_object(cls, v: str, info: ValidationInfo) -> str:
+        # Fail at startup, not on the first sandbox execution: a bad value
+        # here would otherwise surface as an unhandled JSONDecodeError deep
+        # inside pod creation instead of a clear config error.
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{info.field_name} must be valid JSON: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"{info.field_name} must be a JSON object, got {type(parsed).__name__}"
+            )
+        return v
+
+    @field_validator("k8s_sandbox_tolerations")
+    @classmethod
+    def _validate_k8s_tolerations(cls, v: str) -> str:
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"k8s_sandbox_tolerations must be valid JSON: {e}") from e
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"k8s_sandbox_tolerations must be a JSON array, got {type(parsed).__name__}"
+            )
+        return v
 
     # Function execution (always uses Docker for isolation)
     function_timeout: int = 300  # 5 minutes (max execution time)
