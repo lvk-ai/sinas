@@ -39,9 +39,20 @@ async def test_login_existing_user(client: AsyncClient, test_user: User):
 
 
 async def test_login_nonexistent_user(client: AsyncClient):
-    """POST /auth/login returns 403 for an unknown email."""
+    """Unknown emails get a decoy OTP response indistinguishable from a real one
+    (anti-enumeration), and the decoy session id never verifies."""
     resp = await client.post("/auth/login", json={"email": "nobody@example.com"})
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["message"] == "OTP sent to your email"
+    assert body["session_id"]
+
+    verify = await client.post(
+        "/auth/verify-otp",
+        json={"session_id": body["session_id"], "otp_code": "123456"},
+    )
+    assert verify.status_code == 400
+    assert verify.json()["detail"] == "Invalid or expired OTP"
 
 
 # ---------------------------------------------------------------------------

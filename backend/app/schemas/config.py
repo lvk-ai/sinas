@@ -37,6 +37,14 @@ class UserPermissionConfig(BaseModel):
     value: bool
 
 
+class UserIdentityConfig(BaseModel):
+    """External identity linked to a user"""
+
+    provider: str
+    subject: str
+    metadata: Optional[dict[str, Any]] = None
+
+
 class UserConfig(BaseModel):
     """User configuration"""
 
@@ -44,6 +52,8 @@ class UserConfig(BaseModel):
     isActive: bool = True
     roles: list[str] = Field(default_factory=list)
     permissions: list[UserPermissionConfig] = Field(default_factory=list)
+    customFields: Optional[dict[str, Any]] = None
+    identities: list[UserIdentityConfig] = Field(default_factory=list)
 
 
 class LLMProviderConfig(BaseModel):
@@ -373,6 +383,32 @@ class ConnectorAuthConfig(BaseModel):
     header: Optional[str] = None
     position: Optional[str] = None
     paramName: Optional[str] = None
+    # OAuth 2.0 (client-credentials and authorization-code) fields.
+    tokenUrl: Optional[str] = None
+    clientId: Optional[str] = None
+    scopes: Optional[list[str]] = None
+    clientAuthMethod: Optional[str] = None
+    authorizeUrl: Optional[str] = None
+    tokenParams: Optional[dict[str, str]] = None
+
+
+# Single source of truth for connector auth field names across the config round-trip:
+# (camelCase config key, snake_case stored-auth key). Used by config-apply (camel→snake)
+# and the serializer (snake→camel) so a new auth field is added in exactly one place here
+# plus the two schema models above/`ConnectorAuth`, not in four hand-kept lists.
+CONNECTOR_AUTH_FIELD_MAP: list[tuple[str, str]] = [
+    ("type", "type"),
+    ("secret", "secret"),
+    ("header", "header"),
+    ("position", "position"),
+    ("paramName", "param_name"),
+    ("tokenUrl", "token_url"),
+    ("clientId", "client_id"),
+    ("scopes", "scopes"),
+    ("clientAuthMethod", "client_auth_method"),
+    ("authorizeUrl", "authorize_url"),
+    ("tokenParams", "token_params"),
+]
 
 
 class ConnectorRetryConfig(BaseModel):

@@ -32,6 +32,7 @@ class DockerSharedTrustedExecutor:
         execution_id: str,
         trigger_type: str,
         chat_id: str | None,
+        user_custom_fields: dict[str, Any] | None = None,
         db: AsyncSession,
         timeout: int,
     ) -> ExecutionResult:
@@ -50,6 +51,7 @@ class DockerSharedTrustedExecutor:
                 execution_id=execution_id,
                 trigger_type=trigger_type,
                 chat_id=chat_id,
+                user_custom_fields=user_custom_fields,
                 db=db,
                 timeout=timeout,
             )

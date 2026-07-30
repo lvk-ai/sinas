@@ -151,6 +151,24 @@ class ConfigExportService:
                 "roles": [r.name for r in roles],
             }
 
+            if user.custom_fields:
+                user_dict["customFields"] = user.custom_fields
+
+            from app.models.user import UserIdentity
+
+            identity_stmt = select(UserIdentity).where(UserIdentity.user_id == user.id)
+            identity_result = await self.db.execute(identity_stmt)
+            identities = identity_result.scalars().all()
+            if identities:
+                user_dict["identities"] = [
+                    {
+                        "provider": i.provider,
+                        "subject": i.subject,
+                        **({"metadata": i.identity_metadata} if i.identity_metadata else {}),
+                    }
+                    for i in identities
+                ]
+
             exported.append(user_dict)
 
         return exported

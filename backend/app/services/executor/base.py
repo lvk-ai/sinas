@@ -114,6 +114,7 @@ class SandboxExecutor(Protocol):
         execution_id: str,
         trigger_type: str,
         chat_id: str | None,
+        user_custom_fields: dict[str, Any] | None,
         db: AsyncSession,
         timeout: int,
     ) -> ExecutionResult: ...
@@ -163,6 +164,7 @@ class TrustedExecutor(Protocol):
         execution_id: str,
         trigger_type: str,
         chat_id: str | None,
+        user_custom_fields: dict[str, Any] | None,
         db: AsyncSession,
         timeout: int,
     ) -> ExecutionResult: ...

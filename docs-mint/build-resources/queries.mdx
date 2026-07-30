@@ -41,6 +41,7 @@ Locked parameters prevent the LLM from seeing or modifying security-sensitive va
 |---|---|
 | `:user_id` | UUID of the user who triggered the query |
 | `:user_email` | Email of the triggering user |
+| `:user_custom_<field>` | Each scalar entry in the user's [custom fields](/admin/users-roles#custom-fields) (e.g. `:user_custom_region` for `custom_fields.region`) |
 
 These are always available regardless of the query's `input_schema`. Use them for row-level security:
 
@@ -50,7 +51,12 @@ SELECT * FROM orders WHERE created_by = :user_id
 
 -- Audit trail
 INSERT INTO audit_log (action, performed_by) VALUES (:action, :user_email)
+
+-- Per-user scoping on an org-specific attribute
+SELECT * FROM accounts WHERE region = :user_custom_region
 ```
+
+Only scalar custom fields (string, number, boolean) whose names are valid SQL identifiers are exposed; nested objects and lists are skipped.
 
 **Endpoints:**
 

@@ -168,6 +168,7 @@ class FunctionExecutor:
         chat_id: str | None,
         db: AsyncSession,
         timeout: int | None = None,
+        user_custom_fields: dict[str, Any] | None = None,
     ) -> ExecutionResult:
         """
         Execute function in shared worker pool (separate worker containers).
@@ -179,6 +180,7 @@ class FunctionExecutor:
         exec_result = await self.trusted_executor.execute(
             user_id=user_id,
             user_email=user_email,
+            user_custom_fields=user_custom_fields,
             access_token=access_token,
             function_namespace=function.namespace,
             function_name=function.name,
@@ -254,6 +256,7 @@ class FunctionExecutor:
             user_result = await db.execute(select(User).where(User.id == user_id))
             user = user_result.scalar_one_or_none()
             user_email = user.email if user else "unknown@unknown.com"
+            user_custom_fields = (user.custom_fields or {}) if user else {}
 
             # Load function early so we can size the access-token TTL to its
             # configured timeout. (load_function is cached, so this is cheap.)
@@ -338,6 +341,7 @@ class FunctionExecutor:
                                 execution_id=execution_id,
                                 user_id=user_id,
                                 user_email=user_email,
+                                user_custom_fields=user_custom_fields,
                                 access_token=access_token,
                                 trigger_type=trigger_type,
                                 chat_id=chat_id,
@@ -366,6 +370,7 @@ class FunctionExecutor:
                     exec_result = await sandbox.execute(
                         user_id=user_id,
                         user_email=user_email,
+                        user_custom_fields=user_custom_fields,
                         access_token=access_token,
                         function_namespace=function_namespace,
                         function_name=function_name,

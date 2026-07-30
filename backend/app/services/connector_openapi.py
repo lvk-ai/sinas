@@ -9,6 +9,81 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+def _map_security_scheme(scheme: dict, requested_scopes: Optional[list[str]]) -> Optional[dict[str, Any]]:
+    """Map one OpenAPI securityScheme to a connector auth config (no secrets)."""
+    stype = (scheme.get("type") or "").lower()
+
+    if stype == "apikey":
+        param_name = scheme.get("name")
+        location = scheme.get("in")
+        if location == "header":
+            return {"type": "api_key", "position": "header", "header": param_name or "X-Api-Key"}
+        if location == "query":
+            return {"type": "api_key", "position": "query", "param_name": param_name or "api_key"}
+        return None  # cookie apiKey is not supported by connectors
+
+    if stype == "http":
+        http_scheme = (scheme.get("scheme") or "").lower()
+        if http_scheme == "bearer":
+            return {"type": "bearer"}
+        if http_scheme == "basic":
+            return {"type": "basic"}
+        return None
+
+    if stype == "oauth2":
+        flows = scheme.get("flows") or {}
+        # Prefer per-user authorization-code, then machine-to-machine client-credentials.
+        if isinstance(flows.get("authorizationCode"), dict):
+            flow = flows["authorizationCode"]
+            return {
+                "type": "oauth2_authorization_code",
+                "authorize_url": flow.get("authorizationUrl"),
+                "token_url": flow.get("tokenUrl"),
+                "scopes": requested_scopes or list((flow.get("scopes") or {}).keys()),
+            }
+        if isinstance(flows.get("clientCredentials"), dict):
+            flow = flows["clientCredentials"]
+            return {
+                "type": "oauth2_client_credentials",
+                "token_url": flow.get("tokenUrl"),
+                "scopes": requested_scopes or list((flow.get("scopes") or {}).keys()),
+            }
+        return None  # implicit/password flows aren't supported server-side
+
+    return None  # openIdConnect and unknown types
+
+
+def extract_auth(spec: dict) -> Optional[dict[str, Any]]:
+    """Derive a suggested connector auth config from a spec's securitySchemes.
+
+    Returns the auth config in the connector's stored (snake_case) shape, minus any
+    secret/client_id (those aren't in the spec — the user supplies them). Returns None
+    if the spec declares no mappable scheme. When the top-level `security` requirement
+    names specific schemes/scopes, those are preferred over the raw scheme definitions.
+    """
+    schemes = ((spec.get("components") or {}).get("securitySchemes")) or {}
+    if not schemes:
+        return None
+
+    # Scheme name -> required scopes, from the top-level security requirement (if any).
+    requested: dict[str, list[str]] = {}
+    for requirement in (spec.get("security") or []):
+        if isinstance(requirement, dict):
+            for scheme_name, scopes in requirement.items():
+                requested[scheme_name] = scopes or []
+
+    # Try requested schemes first, then any remaining declared scheme.
+    ordered_names = list(requested.keys()) + [n for n in schemes if n not in requested]
+    for name in ordered_names:
+        scheme = schemes.get(name)
+        if not isinstance(scheme, dict):
+            continue
+        mapped = _map_security_scheme(scheme, requested.get(name))
+        if mapped:
+            return {k: v for k, v in mapped.items() if v is not None and v != []}
+    return None
+
+
 def parse_openapi_spec(raw: str) -> dict[str, Any]:
     """Parse JSON or YAML OpenAPI spec string."""
     try:

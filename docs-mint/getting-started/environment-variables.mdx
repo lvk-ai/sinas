@@ -20,6 +20,7 @@ description: "All configuration options"
 |---|---|---|
 | `AUTH_MODE` | `otp` | One of `otp`, `password`, `password+otp`. See [Authentication](/platform/authentication) for the differences. |
 | `SUPERADMIN_PASSWORD` | _(none)_ | Seed password for the superadmin. Only used when `AUTH_MODE` includes `password`. Setting this and restarting acts as a password-reset escape hatch. |
+| `TOKEN_EXCHANGE_DEFAULT_ROLE` | `GuestUsers` | Role assigned to users auto-provisioned via `POST /auth/token/exchange`. See [Token Exchange](/platform/authentication#token-exchange-bring-your-own-auth). |
 
 ## SMTP
 
@@ -116,6 +117,10 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `MAX_TOOL_ITERATIONS` | `25` | Max consecutive tool-call rounds per message |
 | `MAX_HISTORY_MESSAGES` | `100` | Messages loaded for conversation context |
 | `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds) |
+| `AGENT_DELEGATE_TIMEOUT` | `600` | How long a parent agent waits for a delegated sub-agent (block mode). Raise together with `AGENT_JOB_TIMEOUT` — in block mode the parent's own job clock keeps running while it waits |
+| `AGENT_DELEGATE_MODE` | `block` | `block`: parent holds its worker slot while awaiting sub-agents. `suspend`: parent job ends at delegation and a resume job continues the conversation when the children finish (frees the slot) |
+| `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |
+| `AGENT_SUBAGENT_QUEUE` | `true` | Route delegated (sub-agent) jobs to the dedicated `queue-agent-sub` worker so parents can never starve their children of worker slots |
 | `CODE_EXECUTION_TIMEOUT` | `120` | Code execution timeout (seconds) |
 
 ## Scaling
@@ -128,6 +133,8 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `QUEUE_AGENT_REPLICAS` | `2` | Agent queue worker replicas |
 | `QUEUE_FUNCTION_CONCURRENCY` | `10` | Concurrent functions per worker |
 | `QUEUE_AGENT_CONCURRENCY` | `5` | Concurrent agent jobs per worker |
+| `QUEUE_AGENT_SUB_REPLICAS` | `2` | Sub-agent queue worker replicas (delegated agent jobs) |
+| `QUEUE_AGENT_SUB_CONCURRENCY` | `5` | Concurrent jobs per sub-agent worker |
 | `DEFAULT_WORKER_COUNT` | `4` | Shared (trusted) worker containers for `shared_pool` functions. Also the default ceiling for `MAX_EXECUTION_DEPTH`. |
 
 ## Resource Limits (Docker)

@@ -49,6 +49,7 @@ class DockerEphemeralSandboxExecutor:
         execution_id: str,
         trigger_type: str,
         chat_id: str | None,
+        user_custom_fields: dict[str, Any] | None = None,
         db: AsyncSession,
         timeout: int,
     ) -> ExecutionResult:
@@ -87,6 +88,7 @@ class DockerEphemeralSandboxExecutor:
                 "context": {
                     "user_id": user_id,
                     "user_email": user_email,
+                    "user_custom_fields": user_custom_fields or {},
                     "access_token": access_token,
                     "execution_id": execution_id,
                     "trigger_type": trigger_type,

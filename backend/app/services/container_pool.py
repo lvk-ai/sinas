@@ -397,6 +397,7 @@ class ContainerPool:
         chat_id: Optional[str],
         db: AsyncSession,
         timeout: Optional[int] = None,
+        user_custom_fields: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Execute a function in a pooled container.
@@ -448,6 +449,7 @@ class ContainerPool:
                 "context": {
                     "user_id": user_id,
                     "user_email": user_email,
+                    "user_custom_fields": user_custom_fields or {},
                     "access_token": access_token,
                     "execution_id": execution_id,
                     "trigger_type": trigger_type,
