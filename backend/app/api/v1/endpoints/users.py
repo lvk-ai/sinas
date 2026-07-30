@@ -1,6 +1,6 @@
 """User management endpoints."""
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -17,7 +17,7 @@ from app.core.auth import (
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import check_permission
-from app.models.user import Role, User, UserIdentity, UserRole
+from app.models.user import APIKey, RefreshToken, Role, User, UserIdentity, UserRole
 from app.schemas import UserResponse, UserUpdate
 from app.schemas.auth import AdminCreateResetLinkResponse, CreateUserRequest
 from app.schemas.user import UserIdentityInput, UserIdentityResponse, UserWithRolesResponse
@@ -43,6 +43,7 @@ async def _user_with_roles_response(db: AsyncSession, user: User) -> UserWithRol
     return UserWithRolesResponse(
         id=user.id,
         email=user.email,
+        is_active=user.is_active,
         last_login_at=user.last_login_at,
         created_at=user.created_at,
         roles=list(roles_result.scalars().all()),
@@ -108,6 +109,7 @@ async def list_users(
         UserWithRolesResponse(
             id=u.id,
             email=u.email,
+            is_active=u.is_active,
             last_login_at=u.last_login_at,
             created_at=u.created_at,
             roles=roles_by_user.get(u.id, []),
@@ -148,28 +150,37 @@ async def create_user(
     result = await db.execute(select(User).where(User.email == normalized_email))
     user = result.scalar_one_or_none()
 
-    if user:
+    if user and user.is_active:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"User with email '{user_request.email}' already exists",
         )
 
-    # Create new user
-    user = User(email=normalized_email, custom_fields=user_request.custom_fields)
-    db.add(user)
-    await db.flush()
+    if user:
+        # Reactivate a soft-deleted user (role memberships were deactivated on
+        # delete, so they fall through to the GuestUsers assignment below)
+        user.is_active = True
+        await db.flush()
+    else:
+        # Create new user
+        user = User(email=normalized_email, custom_fields=user_request.custom_fields)
+        db.add(user)
+        await db.flush()
 
-    # Link external identities
-    for identity in user_request.identities:
-        try:
-            await link_user_identity(
-                db, user, identity.provider, identity.subject, identity.metadata
-            )
-        except IdentityConflictError as e:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        # Link external identities (new users only; a reactivated account keeps its
+        # existing identity links)
+        for identity in user_request.identities:
+            try:
+                await link_user_identity(
+                    db, user, identity.provider, identity.subject, identity.metadata
+                )
+            except IdentityConflictError as e:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
-    # Check if already has roles
-    memberships_result = await db.execute(select(UserRole).where(UserRole.user_id == user.id))
+    # Check if already has active roles
+    memberships_result = await db.execute(
+        select(UserRole).where(UserRole.user_id == user.id, UserRole.active == True)
+    )
     existing_memberships = memberships_result.scalars().all()
 
     # Only add to GuestUsers if no roles assigned yet
@@ -374,7 +385,7 @@ async def admin_create_password_reset(
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    if not user:
+    if not user or not user.is_active:
         raise HTTPException(status_code=404, detail="User not found")
 
     plain_token, record = await create_password_reset_token(
@@ -418,17 +429,36 @@ async def delete_user(
 
     set_permission_used(request, "sinas.users.delete")
 
-    # Soft delete: deactivate user and remove all role memberships
+    # Soft delete: deactivate the user, remove all role memberships, and revoke
+    # their credentials so existing API keys and refresh tokens stop working
+    # immediately (access tokens die at expiry via the is_active check in auth)
+    now = datetime.now(UTC)
     user.is_active = False
-    from app.models.user import UserRole
-    from datetime import datetime as dt
+
     result = await db.execute(
         select(UserRole).where(UserRole.user_id == user_id, UserRole.active == True)
     )
     for membership in result.scalars().all():
         membership.active = False
-        membership.removed_at = dt.utcnow()
+        membership.removed_at = now
         membership.removed_by = uuid.UUID(current_user_id)
+
+    result = await db.execute(
+        select(APIKey).where(APIKey.user_id == user_id, APIKey.is_active == True)
+    )
+    for api_key in result.scalars().all():
+        api_key.is_active = False
+        api_key.revoked_at = now
+        api_key.revoked_by = uuid.UUID(current_user_id)
+
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.user_id == user_id, RefreshToken.is_revoked == False
+        )
+    )
+    for token in result.scalars().all():
+        token.is_revoked = True
+        token.revoked_at = now
 
     await db.flush()
 

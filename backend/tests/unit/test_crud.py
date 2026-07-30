@@ -40,6 +40,8 @@ FUNCTION_PAYLOAD = {
     "name": "hello",
     "code": "def main(input): return {'result': 'hello'}",
     "description": "test fn",
+    "input_schema": {"type": "object"},
+    "output_schema": {"type": "object"},
 }
 
 
@@ -52,7 +54,7 @@ class TestFunctionsCRUD:
             json=FUNCTION_PAYLOAD,
             headers=auth_headers(test_user),
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 201
         data = resp.json()
         assert data["namespace"] == "test"
         assert data["name"] == "hello"
@@ -96,7 +98,7 @@ class TestFunctionsCRUD:
         resp = await client.delete(
             "/api/v1/functions/test/hello", headers=auth_headers(test_user)
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 204
 
         resp = await client.get(
             "/api/v1/functions/test/hello", headers=auth_headers(test_user)
@@ -290,7 +292,7 @@ class TestQueriesCRUD:
             json=self._query_payload(db_connection),
             headers=auth_headers(test_user),
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 201
         data = resp.json()
         assert data["namespace"] == "test"
         assert data["name"] == "get-users"
