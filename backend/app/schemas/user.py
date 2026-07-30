@@ -9,6 +9,7 @@ from pydantic import BaseModel
 class UserResponse(BaseModel):
     id: uuid.UUID
     email: str
+    is_active: bool = True
     last_login_at: Optional[datetime]
     created_at: datetime
 
@@ -19,6 +20,7 @@ class UserResponse(BaseModel):
 class UserWithRolesResponse(BaseModel):
     id: uuid.UUID
     email: str
+    is_active: bool = True
     last_login_at: Optional[datetime] = None
     created_at: datetime
     roles: list[str]

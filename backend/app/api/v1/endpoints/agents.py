@@ -195,8 +195,9 @@ async def update_agent(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent '{namespace}/{name}' not found"
         )
 
-    # Additional ownership check for non-admin users
-    if not has_all_permission and agent.user_id != user_id:
+    # Additional ownership check for non-admin users (user_id from the token is
+    # a str; agent.user_id is a UUID — compare as strings)
+    if not has_all_permission and str(agent.user_id) != str(user_id):
         raise HTTPException(status_code=403, detail="Not authorized to update this agent")
 
     detach_if_package_managed(agent)
@@ -301,8 +302,9 @@ async def delete_agent(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent '{namespace}/{name}' not found"
         )
 
-    # Additional ownership check for non-admin users
-    if not has_all_permission and agent.user_id != user_id:
+    # Additional ownership check for non-admin users (user_id from the token is
+    # a str; agent.user_id is a UUID — compare as strings)
+    if not has_all_permission and str(agent.user_id) != str(user_id):
         raise HTTPException(status_code=403, detail="Not authorized to delete this agent")
 
     agent.is_active = False

@@ -14,6 +14,9 @@ class User(Base, PermissionMixin):
 
     id: Mapped[uuid_pk]
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, server_default="true", index=True
+    )
     last_login_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[created_at]
     updated_at: Mapped[updated_at]
