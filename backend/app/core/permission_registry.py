@@ -115,6 +115,12 @@ PERMISSION_REGISTRY: list[dict[str, Any]] = [
         "actions": ["create", "read", "delete"],
     },
     {
+        "resource": "auth",
+        "description": "Token exchange for external auth systems",
+        "actions": ["exchange"],
+        "adminOnly": True,
+    },
+    {
         "resource": "roles",
         "description": "Role & permission management",
         "actions": ["create", "read", "update", "delete", "manage_members", "manage_permissions"],
