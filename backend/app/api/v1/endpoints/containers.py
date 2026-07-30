@@ -27,9 +27,20 @@ async def reload_pool_packages(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Reinstall all approved packages in idle sandbox containers.
+    Apply approved-package changes to the sandbox.
+
+    - docker_pool: reinstall packages in idle containers and restart them.
+    - docker_ephemeral: rebuild the baked sandbox image (containers are
+      per-execution, so there is nothing to reload).
     Admin only.
     """
+    from app.core.config import settings
+
+    if settings.sandbox_executor == "docker_ephemeral":
+        from app.services.sandbox_image import build_sandbox_image
+
+        tag = await build_sandbox_image(db)
+        return {"status": "rebuilt", "image": tag}
 
     result = await container_pool.reload_packages(db)
     return result

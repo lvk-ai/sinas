@@ -1,0 +1,144 @@
+## queue-worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: queue-worker
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: queue-worker
+spec:
+  replicas: {{ .Values.queueWorker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: queue-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: queue-worker
+    spec:
+      serviceAccountName: {{ include "sinas.executorManagerSA" . }}
+      {{- include "sinas.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: queue-worker
+          image: {{ .Values.image.registry }}/backend:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "arq", "app.queue.worker.WorkerSettings"]
+          env:
+            {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: QUEUE_FUNCTION_CONCURRENCY
+              value: {{ .Values.queueWorker.concurrency | quote }}
+          volumeMounts:
+            {{- include "sinas.fileStorageMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.queueWorker.resources | nindent 12 }}
+      volumes:
+        {{- include "sinas.fileStorageVolume" . | nindent 8 }}
+---
+## queue-agent
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: queue-agent
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: queue-agent
+spec:
+  replicas: {{ .Values.queueAgent.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: queue-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: queue-agent
+    spec:
+      serviceAccountName: {{ include "sinas.executorManagerSA" . }}
+      {{- include "sinas.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: queue-agent
+          image: {{ .Values.image.registry }}/backend:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "arq", "app.queue.worker.AgentWorkerSettings"]
+          env:
+            {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: QUEUE_AGENT_CONCURRENCY
+              value: {{ .Values.queueAgent.concurrency | quote }}
+          volumeMounts:
+            {{- include "sinas.fileStorageMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.queueAgent.resources | nindent 12 }}
+      volumes:
+        {{- include "sinas.fileStorageVolume" . | nindent 8 }}
+---
+## scheduler
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: scheduler
+    spec:
+      serviceAccountName: {{ include "sinas.executorManagerSA" . }}
+      {{- include "sinas.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: scheduler
+          image: {{ .Values.image.registry }}/backend:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.scheduler.service"]
+          env:
+            {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: SUPERADMIN_EMAIL
+              value: {{ .Values.superadminEmail | quote }}
+          volumeMounts:
+            {{- include "sinas.fileStorageMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+      volumes:
+        {{- include "sinas.fileStorageVolume" . | nindent 8 }}
+---
+## cdc-worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cdc-worker
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cdc-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: cdc-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: cdc-worker
+    spec:
+      {{- include "sinas.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: cdc-worker
+          image: {{ .Values.image.registry }}/backend:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.cdc.service"]
+          env:
+            {{- include "sinas.backendEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.cdcWorker.resources | nindent 12 }}

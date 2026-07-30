@@ -1,0 +1,24 @@
+Sinas has been deployed to namespace {{ .Release.Namespace }}.
+
+  Console:  https://{{ .Values.domain }}/
+  API:      https://{{ .Values.domain }}/api/v1
+  Health:   https://{{ .Values.domain }}/health
+
+Executor configuration:
+  sandbox (untrusted code):  {{ .Values.executor.sandbox }}
+  trusted (shared_pool):     {{ .Values.executor.trusted }}
+  sandbox pod image:         {{ .Values.executor.image }}
+
+{{- if eq .Values.executor.sandbox "k8s_pod" }}
+
+Untrusted code runs in ephemeral hardened Pods created in this namespace
+(label sinas.type=sandbox-executor). Watch them during an execution:
+
+  kubectl get pods -n {{ .Release.Namespace }} -l sinas.type=sandbox-executor -w
+{{- end }}
+
+Check rollout:
+
+  kubectl get pods -n {{ .Release.Namespace }}
+
+The backend runs migrations on startup; first boot can take a minute.

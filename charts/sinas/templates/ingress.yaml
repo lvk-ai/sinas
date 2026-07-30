@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+## Path-based routing:
+##   Backend API paths → backend:8000
+##   Everything else   → console:80 (SPA)
+##
+## Console uses window.location.hostname as the API base, so both services
+## must share the same hostname.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.domain | quote }}
+      {{- if .Values.ingress.tls.secretName }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.domain | quote }}
+      http:
+        paths:
+          {{- range list "/api" "/adapters" "/auth" "/files" "/stores" "/webhooks" "/agents" "/chats" "/functions" "/executions" "/manifests" "/components" "/queries" "/skills" "/collections" "/states" "/jobs" "/templates" "/health" "/docs" "/openapi.json" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          {{- end }}
+          ## Catch-all → console SPA
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+{{- end }}
