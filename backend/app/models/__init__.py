@@ -4,6 +4,7 @@ from .base import Base
 from .batch import Batch, BatchKind, BatchStatus
 from .chat import Chat, Message
 from .connector import Connector
+from .connector_oauth_token import ConnectorOAuthToken
 from .component import Component
 from .component_share import ComponentShare
 from .database_connection import DatabaseConnection
@@ -12,11 +13,13 @@ from .execution import Execution
 from .file import Collection, ContentFilterEvaluation, File, FileVersion
 from .function import Function, FunctionVersion
 from .llm_provider import LLMProvider
+from .llm_usage import LLMUsage
 
 from .dependency import Dependency
 from .package import Package
 from .query import Query
 from .pending_approval import PendingToolApproval
+from .pending_delegation import PendingDelegation
 from .schedule import ScheduledJob
 from .secret import Secret
 from .skill import Skill
@@ -66,13 +69,16 @@ __all__ = [
     "Component",
     "ComponentShare",
     "Connector",
+    "ConnectorOAuthToken",
     "LLMProvider",
+    "LLMUsage",
     "DatabaseConnection",
     "DatabaseTrigger",
     "Query",
     "State",
     "Store",
     "PendingToolApproval",
+    "PendingDelegation",
     "Secret",
     "Template",
     "Skill",

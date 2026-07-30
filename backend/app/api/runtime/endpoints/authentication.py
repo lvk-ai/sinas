@@ -1,8 +1,13 @@
 """Authentication endpoints."""
 
+import html as html_lib
+import json
+import logging
+import secrets
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,6 +75,7 @@ async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str, AuthUse
     return access_token, refresh_token_plain, user_resp
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -453,3 +459,100 @@ async def check_permissions(
         result = any(check.has_permission for check in checks)
 
     return PermissionCheckResponse(result=result, logic=check_request.logic, checks=checks)
+
+
+def _oauth_result_page(ok: bool, message: str) -> HTMLResponse:
+    """Render a tiny page that notifies the opener window and closes itself.
+
+    The connector OAuth flow is opened in a popup; this signals the console (via
+    postMessage) whether the connection succeeded, then closes. No secrets are sent.
+    The message is targeted at the console's own origin (not "*") so it can't be read by
+    an unrelated opener, and the console-side listener validates event.origin in turn.
+    """
+    status_word = "success" if ok else "error"
+    safe = html_lib.escape(message)
+    # The message carries no secret (just a status flag), and the console/API can be on
+    # different origins in local dev, so we post to "*". Spoofing is prevented on the
+    # RECEIVER side: the console validates event.origin against the API origin before
+    # trusting the message (see ConnectorEditor's message listener).
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Connector authorization</title></head>
+<body style="font-family:system-ui;background:#0d0d0d;color:#e5e5e5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center">
+<p style="font-size:15px">{safe}</p>
+<p style="font-size:13px;color:#888">You can close this window.</p>
+</div>
+<script>
+  try {{ window.opener && window.opener.postMessage(
+    {{ type: "connector-oauth", status: "{status_word}" }}, "*"); }} catch (e) {{}}
+  setTimeout(function () {{ window.close(); }}, 1200);
+</script>
+</body></html>"""
+    return HTMLResponse(content=html, status_code=200 if ok else 400)
+
+
+@router.get("/connectors/oauth/callback", include_in_schema=False)
+async def connector_oauth_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public OAuth redirect target. Exchanges the code for tokens for the initiating user.
+
+    Unauthenticated by design (the provider won't send our bearer). The initiating user and
+    connector are recovered from the single-use `state` minted at /connectors/.../oauth/authorize.
+    """
+    from app.core.oauth_state import BIND_COOKIE_NAME, consume_state
+    from app.models.connector import Connector
+    from app.services.connector_service import connector_service
+
+    if error:
+        return _oauth_result_page(False, f"Authorization was denied: {error_description or error}")
+
+    ctx = await consume_state(state)
+    if ctx is None:
+        return _oauth_result_page(False, "This authorization link has expired or was already used.")
+
+    # Browser-binding check: the flow must be completed by the same browser that started
+    # it. The nonce was set as an HttpOnly cookie by the authenticated begin endpoint;
+    # require it to match the one stored with the state. This defeats OAuth account-linking
+    # (an attacker minting a state and having a victim complete it). Constant-time compare.
+    # Skippable only in split-origin local dev (see settings.oauth_bind_browser_session),
+    # where the cookie can't round-trip cross-origin.
+    cookie_nonce = request.cookies.get(BIND_COOKIE_NAME) or ""
+    expected_nonce = ctx.get("browser_nonce") or ""
+    binding_ok = bool(expected_nonce) and secrets.compare_digest(cookie_nonce, expected_nonce)
+    if settings.oauth_bind_browser_session and not binding_ok:
+        resp = _oauth_result_page(
+            False,
+            "This authorization could not be verified for your session. "
+            "Please start the connection again from the connector page.",
+        )
+        resp.delete_cookie(BIND_COOKIE_NAME, path="/")
+        return resp
+    if not binding_ok:
+        logger.warning(
+            "OAuth browser-binding check skipped (oauth_bind_browser_session=false) — "
+            "acceptable only for local single-user dev, never production."
+        )
+
+    if not code:
+        return _oauth_result_page(False, "No authorization code was returned by the provider.")
+
+    connector = await Connector.get_by_name(db, ctx["namespace"], ctx["name"])
+    if connector is None or (connector.auth or {}).get("type") != "oauth2_authorization_code":
+        return _oauth_result_page(False, "Connector is no longer configured for OAuth.")
+
+    ok = await connector_service.exchange_authorization_code(
+        db=db, connector=connector, user_id=ctx["user_id"], code=code, code_verifier=ctx["code_verifier"],
+    )
+    result = _oauth_result_page(
+        ok,
+        f"Connected {connector.namespace}/{connector.name}." if ok
+        else "Failed to exchange the authorization code for a token.",
+    )
+    result.delete_cookie(BIND_COOKIE_NAME, path="/")
+    return result

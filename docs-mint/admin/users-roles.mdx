@@ -45,6 +45,8 @@ PATCH /api/v1/users/{id}
 
 `custom_fields` is owned by Sinas admins and is never overwritten by identity sync (identity `metadata` is, on every sync).
 
+Custom fields are also returned by `GET /auth/me`, so an external service holding a user's Sinas token can read them without admin permissions — treat `/auth/me` as Sinas's userinfo endpoint. Don't store values in custom fields that the user themselves shouldn't see.
+
 ## Declarative config
 
 Users, identities, and custom fields can be provisioned via YAML:

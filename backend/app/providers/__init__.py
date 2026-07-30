@@ -5,8 +5,10 @@ from .factory import create_provider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .openai_provider import OpenAIProvider
+from .tracking import UsageTrackingProvider
 
 __all__ = [
+    "UsageTrackingProvider",
     "BaseLLMProvider",
     "OpenAIProvider",
     "AzureOpenAIProvider",

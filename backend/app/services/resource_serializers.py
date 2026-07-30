@@ -5,6 +5,8 @@ Used by both config_export.py (full config export) and package_service.py
 """
 from typing import Any, Optional
 
+from app.schemas.config import CONNECTOR_AUTH_FIELD_MAP
+
 
 def _remove_none_values(d: dict) -> dict:
     """Remove None values from dictionary recursively."""
@@ -167,12 +169,10 @@ def serialize_connector(conn) -> dict:
         "name": conn.name,
         "description": conn.description,
         "baseUrl": conn.base_url,
+        # Map snake_case stored keys → camelCase config keys via the single field map.
         "auth": _remove_none_values({
-            "type": auth.get("type", "none"),
-            "secret": auth.get("secret"),
-            "header": auth.get("header"),
-            "position": auth.get("position"),
-            "paramName": auth.get("param_name"),
+            **{camel: auth.get(snake) for camel, snake in CONNECTOR_AUTH_FIELD_MAP},
+            "type": auth.get("type", "none"),  # type always present in export
         }),
         "headers": conn.headers if conn.headers else None,
         "retry": _remove_none_values({

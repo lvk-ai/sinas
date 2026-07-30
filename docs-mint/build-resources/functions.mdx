@@ -31,6 +31,7 @@ def handler(input_data, context):
     # {
     #     "user_id":        str,   # ID of the user who triggered execution
     #     "user_email":     str,   # Email of the triggering user
+    #     "user_custom_fields": dict,  # The user's custom fields (org-specific profile data)
     #     "access_token":   str,   # Short-lived JWT for calling the Sinas API
     #     "execution_id":   str,   # Unique execution ID
     #     "trigger_type":   str,   # "AGENT" | "API" | "WEBHOOK" | "SCHEDULE" | "CDC" | "HOOK" | "MANUAL"
