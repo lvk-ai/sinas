@@ -139,10 +139,29 @@ def _pod_manifest(name: str, image: str, deadline_seconds: int) -> dict[str, Any
     }
     if settings.k8s_sandbox_service_account:
         spec["serviceAccountName"] = settings.k8s_sandbox_service_account
+
+    labels = dict(_POD_LABELS)
+    if settings.k8s_release_name:
+        # Present so chart-authored affinity rules (either direction) have
+        # something to match on — this app doesn't decide spread vs. pack,
+        # it just labels the pod and applies whatever scheduling config it's
+        # handed (see k8s_sandbox_* settings docs in config.py).
+        labels["app.kubernetes.io/instance"] = settings.k8s_release_name
+
+    node_selector = json.loads(settings.k8s_sandbox_node_selector)
+    if node_selector:
+        spec["nodeSelector"] = node_selector
+    tolerations = json.loads(settings.k8s_sandbox_tolerations)
+    if tolerations:
+        spec["tolerations"] = tolerations
+    affinity = json.loads(settings.k8s_sandbox_affinity)
+    if affinity:
+        spec["affinity"] = affinity
+
     return {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": name, "labels": dict(_POD_LABELS)},
+        "metadata": {"name": name, "labels": labels},
         "spec": spec,
     }
 
