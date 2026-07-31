@@ -870,7 +870,7 @@ async def execute_single_tool(
             # Truncate oversized results (structure-aware) so a single tool
             # call can't crowd the LLM context, without emitting broken JSON.
             max_result_size = TOOL_RESULT_SIZE_OVERRIDES.get(
-                tool_name, settings.tool_result_max_size
+                tool_name, settings.tool_result_context_max_size
             )
             if len(result_content) > max_result_size:
                 print(f"⚠️ Truncating tool result for {tool_name}: {len(result_content)} -> {max_result_size} bytes", flush=True)
