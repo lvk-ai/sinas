@@ -230,10 +230,10 @@ class Settings(BaseSettings):
     # Tool results above this many characters are truncated (structure-aware,
     # see services/tool_execution.truncate_tool_result) before they enter the
     # LLM context. Distinct from tool_result_max_size above, which caps what
-    # the tool result store persists per row. ~12K tokens: large enough for
-    # realistic listings on a 200K-context model, small enough that one call
-    # can't crowd the window.
-    tool_result_context_max_size: int = 50000
+    # the tool result store persists per row; same 100KB default so the two
+    # caps stay aligned. ~25K tokens per result; deployments that want a
+    # tighter per-turn budget can lower it via TOOL_RESULT_CONTEXT_MAX_SIZE.
+    tool_result_context_max_size: int = 102400
 
     # Agent-to-agent delegation (call_agent_* tools). See issue #90.
     # - agent_delegate_timeout: how long a parent waits for a sub-agent result.

@@ -76,7 +76,7 @@ def test_non_json_falls_back_to_clean_text_cut():
 
 
 def test_default_budget_and_override_registry():
-    assert settings.tool_result_context_max_size == 50000
+    assert settings.tool_result_context_max_size == 102400
     assert TOOL_RESULT_SIZE_OVERRIDES == {}
 
 
@@ -85,6 +85,6 @@ def test_context_cap_is_independent_of_store_cap():
     # what tool_result_store persists per row; the context cap governs what
     # enters the LLM context. They must stay separate fields.
     assert settings.tool_result_max_size == 102400
-    assert settings.tool_result_context_max_size == 50000
+    assert settings.tool_result_context_max_size == 102400
     assert "tool_result_max_size" in type(settings).model_fields
     assert "tool_result_context_max_size" in type(settings).model_fields
