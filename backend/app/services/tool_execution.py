@@ -570,7 +570,11 @@ async def execute_agent_tool(
         }
 
     except Exception as e:
-        logger.error(f"Failed to execute agent tool {tool_name}: {e}")
+        # agent_id_str, not tool_name: tool_name is not in scope here, and the
+        # NameError it raised replaced the real exception in the returned
+        # error, hiding every delegation failure cause from the caller.
+        logger.error(f"Failed to execute agent tool {agent_id_str}: {e}")
+        logger.debug("Delegation failure traceback:\n%s", traceback.format_exc())
         try:
             _delegate_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
             _delegate_span.end()
