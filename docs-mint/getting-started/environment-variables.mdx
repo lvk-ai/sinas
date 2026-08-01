@@ -21,6 +21,7 @@ description: "All configuration options"
 | `AUTH_MODE` | `otp` | One of `otp`, `password`, `password+otp`. See [Authentication](/platform/authentication) for the differences. |
 | `SUPERADMIN_PASSWORD` | _(none)_ | Seed password for the superadmin. Only used when `AUTH_MODE` includes `password`. Setting this and restarting acts as a password-reset escape hatch. |
 | `TOKEN_EXCHANGE_DEFAULT_ROLE` | `GuestUsers` | Role assigned to users auto-provisioned via `POST /auth/token/exchange`. See [Token Exchange](/platform/authentication#token-exchange-bring-your-own-auth). |
+| `OAUTH_BIND_BROWSER_SESSION` | `true` | Bind connector OAuth (authorization-code) flows to the browser that started them via an HttpOnly nonce cookie — prevents account-linking CSRF. Set `false` only for split-origin local dev (console and API on different ports); keep `true` in production. |
 
 ## SMTP
 
@@ -122,6 +123,15 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |
 | `AGENT_SUBAGENT_QUEUE` | `true` | Route delegated (sub-agent) jobs to the dedicated `queue-agent-sub` worker so parents can never starve their children of worker slots |
 | `CODE_EXECUTION_TIMEOUT` | `120` | Code execution timeout (seconds) |
+
+## Tool Results
+
+| Variable | Default | Description |
+|---|---|---|
+| `TOOL_RESULT_CONTEXT_MAX_SIZE` | `102400` | Max characters of a single tool result entering the LLM context (~25K tokens). Oversized results are truncated **structure-aware**: JSON lists trimmed to whole elements, long strings clipped, always with a machine-readable `{"_truncated": true, "returned": X, "total": Y}` marker so the model pages instead of retrying. Lower (e.g. `50000`) for a tighter per-turn token budget |
+| `TOOL_RESULT_MAX_SIZE` | `102400` | Max bytes the tool result **store** persists per result row (distinct from the context cap above) |
+| `TOOL_RESULT_MAX_INLINE` | `5` | Last N tool results kept inline in conversation history |
+| `TOOL_RESULT_RETENTION_DAYS` | `30` | Days stored tool results are retained |
 
 ## Scaling
 
