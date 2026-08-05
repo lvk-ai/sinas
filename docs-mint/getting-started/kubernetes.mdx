@@ -98,6 +98,84 @@ shared ones — that choice lives entirely in your own tooling, not here.
 All four are no-ops by default, matching the behavior described above with
 no scheduling constraint at all.
 
+## Sizing under namespace quotas
+
+Sandbox pods are created **on demand, per execution**, in the release
+namespace — so they compete with the platform's own pods for any namespace
+`ResourceQuota`. Plan the quota headroom explicitly:
+
+- **Sandbox pod size** is set by the executor, with `requests == limits`:
+  `MAX_FUNCTION_MEMORY` (MiB, default `512`) and `MAX_FUNCTION_CPU` (cores,
+  default `1.0`), plus an ephemeral-storage limit from `MAX_FUNCTION_STORAGE`.
+  Pass them via the chart's `extraEnv` to shrink each execution's footprint,
+  e.g. `MAX_FUNCTION_MEMORY=192`, `MAX_FUNCTION_CPU=0.5`.
+- **Concurrency ceiling** ≈ what's left of the quota after the platform pods,
+  divided by one sandbox pod's request. Example: with a
+  `requests.memory: 3Gi` quota and the default chart components requesting
+  ~1.4Gi, a 192Mi sandbox pod allows ~8 concurrent executions; a 512Mi one
+  allows ~3. Check `requests.cpu` and the `pods:` count the same way — the
+  binding constraint is whichever runs out first.
+- **Failure mode:** when the quota is exhausted, pod creation is rejected and
+  the execution fails with a quota error — reduce sandbox size, raise the
+  quota, or lower worker concurrency (`queueWorker`/`queueAgent` values) to
+  bound simultaneous executions.
+- **Trusted (`inprocess`) code has no per-function memory cap** — it runs
+  inside the queue-worker process, so the worker's `resources.limits.memory`
+  *is* the tenant's burst envelope for `shared_pool` functions
+  (worker baseline + concurrency × per-call allocation). Size it accordingly.
+- **Datastores** (postgres, redis, pgbouncer) set no container resources in
+  the chart; on clusters with a `LimitRange` they inherit its defaults, which
+  count against the quota too. Give them explicit values in your own manifest
+  patches if you need deterministic accounting.
+
+The chart's per-component `resources` are values — override any of them
+per deployment.
+
+## Compact profile (density deployments)
+
+For packing several small instances onto one box (e.g. **3 instances on a
+4GB node**), drop ClickHouse and size requests near measured idle usage
+(backend idles ~175MB, workers ~90–120MB):
+
+```yaml
+# compact-values.yaml — ≈650–750MB per instance at idle
+clickhouse:
+  enabled: false          # no ClickHouse pod; request/execution log UI stays empty
+
+backend:
+  resources:
+    requests: { cpu: "200m", memory: "224Mi" }
+    limits:   { cpu: "1",    memory: "768Mi" }
+queueWorker:
+  replicas: 1
+  concurrency: 4          # bounds simultaneous executions (and sandbox pods)
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }   # = shared_pool burst envelope
+queueAgent:
+  replicas: 1
+  concurrency: 2
+  resources:
+    requests: { cpu: "100m", memory: "160Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+extraEnv:
+  - name: MAX_FUNCTION_MEMORY   # sandbox pod request=limit, MiB
+    value: "192"
+  - name: MAX_FUNCTION_CPU
+    value: "0.5"
+```
+
+The math for 3 × on a 4GB node: 3 instances × ~700MB ≈ 2.1GB, k3s host
+overhead ~0.7GB → ~2.8GB idle, leaving ~700MB shared burst headroom — enough
+for a few concurrent 192Mi sandbox pods across tenants. Keep
+`queueWorker.concurrency` low so tenants can't burst past it, or set
+`SANDBOX_EXECUTOR=disabled` for trusted-only tiers.
+
+With `clickhouse.enabled: false` the backend detects the empty
+`CLICKHOUSE_HOST` and disables logging cleanly (no reconnect attempts); the
+Logs pages return empty results.
+
 ## Key values
 
 | Value | Default | Description |

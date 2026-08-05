@@ -66,6 +66,9 @@ redis:
 
 ## ClickHouse
 clickhouse:
+  ## Set false for the compact profile: no ClickHouse pod, request/execution
+  ## logging off, log UI empty. Everything else works normally.
+  enabled: true
   user: default
   password: ""
   database: sinas
@@ -98,22 +101,22 @@ networkPolicy:
 builder:
   resources:
     requests:
-      cpu: "100m"
-      memory: "128Mi"
+      cpu: "50m"
+      memory: "96Mi"
     limits:
       cpu: "500m"
-      memory: "512Mi"
+      memory: "384Mi"
 
 ## Backend (FastAPI)
 backend:
   replicas: 1
   resources:
     requests:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "300m"
+      memory: "384Mi"
     limits:
-      cpu: "2"
-      memory: "2Gi"
+      cpu: "1500m"
+      memory: "1536Mi"
 
 ## Queue worker
 queueWorker:
@@ -124,11 +127,11 @@ queueWorker:
   concurrency: 10
   resources:
     requests:
-      cpu: "200m"
-      memory: "256Mi"
+      cpu: "150m"
+      memory: "192Mi"
     limits:
       cpu: "1"
-      memory: "1Gi"
+      memory: "768Mi"
 
 ## Queue agent worker
 queueAgent:
@@ -137,38 +140,38 @@ queueAgent:
   concurrency: 5
   resources:
     requests:
-      cpu: "200m"
-      memory: "256Mi"
+      cpu: "150m"
+      memory: "192Mi"
     limits:
       cpu: "1"
-      memory: "1Gi"
+      memory: "768Mi"
 
 ## Scheduler
 scheduler:
   resources:
     requests:
-      cpu: "100m"
-      memory: "128Mi"
+      cpu: "50m"
+      memory: "96Mi"
     limits:
       cpu: "500m"
-      memory: "512Mi"
+      memory: "384Mi"
 
 ## CDC worker
 cdcWorker:
   resources:
     requests:
-      cpu: "100m"
-      memory: "128Mi"
+      cpu: "50m"
+      memory: "96Mi"
     limits:
       cpu: "500m"
-      memory: "512Mi"
+      memory: "384Mi"
 
 ## Console (React SPA)
 console:
   resources:
     requests:
-      cpu: "50m"
-      memory: "64Mi"
+      cpu: "25m"
+      memory: "32Mi"
     limits:
       cpu: "200m"
       memory: "128Mi"

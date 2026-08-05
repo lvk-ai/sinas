@@ -21,7 +21,20 @@ class ClickHouseLogger:
         self._initialize_client()
 
     def _initialize_client(self):
-        """Initialize ClickHouse client connection."""
+        """Initialize ClickHouse client connection.
+
+        An empty CLICKHOUSE_HOST means ClickHouse is deliberately disabled
+        (e.g. the compact deployment profile): skip connecting entirely so
+        the per-request `_ensure_client` retry doesn't attempt a connection
+        and log an error on every request. Logging methods no-op and log
+        queries return empty, as with any unavailable ClickHouse.
+        """
+        if not settings.clickhouse_host:
+            if not getattr(self, "_disabled", False):
+                logger.info("ClickHouse disabled (CLICKHOUSE_HOST empty) — request/execution logging off")
+            self._disabled = True
+            self.client = None
+            return
         try:
             self.client = clickhouse_connect.get_client(
                 host=settings.clickhouse_host,
@@ -36,6 +49,8 @@ class ClickHouseLogger:
 
     def _ensure_client(self) -> bool:
         """Ensure client is connected, retry if needed."""
+        if getattr(self, "_disabled", False):
+            return False
         if self.client:
             return True
         self._initialize_client()
