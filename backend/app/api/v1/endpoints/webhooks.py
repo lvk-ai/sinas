@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import get_current_user_with_permissions, set_permission_used
 from app.core.database import get_db
 from app.core.permissions import check_permission
+from app.models.agent import Agent
 from app.models.function import Function
 from app.models.webhook import Webhook
 from app.schemas import WebhookCreate, WebhookResponse, WebhookUpdate
@@ -41,21 +42,34 @@ async def create_webhook(
             status_code=400, detail=f"Webhook path '{webhook_data.path}' already exists"
         )
 
-    # Verify function exists
-    function = await Function.get_by_name(
-        db, webhook_data.function_namespace, webhook_data.function_name, user_id
-    )
-    if not function:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Function '{webhook_data.function_namespace}.{webhook_data.function_name}' not found",
+    # Verify the target resource exists
+    if webhook_data.target_type == "function":
+        function = await Function.get_by_name(
+            db, webhook_data.function_namespace, webhook_data.function_name, user_id
         )
+        if not function:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Function '{webhook_data.function_namespace}.{webhook_data.function_name}' not found",
+            )
+    else:
+        agent = await Agent.get_by_name(db, webhook_data.agent_namespace, webhook_data.agent_name)
+        if not agent:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Agent '{webhook_data.agent_namespace}/{webhook_data.agent_name}' not found",
+            )
     # Create webhook
     webhook = Webhook(
         user_id=user_id,
         path=webhook_data.path,
+        target_type=webhook_data.target_type,
         function_namespace=webhook_data.function_namespace,
         function_name=webhook_data.function_name,
+        agent_namespace=webhook_data.agent_namespace if webhook_data.target_type == "agent" else None,
+        agent_name=webhook_data.agent_name,
+        message_template=webhook_data.message_template,
+        session_key_template=webhook_data.session_key_template,
         http_method=webhook_data.http_method,
         description=webhook_data.description,
         default_values=webhook_data.default_values or {},
@@ -156,6 +170,9 @@ async def update_webhook(
     detach_if_package_managed(webhook)
 
     # Update fields
+    if webhook_data.target_type is not None:
+        webhook.target_type = webhook_data.target_type
+
     if webhook_data.function_namespace is not None or webhook_data.function_name is not None:
         # Use updated namespace or keep existing
         new_namespace = (
@@ -187,6 +204,32 @@ async def update_webhook(
         webhook.function_namespace = new_namespace
         webhook.function_name = new_function_name
 
+    if webhook_data.agent_namespace is not None or webhook_data.agent_name is not None:
+        new_agent_namespace = (
+            webhook_data.agent_namespace
+            if webhook_data.agent_namespace is not None
+            else (webhook.agent_namespace or "default")
+        )
+        new_agent_name = (
+            webhook_data.agent_name if webhook_data.agent_name is not None else webhook.agent_name
+        )
+
+        # Verify new agent exists
+        agent = await Agent.get_by_name(db, new_agent_namespace, new_agent_name)
+        if not agent:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Agent '{new_agent_namespace}/{new_agent_name}' not found",
+            )
+
+        webhook.agent_namespace = new_agent_namespace
+        webhook.agent_name = new_agent_name
+
+    if webhook_data.message_template is not None:
+        webhook.message_template = webhook_data.message_template
+    if webhook_data.session_key_template is not None:
+        webhook.session_key_template = webhook_data.session_key_template
+
     if webhook_data.http_method is not None:
         webhook.http_method = webhook_data.http_method
     if webhook_data.description is not None:
@@ -201,6 +244,27 @@ async def update_webhook(
         webhook.response_mode = webhook_data.response_mode
     if webhook_data.dedup is not None:
         webhook.dedup = webhook_data.dedup.model_dump()
+
+    # Validate resulting target configuration
+    if webhook.target_type == "function":
+        if not webhook.function_name:
+            raise HTTPException(
+                status_code=400, detail="function_name is required for function-target webhooks"
+            )
+        if webhook.response_mode not in ("sync", "async", "raw"):
+            raise HTTPException(status_code=400, detail="Invalid response_mode")
+    else:
+        if not webhook.agent_name or not webhook.message_template:
+            raise HTTPException(
+                status_code=400,
+                detail="agent_name and message_template are required for agent-target webhooks",
+            )
+        if webhook.response_mode == "raw":
+            raise HTTPException(
+                status_code=400,
+                detail="response_mode 'raw' is only supported for function-target webhooks",
+            )
+
     await db.flush()
     await db.refresh(webhook)
 

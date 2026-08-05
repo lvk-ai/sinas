@@ -38,10 +38,32 @@ async def apply_webhooks(
             result = await db.execute(stmt)
             existing = result.scalar_one_or_none()
 
+            target_type = getattr(webhook_config, "targetType", "function")
+
+            # Parse target references (may be "namespace/name" or just "name")
+            func_ns, func_name = "default", None
+            agent_ns, agent_name = None, None
+            if target_type == "agent":
+                agent_ref = webhook_config.agentName or ""
+                if "/" in agent_ref:
+                    agent_ns, agent_name = agent_ref.split("/", 1)
+                else:
+                    agent_ns, agent_name = "default", agent_ref
+            else:
+                func_ref = webhook_config.functionName or ""
+                if "/" in func_ref:
+                    func_ns, func_name = func_ref.split("/", 1)
+                else:
+                    func_ns, func_name = "default", func_ref
+
             config_hash = calculate_hash(
                 {
                     "path": webhook_config.path,
+                    "target_type": target_type,
                     "function_name": webhook_config.functionName,
+                    "agent_name": webhook_config.agentName,
+                    "message_template": webhook_config.messageTemplate,
+                    "session_key_template": webhook_config.sessionKeyTemplate,
                     "http_method": webhook_config.httpMethod,
                     "description": webhook_config.description,
                     "requires_auth": webhook_config.requiresAuth,
@@ -56,15 +78,13 @@ async def apply_webhooks(
                     continue
 
                 if not dry_run:
-                    # Parse function reference (may be "namespace/name" or just "name")
-                    func_ref = webhook_config.functionName
-                    if "/" in func_ref:
-                        func_ns, func_name = func_ref.split("/", 1)
-                    else:
-                        func_ns, func_name = "default", func_ref
-
+                    existing.target_type = target_type
                     existing.function_namespace = func_ns
                     existing.function_name = func_name
+                    existing.agent_namespace = agent_ns
+                    existing.agent_name = agent_name
+                    existing.message_template = webhook_config.messageTemplate
+                    existing.session_key_template = webhook_config.sessionKeyTemplate
                     existing.http_method = webhook_config.httpMethod
                     existing.description = webhook_config.description
                     existing.requires_auth = webhook_config.requiresAuth
@@ -79,17 +99,15 @@ async def apply_webhooks(
 
             else:
                 if not dry_run:
-                    # Parse function reference (may be "namespace/name" or just "name")
-                    func_ref = webhook_config.functionName
-                    if "/" in func_ref:
-                        func_ns, func_name = func_ref.split("/", 1)
-                    else:
-                        func_ns, func_name = "default", func_ref
-
                     new_webhook = Webhook(
                         path=webhook_config.path,
+                        target_type=target_type,
                         function_namespace=func_ns,
                         function_name=func_name,
+                        agent_namespace=agent_ns,
+                        agent_name=agent_name,
+                        message_template=webhook_config.messageTemplate,
+                        session_key_template=webhook_config.sessionKeyTemplate,
                         user_id=owner_user_id,
                         http_method=webhook_config.httpMethod,
                         description=webhook_config.description,

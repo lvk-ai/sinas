@@ -495,8 +495,13 @@ export interface EnabledConnectorConfig {
 export interface Webhook {
   id: string;
   path: string;
+  target_type: 'function' | 'agent';
   function_namespace: string;
-  function_name: string;
+  function_name: string | null;
+  agent_namespace: string | null;
+  agent_name: string | null;
+  message_template: string | null;
+  session_key_template: string | null;
   http_method: string;
   description: string | null;
   default_values: Record<string, any> | null;
@@ -510,8 +515,13 @@ export interface Webhook {
 
 export interface WebhookCreate {
   path: string;
+  target_type?: 'function' | 'agent';
   function_namespace?: string;
-  function_name: string;
+  function_name?: string;
+  agent_namespace?: string;
+  agent_name?: string;
+  message_template?: string;
+  session_key_template?: string;
   http_method?: string;
   description?: string;
   default_values?: Record<string, any>;
@@ -521,8 +531,13 @@ export interface WebhookCreate {
 }
 
 export interface WebhookUpdate {
+  target_type?: 'function' | 'agent';
   function_namespace?: string;
   function_name?: string;
+  agent_namespace?: string;
+  agent_name?: string;
+  message_template?: string;
+  session_key_template?: string;
   http_method?: string;
   description?: string;
   default_values?: Record<string, any>;

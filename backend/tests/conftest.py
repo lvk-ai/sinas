@@ -39,13 +39,18 @@ async def db() -> AsyncGenerator[AsyncSession, None]:
 async def app(db: AsyncSession):
     """Create a FastAPI app with the test DB session injected."""
     from app.main import app as _app
+    from app.main import management_app
 
     async def _override_get_db():
         yield db
 
+    # Override on the mounted management sub-app too — FastAPI dependency
+    # overrides do not propagate into mounted sub-applications.
     _app.dependency_overrides[get_db] = _override_get_db
+    management_app.dependency_overrides[get_db] = _override_get_db
     yield _app
     _app.dependency_overrides.clear()
+    management_app.dependency_overrides.clear()
 
 
 @pytest_asyncio.fixture

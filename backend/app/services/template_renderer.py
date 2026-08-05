@@ -6,9 +6,12 @@ Used for:
 
 Security: Uses sandboxed Jinja2 environment with autoescape enabled.
 """
+import logging
 from typing import Any, Optional
 
-from jinja2 import Environment, StrictUndefined, select_autoescape
+from jinja2 import ChainableUndefined, Environment, StrictUndefined, select_autoescape
+
+logger = logging.getLogger(__name__)
 
 # Sandboxed Jinja2 environment for security
 _jinja_env = Environment(
@@ -17,6 +20,38 @@ _jinja_env = Environment(
     trim_blocks=True,
     lstrip_blocks=True,
 )
+
+
+class _LoggingUndefined(ChainableUndefined):
+    """Undefined that renders as empty string but logs, so a missing payload
+    field never crashes a webhook."""
+
+    def __str__(self) -> str:
+        logger.warning(
+            "Webhook template referenced undefined variable: %s", self._undefined_name
+        )
+        return ""
+
+
+# Environment for webhook message/session-key templates: payloads are untrusted
+# and providers change their schemas, so undefined variables render empty
+# instead of failing. No autoescape — output is plain text, not HTML.
+_webhook_jinja_env = Environment(
+    undefined=_LoggingUndefined,
+    autoescape=False,
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+
+def render_webhook_template(template_str: str, context: dict[str, Any]) -> str:
+    """Render a webhook message/session-key template against a request payload.
+
+    Undefined variables render as empty strings (and are logged) so that
+    unexpected payload shapes never fail the webhook.
+    """
+    template = _webhook_jinja_env.from_string(template_str)
+    return template.render(**context)
 
 
 def render_template(template_str: str, context: dict[str, Any]) -> str:
