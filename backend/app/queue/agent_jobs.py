@@ -90,6 +90,27 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     channel_id = kwargs["channel_id"]
     # Optional — set by batch_service so the Execution row mirrors the job lifecycle.
     execution_id = kwargs.get("execution_id")
+    # Agent-to-agent delegation metadata (issue #90). depth bounds chains and
+    # routes to the sub-agent queue; the pending_delegation fields mean a
+    # suspended parent is waiting on this job's result.
+    depth = kwargs.get("depth", 0)
+    pending_delegation_id = kwargs.get("pending_delegation_id")
+    parent_tool_call_id = kwargs.get("parent_tool_call_id")
+
+    from app.services.delegation import (
+        current_channel_id,
+        current_delegation_depth,
+        current_job_meta,
+    )
+
+    current_delegation_depth.set(depth)
+    current_channel_id.set(channel_id)
+    current_job_meta.set({
+        "execution_id": execution_id,
+        "stream_ttl": kwargs.get("stream_ttl"),
+        "parent_pending_delegation_id": pending_delegation_id,
+        "parent_tool_call_id": parent_tool_call_id,
+    })
 
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -149,6 +170,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
         },
     ):
         _agent_output_parts: list[str] = []
+        _suspended = False
         try:
             async with AsyncSessionLocal() as db:
                 message_service = MessageService(db)
@@ -165,6 +187,8 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
 
                     if chunk.get("content"):
                         _agent_output_parts.append(chunk["content"])
+                    if chunk.get("type") == "delegation_pending":
+                        _suspended = True
                     await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
 
             # Set agent output on the current span
@@ -172,6 +196,19 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             _current_span = trace.get_current_span()
             if _agent_output and _current_span:
                 _current_span.set_attribute(otel_attr("output"), _agent_output)
+
+            if _suspended:
+                # The conversation continues in a delegate-resume job (issue
+                # #90): no "done" event, no Execution termination, no report
+                # to our own parent — the resume job owns all of that.
+                await redis.set(
+                    f"{JOB_STATUS_PREFIX}{job_id}",
+                    json.dumps({**base_fields, "status": "suspended"}),
+                    ex=JOB_TTL,
+                )
+                completed = True
+                logger.info(f"Agent message job {job_id} suspended on delegation")
+                return
 
             # Signal completion
             await stream_relay.publish_done(channel_id)
@@ -188,6 +225,21 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                 final_output = {"final_message": "".join(_agent_output_parts)}
                 await _terminate_execution_row(
                     execution_id, ExecutionStatus.COMPLETED, output=final_output,
+                )
+
+            # Suspend-on-delegate hook (issue #90): report our final content to
+            # the suspended parent; the last child triggers the parent's resume.
+            if pending_delegation_id and parent_tool_call_id:
+                from app.services.delegation import on_child_complete
+
+                await on_child_complete(
+                    pending_delegation_id,
+                    parent_tool_call_id,
+                    json.dumps({
+                        "response": "".join(_agent_output_parts),
+                        "chat_id": chat_id,
+                    }),
+                    user_token=user_token,
                 )
 
             completed = True
@@ -211,6 +263,24 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                 await _terminate_execution_row(
                     execution_id, ExecutionStatus.FAILED, error=str(e),
                 )
+
+            # A failed child must still report back, or the suspended parent
+            # would wait forever on a result that is never coming.
+            if pending_delegation_id and parent_tool_call_id:
+                from app.services.delegation import on_child_complete
+
+                try:
+                    await on_child_complete(
+                        pending_delegation_id,
+                        parent_tool_call_id,
+                        json.dumps({"error": str(e), "chat_id": chat_id}),
+                        user_token=user_token,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to report child failure to pending delegation %s",
+                        pending_delegation_id,
+                    )
 
             completed = True
             raise
@@ -254,6 +324,11 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     pending_approval_id = kwargs["pending_approval_id"]
     approved = kwargs["approved"]
     channel_id = kwargs["channel_id"]
+
+    from app.services.delegation import current_channel_id, current_delegation_depth
+
+    current_delegation_depth.set(kwargs.get("depth", 0))
+    current_channel_id.set(channel_id)
 
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -386,3 +461,179 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                 )
             except Exception:
                 logger.error(f"Failed to update status for cancelled agent resume job {job_id}")
+
+
+async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
+    """Continue a parent conversation suspended on sub-agent delegations.
+
+    Enqueued by the LAST finishing child (see `delegation.on_child_complete`).
+    All delegate tool results are already persisted as tool-role Message rows,
+    so this job only runs the follow-up phase of the tool round: rebuild the
+    conversation from the DB, stream the next LLM turn, and keep going
+    (further tool rounds included). Issue #90.
+    """
+    from redis.asyncio import Redis
+
+    from app.core.database import AsyncSessionLocal
+    from app.services.delegation import (
+        current_channel_id,
+        current_delegation_depth,
+        current_job_meta,
+    )
+    from app.services.message_service import MessageService
+    from app.services.stream_relay import stream_relay
+
+    job_id = kwargs["job_id"]
+    chat_id = kwargs["chat_id"]
+    user_id = kwargs["user_id"]
+    user_token = kwargs["user_token"]
+    channel_id = kwargs["channel_id"]
+    context = kwargs["conversation_context"]
+    # Inherited from the suspended job (see message_service suspend block).
+    execution_id = context.get("execution_id")
+    parent_pending_delegation_id = context.get("parent_pending_delegation_id")
+    parent_tool_call_id = context.get("parent_tool_call_id")
+
+    current_delegation_depth.set(context.get("delegation_depth", 0))
+    current_channel_id.set(channel_id)
+    current_job_meta.set({
+        "execution_id": execution_id,
+        "stream_ttl": context.get("stream_ttl"),
+        "parent_pending_delegation_id": parent_pending_delegation_id,
+        "parent_tool_call_id": parent_tool_call_id,
+    })
+
+    redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
+
+    logger.info(f"Agent worker resuming chat {chat_id} after delegation (job={job_id})")
+
+    base_fields = {
+        "channel_id": channel_id,
+        "queue": "agents",
+        "type": "delegate_resume",
+        "chat_id": chat_id,
+    }
+    await redis.set(
+        f"{JOB_STATUS_PREFIX}{job_id}",
+        json.dumps({**base_fields, "status": "running"}),
+        ex=JOB_TTL,
+    )
+
+    stream_ttl = context.get("stream_ttl")
+    ping_task = asyncio.create_task(_ping_loop(channel_id, ttl=stream_ttl))
+
+    completed = False
+    _suspended = False
+    _output_parts: list[str] = []
+    try:
+        async with AsyncSessionLocal() as db:
+            message_service = MessageService(db)
+            async for chunk in message_service._stream_followup_after_tools(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_token=user_token,
+                provider=context.get("provider"),
+                model=context.get("model"),
+                temperature=context.get("temperature", 0.7),
+                max_tokens=context.get("max_tokens"),
+                tools=context.get("tools", []),
+                status_templates=context.get("status_templates", {}),
+                depth=context.get("tool_iteration_depth", 0),
+                agent_label=context.get("agent_label"),
+                tool_summary="delegated sub-agent results",
+            ):
+                if isinstance(chunk, dict):
+                    if chunk.get("content"):
+                        _output_parts.append(chunk["content"])
+                    if chunk.get("type") == "delegation_pending":
+                        _suspended = True
+                    await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+
+        if _suspended:
+            # Suspended again on a further round of delegations — the next
+            # delegate-resume job carries the same inherited meta forward.
+            await redis.set(
+                f"{JOB_STATUS_PREFIX}{job_id}",
+                json.dumps({**base_fields, "status": "suspended"}),
+                ex=JOB_TTL,
+            )
+            completed = True
+            logger.info(f"Delegate-resume job {job_id} suspended again on delegation")
+            return
+
+        await stream_relay.publish_done(channel_id)
+        await redis.set(
+            f"{JOB_STATUS_PREFIX}{job_id}",
+            json.dumps({**base_fields, "status": "completed"}),
+            ex=JOB_TTL,
+        )
+
+        if execution_id:
+            await _terminate_execution_row(
+                execution_id,
+                ExecutionStatus.COMPLETED,
+                output={"final_message": "".join(_output_parts)},
+            )
+
+        # This conversation is itself a delegated child: report our final
+        # content to OUR suspended parent now that we're truly done.
+        if parent_pending_delegation_id and parent_tool_call_id:
+            from app.services.delegation import on_child_complete
+
+            await on_child_complete(
+                parent_pending_delegation_id,
+                parent_tool_call_id,
+                json.dumps({
+                    "response": "".join(_output_parts),
+                    "chat_id": chat_id,
+                }),
+                user_token=user_token,
+            )
+
+        completed = True
+        logger.info(f"Delegate-resume job {job_id} completed")
+
+    except Exception as e:
+        logger.error(f"Delegate-resume job {job_id} failed: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        await stream_relay.publish_error(channel_id, str(e))
+        await redis.set(
+            f"{JOB_STATUS_PREFIX}{job_id}",
+            json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+            ex=JOB_TTL,
+        )
+        if execution_id:
+            await _terminate_execution_row(
+                execution_id, ExecutionStatus.FAILED, error=str(e),
+            )
+        if parent_pending_delegation_id and parent_tool_call_id:
+            from app.services.delegation import on_child_complete
+
+            try:
+                await on_child_complete(
+                    parent_pending_delegation_id,
+                    parent_tool_call_id,
+                    json.dumps({"error": str(e), "chat_id": chat_id}),
+                    user_token=user_token,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to report resume failure to pending delegation %s",
+                    parent_pending_delegation_id,
+                )
+        completed = True
+        raise
+
+    finally:
+        ping_task.cancel()
+        if not completed:
+            logger.warning(f"Delegate-resume job {job_id} cancelled/timed out")
+            try:
+                await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                await redis.set(
+                    f"{JOB_STATUS_PREFIX}{job_id}",
+                    json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                    ex=JOB_TTL,
+                )
+            except Exception:
+                logger.error(f"Failed to update status for cancelled delegate-resume job {job_id}")

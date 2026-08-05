@@ -23,7 +23,7 @@ class Connector(Base, PermissionMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # Auth: {"type": "bearer|basic|api_key|sinas_token|none", "secret": "SECRET_NAME", ...}
+    # Auth: {"type": "bearer|basic|api_key|sinas_token|oauth2_client_credentials|none", "secret": "SECRET_NAME", ...}
     auth: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict, server_default='{"type": "none"}')
 
     # Static default headers: {"X-Custom": "value"}

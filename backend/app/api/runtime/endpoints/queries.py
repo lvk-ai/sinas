@@ -3,16 +3,15 @@ import time
 
 import jsonschema
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
 from app.core.database import get_db
 from app.core.permissions import check_permission
 from app.models.query import Query
-from app.models.user import User
 from app.schemas.query import QueryExecuteRequest, QueryExecuteResponse
 from app.services.database_pool import DatabasePoolManager
+from app.services.user_context import load_user_context, query_param_context
 
 router = APIRouter()
 
@@ -50,14 +49,10 @@ async def execute_query(
         except jsonschema.ValidationError as e:
             raise HTTPException(status_code=400, detail=f"Input validation error: {e.message}")
 
-    # Merge context variables
+    # Merge context variables (user_id, user_email, user_custom_<field>)
     params = {**execute_request.input}
-    params["user_id"] = str(user_id)
-
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    user = user_result.scalar_one_or_none()
-    if user:
-        params["user_email"] = user.email
+    user_ctx = await load_user_context(db, user_id)
+    params.update(query_param_context(user_ctx))
 
     start_time = time.time()
     try:

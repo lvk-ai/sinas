@@ -1,0 +1,10 @@
+apiVersion: v2
+name: sinas
+description: >-
+  Deploys Sinas on Kubernetes: backend, queue workers, scheduler, CDC worker,
+  console, and bundled datastores. Untrusted code runs in ephemeral hardened
+  sandbox Pods (SANDBOX_EXECUTOR=k8s_pod) — no Docker socket or privileged
+  DinD required.
+type: application
+version: 0.1.0
+appVersion: "latest"

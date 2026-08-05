@@ -17,6 +17,7 @@ from app.core.database import AsyncSessionLocal
 from app.models import Agent, Chat, Message
 from app.models.function import Function
 from app.models.pending_approval import PendingToolApproval
+from app.core.config import settings
 from app.models.user import User
 from app.services.code_execution import execute as execute_code
 from app.services.collection_tools import CollectionToolConverter
@@ -36,6 +37,138 @@ from app.services.template_renderer import render_template
 from app.services.tool_result_store import get_tool_result, save_tool_result
 
 logger = logging.getLogger(__name__)
+
+# Per-tool overrides for the truncation budget, keyed by tool name. Empty by
+# default; deployments or callers can register exceptions for tools whose
+# results are known-large and structurally safe.
+TOOL_RESULT_SIZE_OVERRIDES: dict[str, int] = {}
+
+_TRUNCATION_SUFFIX = "\n\n[... result truncated]"
+
+
+def _clean_text_cut(content: str, max_size: int) -> str:
+    """Fallback: cut plain text at a whitespace boundary and mark it."""
+    budget = max_size - len(_TRUNCATION_SUFFIX)
+    cut = content[:budget]
+    boundary = max(cut.rfind("\n"), cut.rfind(" "))
+    if boundary > budget // 2:
+        cut = cut[:boundary]
+    return cut + _TRUNCATION_SUFFIX
+
+
+def _largest_string_slot(container):
+    """Find the (parent, key) of the largest string value, looking one level
+    into nested dicts (a connector response's `body`). Returns (None, None)
+    when there is no string worth clipping."""
+    best_parent, best_key, best_len = None, None, 0
+    stack = [container]
+    seen_depth = {id(container): 0}
+    while stack:
+        node = stack.pop()
+        depth = seen_depth[id(node)]
+        for key, value in node.items():
+            if isinstance(value, str) and len(value) > best_len:
+                best_parent, best_key, best_len = node, key, len(value)
+            elif isinstance(value, dict) and depth < 1:
+                seen_depth[id(value)] = depth + 1
+                stack.append(value)
+    return best_parent, best_key
+
+
+def truncate_tool_result(result_content: str, max_size: int) -> str:
+    """Cap an oversized tool result without breaking its structure.
+
+    A blind byte-slice leaves the model with unparseable JSON and no way to
+    reach the remainder, so it retries the same call forever. Instead:
+      - JSON arrays (bare, or the largest list inside a dict, e.g. a
+        connector response's `body`) are trimmed to whole elements and a
+        marker {"_truncated": true, "returned": n, "total": N} tells the
+        model there is more to page through.
+      - JSON objects dominated by one string (a document body) get that
+        string clipped, with the same marker shape describing the clip.
+      - Anything unparseable is cut at a whitespace boundary with a visible
+        text suffix, as before.
+    Always returns content of at most max_size characters.
+    """
+    if len(result_content) <= max_size:
+        return result_content
+    try:
+        parsed = json.loads(result_content)
+    except (ValueError, TypeError):
+        return _clean_text_cut(result_content, max_size)
+
+    def _fit_list(items: list, overhead_probe) -> str | None:
+        """Keep a prefix of whole elements such that the rebuilt payload
+        fits. Returns the serialized payload, or None if impossible."""
+        total = len(items)
+        kept = list(items)
+        while True:
+            marker = {"_truncated": True, "returned": len(kept), "total": total}
+            candidate = overhead_probe(kept, marker)
+            if len(candidate) <= max_size:
+                return candidate
+            if not kept:
+                return None
+            kept.pop()
+
+    if isinstance(parsed, list):
+        fitted = _fit_list(
+            parsed, lambda kept, marker: json.dumps(kept + [marker])
+        )
+        if fitted is not None:
+            return fitted
+        return _clean_text_cut(result_content, max_size)
+
+    if isinstance(parsed, dict):
+        # Prefer trimming the largest list value (one level deep covers the
+        # connector envelope's `body`).
+        list_slots = [
+            (parent, key)
+            for parent in [parsed]
+            + [v for v in parsed.values() if isinstance(v, dict)]
+            for key, value in parent.items()
+            if isinstance(value, list) and value
+        ]
+        if list_slots:
+            parent, key = max(
+                list_slots, key=lambda slot: len(json.dumps(slot[0][slot[1]]))
+            )
+            original = parent[key]
+
+            def probe(kept, marker):
+                parent[key] = kept
+                parsed["_truncated"] = {**marker, "field": key}
+                return json.dumps(parsed)
+
+            fitted = _fit_list(original, probe)
+            if fitted is not None:
+                return fitted
+            parent[key] = original
+            parsed.pop("_truncated", None)
+
+        s_parent, s_key = _largest_string_slot(parsed)
+        if s_parent is not None:
+            original_str = s_parent[s_key]
+            total_len = len(original_str)
+            # JSON escaping inflates the string ("\n" -> "\\n"), so converge
+            # on the clip length instead of computing it once.
+            clip = min(total_len, max_size)
+            while clip > 0:
+                s_parent[s_key] = original_str[:clip]
+                parsed["_truncated"] = {
+                    "_truncated": True,
+                    "field": s_key,
+                    "returned": clip,
+                    "total": total_len,
+                }
+                candidate = json.dumps(parsed)
+                if len(candidate) <= max_size:
+                    return candidate
+                clip -= max(len(candidate) - max_size, 32)
+            s_parent[s_key] = original_str
+            parsed.pop("_truncated", None)
+
+    return _clean_text_cut(result_content, max_size)
 
 
 def validate_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -268,28 +401,36 @@ async def check_approval_requirements(
     return requires_approval
 
 
-async def execute_agent_tool(
+async def prepare_agent_delegation(
     db: AsyncSession,
-    chat: Chat,
     user_id: str,
-    user_token: str,
     agent_id_str: str,
     arguments: dict[str, Any],
-    create_chat_with_agent_fn,
 ) -> dict[str, Any]:
-    """Execute an agent tool call by creating or resuming a chat."""
+    """Resolve a `call_agent_*` target and create (or load) its sub-chat.
+
+    Everything `execute_agent_tool` does before enqueueing — shared with the
+    suspend-on-delegate path in message_service (issue #90), which enqueues
+    the child itself and ends the parent job instead of blocking.
+
+    Returns {"error": ...} on failure, else
+    {"agent": Agent, "sub_chat": Chat, "content": str, "depth": int}.
+    """
     if not agent_id_str:
         return {"error": "Agent ID not provided"}
-
-    # Load agent
-    from app.core.telemetry import get_tracer, otel_attr
-    _agent_tracer = get_tracer()
 
     result = await db.execute(select(Agent).where(Agent.id == agent_id_str))
     agent = result.scalar_one_or_none()
 
     if not agent:
         return {"error": f"Agent not found: {agent_id_str}"}
+
+    # Bound delegation chains (issue #90) — reject before spending a sub-chat.
+    from app.services.delegation import child_depth_or_error
+
+    child_depth, depth_error = child_depth_or_error()
+    if depth_error:
+        return {"error": depth_error}
 
     # Check user has permission to use this sub-agent
     user_permissions = await get_user_permissions(db, user_id)
@@ -308,34 +449,58 @@ async def execute_agent_tool(
 
     # Resume existing chat or create a new one
     resume_chat_id = arguments.get("_chat_id")
+    if resume_chat_id:
+        # Verify the chat exists, belongs to this user and agent
+        result = await db.execute(
+            select(Chat).where(
+                Chat.id == resume_chat_id,
+                Chat.user_id == user_id,
+                Chat.agent_id == agent_id_str,
+            )
+        )
+        sub_chat = result.scalar_one_or_none()
+        if not sub_chat:
+            return {"error": f"Chat {resume_chat_id} not found or does not belong to this agent"}
+        logger.info(f"Resuming sub-agent chat {sub_chat.id} with {agent.namespace}/{agent.name}")
+    else:
+        # Create sub-chat using our own db session (not the parent's)
+        # to avoid cross-session issues with the parent MessageService.
+        sub_chat = Chat(
+            user_id=user_id,
+            agent_id=str(agent.id),
+            agent_namespace=agent.namespace,
+            agent_name=agent.name,
+            title=f"Sub-chat: {agent.name}",
+            chat_metadata={"agent_input": input_data} if input_data else None,
+        )
+        db.add(sub_chat)
+        await db.commit()
+        await db.refresh(sub_chat)
+
+    return {"agent": agent, "sub_chat": sub_chat, "content": content, "depth": child_depth}
+
+
+async def execute_agent_tool(
+    db: AsyncSession,
+    chat: Chat,
+    user_id: str,
+    user_token: str,
+    agent_id_str: str,
+    arguments: dict[str, Any],
+    create_chat_with_agent_fn,
+) -> dict[str, Any]:
+    """Execute an agent tool call by creating or resuming a chat."""
+    from app.core.telemetry import get_tracer, otel_attr
+    _agent_tracer = get_tracer()
+
     try:
-        if resume_chat_id:
-            # Verify the chat exists, belongs to this user and agent
-            result = await db.execute(
-                select(Chat).where(
-                    Chat.id == resume_chat_id,
-                    Chat.user_id == user_id,
-                    Chat.agent_id == agent_id_str,
-                )
-            )
-            sub_chat = result.scalar_one_or_none()
-            if not sub_chat:
-                return {"error": f"Chat {resume_chat_id} not found or does not belong to this agent"}
-            logger.info(f"Resuming sub-agent chat {sub_chat.id} with {agent.namespace}/{agent.name}")
-        else:
-            # Create sub-chat using our own db session (not the parent's)
-            # to avoid cross-session issues with the parent MessageService.
-            sub_chat = Chat(
-                user_id=user_id,
-                agent_id=str(agent.id),
-                agent_namespace=agent.namespace,
-                agent_name=agent.name,
-                title=f"Sub-chat: {agent.name}",
-                chat_metadata={"agent_input": input_data} if input_data else None,
-            )
-            db.add(sub_chat)
-            await db.commit()
-            await db.refresh(sub_chat)
+        prep = await prepare_agent_delegation(db, user_id, agent_id_str, arguments)
+        if "error" in prep:
+            return prep
+        agent = prep["agent"]
+        sub_chat = prep["sub_chat"]
+        content = prep["content"]
+        child_depth = prep["depth"]
 
         # Route agent-to-agent calls through the queue so each sub-agent
         # runs in its own worker — enables agent swarms without recursive blocking.
@@ -357,15 +522,20 @@ async def execute_agent_tool(
             content=content,
             channel_id=channel_id,
             agent=f"{agent.namespace}/{agent.name}",
+            depth=child_depth,
         )
 
         # Wait for the sub-agent to finish by reading the Redis stream.
         # Use a longer timeout than the default SUBSCRIBE_WAIT_TIMEOUT since
         # agent-to-agent calls can take minutes (the sub-agent may itself be
-        # making tool calls, calling other agents, etc.).
+        # making tool calls, calling other agents, etc.). NOTE: this "block"
+        # mode holds the parent's worker slot for the whole wait; see
+        # settings.agent_delegate_mode and issue #90.
         final_content = ""
         got_terminal = False
-        async for event in stream_relay.subscribe(channel_id, timeout=600):
+        async for event in stream_relay.subscribe(
+            channel_id, timeout=settings.agent_delegate_timeout
+        ):
             if event.get("content"):
                 final_content += event["content"]
             if event.get("type") in ("done", "error"):
@@ -400,7 +570,11 @@ async def execute_agent_tool(
         }
 
     except Exception as e:
-        logger.error(f"Failed to execute agent tool {tool_name}: {e}")
+        # agent_id_str, not tool_name: tool_name is not in scope here, and the
+        # NameError it raised replaced the real exception in the returned
+        # error, hiding every delegation failure cause from the caller.
+        logger.error(f"Failed to execute agent tool {agent_id_str}: {e}")
+        logger.debug("Delegation failure traceback:\n%s", traceback.format_exc())
         try:
             _delegate_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
             _delegate_span.end()
@@ -697,11 +871,14 @@ async def execute_single_tool(
 
             result_content = json.dumps(result) if not isinstance(result, str) else result
 
-            # Truncate oversized results to prevent LLM token overflow
-            max_result_size = 10000  # 10KB max per tool result for LLM context
+            # Truncate oversized results (structure-aware) so a single tool
+            # call can't crowd the LLM context, without emitting broken JSON.
+            max_result_size = TOOL_RESULT_SIZE_OVERRIDES.get(
+                tool_name, settings.tool_result_context_max_size
+            )
             if len(result_content) > max_result_size:
                 print(f"⚠️ Truncating tool result for {tool_name}: {len(result_content)} -> {max_result_size} bytes", flush=True)
-                result_content = result_content[:max_result_size] + '\n\n[... result truncated]'
+                result_content = truncate_tool_result(result_content, max_result_size)
 
     except Exception as e:
         print(f"❌ Tool execution failed: {tool_name}: {e}", flush=True)

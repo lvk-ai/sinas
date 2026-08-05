@@ -20,6 +20,8 @@ description: "All configuration options"
 |---|---|---|
 | `AUTH_MODE` | `otp` | One of `otp`, `password`, `password+otp`. See [Authentication](/platform/authentication) for the differences. |
 | `SUPERADMIN_PASSWORD` | _(none)_ | Seed password for the superadmin. Only used when `AUTH_MODE` includes `password`. Setting this and restarting acts as a password-reset escape hatch. |
+| `TOKEN_EXCHANGE_DEFAULT_ROLE` | `GuestUsers` | Role assigned to users auto-provisioned via `POST /auth/token/exchange`. See [Token Exchange](/platform/authentication#token-exchange-bring-your-own-auth). |
+| `OAUTH_BIND_BROWSER_SESSION` | `true` | Bind connector OAuth (authorization-code) flows to the browser that started them via an HttpOnly nonce cookie — prevents account-linking CSRF. Set `false` only for split-origin local dev (console and API on different ports); keep `true` in production. |
 
 ## SMTP
 
@@ -67,7 +69,40 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `MAX_EXECUTION_DEPTH` | _(= workers)_ | Max nesting depth for execution chains (a function/agent invoking another execution). A deeper call is rejected fast instead of deadlocking the shared pool. Defaults to `DEFAULT_WORKER_COUNT`; `0` disables. |
 | `SHARED_POOL_RESERVE` | `0` | Shared-worker slots reserved for nested calls so a parent waiting on a child can't starve the pool. `0` = off. For full single-chain safety set to `MAX_EXECUTION_DEPTH - 1`. |
 
+## Executors
+
+How Sinas runs user code. `SANDBOX_EXECUTOR` handles untrusted code
+(untrusted functions and agent code execution) and must isolate every
+execution; `TRUSTED_EXECUTOR` handles admin-approved functions
+(`shared_pool=true`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `SANDBOX_EXECUTOR` | `docker_pool` | `docker_pool` (warm container pool), `docker_ephemeral` (single-use container per execution, baked package image), `k8s_pod` (single-use Kubernetes pod per execution), or `disabled` (reject sandbox executions) |
+| `TRUSTED_EXECUTOR` | `docker_shared` | `docker_shared` (long-lived shared worker containers) or `inprocess` (run inside the queue-worker process — no Docker socket needed, but no `input()`/pause support) |
+
+With `SANDBOX_EXECUTOR=k8s_pod` and `TRUSTED_EXECUTOR=inprocess`, no process
+needs a Docker socket — this is the configuration the Helm chart uses.
+`inprocess` runs trusted code with the worker's own environment and
+credentials, so only enable `shared_pool` on functions you'd trust with them.
+
+### Kubernetes executor (`SANDBOX_EXECUTOR=k8s_pod`)
+
+Requires running in-cluster with a ServiceAccount that can `create`/`get`/
+`list`/`delete` pods and use `pods/exec` in the sandbox namespace (the Helm
+chart provisions this).
+
+| Variable | Default | Description |
+|---|---|---|
+| `K8S_SANDBOX_NAMESPACE` | _(own namespace)_ | Namespace for sandbox pods |
+| `K8S_SANDBOX_IMAGE` | `FUNCTION_CONTAINER_IMAGE` | Image for sandbox pods (must be pullable by the cluster) |
+| `K8S_SANDBOX_SERVICE_ACCOUNT` | _(namespace default)_ | ServiceAccount assigned to sandbox pods |
+| `K8S_SANDBOX_POD_READY_TIMEOUT` | `120` | Seconds to wait for a sandbox pod to become ready |
+| `K8S_SANDBOX_INSTALL_DEPENDENCIES` | `true` | `pip install` platform dependencies into each pod; set to `false` when they are baked into `K8S_SANDBOX_IMAGE` |
+
 ## Sandbox Containers
+
+Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -83,7 +118,20 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `MAX_TOOL_ITERATIONS` | `25` | Max consecutive tool-call rounds per message |
 | `MAX_HISTORY_MESSAGES` | `100` | Messages loaded for conversation context |
 | `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds) |
+| `AGENT_DELEGATE_TIMEOUT` | `600` | How long a parent agent waits for a delegated sub-agent (block mode). Raise together with `AGENT_JOB_TIMEOUT` — in block mode the parent's own job clock keeps running while it waits |
+| `AGENT_DELEGATE_MODE` | `block` | `block`: parent holds its worker slot while awaiting sub-agents. `suspend`: parent job ends at delegation and a resume job continues the conversation when the children finish (frees the slot) |
+| `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |
+| `AGENT_SUBAGENT_QUEUE` | `true` | Route delegated (sub-agent) jobs to the dedicated `queue-agent-sub` worker so parents can never starve their children of worker slots |
 | `CODE_EXECUTION_TIMEOUT` | `120` | Code execution timeout (seconds) |
+
+## Tool Results
+
+| Variable | Default | Description |
+|---|---|---|
+| `TOOL_RESULT_CONTEXT_MAX_SIZE` | `102400` | Max characters of a single tool result entering the LLM context (~25K tokens). Oversized results are truncated **structure-aware**: JSON lists trimmed to whole elements, long strings clipped, always with a machine-readable `{"_truncated": true, "returned": X, "total": Y}` marker so the model pages instead of retrying. Lower (e.g. `50000`) for a tighter per-turn token budget |
+| `TOOL_RESULT_MAX_SIZE` | `102400` | Max bytes the tool result **store** persists per result row (distinct from the context cap above) |
+| `TOOL_RESULT_MAX_INLINE` | `5` | Last N tool results kept inline in conversation history |
+| `TOOL_RESULT_RETENTION_DAYS` | `30` | Days stored tool results are retained |
 
 ## Scaling
 
@@ -95,6 +143,8 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `QUEUE_AGENT_REPLICAS` | `2` | Agent queue worker replicas |
 | `QUEUE_FUNCTION_CONCURRENCY` | `10` | Concurrent functions per worker |
 | `QUEUE_AGENT_CONCURRENCY` | `5` | Concurrent agent jobs per worker |
+| `QUEUE_AGENT_SUB_REPLICAS` | `2` | Sub-agent queue worker replicas (delegated agent jobs) |
+| `QUEUE_AGENT_SUB_CONCURRENCY` | `5` | Concurrent jobs per sub-agent worker |
 | `DEFAULT_WORKER_COUNT` | `4` | Shared (trusted) worker containers for `shared_pool` functions. Also the default ceiling for `MAX_EXECUTION_DEPTH`. |
 
 ## Resource Limits (Docker)

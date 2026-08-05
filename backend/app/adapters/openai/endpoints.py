@@ -112,6 +112,7 @@ async def chat_completions(
             request=request,
             provider=provider,
             model_name=model_name,
+            user_id=user_id,
             db=db,
         )
 
@@ -254,10 +255,16 @@ async def _passthrough_mode(
     request: ChatCompletionRequest,
     provider: LLMProvider,
     model_name: str,
+    user_id: str,
     db: AsyncSession,
 ):
     """Handle passthrough mode: direct LLM provider call."""
-    llm_provider = await create_provider(provider.name, model_name, db)
+    llm_provider = await create_provider(
+        provider.name,
+        model_name,
+        db,
+        usage_context={"user_id": user_id, "source": "openai_adapter_passthrough"},
+    )
 
     # Convert messages to dict format
     messages = []
@@ -290,9 +297,15 @@ async def _passthrough_mode(
             **kwargs,
         )
         content = response.get("content", "")
+        usage = response.get("usage") or {}
         return ChatCompletionResponse(
             model=model_name,
             choices=[Choice(message=ChoiceMessage(content=content))],
+            usage=UsageInfo(
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+            ),
         )
 
 

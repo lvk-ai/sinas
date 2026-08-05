@@ -1,0 +1,238 @@
+{{- if .Values.clickhouse.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+data:
+  network.xml: |
+    <clickhouse>
+        <listen_host>0.0.0.0</listen_host>
+    </clickhouse>
+
+  system-logs.xml: |
+    <clickhouse>
+        <!-- Disable high-volume system logs that cause merge bloat on small deployments -->
+        <metric_log remove="1" />
+        <asynchronous_metric_log remove="1" />
+        <trace_log remove="1" />
+        <processors_profile_log remove="1" />
+
+        <text_log>
+            <database>system</database>
+            <table>text_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <ttl>event_date + INTERVAL 1 DAY</ttl>
+        </text_log>
+        <query_log>
+            <database>system</database>
+            <table>query_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <ttl>event_date + INTERVAL 1 DAY</ttl>
+        </query_log>
+        <part_log>
+            <database>system</database>
+            <table>part_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <ttl>event_date + INTERVAL 1 DAY</ttl>
+        </part_log>
+        <error_log>
+            <database>system</database>
+            <table>error_log</table>
+            <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+            <ttl>event_date + INTERVAL 1 DAY</ttl>
+        </error_log>
+    </clickhouse>
+
+  resource-limits.xml: |
+    <clickhouse>
+        <max_server_memory_usage>{{ .Values.clickhouse.memoryLimit | replace "Gi" "073741824" | replace "Mi" "048576" }}</max_server_memory_usage>
+        <background_pool_size>9</background_pool_size>
+        <background_merges_mutations_concurrency_ratio>3</background_merges_mutations_concurrency_ratio>
+        <background_schedule_pool_size>4</background_schedule_pool_size>
+        <background_common_pool_size>4</background_common_pool_size>
+        <background_move_pool_size>2</background_move_pool_size>
+        <background_fetches_pool_size>2</background_fetches_pool_size>
+        <max_connections>64</max_connections>
+        <mark_cache_size>134217728</mark_cache_size>
+    </clickhouse>
+
+  user-limits.xml: |
+    <clickhouse>
+        <profiles>
+            <default>
+                <max_memory_usage>268435456</max_memory_usage>
+                <max_bytes_before_external_group_by>134217728</max_bytes_before_external_group_by>
+                <max_bytes_before_external_sort>134217728</max_bytes_before_external_sort>
+            </default>
+        </profiles>
+    </clickhouse>
+
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS {{ .Values.clickhouse.database }};
+
+    CREATE TABLE IF NOT EXISTS {{ .Values.clickhouse.database }}.request_logs
+    (
+        request_id UUID DEFAULT generateUUIDv4(),
+        timestamp DateTime64(3) DEFAULT now64(3),
+        user_id String,
+        user_email String,
+        permission_used String,
+        has_permission Boolean,
+        method String,
+        path String,
+        query_params String,
+        request_body String,
+        user_agent String,
+        referer String,
+        ip_address String,
+        status_code UInt16,
+        response_time_ms UInt32,
+        response_size_bytes UInt32,
+        resource_type String,
+        resource_id String,
+        group_id String,
+        error_message String,
+        error_type String,
+        metadata String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY toYYYYMM(timestamp)
+    ORDER BY (timestamp, user_id, path)
+    SETTINGS index_granularity = 8192;
+
+    CREATE INDEX IF NOT EXISTS idx_user ON {{ .Values.clickhouse.database }}.request_logs (user_id) TYPE bloom_filter GRANULARITY 1;
+    CREATE INDEX IF NOT EXISTS idx_permission ON {{ .Values.clickhouse.database }}.request_logs (permission_used) TYPE bloom_filter GRANULARITY 1;
+    CREATE INDEX IF NOT EXISTS idx_path ON {{ .Values.clickhouse.database }}.request_logs (path) TYPE bloom_filter GRANULARITY 1;
+
+    CREATE TABLE IF NOT EXISTS {{ .Values.clickhouse.database }}.execution_logs
+    (
+        log_id UUID DEFAULT generateUUIDv4(),
+        timestamp DateTime64(3) DEFAULT now64(3),
+        execution_id String,
+        event String,
+        function_name String,
+        step_id String,
+        input_data String,
+        output_data String,
+        error String,
+        duration_ms UInt32,
+        status String
+    )
+    ENGINE = MergeTree()
+    PARTITION BY toYYYYMM(timestamp)
+    ORDER BY (timestamp, execution_id, event)
+    SETTINGS index_granularity = 8192;
+
+    CREATE INDEX IF NOT EXISTS idx_execution ON {{ .Values.clickhouse.database }}.execution_logs (execution_id) TYPE bloom_filter GRANULARITY 1;
+    CREATE INDEX IF NOT EXISTS idx_event ON {{ .Values.clickhouse.database }}.execution_logs (event) TYPE bloom_filter GRANULARITY 1;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: clickhouse
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24-alpine
+          env:
+            - name: CLICKHOUSE_DB
+              value: {{ .Values.clickhouse.database | quote }}
+            - name: CLICKHOUSE_USER
+              value: {{ .Values.clickhouse.user | quote }}
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: clickhouse-password
+          resources:
+            limits:
+              memory: {{ .Values.clickhouse.memoryLimit }}
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/network.xml
+              subPath: network.xml
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/system-logs.xml
+              subPath: system-logs.xml
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/resource-limits.xml
+              subPath: resource-limits.xml
+            - name: config
+              mountPath: /etc/clickhouse-server/users.d/user-limits.xml
+              subPath: user-limits.xml
+            - name: config
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+      volumes:
+        - name: config
+          configMap:
+            name: clickhouse-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000
+{{- end }}

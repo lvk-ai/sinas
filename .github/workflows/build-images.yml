@@ -1,14 +1,39 @@
 name: Build & Push Docker Images
 
+# Builds the four Sinas images (backend, builder, executor, console) and pushes them to
+# GHCR. See RELEASING.md for the full versioning/release flow.
+#
+# Triggers & resulting image tags:
+#   push to dev            -> :dev            (+ :sha-…)      integration builds
+#   push to main           -> :edge           (+ :sha-…)
+#   tag 0.3.0-rc.1         -> :0.3.0-rc.1                     release candidate (prerelease)
+#   tag 0.3.0              -> :0.3.0 :0.3 :latest             final release
+#   manual dispatch        -> :<image_tag or sanitized ref>  build ANY branch/SHA on demand
+#
+# Only a final (non-prerelease) semver tag moves :latest (metadata-action latest=auto).
 on:
   push:
-    branches: [main]
-    tags: ['v*']
+    branches: [main, dev]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'          # 0.3.0        (final)
+      - '[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+' # 0.3.0-rc.1   (release candidate)
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build (e.g. a feature branch)
+        required: true
+        default: dev
+      image_tag:
+        description: 'Tag for the built images (optional; default: sanitized ref name)'
+        required: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  # Multi-arch so images run on amd64 cloud nodes AND arm64 (Apple Silicon, arm nodes).
+  # arm64 builds via QEMU emulation add build time; see RELEASING.md for the native-runner
+  # optimization if CI feels slow.
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   build:
@@ -35,6 +60,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested ref; otherwise the triggering ref.
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Resolve dispatch image tag
+        if: github.event_name == 'workflow_dispatch'
+        id: disp
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.event.inputs.ref }}"
+          # Sanitize to a valid, readable image tag.
+          TAG=$(printf '%s' "$TAG" | sed 's#[^a-zA-Z0-9._-]#-#g' | cut -c1-120)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -51,13 +92,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_PREFIX }}/${{ matrix.name }}
+          # metadata-action skips {{major}}.{{minor}} and :latest for prereleases, so a
+          # -rc tag only ever produces its own exact tag.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=sha,prefix=
-          # latest=auto (default): applied only to non-prerelease semver tags,
-          # so v0.1.0 updates `latest` but v0.2.0-rc.1 does not.
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=sha,prefix=,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=${{ steps.disp.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -67,6 +110,53 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          # Per-image cache scope so the four images don't clobber each other's cache.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          platforms: ${{ env.PLATFORMS }}
+
+  # On a version tag, publish a GitHub Release with a ready-to-run, version-pinned
+  # docker-compose.yml and the packaged Helm chart attached, then push the chart to
+  # GHCR as an OCI artifact. Prerelease flag is set automatically for -rc tags.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write   # OCI chart push
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Generate version-pinned docker-compose
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          # Pin the image tag to this release; the registry default already points at GHCR,
+          # so the file runs as-is (users still supply their own .env for secrets/config).
+          sed "s/\${IMAGE_TAG:-latest}/${VERSION}/g" docker-compose.yml > "docker-compose-${VERSION}.yml"
+
+      - name: Package Helm chart
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          # Stamp chart + appVersion from the tag so `--version <release>` resolves;
+          # the in-repo Chart.yaml version is only a placeholder for lint/template.
+          helm package charts/sinas --version "$VERSION" --app-version "$VERSION" -d .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            docker-compose-${{ github.ref_name }}.yml
+            sinas-${{ github.ref_name }}.tgz
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+      # Runs AFTER the release exists and is non-fatal: the attached .tgz is the
+      # guaranteed install path, so a registry hiccup can never fail a release.
+      - name: Push chart to GHCR (OCI)
+        continue-on-error: true
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm push "sinas-${GITHUB_REF_NAME}.tgz" oci://ghcr.io/${{ github.repository_owner }}/charts

@@ -1,0 +1,48 @@
+name: Helm Chart Checks
+
+# Phase-0 gate from the footprint plan: every chart change must lint and
+# render. Templates both profiles so a values regression in either the
+# default or the compact (clickhouse-less) shape fails CI.
+on:
+  push:
+    branches: [main, dev]
+    paths: ['charts/**']
+  pull_request:
+    paths: ['charts/**']
+
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: |
+          helm lint charts/sinas \
+            --set domain=ci.example.com \
+            --set secrets.secretKey=ci --set secrets.encryptionKey=ci \
+            --set postgres.password=ci --set clickhouse.password=ci
+
+      - name: helm template (default profile)
+        run: |
+          helm template ci charts/sinas \
+            --set domain=ci.example.com \
+            --set secrets.secretKey=ci --set secrets.encryptionKey=ci \
+            --set postgres.password=ci --set clickhouse.password=ci \
+            > /tmp/default.yaml
+          grep -q "kind: StatefulSet" /tmp/default.yaml
+          grep -q "name: clickhouse" /tmp/default.yaml
+
+      - name: helm template (compact profile, clickhouse disabled)
+        run: |
+          helm template ci charts/sinas \
+            --set domain=ci.example.com \
+            --set secrets.secretKey=ci --set secrets.encryptionKey=ci \
+            --set postgres.password=ci \
+            --set clickhouse.enabled=false \
+            > /tmp/compact.yaml
+          ! grep -q "name: clickhouse" /tmp/compact.yaml
+          # backend must get the explicit-disable signal
+          grep -q 'CLICKHOUSE_HOST' /tmp/compact.yaml

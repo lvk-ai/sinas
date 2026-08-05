@@ -31,6 +31,7 @@ from app.services.query_tools import QueryToolConverter
 from app.services.skill_tools import SkillToolConverter
 from app.services.state_tools import StateTools
 from app.services.template_renderer import render_template
+from app.services.user_context import load_user_context, merge_user_template_context
 from app.services.tool_discovery import (
     get_available_tools,
     strip_tool_metadata,
@@ -267,6 +268,13 @@ class MessageService:
         if final_template_variables is None and chat.chat_metadata:
             final_template_variables = chat.chat_metadata.get("agent_input")
 
+        # Always expose the platform-provided user context as {{user.*}}
+        # (overrides any caller-supplied "user" variable — not spoofable)
+        user_ctx = await load_user_context(self.db, user_id)
+        final_template_variables = merge_user_template_context(
+            final_template_variables, user_ctx
+        )
+
         # Build conversation history
         messages = await build_conversation_history(
             db=self.db,
@@ -294,7 +302,18 @@ class MessageService:
         )
 
         # Create LLM provider
-        llm_provider = await create_provider(provider_name, final_model, self.db)
+        llm_provider = await create_provider(
+            provider_name,
+            final_model,
+            self.db,
+            usage_context={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "message_id": user_message.id,
+                "agent": f"{agent.namespace}/{agent.name}" if agent else None,
+                "source": "chat",
+            },
+        )
 
         # If no model specified, use the provider's default model
         if not final_model:
@@ -394,6 +413,11 @@ class MessageService:
             **llm_kwargs,
         )
         end_time = datetime.now(UTC)
+
+        _usage = response.get("usage") or {}
+        if _usage.get("total_tokens"):
+            _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
+            _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
 
         await self._log_request(
             user_id=user_id,
@@ -583,6 +607,7 @@ class MessageService:
         """Stream LLM response."""
         full_content = ""
         tool_calls_list = []
+        stream_usage = None
 
         clean_tools = strip_tool_metadata(tools)
 
@@ -593,6 +618,9 @@ class MessageService:
             temperature=final_temperature,
             max_tokens=max_tokens,
         ):
+            if chunk.get("usage"):
+                stream_usage = chunk["usage"]
+
             if chunk.get("content"):
                 if isinstance(chunk["content"], str):
                     full_content += chunk["content"]
@@ -652,6 +680,9 @@ class MessageService:
                 otel_attr("user_id"): user_id,
                 otel_attr("labels"): _labels,
             })
+            if stream_usage and stream_usage.get("total_tokens"):
+                _s.set_attribute("gen_ai.usage.input_tokens", stream_usage.get("prompt_tokens", 0))
+                _s.set_attribute("gen_ai.usage.output_tokens", stream_usage.get("completion_tokens", 0))
             _s.end()
         except Exception:
             pass
@@ -832,6 +863,34 @@ class MessageService:
 
         # Separate tool calls into parallel and sequential groups
         valid_tool_calls = [tc for tc in tool_calls if tc.get("id")]
+
+        # Suspend-on-delegate (issue #90): in "suspend" mode, agent-delegation
+        # tools are split off — they don't execute (and block) here. After the
+        # regular tools finish, the children are enqueued and this generator
+        # ends, freeing the worker slot; a delegate-resume job continues the
+        # conversation when the last child reports back. Requires a job
+        # channel (current_channel_id) — direct/synchronous paths still block.
+        from app.services.delegation import current_channel_id
+
+        delegate_calls: list[dict[str, Any]] = []
+        _meta_by_name: dict[str, dict[str, Any]] = {}
+        if (
+            settings.agent_delegate_mode == "suspend"
+            and current_channel_id.get() is not None
+        ):
+            _meta_by_name = (
+                {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools}
+                if tools
+                else {}
+            )
+            non_delegate_calls = []
+            for tc in valid_tool_calls:
+                if _meta_by_name.get(tc["function"]["name"], {}).get("agent_id"):
+                    delegate_calls.append(tc)
+                else:
+                    non_delegate_calls.append(tc)
+            valid_tool_calls = non_delegate_calls
+
         parallel_calls = []
         sequential_calls = []
 
@@ -953,6 +1012,130 @@ class MessageService:
                 pass
         asyncio.create_task(_persist_results())
 
+        # Suspend on the delegated calls (issue #90): enqueue children and end
+        # this generator instead of blocking a worker slot on their streams.
+        if delegate_calls:
+            from app.services.delegation import (
+                current_delegation_depth,
+                suspend_delegations,
+            )
+            from app.services.tool_execution import prepare_agent_delegation
+
+            prepared: list[dict[str, Any]] = []
+            for tc in delegate_calls:
+                args = safe_parse_arguments(tc["function"].get("arguments", ""))
+                yield {
+                    "type": "tool_start",
+                    "tool_call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"].get("arguments", "{}"),
+                    "description": build_tool_status(tc["function"]["name"], args, status_templates),
+                }
+                meta = _meta_by_name.get(tc["function"]["name"], {})
+                prep = await prepare_agent_delegation(
+                    self.db, user_id, meta.get("agent_id"), args
+                )
+                if "error" in prep:
+                    # Failed before enqueue (unknown agent, permissions, depth
+                    # bound) — record as an immediate tool result instead.
+                    error_content = json.dumps(prep)
+                    tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                    self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                    await self.db.commit()
+                    yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                else:
+                    prepared.append(
+                        {
+                            "tool_call_id": tc["id"],
+                            "sub_chat_id": str(prep["sub_chat"].id),
+                            "agent": f"{prep['agent'].namespace}/{prep['agent'].name}",
+                            "content": prep["content"],
+                        }
+                    )
+
+            if prepared:
+                from app.services.delegation import current_job_meta
+
+                await suspend_delegations(
+                    self.db,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    channel_id=current_channel_id.get(),
+                    delegations=prepared,
+                    conversation_context={
+                        "provider": provider,
+                        "model": model,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "tools": tools,
+                        "status_templates": status_templates,
+                        "agent_label": agent_label,
+                        "tool_iteration_depth": depth,
+                        "delegation_depth": current_delegation_depth.get(),
+                        # Job-level fields the resume job must inherit:
+                        # batch Execution row, stream TTL, and (when this
+                        # conversation is itself a delegated child) the
+                        # parent checkpoint to report to on completion.
+                        **current_job_meta.get(),
+                    },
+                )
+                yield {
+                    "type": "delegation_pending",
+                    "tool_call_ids": [d["tool_call_id"] for d in prepared],
+                }
+                return
+            # All delegations failed at prepare — fall through to the regular
+            # follow-up turn with their error results.
+
+        # Follow-up LLM turn — extracted so the delegate-resume job (issue
+        # #90) can re-enter the tool round from persisted state.
+        tool_summary = (
+            ", ".join(f"{r[1]}" for r in tool_results.values())[:500]
+            if tool_results
+            else "tool results"
+        )
+        async for chunk in self._stream_followup_after_tools(
+            chat_id=chat_id,
+            user_id=user_id,
+            user_token=user_token,
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            permissions=permissions,
+            status_templates=status_templates,
+            depth=depth,
+            agent_label=agent_label,
+            tool_summary=tool_summary,
+        ):
+            yield chunk
+
+    async def _stream_followup_after_tools(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        user_token: str,
+        provider: Optional[str],
+        model: Optional[str],
+        temperature: float,
+        max_tokens: Optional[int],
+        tools: list[dict[str, Any]],
+        permissions: Optional[dict[str, bool]] = None,
+        status_templates: dict[str, str] = {},
+        depth: int = 0,
+        agent_label: Optional[str] = None,
+        tool_summary: str = "tool results",
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Rebuild the conversation from the DB and stream the next LLM turn.
+
+        The second half of a tool round — everything after the tool results
+        are persisted as Message rows. Called inline by _handle_tool_calls,
+        and re-entered by execute_agent_delegate_resume_job once suspended
+        sub-agents have reported back (issue #90).
+        """
         result_chat = await self.db.execute(select(Chat).where(Chat.id == chat_id))
         chat = result_chat.scalar_one_or_none()
 
@@ -1000,7 +1183,22 @@ class MessageService:
                 message_dict["name"] = msg.name
             updated_messages.append(message_dict)
 
-        llm_provider = await create_provider(provider, model, self.db)
+        _agent_label = (
+            f"{chat.agent_namespace}/{chat.agent_name}"
+            if chat and chat.agent_namespace and chat.agent_name
+            else None
+        )
+        llm_provider = await create_provider(
+            provider,
+            model,
+            self.db,
+            usage_context={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "agent": _agent_label,
+                "source": "chat",
+            },
+        )
 
         clean_tools = strip_tool_metadata(tools)
 
@@ -1061,7 +1259,7 @@ class MessageService:
         # Record follow-up LLM call as a span
         try:
             # Summarize: tool results that were fed back to the LLM
-            _tool_summary = ", ".join(f"{r[1]}" for r in tool_results.values())[:500] if tool_results else "tool results"
+            _tool_summary = tool_summary
             _labels = json.dumps([f"agent:{agent_label}"]) if agent_label else "[]"
             _s2 = _tracer.start_span("llm.call", attributes={
                 "gen_ai.request.model": model or "",

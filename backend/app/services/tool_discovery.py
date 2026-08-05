@@ -18,6 +18,7 @@ from app.services.function_tools import FunctionToolConverter
 from app.services.query_tools import QueryToolConverter
 from app.services.skill_tools import SkillToolConverter
 from app.services.state_tools import StateTools
+from app.services.user_context import load_user_context, merge_user_template_context
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,12 @@ async def get_available_tools(
     agent_input_context = {}
     if chat.chat_metadata and "agent_input" in chat.chat_metadata:
         agent_input_context = chat.chat_metadata["agent_input"]
+
+    # Expose the platform-provided user context as {{user.*}} in locked and
+    # overridable tool parameters (overrides any "user" key from agent input —
+    # not spoofable)
+    user_ctx = await load_user_context(db, user_id)
+    agent_input_context = merge_user_template_context(agent_input_context, user_ctx)
 
     # Get function tools (only if list has items - opt-in)
     if agent.enabled_functions and len(agent.enabled_functions) > 0:

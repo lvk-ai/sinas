@@ -1,7 +1,8 @@
+import json
 import os
 from typing import Optional
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 VALID_AUTH_MODES = {"otp", "password", "password+otp"}
@@ -87,6 +88,81 @@ class Settings(BaseSettings):
     smtp_server_host: str = "0.0.0.0"
     smtp_server_port: int = 2525  # Port for incoming email SMTP server
 
+    # Executor selection — see `app/services/executor/` for the abstraction.
+    # - sandbox_executor: backend for untrusted code (per-function untrusted
+    #   functions and agent codeExecution). Must isolate per execution.
+    #     "docker_pool"      — long-lived Docker container pool (current default)
+    #     "docker_ephemeral" — single-use Docker container per execution
+    #     "k8s_pod"          — single-use k8s Pod per execution (for k8s deploys)
+    #     "disabled"         — sandbox features rejected; deploy is trusted-only
+    # - trusted_executor: backend for admin-approved code (Function.shared_pool=True).
+    #     "docker_shared" — dedicated long-lived Docker workers (current default)
+    #     "inprocess"     — run inside the calling process; no Docker socket needed
+    sandbox_executor: str = "docker_pool"
+    trusted_executor: str = "docker_shared"
+
+    # k8s_pod sandbox executor (only read when sandbox_executor="k8s_pod").
+    # Runs in-cluster: credentials come from the pod's ServiceAccount, which
+    # needs create/get/delete + exec on pods in `k8s_sandbox_namespace`.
+    k8s_sandbox_namespace: str = ""  # "" = this pod's namespace (POD_NAMESPACE env or serviceaccount file)
+    k8s_sandbox_image: str = ""  # "" = function_container_image; must be pullable by the cluster
+    k8s_sandbox_service_account: str = ""  # SA for sandbox pods; "" = namespace default
+    k8s_sandbox_pod_ready_timeout: int = 120  # seconds to wait for a sandbox pod to become Ready
+    k8s_sandbox_install_dependencies: bool = True  # pip install Dependency specs into each pod (skip if baked into k8s_sandbox_image)
+
+    # Scheduling for sandbox pods — deliberately dumb/generic so the actual
+    # policy (spread one-client-per-node vs. pack many clients per node,
+    # etc.) lives entirely in the Helm chart's values, not in app code. This
+    # app only applies whatever it's handed:
+    #   - k8s_release_name: stamped as app.kubernetes.io/instance on the pod,
+    #     so chart-authored affinity rules (either direction) have something
+    #     to match on. "" = no label.
+    #   - k8s_sandbox_node_selector / k8s_sandbox_tolerations: verbatim
+    #     nodeSelector / tolerations, JSON-encoded.
+    #   - k8s_sandbox_affinity: a verbatim K8s `affinity` object (podAffinity
+    #     to pack onto the same node as other pods matching a label,
+    #     podAntiAffinity to spread, nodeAffinity, or any combination),
+    #     JSON-encoded. The chart decides which shape to send — e.g. required
+    #     podAntiAffinity for a paid/isolated plan, required podAffinity
+    #     keyed on a shared "plan=free" label to force free-tier clients onto
+    #     the same node, or "{}" for no constraint. Changing that policy is a
+    #     chart values change, not an app change.
+    # All empty/no-op by default — matches today's behavior on generic
+    # clusters with no per-client scheduling policy.
+    k8s_release_name: str = ""
+    k8s_sandbox_node_selector: str = "{}"  # JSON object, e.g. {"role": "shared"}
+    k8s_sandbox_tolerations: str = "[]"  # JSON list of Toleration dicts
+    k8s_sandbox_affinity: str = "{}"  # JSON k8s Affinity object (podAffinity/podAntiAffinity/nodeAffinity)
+
+    @field_validator("k8s_sandbox_node_selector", "k8s_sandbox_affinity")
+    @classmethod
+    def _validate_k8s_json_object(cls, v: str, info: ValidationInfo) -> str:
+        # Fail at startup, not on the first sandbox execution: a bad value
+        # here would otherwise surface as an unhandled JSONDecodeError deep
+        # inside pod creation instead of a clear config error.
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{info.field_name} must be valid JSON: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"{info.field_name} must be a JSON object, got {type(parsed).__name__}"
+            )
+        return v
+
+    @field_validator("k8s_sandbox_tolerations")
+    @classmethod
+    def _validate_k8s_tolerations(cls, v: str) -> str:
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"k8s_sandbox_tolerations must be valid JSON: {e}") from e
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"k8s_sandbox_tolerations must be a JSON array, got {type(parsed).__name__}"
+            )
+        return v
+
     # Function execution (always uses Docker for isolation)
     function_timeout: int = 300  # 5 minutes (max execution time)
     # Max nesting depth for execution chains (a function/agent invoking another
@@ -142,6 +218,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     queue_function_concurrency: int = 10
     queue_agent_concurrency: int = 5
+    queue_agent_sub_concurrency: int = 5  # concurrency of the sub-agent queue worker
     queue_default_timeout: int = 300
     queue_max_retries: int = 3
     queue_retry_delay: int = 10
@@ -149,6 +226,32 @@ class Settings(BaseSettings):
     # Agent job settings
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)
+
+    # Tool results above this many characters are truncated (structure-aware,
+    # see services/tool_execution.truncate_tool_result) before they enter the
+    # LLM context. Distinct from tool_result_max_size above, which caps what
+    # the tool result store persists per row; same 100KB default so the two
+    # caps stay aligned. ~25K tokens per result; deployments that want a
+    # tighter per-turn budget can lower it via TOOL_RESULT_CONTEXT_MAX_SIZE.
+    tool_result_context_max_size: int = 102400
+
+    # Agent-to-agent delegation (call_agent_* tools). See issue #90.
+    # - agent_delegate_timeout: how long a parent waits for a sub-agent result.
+    #   Must be < agent_job_timeout in "block" mode, since the parent's own job
+    #   clock keeps running while it waits.
+    # - agent_subagent_queue: route delegated (depth > 0) agent jobs to the
+    #   dedicated sub-agent queue so children never compete with top-level
+    #   parents for worker slots. Requires the sub-agent worker process
+    #   (SubAgentWorkerSettings); disable to restore single-queue routing.
+    # - agent_max_delegation_depth: reject delegation chains deeper than this.
+    # - agent_delegate_mode: "block" (parent holds its worker slot while
+    #   awaiting the child) or "suspend" (parent job ends at delegation and a
+    #   resume job continues the conversation when the children finish —
+    #   frees the slot, at the cost of a brief stream gap between jobs).
+    agent_delegate_timeout: int = 600
+    agent_subagent_queue: bool = True
+    agent_max_delegation_depth: int = 5
+    agent_delegate_mode: str = "block"
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
@@ -162,6 +265,9 @@ class Settings(BaseSettings):
     # password: password only (works airgapped, no SMTP needed)
     # password+otp: both required (password + email-OTP as liveness check)
     auth_mode: str = "otp"
+
+    # Role assigned to users auto-provisioned via POST /auth/token/exchange
+    token_exchange_default_role: str = "GuestUsers"
 
     @field_validator("auth_mode")
     @classmethod
@@ -184,6 +290,28 @@ class Settings(BaseSettings):
 
     # Domain (for generating external URLs, e.g., temp file URLs)
     domain: Optional[str] = None  # FQDN like "app.example.com"; localhost or None = no external URLs
+
+    # OAuth authorization-code: bind the consent flow to the browser that started it
+    # (an HttpOnly nonce cookie set by the authenticated begin call, checked at the
+    # callback) to prevent account-linking/login-CSRF. Requires the console and API to be
+    # same-site (they are in a normal single-domain deployment). MUST stay True in any
+    # multi-user/production deployment. Set False ONLY for local dev where the console and
+    # API run on different origins (e.g. console :51245 + API :8000) so the cookie can't
+    # round-trip — disabling it there just removes the extra CSRF check for local testing.
+    oauth_bind_browser_session: bool = True
+
+    @property
+    def public_base_url(self) -> str:
+        """External origin the browser reaches this app at ('scheme://host', no trailing slash).
+
+        Single source of truth for public URLs the browser must hit exactly (OAuth
+        redirect/callback, postMessage target origin). Falls back to the backend port for
+        local dev when no external domain is configured.
+        """
+        domain = (self.domain or "").strip()
+        if not domain or domain.lower() in ("localhost", "127.0.0.1"):
+            return f"http://localhost:{self.backend_port}"
+        return f"https://{domain}"
 
     # Component builder
     builder_url: str = "http://sinas-builder:3000"  # URL for esbuild compilation service

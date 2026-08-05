@@ -228,25 +228,28 @@ async def function_worker_startup(ctx: dict) -> None:
 
     # Discover shared worker containers (created by scheduler).
     # Retry a few times — the scheduler may still be starting up.
-    from app.services.shared_worker_manager import shared_worker_manager
+    # Skipped for non-Docker executors (k8s / single-container).
+    if settings.trusted_executor == "docker_shared":
+        from app.services.shared_worker_manager import shared_worker_manager
 
-    for attempt in range(10):
-        await shared_worker_manager._discover_existing_workers()
-        if shared_worker_manager.workers:
-            break
-        if attempt < 9:
-            print(f"⏳ No shared containers found, waiting for scheduler... ({attempt + 1}/10)")
-            await asyncio.sleep(3)
+        for attempt in range(10):
+            await shared_worker_manager._discover_existing_workers()
+            if shared_worker_manager.workers:
+                break
+            if attempt < 9:
+                print(f"⏳ No shared containers found, waiting for scheduler... ({attempt + 1}/10)")
+                await asyncio.sleep(3)
 
-    shared_worker_manager._initialized = True
-    print(f"✅ Discovered {len(shared_worker_manager.workers)} shared containers")
+        shared_worker_manager._initialized = True
+        print(f"✅ Discovered {len(shared_worker_manager.workers)} shared containers")
 
     # Discover existing sandbox containers (created by backend leader)
-    from app.services.container_pool import container_pool
+    if settings.sandbox_executor == "docker_pool":
+        from app.services.container_pool import container_pool
 
-    await container_pool._discover_existing_containers()
-    container_pool._initialized = True
-    print(f"✅ Discovered {len(container_pool.idle)} sandbox containers")
+        await container_pool._discover_existing_containers()
+        container_pool._initialized = True
+        print(f"✅ Discovered {len(container_pool.idle)} sandbox containers")
 
     # Start heartbeat
     worker_id = str(uuid.uuid4())
@@ -283,11 +286,12 @@ async def agent_worker_startup(ctx: dict) -> None:
     from app.core.database import AsyncSessionLocal  # noqa: F401
 
     # Discover sandbox containers (needed for code execution tool)
-    from app.services.container_pool import container_pool
+    if settings.sandbox_executor == "docker_pool":
+        from app.services.container_pool import container_pool
 
-    await container_pool._discover_existing_containers()
-    container_pool._initialized = True
-    print(f"✅ Agent worker discovered {len(container_pool.idle)} sandbox containers")
+        await container_pool._discover_existing_containers()
+        container_pool._initialized = True
+        print(f"✅ Agent worker discovered {len(container_pool.idle)} sandbox containers")
 
     # Start heartbeat
     worker_id = str(uuid.uuid4())
@@ -342,6 +346,7 @@ class WorkerSettings:
 
 # Import agent jobs for combined worker
 from app.queue.agent_jobs import (
+    execute_agent_delegate_resume_job,
     execute_agent_message_job,
     execute_agent_resume_job,
 )
@@ -350,11 +355,39 @@ from app.queue.agent_jobs import (
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
-    functions = [execute_agent_message_job, execute_agent_resume_job]
+    functions = [
+        execute_agent_message_job,
+        execute_agent_resume_job,
+        execute_agent_delegate_resume_job,
+    ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:agents"
     max_jobs = settings.queue_agent_concurrency
     job_timeout = settings.agent_job_timeout  # Default timeout, can be overridden per-job
+    max_tries = 1  # No retry for agent conversations (side effects)
+
+
+class SubAgentWorkerSettings:
+    """arq worker settings for DELEGATED agent jobs (issue #90).
+
+    Same job handlers as AgentWorkerSettings, different queue: agent-to-agent
+    calls (depth > 0) land here so parents blocked on children can never
+    starve them of worker slots. Run as its own process:
+
+        python -m arq app.queue.worker.SubAgentWorkerSettings
+    """
+
+    functions = [
+        execute_agent_message_job,
+        execute_agent_resume_job,
+        execute_agent_delegate_resume_job,
+    ]
+    on_startup = agent_worker_startup
+    on_shutdown = shutdown
+    redis_settings = get_redis_settings()
+    queue_name = "sinas:queue:agents:sub"
+    max_jobs = settings.queue_agent_sub_concurrency
+    job_timeout = settings.agent_job_timeout
     max_tries = 1  # No retry for agent conversations (side effects)
