@@ -19,6 +19,35 @@ exactly why the pod-based executor exists).
 
 ## Install
 
+The chart is published with every release — no checkout required. Install it
+straight from the registry (replace `0.3.0` with the version you want):
+
+```bash
+helm install sinas oci://ghcr.io/sinas-platform/charts/sinas --version 0.3.0 \
+  --namespace sinas --create-namespace \
+  --set domain=sinas.example.com \
+  --set ingress.className=nginx \
+  --set secrets.secretKey=$(openssl rand -hex 32) \
+  --set secrets.encryptionKey=$(python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())") \
+  --set postgres.password=$(openssl rand -hex 16) \
+  --set clickhouse.password=$(openssl rand -hex 16) \
+  --set superadminEmail=you@example.com
+```
+
+Every release also attaches a packaged `sinas-<version>.tgz` you can install
+from directly, and a checkout works too:
+
+```bash
+# from the release asset
+helm install sinas https://github.com/sinas-platform/sinas/releases/download/0.3.0/sinas-0.3.0.tgz  [...]
+
+# or from a checkout of the tag
+git checkout 0.3.0 && helm install sinas ./charts/sinas  [...]
+```
+
+<details>
+<summary>Full example with a local checkout</summary>
+
 ```bash
 helm install sinas ./charts/sinas \
   --namespace sinas --create-namespace \
@@ -30,6 +59,8 @@ helm install sinas ./charts/sinas \
   --set clickhouse.password=$(openssl rand -hex 16) \
   --set superadminEmail=you@example.com
 ```
+
+</details>
 
 The backend runs database migrations on startup; first boot takes a minute.
 Watch sandbox pods appear during executions:

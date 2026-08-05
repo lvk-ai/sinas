@@ -52,6 +52,19 @@ git tag 0.3.0 && git push origin 0.3.0
 git checkout dev && git merge main && git push
 ```
 
+## Release artifacts
+
+Every version tag publishes, besides the images:
+
+- a version-pinned **`docker-compose-<version>.yml`** (GitHub Release asset)
+- the packaged **Helm chart `sinas-<version>.tgz`** (GitHub Release asset), with chart
+  version and appVersion stamped from the tag
+- the same chart pushed to **`oci://ghcr.io/sinas-platform/charts/sinas`**, so users can
+  `helm install --version <version>` with no checkout
+
+The OCI push runs after the Release is created and is non-fatal — the attached `.tgz` is
+the guaranteed install path.
+
 ## Running a specific version
 
 Every release attaches a **version-pinned `docker-compose-<version>.yml`** to its GitHub
