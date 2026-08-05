@@ -53,6 +53,9 @@ pipelines:
     inputSchema:            # validates run input (trigger payload / tool args / manual run)
       type: object
       properties: {}
+    perUser:                # optional: fan out one run per user connected to this
+      connector: google/gmail        # connector (oauth2_authorization_code)
+      disableAfterFailures: 5        # per-user skip-until-reconnect (optional)
     steps:
       - name: fetch
         type: connector
@@ -119,7 +122,7 @@ Step names are unique per pipeline (`^[a-zA-Z_][a-zA-Z0-9_-]*$`); step count cap
 ```
 
 v1 lands **raw JSONB** — no schema evolution, no column mapping. The table is
-auto-created on first run if missing:
+auto-created on first run if missing. Shared pipelines:
 
 ```sql
 CREATE TABLE IF NOT EXISTS "<table>" (
@@ -129,6 +132,25 @@ CREATE TABLE IF NOT EXISTS "<table>" (
 );
 INSERT ... ON CONFLICT (pk) DO UPDATE SET payload = EXCLUDED.payload, synced_at = now();
 ```
+
+`perUser` pipelines (see Per-user runs) write many users' data into one table, and
+source ids (Gmail message ids, Slack ts) are only unique *per account* — so rows
+carry the user they were synced for and the key is composite:
+
+```sql
+CREATE TABLE IF NOT EXISTS "<table>" (
+  user_id    uuid NOT NULL,
+  pk         text NOT NULL,
+  payload    jsonb NOT NULL,
+  synced_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, pk)
+);
+```
+
+with `user_id` = the run's user, injected implicitly (not mappable — attribution
+must not be spoofable from payload data). The conflict target matches the shape.
+Switching a pipeline between shared and perUser after the table exists is a
+validation error (shape mismatch), not a silent migration.
 
 All items in one run are upserted in a single transaction (all-or-nothing), so a
 failed run holds the cursor and safely replays. `primaryKey` is evaluated per item
@@ -152,8 +174,8 @@ The run context document:
 {
   "input":  { },                  // pipeline run input (trigger payload / tool args / run body)
   "steps":  { "<name>": { "output": ... } },   // completed steps only
-  "cursor": "...",                // current committed cursor value, or null
-  "run":    { "id": "...", "triggerType": "SCHEDULE", "firedAt": "..." }
+  "cursor": "...",                // committed cursor for this run's scope (see Per-user), or null
+  "run":    { "id": "...", "triggerType": "SCHEDULE", "firedAt": "...", "userId": "..." }
 }
 ```
 
@@ -256,6 +278,80 @@ in a new `backend/app/services/pipeline_runner.py`, and two entry points:
 | Recursion | No pipeline step type "pipeline"; agents are the only re-entry, and they are depth-bounded via the existing delegation counter. |
 | Latency floor | connector/query/load steps are in-process (ms). A function step adds one queue round-trip (tens of ms warm, `shared_pool` recommended for mapping-adjacent functions). An `asTool` pipeline of connector+query steps is comfortably interactive. |
 
+## Per-user runs (fan-out)
+
+The single-global-cursor model is wrong for any pipeline whose source connector
+authenticates per user: each connected user is an independent source with their
+own position in the stream. Motivating case: a personal cross-platform inbox —
+per-user ingestion of Gmail/Slack messages into one table, agents sort
+downstream.
+
+Per-user auth exists in two forms today, and both make a source per-user:
+
+1. `oauth2_authorization_code` — per-user tokens in `connector_oauth_tokens`
+   (PR #85).
+2. **Private secret overrides** — for `bearer`/`basic`/`api_key`/
+   `oauth2_client_credentials`, `_resolve_secret_value` resolves a private Secret
+   (visibility `private`, owned by the user) over the shared one of the same
+   name; the client-credentials token cache is keyed by `user_id` for exactly
+   this reason. Users who each store their own API key under the connector's
+   secret name are independent sources too.
+
+`perUser: {connector: <ns/name>}` declares this. Semantics:
+
+- **Fan-out**: a trigger firing the pipeline enqueues one *fire* job; the fire job
+  expands to one queued run per **connected user**, enumerated by the declared
+  connector's auth type:
+  - `oauth2_authorization_code` → users with a `connector_oauth_tokens` row (the
+    set the OAuth status endpoint reports);
+  - secret-based auth (`bearer`/`basic`/`api_key`/`oauth2_client_credentials`) →
+    users holding a **private** Secret named by the connector's `auth.secret`.
+    Users without a private override are *not* fanned out — they'd silently run
+    against the shared credential, which is never what a per-user pipeline means.
+  - `none`/`sinas_token` → no user registry exists; `perUser` on such a
+    connector is a validation error.
+
+  Triggers stay dumb; expansion lives in the pipeline job handler.
+- **Identity**: each run executes *as* that user — `user_id` is theirs, a JWT is
+  minted for them (scheduler pattern), so connector steps resolve their OAuth
+  token exactly as `execute_operation(user_id=...)` already does, and function/
+  agent/query steps run under their permissions. The run context exposes
+  `run.userId`.
+- **Isolation**: cursor, single-flight lock, coalesce flag, hold-on-failure, and
+  consecutive-failure counting are all keyed per `(pipeline, user)`. One user's
+  revoked token or failing mailbox must never block or fail other users' runs.
+  `perUser.disableAfterFailures: N` skips a user after N consecutive failures
+  *until they re-credential* — the OAuth callback storing a fresh token, or a
+  create/update of their private Secret, resets the counter (the natural
+  recovery points) — rather than deactivating the pipeline.
+- **Validation**: `perUser` requires an auth type with a user registry (the
+  enumeration rules above); `none`/`sinas_token` is a validation error. Global
+  cursor (`perUser` absent) remains correct for shared-credential sources (a
+  shared secret with no private overrides in play) and CDC-fed pipelines.
+- **Manual runs / tools**: `POST .../run` on a perUser pipeline runs for the
+  *calling* user only (natural for testing and for `asTool` invocation, which
+  always executes as the chat's user); `?allUsers=true` requires `run:all` and
+  fans out like a trigger.
+- **Concurrency across users**: runs for different users may execute in parallel
+  (bounded by the pipeline queue's worker concurrency); a per-pipeline
+  `maxConcurrentUsers` throttle is future work if fan-out sizes demand it.
+- **Consent note**: fan-out is gated on the OAuth connection itself — connecting
+  a connector is the user's consent for pipelines sourced from it to run on their
+  behalf (admins control which pipelines exist). A per-user opt-in/opt-out flag
+  per pipeline is future work.
+
+Source specifics that shaped this (and belong in the docs examples):
+
+- *Gmail* `history.list` — a true since-cursor (`startHistoryId` → response
+  `historyId`), per user. The schema example above.
+- *Slack* `search.messages` with a **user** token (scope `search:read`; Slack's
+  OAuth v2 nests it under `authed_user.access_token` — the configurable
+  token-response path for connector OAuth is being added separately in the 0.3.0
+  work, and this design assumes it). Slack's `after:` filter is day-granular, so
+  the cursor is the last-synced *day* re-polled with overlap; the duplicates this
+  produces are exactly what the at-least-once + idempotent-upsert contract
+  absorbs (conflict target `(user_id, pk)` with pk = `channel:ts`).
+
 ## Cursor state ("reversed CDC")
 
 Any step may declare `cursor: {param, path, initial?}`; in practice it's step 1.
@@ -278,9 +374,18 @@ Semantics:
 - If `path` yields null on a successful run (e.g. empty poll), the cursor is left
   unchanged — never regress or clear a bookmark on "no data".
 
-Cursor storage: `cursor_value TEXT` on the `pipelines` row (exactly like
-`DatabaseTrigger.last_poll_value` — one bookmark per pipeline). Multiple cursor
-steps per pipeline are rejected at validation in v1.
+Cursor storage:
+
+- Shared pipelines: `cursor_value TEXT` on the `pipelines` row (exactly like
+  `DatabaseTrigger.last_poll_value` — one bookmark per pipeline).
+- `perUser` pipelines: a `pipeline_cursors` table —
+  `(pipeline_id FK, user_id FK, cursor_value TEXT, consecutive_failures INT,
+  last_error TEXT, updated_at)`, unique `(pipeline_id, user_id)`, CASCADE on both
+  FKs. Keeping the shared bookmark on the pipeline row and per-user bookmarks in
+  their own table avoids NULL-in-unique-constraint contortions and gives per-user
+  failure state a natural home.
+
+Multiple cursor steps per pipeline are rejected at validation in v1.
 
 Optional pagination on a cursor-bearing (or any connector/function) step is
 deferred to v1.1 unless trivially cheap during implementation:
@@ -293,9 +398,11 @@ Gmail and Jira consumers can ship without it (batch sizes cover the poll interva
 A slow run and the next trigger firing must not overlap (CDC gets this for free
 from its one-loop-per-trigger process model; queued pipeline runs do not). Design:
 
-- Per-pipeline Redis lock `sinas:pipeline:lock:{id}` acquired with `SET NX EX
-  <syncTimeout+margin>` at run start, held for the run, refreshed by the runner on
-  long runs, released in a `finally`.
+- A Redis lock per run scope — `sinas:pipeline:lock:{id}` for shared pipelines,
+  `sinas:pipeline:lock:{id}:{user_id}` for perUser runs (the coalesce flag is
+  keyed identically) — acquired with `SET NX EX <syncTimeout+margin>` at run
+  start, held for the run, refreshed by the runner on long runs, released in a
+  `finally`. Different users' runs of the same perUser pipeline never contend.
 - `concurrency: single` (the default whenever cursor config is present): if the
   lock is held, a queued firing sets a *coalesce flag*
   (`sinas:pipeline:pending:{id}`) and exits; the lock holder checks the flag on
@@ -317,7 +424,8 @@ from its one-loop-per-trigger process model; queued pipeline runs do not). Desig
   steps. Agent steps are **not** retried by the runner in v1 (side effects +
   cost); their one-shot failure fails the run.
 - **Run failure**: first step to exhaust retries fails the run: status `failed`,
-  error + failing step recorded, cursor held, remaining steps skipped. There is no
+  error + failing step recorded, cursor held (for the run's scope — one user's
+  failure holds only that user's cursor), remaining steps skipped. There is no
   `continueOnError` in v1 — a linear pipeline whose step N failed has nothing
   sound to feed step N+1 (`when:` conditions are the future home for "optional"
   steps).
@@ -329,7 +437,10 @@ from its one-loop-per-trigger process model; queued pipeline runs do not). Desig
   *consecutive* failed runs the pipeline is deactivated (`is_active = false`) with
   `error_message` set (the `DatabaseTrigger.error_message` pattern), surfacing in
   console/config export rather than silently burning quota forever. Default: off
-  (halt-and-hold-cursor only, cadence bounded by the trigger).
+  (halt-and-hold-cursor only, cadence bounded by the trigger). For perUser
+  pipelines the analogous knob lives under `perUser.disableAfterFailures` and
+  applies per user (skip-until-reconnect, counter on `pipeline_cursors`) — a
+  single user's dead token never deactivates the pipeline for everyone.
 
 ## Observability
 
@@ -351,11 +462,14 @@ the `steps` summary only — acceptable for v1 and consistent with how connector
 tool calls are (not) recorded today. Runs API:
 
 ```
-POST /pipelines/{ns}/{name}/run          {input?, mode: sync|async}
-GET  /pipelines/{ns}/{name}/runs         ?status=&limit=
+POST /pipelines/{ns}/{name}/run          {input?, mode: sync|async}   (?allUsers=true for perUser fan-out, requires run:all)
+GET  /pipelines/{ns}/{name}/runs         ?status=&user=&limit=
 GET  /pipelines/runs/{run_id}
 POST /pipelines/runs/{run_id}/replay
 ```
+
+`pipeline_runs.user_id` is the user the run executed as — for perUser fan-out,
+the connected user, not the trigger's owner.
 
 Retention: `pipeline_runs` rows pruned by the same janitor cadence as executions
 (config `PIPELINE_RUN_RETENTION_DAYS`, default 30).
@@ -379,9 +493,11 @@ This absorbs the parked transforms use cases as whole semantic tools:
 ## Resource plumbing (mechanical, follows existing patterns)
 
 - `pipelines` table: id, user_id, namespace, name (unique together), description,
-  input_schema, steps (JSON), as_tool, tool_description, sync_timeout_seconds,
-  concurrency, disable_after_failures, cursor_value, error_message, output
-  (JSON), is_active, managed_by/config_name/config_checksum, timestamps.
+  input_schema, steps (JSON), per_user (JSON, nullable), as_tool,
+  tool_description, sync_timeout_seconds, concurrency, disable_after_failures,
+  cursor_value, error_message, output (JSON), is_active,
+  managed_by/config_name/config_checksum, timestamps. Plus the `pipeline_cursors`
+  table (see Cursor state) for perUser bookmarks and per-user failure counters.
   `PermissionMixin`; permission base `sinas.pipelines/{ns}/{name}` with actions
   `create/read/update/delete/run`; default Users role: `read:own` + `run:own`
   (creation/update stay admin-granted, matching queries' conservative default
@@ -434,7 +550,8 @@ Parked from the superseded 2026-07-27 brief:
 Also future: `when:` per-step conditions, typed-column `load` with schema
 evolution, pagination config (if not landed in v1), session-continuity agent
 steps, dedup keys for effectively-once agent steps, pipeline-level `env`/constants
-block.
+block, per-user opt-in/opt-out flags for perUser pipelines, `maxConcurrentUsers`
+fan-out throttle.
 
 ## Open questions
 
@@ -455,13 +572,19 @@ block.
 
 - Unit: mapping resolution (literal/`.$`/whole-input/missing-path→null), step
   input assembly, cursor inject/read/hold-on-failure/no-regress-on-null, retry
-  policy, single-flight lock + coalesce flag, run finalization (status, cursor
-  commit atomicity), agent-reply schema validation, `load` pk extraction +
-  transactional upsert, steps validation rules, config round-trip
+  policy, single-flight lock + coalesce flag (shared and per-user keying), run
+  finalization (status, cursor commit atomicity), agent-reply schema validation,
+  `load` pk extraction + transactional upsert (both table shapes, implicit
+  user_id not spoofable via mapping), fan-out expansion (connected-user
+  enumeration for both OAuth-token and private-secret registries, per-user
+  failure isolation, skip-until-re-credential + counter reset on token store /
+  private-secret update), steps validation rules, config round-trip
   (YAML→DB→export) with `.$` keys intact.
 - Integration (dev stack): schedule→pipeline Gmail-shaped poll with a stub
-  connector (cursor advances only on success), webhook→pipeline sync+async,
-  tool-invoked pipeline from a chat, replay of a failed run.
+  connector (cursor advances only on success), a perUser fan-out with two
+  connected users where one token is revoked (the other user's runs proceed,
+  cursors stay independent), webhook→pipeline sync+async, tool-invoked pipeline
+  from a chat, replay of a failed run.
 - Latency: measure inline runner overhead for a 3-step connector/query pipeline
   (target: <100ms added over the raw calls) and function-step queue round-trip;
   record numbers in the PR.
