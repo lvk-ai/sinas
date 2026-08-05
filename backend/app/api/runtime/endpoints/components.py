@@ -20,13 +20,13 @@ from app.models.component import Component
 from app.models.component_share import ComponentShare
 from app.models.function import Function
 from app.models.query import Query
-from app.models.user import User
 from app.models.execution import TriggerType
 from app.schemas.component import ProxyExecuteRequest, StateProxyRequest
 from app.models.state import State
 from app.services.content_tokens import generate_component_render_token
 from app.services.database_pool import DatabasePoolManager
 from app.services.queue_service import queue_service
+from app.services.user_context import load_user_context, query_param_context
 
 router = APIRouter()
 
@@ -376,12 +376,8 @@ async def proxy_query_execute(
             raise HTTPException(status_code=400, detail=f"Input validation error: {e.message}")
 
     params = {**body.input}
-    params["user_id"] = str(user_id)
-
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    user = user_result.scalar_one_or_none()
-    if user:
-        params["user_email"] = user.email
+    user_ctx = await load_user_context(db, user_id)
+    params.update(query_param_context(user_ctx))
 
     start_time = time.time()
     pool_manager = DatabasePoolManager.get_instance()

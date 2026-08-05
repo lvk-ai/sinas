@@ -1,0 +1,23 @@
+{{- if (.Values.fileStorage).storageClass }}
+## Shared persistent volume for user-uploaded files (/var/sinas/files).
+## Mounted into backend, queue-worker, queue-agent, and scheduler.
+##
+## Scaleway SBS (and most block storage) is ReadWriteOnce — it can only attach
+## to a single node. All pods that mount this volume must be co-located on the
+## same node.
+##
+## For multi-node production use, use an RWX storage class (NFS, Longhorn, etc.)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-file-storage
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.fileStorage.size | default "5Gi" }}
+  storageClassName: {{ .Values.fileStorage.storageClass }}
+{{- end }}

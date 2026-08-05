@@ -4,6 +4,8 @@ import html as html_lib
 import json
 import logging
 import secrets
+import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
@@ -47,7 +49,19 @@ from app.schemas.auth import (
     RefreshRequest,
     RefreshResponse,
     ResetPasswordRequest,
+    TokenExchangeRequest,
+    TokenExchangeResponse,
 )
+from app.services.user_identity import (
+    IdentityConflictError,
+    get_user_by_identity,
+    link_user_identity,
+)
+
+
+# Verified in place of a real hash for unknown accounts so login timing does
+# not reveal whether an email exists.
+_DUMMY_PASSWORD_HASH = hash_password("enumeration-resistant-dummy")
 
 
 async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str, AuthUserResponse]:
@@ -79,7 +93,8 @@ async def login(request: LoginRequest, http_request: Request, db: AsyncSession =
     - password:     email + password → returns tokens immediately (session_id=None)
     - password+otp: email + password → verifies password, sends OTP, returns session_id
 
-    User must exist — users are created by admins only.
+    User must exist — users are created by admins only. Responses never reveal
+    whether an email has an account (anti-enumeration).
     """
     await rate_limit_by_ip(http_request, "login", settings.rate_limit_login_ip_max, settings.rate_limit_window_seconds)
     await rate_limit_by_value(request.email, "login:email", settings.rate_limit_login_email_max, settings.rate_limit_window_seconds)
@@ -94,29 +109,31 @@ async def login(request: LoginRequest, http_request: Request, db: AsyncSession =
             detail="Password required for this auth mode.",
         )
 
-    # Check if user exists - no auto-provisioning
+    # Check if user exists and is active - no auto-provisioning. To prevent
+    # account enumeration, unknown and deactivated (soft-deleted) emails must
+    # get responses indistinguishable from real accounts: a decoy session in
+    # OTP-only mode, the generic 401 in password modes.
     result = await db.execute(select(User).where(User.email == normalize_email(request.email)))
     user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User not found. Contact your administrator.",
-        )
+    valid_account = user is not None and user.is_active
 
-    # Verify password before any OTP send so we don't email on bad credentials
+    # Verify password before any OTP send so we don't email on bad credentials.
+    # Unknown accounts and accounts without a password verify against a dummy
+    # hash to keep response timing uniform, then get the same generic 401.
     if requires_password:
-        if not user.password_hash:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="No password set for this account. Contact your administrator for a reset link.",
-            )
-        if not verify_password(request.password or "", user.password_hash):
+        real_hash = user.password_hash if valid_account else None
+        password_ok = verify_password(request.password or "", real_hash or _DUMMY_PASSWORD_HASH)
+        if not (real_hash and password_ok):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password.",
             )
 
     if requires_otp:
+        if not valid_account:
+            # Decoy: no email is sent; verifying any code against this session
+            # id fails with the same "Invalid or expired OTP" as a wrong code.
+            return LoginResponse(message="OTP sent to your email", session_id=uuid.uuid4())
         try:
             otp_session = await create_otp_session(db, request.email)
         except Exception as e:
@@ -155,10 +172,11 @@ async def verify_otp(request: OTPVerifyRequest, http_request: Request, db: Async
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP"
         )
 
-    # Get user (must exist - checked during login)
+    # Get user (must exist and be active - checked during login, re-checked here
+    # in case the user was deactivated between OTP send and verification)
     user = await get_user_by_email(db, otp_session.email)
 
-    if not user:
+    if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User not found. Contact your administrator.",
@@ -172,6 +190,91 @@ async def verify_otp(request: OTPVerifyRequest, http_request: Request, db: Async
         token_type="bearer",
         expires_in=settings.access_token_expire_minutes * 60,
         user=user_resp,
+    )
+
+
+@router.post("/token/exchange", response_model=TokenExchangeResponse)
+async def token_exchange(
+    request: Request,
+    exchange: TokenExchangeRequest,
+    current_user_data=Depends(get_current_user_with_permissions),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Exchange an external identity for Sinas tokens (RFC 8693 shape).
+
+    A trusted partner backend — authenticated with an API key holding
+    sinas.auth.exchange:all — asserts that it has authenticated the user
+    identified by (provider, subject) and receives a Sinas access + refresh
+    token pair for that user. With auto_provision, unknown users are created
+    with the configured default role.
+
+    The caller is trusted to assert identities: guard the exchange permission
+    like any other admin credential.
+    """
+    _, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.auth.exchange:all"):
+        set_permission_used(request, "sinas.auth.exchange:all", has_perm=False)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to exchange tokens",
+        )
+
+    set_permission_used(request, "sinas.auth.exchange:all")
+
+    provisioned = False
+    user = await get_user_by_identity(db, exchange.provider, exchange.subject)
+
+    # Fallback: link the identity to an existing user matched by email
+    if not user and exchange.email:
+        user = await get_user_by_email(db, exchange.email)
+
+    if not user:
+        if not exchange.auto_provision:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No user linked to this identity",
+            )
+        if not exchange.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="email is required to auto-provision a user",
+            )
+
+        user = User(
+            email=normalize_email(exchange.email),
+            custom_fields=exchange.custom_fields,
+        )
+        db.add(user)
+        await db.flush()
+
+        default_role = await Role.get_by_name(db, settings.token_exchange_default_role)
+        if default_role:
+            db.add(UserRole(role_id=default_role.id, user_id=user.id, active=True))
+        provisioned = True
+    elif exchange.custom_fields:
+        # Shallow merge: partner-provided keys win, admin-set keys survive
+        user.custom_fields = {**(user.custom_fields or {}), **exchange.custom_fields}
+
+    try:
+        await link_user_identity(
+            db, user, exchange.provider, exchange.subject, exchange.metadata
+        )
+    except IdentityConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    user.last_login_at = datetime.now(UTC)
+
+    access_token, refresh_token, user_resp = await _issue_tokens(db, user)
+
+    return TokenExchangeResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        user=user_resp,
+        provisioned=provisioned,
     )
 
 
@@ -280,7 +383,7 @@ async def redeem_password_reset(
 
     result = await db.execute(select(User).where(User.id == record.user_id))
     user = result.scalar_one_or_none()
-    if not user:
+    if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.password_hash = hash_password(request.new_password)

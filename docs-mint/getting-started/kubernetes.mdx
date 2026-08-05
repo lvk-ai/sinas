@@ -1,0 +1,203 @@
+---
+title: "Deploy on Kubernetes"
+description: "Run Sinas on any Kubernetes cluster with the bundled Helm chart"
+---
+
+Sinas ships a Helm chart at [`charts/sinas`](https://github.com/sinas-platform/sinas/tree/main/charts/sinas)
+that deploys the full platform — backend, queue workers, scheduler, CDC
+worker, console — plus bundled PostgreSQL, Redis, and ClickHouse.
+
+Untrusted code (untrusted functions and agent code execution) runs in
+**ephemeral hardened Pods**: one pod per execution, created through the
+Kubernetes API and deleted afterwards. No Docker socket, no privileged
+Docker-in-Docker. Admin-approved (`shared_pool`) functions run in-process in
+the queue workers.
+
+This works on any conformant cluster — kind, k3s, Scaleway Kapsule, GKE,
+**AWS EKS** (EKS nodes run containerd and have no Docker socket, which is
+exactly why the pod-based executor exists).
+
+## Install
+
+```bash
+helm install sinas ./charts/sinas \
+  --namespace sinas --create-namespace \
+  --set domain=sinas.example.com \
+  --set ingress.className=nginx \
+  --set secrets.secretKey=$(openssl rand -hex 32) \
+  --set secrets.encryptionKey=$(python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())") \
+  --set postgres.password=$(openssl rand -hex 16) \
+  --set clickhouse.password=$(openssl rand -hex 16) \
+  --set superadminEmail=you@example.com
+```
+
+The backend runs database migrations on startup; first boot takes a minute.
+Watch sandbox pods appear during executions:
+
+```bash
+kubectl get pods -n sinas -l sinas.type=sandbox-executor -w
+```
+
+## How sandbox pods are secured
+
+Each execution pod is created with the same hardening as the Docker sandbox:
+
+- all capabilities dropped (`CHOWN`/`SETUID`/`SETGID` added back), no
+  privilege escalation, `RuntimeDefault` seccomp profile
+- memory / CPU / ephemeral-storage limits from `MAX_FUNCTION_*`
+- in-memory `/tmp` (100Mi), single-use, deleted after the execution,
+  `activeDeadlineSeconds` as a leak backstop
+- **no ServiceAccount token** — sandbox pods cannot talk to the Kubernetes API
+- a NetworkPolicy that allows DNS and internet egress only: sandbox pods can
+  never reach cluster-internal services (PostgreSQL, Redis, other namespaces)
+
+The services themselves use a ServiceAccount whose Role is limited to
+`pods` + `pods/exec` in the release namespace — that is the entire privilege
+surface replacing the Docker socket.
+
+<Note>
+NetworkPolicies require a CNI that enforces them (Cilium, Calico, kindnetd on
+recent kind, VPC CNI with a policy engine on EKS). Without enforcement the
+deployment still works, but sandbox pods are not network-isolated.
+</Note>
+
+## Executor image and cold-start latency
+
+Sandbox pods run `executor.image`. By default, platform dependencies (the
+admin-managed package list) are `pip install`ed into each pod at creation,
+which adds seconds to every sandbox execution. For production, bake them in:
+
+```dockerfile
+FROM ghcr.io/sinas-platform/sinas/executor:latest
+RUN pip install --no-cache-dir <your dependency list>
+```
+
+```yaml
+executor:
+  image: registry.example.com/sinas-executor-baked:v1
+  installDependencies: false
+```
+
+## Advanced: per-client node scheduling
+
+These aren't exposed as values in the bundled `charts/sinas` chart — they're
+env vars for operators building their own multi-tenant deployment tooling
+around the k8s_pod executor (e.g. a chart that provisions one release per
+customer). Sinas doesn't decide scheduling policy itself; it just applies
+whatever it's given, so the same knobs work whether you want every
+customer's sandbox pods spread across dedicated nodes or packed together on
+shared ones — that choice lives entirely in your own tooling, not here.
+
+| Setting | Default | Description |
+|---|---|---|
+| `K8S_RELEASE_NAME` | _(empty)_ | Stamped as the `app.kubernetes.io/instance` label on sandbox pods, so your own affinity rules have something to match on. No label if unset. |
+| `K8S_SANDBOX_NODE_SELECTOR` | `{}` | JSON-encoded `nodeSelector` applied verbatim to sandbox pods. |
+| `K8S_SANDBOX_TOLERATIONS` | `[]` | JSON-encoded list of `toleration` objects applied verbatim. |
+| `K8S_SANDBOX_AFFINITY` | `{}` | JSON-encoded K8s `affinity` object (`podAffinity` to pack a customer's sandbox pods onto the same node as their other workloads, `podAntiAffinity` to spread them across dedicated nodes, `nodeAffinity`, or any combination) applied verbatim. |
+
+All four are no-ops by default, matching the behavior described above with
+no scheduling constraint at all.
+
+## Sizing under namespace quotas
+
+Sandbox pods are created **on demand, per execution**, in the release
+namespace — so they compete with the platform's own pods for any namespace
+`ResourceQuota`. Plan the quota headroom explicitly:
+
+- **Sandbox pod size** is set by the executor, with `requests == limits`:
+  `MAX_FUNCTION_MEMORY` (MiB, default `512`) and `MAX_FUNCTION_CPU` (cores,
+  default `1.0`), plus an ephemeral-storage limit from `MAX_FUNCTION_STORAGE`.
+  Pass them via the chart's `extraEnv` to shrink each execution's footprint,
+  e.g. `MAX_FUNCTION_MEMORY=192`, `MAX_FUNCTION_CPU=0.5`.
+- **Concurrency ceiling** ≈ what's left of the quota after the platform pods,
+  divided by one sandbox pod's request. Example: with a
+  `requests.memory: 3Gi` quota and the default chart components requesting
+  ~1.4Gi, a 192Mi sandbox pod allows ~8 concurrent executions; a 512Mi one
+  allows ~3. Check `requests.cpu` and the `pods:` count the same way — the
+  binding constraint is whichever runs out first.
+- **Failure mode:** when the quota is exhausted, pod creation is rejected and
+  the execution fails with a quota error — reduce sandbox size, raise the
+  quota, or lower worker concurrency (`queueWorker`/`queueAgent` values) to
+  bound simultaneous executions.
+- **Trusted (`inprocess`) code has no per-function memory cap** — it runs
+  inside the queue-worker process, so the worker's `resources.limits.memory`
+  *is* the tenant's burst envelope for `shared_pool` functions
+  (worker baseline + concurrency × per-call allocation). Size it accordingly.
+- **Datastores** (postgres, redis, pgbouncer) set no container resources in
+  the chart; on clusters with a `LimitRange` they inherit its defaults, which
+  count against the quota too. Give them explicit values in your own manifest
+  patches if you need deterministic accounting.
+
+The chart's per-component `resources` are values — override any of them
+per deployment.
+
+## Compact profile (density deployments)
+
+For packing several small instances onto one box (e.g. **3 instances on a
+4GB node**), drop ClickHouse and size requests near measured idle usage
+(backend idles ~175MB, workers ~90–120MB):
+
+```yaml
+# compact-values.yaml — ≈650–750MB per instance at idle
+clickhouse:
+  enabled: false          # no ClickHouse pod; request/execution log UI stays empty
+
+backend:
+  resources:
+    requests: { cpu: "200m", memory: "224Mi" }
+    limits:   { cpu: "1",    memory: "768Mi" }
+queueWorker:
+  replicas: 1
+  concurrency: 4          # bounds simultaneous executions (and sandbox pods)
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }   # = shared_pool burst envelope
+queueAgent:
+  replicas: 1
+  concurrency: 2
+  resources:
+    requests: { cpu: "100m", memory: "160Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+extraEnv:
+  - name: MAX_FUNCTION_MEMORY   # sandbox pod request=limit, MiB
+    value: "192"
+  - name: MAX_FUNCTION_CPU
+    value: "0.5"
+```
+
+The math for 3 × on a 4GB node: 3 instances × ~700MB ≈ 2.1GB, k3s host
+overhead ~0.7GB → ~2.8GB idle, leaving ~700MB shared burst headroom — enough
+for a few concurrent 192Mi sandbox pods across tenants. Keep
+`queueWorker.concurrency` low so tenants can't burst past it, or set
+`SANDBOX_EXECUTOR=disabled` for trusted-only tiers.
+
+With `clickhouse.enabled: false` the backend detects the empty
+`CLICKHOUSE_HOST` and disables logging cleanly (no reconnect attempts); the
+Logs pages return empty results.
+
+## Key values
+
+| Value | Default | Description |
+|---|---|---|
+| `domain` | — | Hostname for console + API (one shared hostname) |
+| `ingress.enabled` | `true` | Create a standard `Ingress`; disable to bring your own routing |
+| `ingress.className` | — | e.g. `nginx`, `traefik`, `alb` |
+| `executor.sandbox` | `k8s_pod` | Sandbox executor; `disabled` for trusted-only deployments |
+| `executor.trusted` | `inprocess` | Trusted executor |
+| `executor.image` | ghcr executor | Image for sandbox pods |
+| `executor.installDependencies` | `true` | Per-pod `pip install` (set `false` with a baked image) |
+| `registry.username/password` | — | Pull secret for private registries (also attached to sandbox pods) |
+| `fileStorage.storageClass` | _(emptyDir)_ | RWX storage class for shared file storage on multi-node clusters |
+| `networkPolicy.enabled` | `true` | Namespace isolation + sandbox lockdown |
+| `networkPolicy.ingressNamespace` | _(any)_ | Restrict which namespace may reach backend/console |
+
+## Limitations
+
+- `input()` / human-in-the-loop pauses are unavailable: sandbox pods are
+  single-use (sandbox mode has always rejected `input()`), and the
+  `inprocess` trusted executor is run-to-completion. Durable pause/resume is
+  tracked in [issue #79](https://github.com/sinas-platform/sinas/issues/79).
+- The bundled datastores are convenience-grade. For production, point
+  `DATABASE_URL`-family settings at managed services (e.g. RDS, ElastiCache)
+  and disable the bundled StatefulSets.

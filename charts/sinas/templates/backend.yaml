@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  replicas: {{ .Values.backend.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: {{ include "sinas.executorManagerSA" . }}
+      {{- include "sinas.imagePullSecrets" . | nindent 6 }}
+      {{- if .Values.smtp.ipv4 }}
+      hostAliases:
+        - ip: {{ .Values.smtp.ipv4 | quote }}
+          hostnames:
+            - {{ .Values.smtp.host | quote }}
+      {{- end }}
+      containers:
+        - name: backend
+          image: {{ .Values.image.registry }}/backend:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+          ports:
+            - containerPort: 8000
+          env:
+            {{- include "sinas.backendEnv" . | nindent 12 }}
+            - name: SUPERADMIN_EMAIL
+              value: {{ .Values.superadminEmail | quote }}
+            - name: SMTP_HOST
+              value: {{ .Values.smtp.host | quote }}
+            - name: SMTP_PORT
+              value: {{ .Values.smtp.port | quote }}
+            - name: SMTP_USER
+              value: {{ .Values.smtp.user | quote }}
+            - name: SMTP_DOMAIN
+              value: {{ .Values.smtp.domain | quote }}
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: smtp-password
+          volumeMounts:
+            {{- include "sinas.fileStorageMount" . | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+      volumes:
+        {{- include "sinas.fileStorageVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: backend
+  ports:
+    - port: 8000
+      targetPort: 8000

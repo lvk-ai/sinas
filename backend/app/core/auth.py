@@ -431,7 +431,7 @@ async def validate_refresh_token(db: AsyncSession, plain_token: str) -> Optional
     result = await db.execute(select(User).where(User.id == refresh_token.user_id))
     user = result.scalar_one_or_none()
 
-    if not user:
+    if not user or not user.is_active:
         return None
 
     # Update last login timestamp
@@ -581,7 +581,7 @@ async def validate_api_key(db: AsyncSession, key: str) -> Optional[tuple[User, d
     result = await db.execute(select(User).where(User.id == api_key.user_id))
     user = result.scalar_one_or_none()
 
-    if not user:
+    if not user or not user.is_active:
         return None
 
     # Update last login timestamp
@@ -644,11 +644,11 @@ async def verify_jwt_or_api_key(
         # This ensures permissions are always current (no stale token permissions)
         permissions = await get_user_permissions(db, str(user_id))
 
-        # Verify user exists
+        # Verify user exists and is active (soft-deleted users lose access immediately)
         result = await db.execute(select(User).where(User.id == user_id))
         user = result.scalar_one_or_none()
 
-        if not user:
+        if not user or not user.is_active:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
         return str(user_id), email, permissions
@@ -885,6 +885,12 @@ async def initialize_superadmin(db: AsyncSession):
         await db.commit()
         await db.refresh(user)
         logger.info(f"Admin user created: {email}")
+
+    if not user.is_active:
+        # Escape hatch: a soft-deleted superadmin is reactivated on restart
+        user.is_active = True
+        await db.commit()
+        logger.info(f"Superadmin user reactivated: {email}")
 
     result = await db.execute(
         select(UserRole).where(UserRole.role_id == admins_role.id, UserRole.user_id == user.id)

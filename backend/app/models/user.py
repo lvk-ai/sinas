@@ -14,6 +14,9 @@ class User(Base, PermissionMixin):
 
     id: Mapped[uuid_pk]
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, server_default="true", index=True
+    )
     last_login_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[created_at]
     updated_at: Mapped[updated_at]
@@ -23,10 +26,8 @@ class User(Base, PermissionMixin):
     config_name: Mapped[Optional[str]] = mapped_column(Text)
     config_checksum: Mapped[Optional[str]] = mapped_column(Text)
 
-    # External auth (null = OTP user)
-    external_user_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True)
-    external_metadata: Mapped[Optional[dict]] = mapped_column(JSON)
-    last_external_sync: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
+    # Org-specific profile data (owned by Sinas admins, never overwritten by identity sync)
+    custom_fields: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Password auth (null = no password set; user must use OTP or have admin reset)
     password_hash: Mapped[Optional[str]] = mapped_column(String(255))
@@ -34,6 +35,9 @@ class User(Base, PermissionMixin):
     # Relationships
     role_memberships: Mapped[list["UserRole"]] = relationship(
         "UserRole", back_populates="user", foreign_keys="[UserRole.user_id]"
+    )
+    identities: Mapped[list["UserIdentity"]] = relationship(
+        "UserIdentity", back_populates="user", cascade="all, delete-orphan"
     )
     api_keys: Mapped[list["APIKey"]] = relationship(
         "APIKey", back_populates="user", foreign_keys="[APIKey.user_id]"
@@ -62,6 +66,33 @@ class User(Base, PermissionMixin):
             return str(self.id) == user_id
 
         return False
+
+
+class UserIdentity(Base):
+    """
+    External identity linked to a user. A user can hold multiple identities
+    (e.g. a partner application's user id and an OIDC subject), each keyed by
+    (provider, subject). Subjects are stable external identifiers — never
+    email addresses, which can change at the provider.
+    """
+
+    __tablename__ = "user_identities"
+    __table_args__ = (
+        Index("ix_user_identity_provider_subject", "provider", "subject", unique=True),
+    )
+
+    id: Mapped[uuid_pk]
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Claims/profile snapshot from the provider; overwritten on sync
+    identity_metadata: Mapped[Optional[dict]] = mapped_column(JSON)
+    last_synced_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[created_at]
+    updated_at: Mapped[updated_at]
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="identities")
 
 
 class Role(Base):
