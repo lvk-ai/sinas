@@ -66,6 +66,9 @@ redis:
 
 ## ClickHouse
 clickhouse:
+  ## Set false for the compact profile: no ClickHouse pod, request/execution
+  ## logging off, log UI empty. Everything else works normally.
+  enabled: true
   user: default
   password: ""
   database: sinas

@@ -63,6 +63,7 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
   value: "postgresql://{{ .Values.postgres.user }}:$(DATABASE_PASSWORD)@pgbouncer:5432/{{ .Values.postgres.database }}"
 - name: DATABASE_DIRECT_HOST
   value: postgres
+{{- if .Values.clickhouse.enabled }}
 - name: CLICKHOUSE_HOST
   value: clickhouse
 - name: CLICKHOUSE_PORT
@@ -71,6 +72,12 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
   value: {{ .Values.clickhouse.user | quote }}
 - name: CLICKHOUSE_DATABASE
   value: {{ .Values.clickhouse.database | quote }}
+{{- else }}
+## Empty host = explicit disable: the backend skips ClickHouse entirely
+## (no connection retries, logging methods no-op, log queries return empty).
+- name: CLICKHOUSE_HOST
+  value: ""
+{{- end }}
 - name: REDIS_URL
   value: "redis://redis:6379/0"
 - name: BUILDER_URL
@@ -105,11 +112,13 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
     secretKeyRef:
       name: {{ .Release.Name }}-secrets
       key: encryption-key
+{{- if .Values.clickhouse.enabled }}
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
       name: {{ .Release.Name }}-secrets
       key: clickhouse-password
+{{- end }}
 - name: BACKEND_PORT
   value: "8000"
 {{- with .Values.extraEnv }}
