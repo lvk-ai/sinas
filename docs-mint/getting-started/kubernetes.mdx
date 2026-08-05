@@ -119,6 +119,10 @@ namespace — so they compete with the platform's own pods for any namespace
   the execution fails with a quota error — reduce sandbox size, raise the
   quota, or lower worker concurrency (`queueWorker`/`queueAgent` values) to
   bound simultaneous executions.
+- **Trusted (`inprocess`) code has no per-function memory cap** — it runs
+  inside the queue-worker process, so the worker's `resources.limits.memory`
+  *is* the tenant's burst envelope for `shared_pool` functions
+  (worker baseline + concurrency × per-call allocation). Size it accordingly.
 - **Datastores** (postgres, redis, pgbouncer) set no container resources in
   the chart; on clusters with a `LimitRange` they inherit its defaults, which
   count against the quota too. Give them explicit values in your own manifest
