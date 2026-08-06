@@ -3,7 +3,7 @@ Integration appliers: webhooks, templates, schedules, database triggers
 """
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,21 @@ from app.models.webhook import Webhook
 from app.services.config_apply.normalizers import should_skip_existing
 
 logger = logging.getLogger(__name__)
+
+
+
+def _dedup_storage(dedup) -> Optional[dict]:
+    """Canonical storage shape for a webhook dedup block.
+
+    The config schema field is `ttlSeconds`, but the stored blob is read by
+    dedup_service (and written by the REST schema) as `ttl_seconds`. Dumping the
+    config model verbatim stored the camelCase key, which the consumer never
+    read — every config-managed webhook silently ran on the default TTL. Emit
+    the snake_case shape so both write paths agree.
+    """
+    if not dedup:
+        return None
+    return {"key": dedup.key, "ttl_seconds": dedup.ttlSeconds}
 
 
 async def apply_webhooks(
@@ -38,16 +53,38 @@ async def apply_webhooks(
             result = await db.execute(stmt)
             existing = result.scalar_one_or_none()
 
+            target_type = getattr(webhook_config, "targetType", "function")
+
+            # Parse target references (may be "namespace/name" or just "name")
+            func_ns, func_name = "default", None
+            agent_ns, agent_name = None, None
+            if target_type == "agent":
+                agent_ref = webhook_config.agentName or ""
+                if "/" in agent_ref:
+                    agent_ns, agent_name = agent_ref.split("/", 1)
+                else:
+                    agent_ns, agent_name = "default", agent_ref
+            else:
+                func_ref = webhook_config.functionName or ""
+                if "/" in func_ref:
+                    func_ns, func_name = func_ref.split("/", 1)
+                else:
+                    func_ns, func_name = "default", func_ref
+
             config_hash = calculate_hash(
                 {
                     "path": webhook_config.path,
+                    "target_type": target_type,
                     "function_name": webhook_config.functionName,
+                    "agent_name": webhook_config.agentName,
+                    "message_template": webhook_config.messageTemplate,
+                    "session_key_template": webhook_config.sessionKeyTemplate,
                     "http_method": webhook_config.httpMethod,
                     "description": webhook_config.description,
                     "requires_auth": webhook_config.requiresAuth,
                     "default_values": webhook_config.defaultValues,
                     "response_mode": webhook_config.responseMode,
-                    "dedup": webhook_config.dedup.model_dump() if webhook_config.dedup else None,
+                    "dedup": _dedup_storage(webhook_config.dedup),
                 }
             )
 
@@ -56,22 +93,26 @@ async def apply_webhooks(
                     continue
 
                 if not dry_run:
-                    # Parse function reference (may be "namespace/name" or just "name")
-                    func_ref = webhook_config.functionName
-                    if "/" in func_ref:
-                        func_ns, func_name = func_ref.split("/", 1)
-                    else:
-                        func_ns, func_name = "default", func_ref
-
+                    existing.target_type = target_type
                     existing.function_namespace = func_ns
                     existing.function_name = func_name
+                    existing.agent_namespace = agent_ns
+                    existing.agent_name = agent_name
+                    existing.message_template = webhook_config.messageTemplate
+                    existing.session_key_template = webhook_config.sessionKeyTemplate
                     existing.http_method = webhook_config.httpMethod
                     existing.description = webhook_config.description
                     existing.requires_auth = webhook_config.requiresAuth
                     existing.default_values = webhook_config.defaultValues
                     existing.response_mode = webhook_config.responseMode
-                    existing.dedup = webhook_config.dedup.model_dump() if webhook_config.dedup else None
-                    existing.is_active = True
+                    existing.dedup = _dedup_storage(webhook_config.dedup)
+                    # Deliberately NOT re-enabling: is_active is operator state,
+                    # not config state (WebhookConfig has no isActive field), so
+                    # a re-apply must not silently re-arm a webhook someone
+                    # disabled. This matters because adding fields to the
+                    # config_hash input changes every existing webhook's
+                    # checksum, so the first apply after such a change updates
+                    # them all even when the YAML is byte-identical.
                     existing.config_checksum = config_hash
                     existing.updated_at = datetime.utcnow()
 
@@ -79,24 +120,22 @@ async def apply_webhooks(
 
             else:
                 if not dry_run:
-                    # Parse function reference (may be "namespace/name" or just "name")
-                    func_ref = webhook_config.functionName
-                    if "/" in func_ref:
-                        func_ns, func_name = func_ref.split("/", 1)
-                    else:
-                        func_ns, func_name = "default", func_ref
-
                     new_webhook = Webhook(
                         path=webhook_config.path,
+                        target_type=target_type,
                         function_namespace=func_ns,
                         function_name=func_name,
+                        agent_namespace=agent_ns,
+                        agent_name=agent_name,
+                        message_template=webhook_config.messageTemplate,
+                        session_key_template=webhook_config.sessionKeyTemplate,
                         user_id=owner_user_id,
                         http_method=webhook_config.httpMethod,
                         description=webhook_config.description,
                         requires_auth=webhook_config.requiresAuth,
                         default_values=webhook_config.defaultValues,
                         response_mode=webhook_config.responseMode,
-                        dedup=webhook_config.dedup.model_dump() if webhook_config.dedup else None,
+                        dedup=_dedup_storage(webhook_config.dedup),
                         is_active=True,
                         managed_by=managed_by,
                         config_name=config_name,

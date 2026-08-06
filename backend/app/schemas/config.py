@@ -237,13 +237,36 @@ class WebhookConfig(BaseModel):
     """Webhook configuration"""
 
     path: str
-    functionName: str
+    targetType: str = "function"  # "function" or "agent"
+    functionName: Optional[str] = None  # for function targets ("namespace/name" or "name")
+    agentName: Optional[str] = None  # for agent targets (namespace/name)
+    messageTemplate: Optional[str] = None  # Jinja2, rendered against the request payload
+    sessionKeyTemplate: Optional[str] = None  # Jinja2, optional conversation continuity key
     httpMethod: str = "POST"
     description: Optional[str] = None
     requiresAuth: bool = True
     defaultValues: dict[str, Any] = Field(default_factory=dict)
-    responseMode: str = "sync"
+    responseMode: str = "sync"  # "sync", "async", or "raw" (raw: function targets only)
     dedup: Optional[WebhookDedupConfig] = None
+
+    @validator("dedup", always=True)
+    def validate_target(cls, v, values):
+        target_type = values.get("targetType", "function")
+        if target_type not in ("function", "agent"):
+            raise ValueError("targetType must be 'function' or 'agent'")
+        if values.get("responseMode") not in ("sync", "async", "raw"):
+            raise ValueError("responseMode must be 'sync', 'async', or 'raw'")
+        if target_type == "function":
+            if not values.get("functionName"):
+                raise ValueError("functionName is required for function-target webhooks")
+        else:
+            if not values.get("agentName"):
+                raise ValueError("agentName is required for agent-target webhooks")
+            if not values.get("messageTemplate"):
+                raise ValueError("messageTemplate is required for agent-target webhooks")
+            if values.get("responseMode") == "raw":
+                raise ValueError("responseMode 'raw' is only supported for function-target webhooks")
+        return v
 
 
 class ScheduleConfig(BaseModel):

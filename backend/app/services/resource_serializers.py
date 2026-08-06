@@ -118,16 +118,46 @@ def serialize_template(template) -> dict:
 
 
 def serialize_webhook(webhook) -> dict:
+    target_type = getattr(webhook, "target_type", "function") or "function"
     return _remove_none_values({
         "path": webhook.path,
-        "functionName": f"{webhook.function_namespace}/{webhook.function_name}",
+        # Omitted for function targets so legacy exports stay unchanged
+        "targetType": target_type if target_type != "function" else None,
+        "functionName": f"{webhook.function_namespace}/{webhook.function_name}"
+        if target_type == "function"
+        else None,
+        "agentName": f"{webhook.agent_namespace}/{webhook.agent_name}"
+        if target_type == "agent"
+        else None,
+        "messageTemplate": webhook.message_template if target_type == "agent" else None,
+        "sessionKeyTemplate": webhook.session_key_template if target_type == "agent" else None,
         "httpMethod": webhook.http_method,
         "requiresAuth": webhook.requires_auth,
         "description": webhook.description,
         "defaultValues": webhook.default_values or None,
         "responseMode": getattr(webhook, "response_mode", None),
-        "dedup": getattr(webhook, "dedup", None) or None,
+        "dedup": _serialize_dedup(getattr(webhook, "dedup", None)),
     })
+
+
+def _serialize_dedup(dedup: Optional[dict]) -> Optional[dict]:
+    """Export a stored dedup blob in the config schema's camelCase shape.
+
+    Storage is snake_case (`ttl_seconds`); the config schema expects
+    `ttlSeconds`. Exporting the raw blob emitted the snake_case key, which
+    WebhookDedupConfig then ignored on re-apply — silently resetting the TTL to
+    its default on a no-op round-trip. Older rows may still hold `ttlSeconds`,
+    so accept either on the way out.
+    """
+    if not dedup:
+        return None
+    ttl = dedup.get("ttl_seconds")
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        ttl = dedup.get("ttlSeconds")
+    out: dict[str, Any] = {"key": dedup.get("key")}
+    if isinstance(ttl, int) and not isinstance(ttl, bool):
+        out["ttlSeconds"] = ttl
+    return out
 
 
 def serialize_schedule(schedule) -> dict:
