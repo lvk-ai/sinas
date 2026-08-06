@@ -447,6 +447,8 @@ async def _create_function(db: AsyncSession, user) -> Function:
         namespace="slack",
         name=f"handler-{uuid.uuid4().hex[:8]}",
         code="def main(input): return input",
+        input_schema={},
+        output_schema={},
         is_active=True,
     )
     db.add(fn)
@@ -656,8 +658,38 @@ class TestRuntimeAgentTarget:
 
         monkeypatch.setattr(queue_service, "enqueue_agent_message", fake_enqueue_agent_message)
 
-        # Payload missing everything the template references
+        # Payload missing everything the template references: undefined
+        # variables render empty, the webhook still succeeds
         resp = await client.post(f"/webhooks/{path}", json={"unrelated": True})
         assert resp.status_code == 202, resp.text
-        # Rendered empty -> falls back to the JSON payload
+        assert captured["content"] == "New issue :"
+
+    async def test_fully_empty_render_falls_back_to_payload(
+        self, client, db, test_user, monkeypatch
+    ):
+        agent, path = await self._setup(db, test_user)
+
+        # Make the whole template render empty
+        from sqlalchemy import select as sa_select
+
+        result = await db.execute(sa_select(Webhook).where(Webhook.path == path))
+        webhook = result.scalar_one()
+        webhook.message_template = "{{ missing }}"
+        await db.flush()
+
+        monkeypatch.setattr(db, "commit", db.flush)
+
+        from app.services.queue_service import queue_service
+
+        captured = {}
+
+        async def fake_enqueue_agent_message(**kwargs):
+            captured.update(kwargs)
+            return "job-z"
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", fake_enqueue_agent_message)
+
+        resp = await client.post(f"/webhooks/{path}", json={"unrelated": True})
+        assert resp.status_code == 202, resp.text
+        # Empty render falls back to the JSON payload so the agent gets context
         assert "unrelated" in captured["content"]

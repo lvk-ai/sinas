@@ -152,7 +152,9 @@ async def _execute_agent_webhook(
             content=message,
             channel_id=str(uuid.uuid4()),
             agent=f"{agent.namespace}/{agent.name}",
-            trigger_type=TriggerType.WEBHOOK.value,
+            # Agent-message jobs use lowercase trigger labels (cf. scheduler's
+            # "schedule"), unlike TriggerType enum values used for functions
+            trigger_type="webhook",
             job_timeout=agent.default_job_timeout,
         )
         return JSONResponse({"chat_id": chat_id, "job_id": job_id}, status_code=202)

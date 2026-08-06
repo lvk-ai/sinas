@@ -1,7 +1,7 @@
 """add agent targets and raw response mode to webhooks
 
 Revision ID: w2a3b4t5g6t7
-Revises: c1a2c3h4e5t6
+Revises: 70ea30af567e
 Create Date: 2026-07-27
 """
 import sqlalchemy as sa
@@ -9,7 +9,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "w2a3b4t5g6t7"
-down_revision = "c1a2c3h4e5t6"
+down_revision = "70ea30af567e"
 branch_labels = None
 depends_on = None
 
