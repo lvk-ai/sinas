@@ -2,7 +2,7 @@
 agents.enabled_pipelines; database_triggers pipeline targets
 
 Revision ID: p1i2p3l4n5s6
-Revises: c1a2c3h4e5t6
+Revises: 70ea30af567e
 Create Date: 2026-07-28
 """
 import sqlalchemy as sa
@@ -10,7 +10,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "p1i2p3l4n5s6"
-down_revision = "c1a2c3h4e5t6"
+down_revision = "70ea30af567e"
 branch_labels = None
 depends_on = None
 
