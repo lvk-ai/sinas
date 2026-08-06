@@ -28,6 +28,7 @@ from app.services.config_apply.resources import (
     apply_dependencies,
     apply_functions,
     apply_manifests,
+    apply_pipelines,
     apply_queries,
     apply_secrets,
     apply_skills,
@@ -236,6 +237,13 @@ class ConfigApplyService:
                     agents=config.spec.agents,
                     llm_provider_ids=self.llm_provider_ids,
                     agent_ids=self.agent_ids,
+                )
+            # Pipelines apply after connectors/functions/queries/agents (their
+            # step references), and before the triggers that may target them.
+            if "pipelines" not in self.skip_resource_types:
+                await apply_pipelines(
+                    **common_with_owner,
+                    pipelines=config.spec.pipelines,
                 )
             if "webhooks" not in self.skip_resource_types:
                 await apply_webhooks(

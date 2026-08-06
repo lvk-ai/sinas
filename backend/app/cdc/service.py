@@ -259,17 +259,29 @@ class CDCManager:
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             }
 
-                            # Enqueue function execution
+                            # Enqueue the target: function execution or pipeline fire.
+                            # Note: CDC advances its own bookmark at enqueue time
+                            # (below) regardless of downstream success; a pipeline's
+                            # own cursor (if any) is managed by the pipeline runner.
                             execution_id = str(uuid.uuid4())
-                            await queue_service.enqueue_function(
-                                function_namespace=trigger.function_namespace,
-                                function_name=trigger.function_name,
-                                input_data=payload,
-                                execution_id=execution_id,
-                                trigger_type="CDC",
-                                trigger_id=trigger_id,
-                                user_id=str(trigger.user_id),
-                            )
+                            if trigger.target_type == "pipeline":
+                                await queue_service.enqueue_pipeline_fire(
+                                    namespace=trigger.pipeline_namespace or "default",
+                                    name=trigger.pipeline_name,
+                                    run_input=payload,
+                                    trigger_type="CDC",
+                                    trigger_id=trigger_id,
+                                )
+                            else:
+                                await queue_service.enqueue_function(
+                                    function_namespace=trigger.function_namespace,
+                                    function_name=trigger.function_name,
+                                    input_data=payload,
+                                    execution_id=execution_id,
+                                    trigger_type="CDC",
+                                    trigger_id=trigger_id,
+                                    user_id=str(trigger.user_id),
+                                )
 
                             # Update bookmark and clear error
                             async with AsyncSessionLocal() as db:

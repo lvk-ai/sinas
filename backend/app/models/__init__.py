@@ -19,6 +19,7 @@ from .dependency import Dependency
 from .package import Package
 from .query import Query
 from .pending_approval import PendingToolApproval
+from .pipeline import Pipeline, PipelineCursor, PipelineRun
 from .pending_delegation import PendingDelegation
 from .schedule import ScheduledJob
 from .secret import Secret

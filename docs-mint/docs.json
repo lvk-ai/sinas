@@ -38,6 +38,7 @@
               "build-resources/system-tools",
               "build-resources/functions",
               "build-resources/queries",
+              "build-resources/pipelines",
               "build-resources/connectors",
               "build-resources/skills",
               "build-resources/components",

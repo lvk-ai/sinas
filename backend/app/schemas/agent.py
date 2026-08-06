@@ -100,6 +100,7 @@ class AgentCreate(BaseModel):
     enabled_collections: Optional[list[EnabledCollectionConfig]] = None  # Collection access configs
     enabled_components: Optional[list[str]] = None  # List of "namespace/name" component references
     enabled_connectors: Optional[list[dict[str, Any]]] = None  # [{"connector": "ns/name", "operations": [...], "parameters": {...}}]
+    enabled_pipelines: Optional[list[str]] = None  # List of "namespace/name" pipeline references (asTool)
     hooks: Optional[AgentHooks] = None
     icon: Optional[str] = None  # "collection:ns/coll/file" or "url:https://..."
     is_default: Optional[bool] = False
@@ -156,6 +157,7 @@ class AgentUpdate(BaseModel):
     enabled_collections: Optional[list[EnabledCollectionConfig]] = None  # Collection access configs
     enabled_components: Optional[list[str]] = None  # List of "namespace/name" component references
     enabled_connectors: Optional[list[dict[str, Any]]] = None  # [{"connector": "ns/name", "operations": [...], "parameters": {...}}]
+    enabled_pipelines: Optional[list[str]] = None  # List of "namespace/name" pipeline references (asTool)
     hooks: Optional[AgentHooks] = None
     icon: Optional[str] = None  # "collection:ns/coll/file" or "url:https://..."
     is_active: Optional[bool] = None
@@ -192,6 +194,7 @@ class AgentResponse(BaseModel):
     enabled_collections: list[EnabledCollectionConfig] = []
     enabled_components: list[str] = []
     enabled_connectors: list[dict[str, Any]] = []
+    enabled_pipelines: list[str] = []
     hooks: Optional[dict[str, Any]] = None
     icon: Optional[str] = None
     icon_url: Optional[str] = None

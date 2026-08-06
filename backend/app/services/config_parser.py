@@ -446,17 +446,54 @@ class ConfigParser:
                     )
                 )
 
-        # Validate schedule references
+        # Pipeline names (config + database) for schedule/trigger target checks
+        pipeline_names = {
+            f"{p.get('namespace', 'default')}/{p['name']}" for p in spec.get("pipelines", [])
+        }
+        db_pipeline_names: set[str] = set()
+        if db:
+            from app.models.pipeline import Pipeline as PipelineModel
+
+            result = await db.execute(select(PipelineModel.namespace, PipelineModel.name))
+            db_pipeline_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
+        all_pipeline_names = pipeline_names | db_pipeline_names
+
+        # Validate schedule references (target depends on scheduleType)
         for i, schedule in enumerate(spec.get("schedules", [])):
-            # Build function reference as namespace/name
-            func_namespace = schedule.get("functionNamespace", "default")
-            func_name = schedule["functionName"]
-            func_ref = f"{func_namespace}/{func_name}"
-            if not _ref_matches_any(func_ref, all_function_names):
-                errors.append(
-                    ConfigValidationError(
-                        path=f"spec.schedules[{i}].functionName",
-                        message=f"Referenced function '{func_ref}' not defined",
+            schedule_type = schedule.get("scheduleType", "function")
+            if schedule_type == "pipeline":
+                pipeline_ref = schedule.get("pipelineName") or ""
+                if "/" not in pipeline_ref:
+                    pipeline_ref = f"default/{pipeline_ref}"
+                if not _ref_matches_any(pipeline_ref, all_pipeline_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.schedules[{i}].pipelineName",
+                            message=f"Referenced pipeline '{pipeline_ref}' not defined",
+                        )
                     )
-                )
+            elif schedule_type == "agent":
+                agent_ref = schedule.get("agentName") or ""
+                if "/" not in agent_ref:
+                    agent_ref = f"default/{agent_ref}"
+                if not _ref_matches_any(agent_ref, all_agent_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.schedules[{i}].agentName",
+                            message=f"Referenced agent '{agent_ref}' not defined",
+                        )
+                    )
+            else:
+                func_namespace = schedule.get("functionNamespace", "default")
+                func_name = schedule.get("functionName")
+                func_ref = f"{func_namespace}/{func_name}"
+                if "/" in (func_name or ""):
+                    func_ref = func_name
+                if not _ref_matches_any(func_ref, all_function_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.schedules[{i}].functionName",
+                            message=f"Referenced function '{func_ref}' not defined",
+                        )
+                    )
 

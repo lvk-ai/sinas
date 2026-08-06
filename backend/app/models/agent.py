@@ -102,6 +102,11 @@ class Agent(Base, PermissionMixin):
         JSON, nullable=False, default=list, server_default="[]"
     )  # [{"connector": "ns/name", "operations": [...], "parameters": {...}}]
 
+    # Pipeline access (pipelines with asTool exposed as tools)
+    enabled_pipelines: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )  # List of "namespace/name" pipeline references (wildcards supported)
+
     # Message lifecycle hooks
     hooks: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     # {"on_user_message": [...], "on_assistant_message": [...]}

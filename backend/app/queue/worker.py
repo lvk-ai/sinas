@@ -306,6 +306,76 @@ async def agent_worker_startup(ctx: dict) -> None:
     logger.info(f"Agent worker started (id={worker_id})")
 
 
+async def execute_pipeline_run_job(ctx: dict, **kwargs: Any) -> Any:
+    """Execute one pipeline run (one user scope) in the pipeline worker."""
+    from app.services import pipeline_runner
+
+    pipeline_id = kwargs["pipeline_id"]
+    user_id = kwargs["user_id"]
+
+    token = await pipeline_runner.mint_run_token(user_id)
+    if not token:
+        logger.error(f"Pipeline run job: user {user_id} not found, dropping run")
+        return {"status": "failed", "error": f"User {user_id} not found"}
+
+    return await pipeline_runner.run_pipeline(
+        pipeline_id,
+        kwargs.get("run_input"),
+        trigger_type=kwargs.get("trigger_type", "API"),
+        trigger_id=kwargs.get("trigger_id"),
+        user_id=user_id,
+        user_token=token,
+        sync=False,
+    )
+
+
+async def execute_pipeline_fire_job(ctx: dict, **kwargs: Any) -> Any:
+    """Expand a trigger firing into per-scope run jobs (perUser fan-out)."""
+    from app.services import pipeline_runner
+
+    job_ids = await pipeline_runner.fire_pipeline(
+        kwargs["namespace"],
+        kwargs["name"],
+        kwargs.get("run_input"),
+        trigger_type=kwargs.get("trigger_type", "API"),
+        trigger_id=kwargs.get("trigger_id"),
+    )
+    return {"runs": len(job_ids), "job_ids": job_ids}
+
+
+async def pipeline_worker_startup(ctx: dict) -> None:
+    """arq startup hook for the pipeline worker.
+
+    Pipeline runs are await-heavy orchestration (they wait on child function/
+    agent executions and HTTP), so this worker runs many jobs concurrently and
+    needs no container discovery.
+    """
+    from redis.asyncio import Redis
+
+    from app.core.telemetry import init_telemetry
+    init_telemetry()
+
+    ctx["redis"] = Redis.from_url(settings.redis_url, decode_responses=True)
+
+    # Eagerly import the runner so the first job doesn't pay import cost
+    from app.services import pipeline_runner  # noqa: F401
+
+    worker_id = str(uuid.uuid4())
+    ctx["worker_id"] = worker_id
+    heartbeat_data = {
+        "worker_id": worker_id,
+        "queue": "pipelines",
+        "max_jobs": settings.queue_pipeline_concurrency,
+        "started_at": time.time(),
+        "last_heartbeat": time.time(),
+    }
+    ctx["_heartbeat_task"] = asyncio.create_task(
+        _heartbeat_loop(ctx["redis"], worker_id, heartbeat_data)
+    )
+
+    logger.info(f"Pipeline worker started (id={worker_id})")
+
+
 async def shutdown(ctx: dict) -> None:
     """arq worker shutdown hook."""
     # Cancel heartbeat
@@ -363,6 +433,24 @@ class AgentWorkerSettings:
     max_jobs = settings.queue_agent_concurrency
     job_timeout = settings.agent_job_timeout  # Default timeout, can be overridden per-job
     max_tries = 1  # No retry for agent conversations (side effects)
+
+
+class PipelineWorkerSettings:
+    """arq worker settings for pipeline runs. Own queue + process so long
+    pipeline runs never starve function workers (and vice versa). High
+    concurrency: runs mostly await child executions and HTTP.
+
+        python -m arq app.queue.worker.PipelineWorkerSettings
+    """
+
+    functions = [execute_pipeline_run_job, execute_pipeline_fire_job]
+    on_startup = pipeline_worker_startup
+    on_shutdown = shutdown
+    redis_settings = get_redis_settings()
+    queue_name = "sinas:queue:pipelines"
+    max_jobs = settings.queue_pipeline_concurrency
+    job_timeout = settings.pipeline_job_timeout
+    max_tries = 1  # runs are re-fired by triggers; never auto-retried (side effects)
 
 
 class SubAgentWorkerSettings:

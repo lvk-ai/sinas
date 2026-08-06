@@ -140,6 +140,9 @@ def serialize_schedule(schedule) -> dict:
         "agentName": f"{schedule.target_namespace}/{schedule.target_name}"
         if schedule.schedule_type == "agent"
         else None,
+        "pipelineName": f"{schedule.target_namespace}/{schedule.target_name}"
+        if schedule.schedule_type == "pipeline"
+        else None,
         "content": schedule.content,
         "cronExpression": schedule.cron_expression,
         "isActive": schedule.is_active,
@@ -213,6 +216,7 @@ def serialize_agent(agent, provider_name: Optional[str] = None) -> dict:
         "enabledCollections": agent.enabled_collections or None,
         "enabledComponents": agent.enabled_components or None,
         "enabledConnectors": agent.enabled_connectors or None,
+        "enabledPipelines": agent.enabled_pipelines or None,
         "hooks": agent.hooks or None,
         "icon": agent.icon,
         "isDefault": agent.is_default if agent.is_default else None,
@@ -244,9 +248,41 @@ def serialize_database_trigger(trigger, connection_name: Optional[str] = None) -
         "schemaName": trigger.schema_name,
         "tableName": trigger.table_name,
         "operations": trigger.operations,
-        "functionName": f"{trigger.function_namespace}/{trigger.function_name}",
+        "targetType": trigger.target_type if trigger.target_type != "function" else None,
+        "functionName": f"{trigger.function_namespace}/{trigger.function_name}"
+        if trigger.function_name
+        else None,
+        "pipelineName": f"{trigger.pipeline_namespace or 'default'}/{trigger.pipeline_name}"
+        if trigger.pipeline_name
+        else None,
         "pollColumn": trigger.poll_column,
         "pollIntervalSeconds": trigger.poll_interval_seconds,
         "batchSize": trigger.batch_size,
         "isActive": trigger.is_active,
     })
+
+
+def serialize_pipeline(pipeline) -> dict:
+    """Export a pipeline. cursor_value / error_message / failure counters are
+    runtime state, not config — deliberately not exported. Steps/perUser are
+    stored verbatim (camelCase, `.$` keys intact) and pass straight through."""
+    out = {
+        "namespace": pipeline.namespace,
+        "name": pipeline.name,
+        "description": pipeline.description,
+        "inputSchema": pipeline.input_schema or None,
+        "steps": pipeline.steps,
+        "perUser": pipeline.per_user,
+        "asTool": pipeline.as_tool or None,
+        "toolDescription": pipeline.tool_description,
+        "syncTimeoutSeconds": pipeline.sync_timeout_seconds if pipeline.sync_timeout_seconds != 120 else None,
+        "concurrency": pipeline.concurrency,
+        "disableAfterFailures": pipeline.disable_after_failures,
+        "isActive": pipeline.is_active,
+    }
+    mapping = pipeline.output_mapping or {}
+    if "output.$" in mapping:
+        out["output.$"] = mapping["output.$"]
+    elif "output" in mapping:
+        out["output"] = mapping["output"]
+    return _remove_none_values(out)
