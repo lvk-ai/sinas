@@ -658,11 +658,15 @@ class TestRuntimeAgentTarget:
 
         monkeypatch.setattr(queue_service, "enqueue_agent_message", fake_enqueue_agent_message)
 
-        # Payload missing everything the template references: undefined
-        # variables render empty, the webhook still succeeds
+        # Payload missing everything the template references: the webhook must
+        # still succeed (undefined variables never raise), but a PARTIAL render
+        # must not be sent as-is. 'New issue :' is non-empty yet carries no
+        # information about the event, so the agent would be invoked — and
+        # billed — with nothing to act on. Fall back to the raw payload instead.
         resp = await client.post(f"/webhooks/{path}", json={"unrelated": True})
         assert resp.status_code == 202, resp.text
-        assert captured["content"] == "New issue :"
+        assert captured["content"] != "New issue :"
+        assert "unrelated" in captured["content"]
 
     async def test_fully_empty_render_falls_back_to_payload(
         self, client, db, test_user, monkeypatch
@@ -693,3 +697,119 @@ class TestRuntimeAgentTarget:
         assert resp.status_code == 202, resp.text
         # Empty render falls back to the JSON payload so the agent gets context
         assert "unrelated" in captured["content"]
+
+
+# =========================================================================
+# Authorization (PR #111 review): triggering a webhook runs AS THE OWNER, so
+# ownership — not the caller's access to the target — is what authorizes it.
+# =========================================================================
+
+
+async def _user_with_perms(db: AsyncSession, perms: list[str]):
+    """A user whose role grants exactly `perms`."""
+    from app.models.user import Role, RolePermission, User, UserRole
+
+    role = Role(name=f"role-{uuid.uuid4().hex[:8]}", description="perm fixture")
+    db.add(role)
+    await db.flush()
+    await db.refresh(role)
+    for key in perms:
+        db.add(RolePermission(role_id=role.id, permission_key=key, permission_value=True))
+
+    user = User(email=f"u-{uuid.uuid4().hex[:8]}@example.com")
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    db.add(UserRole(role_id=role.id, user_id=user.id, active=True))
+    await db.flush()
+    return user
+
+
+async def _agent_webhook(db: AsyncSession, owner, *, requires_auth: bool):
+    agent = Agent(
+        user_id=owner.id,
+        namespace="jira",
+        name=f"triage-{uuid.uuid4().hex[:8]}",
+        is_active=True,
+    )
+    db.add(agent)
+    await db.flush()
+    await db.refresh(agent)
+
+    path = f"jira/auth-{uuid.uuid4().hex[:8]}"
+    db.add(
+        Webhook(
+            user_id=owner.id,
+            path=path,
+            target_type="agent",
+            function_namespace="default",
+            function_name=None,
+            agent_namespace=agent.namespace,
+            agent_name=agent.name,
+            message_template="Issue {{ key }}",
+            http_method="POST",
+            requires_auth=requires_auth,
+            response_mode="async",
+        )
+    )
+    await db.flush()
+    return agent, path
+
+
+class TestWebhookOwnershipAuthorization:
+    async def test_non_owner_with_chat_all_is_rejected(self, db: AsyncSession, client):
+        """`sinas.agents/*/*.chat:all` is a DEFAULT grant for every user, so a
+        target-permission check would let any authenticated user drive someone
+        else's webhook — and it runs as the owner, with the owner's secrets."""
+        owner = await _user_with_perms(db, ["sinas.agents/*/*.chat:all"])
+        other = await _user_with_perms(db, ["sinas.agents/*/*.chat:all"])
+        _agent, path = await _agent_webhook(db, owner, requires_auth=True)
+
+        resp = await client.post(
+            f"/webhooks/{path}", json={"key": "AB-1"}, headers=auth_headers(other)
+        )
+        assert resp.status_code == 403, resp.text
+
+    async def test_owner_is_allowed(self, db: AsyncSession, client, monkeypatch):
+        """Regression guard: the ownership rule must not lock out the owner."""
+        owner = await _user_with_perms(db, ["sinas.agents/*/*.chat:all"])
+        _agent, path = await _agent_webhook(db, owner, requires_auth=True)
+
+        monkeypatch.setattr(db, "commit", db.flush)
+        from app.services.queue_service import queue_service
+
+        async def fake_enqueue_agent_message(**kwargs):
+            return "job-owner"
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", fake_enqueue_agent_message)
+
+        resp = await client.post(
+            f"/webhooks/{path}", json={"key": "AB-1"}, headers=auth_headers(owner)
+        )
+        assert resp.status_code == 202, resp.text
+
+    async def test_owner_without_chat_permission_is_rejected(
+        self, db: AsyncSession, client
+    ):
+        """Permissions can be narrowed after the webhook is created; the target
+        check must be re-evaluated per request, not trusted from creation."""
+        owner = await _user_with_perms(db, [])  # no chat permission at all
+        _agent, path = await _agent_webhook(db, owner, requires_auth=False)
+
+        resp = await client.post(f"/webhooks/{path}", json={"key": "AB-1"})
+        assert resp.status_code == 403, resp.text
+
+    async def test_deactivated_owner_cannot_fire_public_webhook(
+        self, db: AsyncSession, client
+    ):
+        """Soft-deleting a user revokes their API keys and tokens (#102). A
+        public webhook that keeps minting tokens for them would re-open exactly
+        the access that deletion was supposed to close."""
+        owner = await _user_with_perms(db, ["sinas.agents/*/*.chat:all"])
+        _agent, path = await _agent_webhook(db, owner, requires_auth=False)
+
+        owner.is_active = False
+        await db.flush()
+
+        resp = await client.post(f"/webhooks/{path}", json={"key": "AB-1"})
+        assert resp.status_code == 403, resp.text

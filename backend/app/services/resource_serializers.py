@@ -136,8 +136,28 @@ def serialize_webhook(webhook) -> dict:
         "description": webhook.description,
         "defaultValues": webhook.default_values or None,
         "responseMode": getattr(webhook, "response_mode", None),
-        "dedup": getattr(webhook, "dedup", None) or None,
+        "dedup": _serialize_dedup(getattr(webhook, "dedup", None)),
     })
+
+
+def _serialize_dedup(dedup: Optional[dict]) -> Optional[dict]:
+    """Export a stored dedup blob in the config schema's camelCase shape.
+
+    Storage is snake_case (`ttl_seconds`); the config schema expects
+    `ttlSeconds`. Exporting the raw blob emitted the snake_case key, which
+    WebhookDedupConfig then ignored on re-apply — silently resetting the TTL to
+    its default on a no-op round-trip. Older rows may still hold `ttlSeconds`,
+    so accept either on the way out.
+    """
+    if not dedup:
+        return None
+    ttl = dedup.get("ttl_seconds")
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        ttl = dedup.get("ttlSeconds")
+    out: dict[str, Any] = {"key": dedup.get("key")}
+    if isinstance(ttl, int) and not isinstance(ttl, bool):
+        out["ttlSeconds"] = ttl
+    return out
 
 
 def serialize_schedule(schedule) -> dict:

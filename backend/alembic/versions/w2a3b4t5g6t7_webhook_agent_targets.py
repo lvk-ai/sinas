@@ -28,6 +28,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Agent-target rows have function_name NULL by design, so restoring NOT NULL
+    # would abort on them (and, where DDL isn't transactional, leave the schema
+    # half-reverted). They have no meaning without the agent columns being
+    # dropped below, so remove them first.
+    op.execute("DELETE FROM webhooks WHERE target_type = 'agent'")
     op.alter_column("webhooks", "function_name", existing_type=sa.String(255), nullable=False)
     op.drop_column("webhooks", "session_key_template")
     op.drop_column("webhooks", "message_template")

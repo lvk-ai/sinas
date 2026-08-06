@@ -3,7 +3,7 @@ Integration appliers: webhooks, templates, schedules, database triggers
 """
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,21 @@ from app.models.webhook import Webhook
 from app.services.config_apply.normalizers import should_skip_existing
 
 logger = logging.getLogger(__name__)
+
+
+
+def _dedup_storage(dedup) -> Optional[dict]:
+    """Canonical storage shape for a webhook dedup block.
+
+    The config schema field is `ttlSeconds`, but the stored blob is read by
+    dedup_service (and written by the REST schema) as `ttl_seconds`. Dumping the
+    config model verbatim stored the camelCase key, which the consumer never
+    read — every config-managed webhook silently ran on the default TTL. Emit
+    the snake_case shape so both write paths agree.
+    """
+    if not dedup:
+        return None
+    return {"key": dedup.key, "ttl_seconds": dedup.ttlSeconds}
 
 
 async def apply_webhooks(
@@ -69,7 +84,7 @@ async def apply_webhooks(
                     "requires_auth": webhook_config.requiresAuth,
                     "default_values": webhook_config.defaultValues,
                     "response_mode": webhook_config.responseMode,
-                    "dedup": webhook_config.dedup.model_dump() if webhook_config.dedup else None,
+                    "dedup": _dedup_storage(webhook_config.dedup),
                 }
             )
 
@@ -90,8 +105,14 @@ async def apply_webhooks(
                     existing.requires_auth = webhook_config.requiresAuth
                     existing.default_values = webhook_config.defaultValues
                     existing.response_mode = webhook_config.responseMode
-                    existing.dedup = webhook_config.dedup.model_dump() if webhook_config.dedup else None
-                    existing.is_active = True
+                    existing.dedup = _dedup_storage(webhook_config.dedup)
+                    # Deliberately NOT re-enabling: is_active is operator state,
+                    # not config state (WebhookConfig has no isActive field), so
+                    # a re-apply must not silently re-arm a webhook someone
+                    # disabled. This matters because adding fields to the
+                    # config_hash input changes every existing webhook's
+                    # checksum, so the first apply after such a change updates
+                    # them all even when the YAML is byte-identical.
                     existing.config_checksum = config_hash
                     existing.updated_at = datetime.utcnow()
 
@@ -114,7 +135,7 @@ async def apply_webhooks(
                         requires_auth=webhook_config.requiresAuth,
                         default_values=webhook_config.defaultValues,
                         response_mode=webhook_config.responseMode,
-                        dedup=webhook_config.dedup.model_dump() if webhook_config.dedup else None,
+                        dedup=_dedup_storage(webhook_config.dedup),
                         is_active=True,
                         managed_by=managed_by,
                         config_name=config_name,

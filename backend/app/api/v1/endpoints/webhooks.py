@@ -53,11 +53,29 @@ async def create_webhook(
                 detail=f"Function '{webhook_data.function_namespace}.{webhook_data.function_name}' not found",
             )
     else:
-        agent = await Agent.get_by_name(db, webhook_data.agent_namespace, webhook_data.agent_name)
+        # Agents are shared by design (chat:all/read:all are default grants), so
+        # the lookup is intentionally not ownership-scoped — the permission check
+        # below is what authorizes the target.
+        agent = await Agent.get_by_name(
+            db, webhook_data.agent_namespace, webhook_data.agent_name
+        )
         if not agent:
             raise HTTPException(
                 status_code=404,
                 detail=f"Agent '{webhook_data.agent_namespace}/{webhook_data.agent_name}' not found",
+            )
+        # Fail fast if the creator can't chat with the target: a webhook they
+        # could never legitimately trigger shouldn't be creatable. This mirrors
+        # POST /agents/{ns}/{name}/invoke. The authoritative check is at
+        # execution time (permissions can be narrowed after creation).
+        _chat_perm = (
+            f"sinas.agents/{webhook_data.agent_namespace}/{webhook_data.agent_name}.chat:all"
+        )
+        if not check_permission(permissions, _chat_perm):
+            set_permission_used(request, _chat_perm, has_perm=False)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized to chat with agent '{webhook_data.agent_namespace}/{webhook_data.agent_name}'",
             )
     # Create webhook
     webhook = Webhook(
@@ -214,21 +232,36 @@ async def update_webhook(
             webhook_data.agent_name if webhook_data.agent_name is not None else webhook.agent_name
         )
 
-        # Verify new agent exists
+        # Verify the new agent exists; reachability is enforced by the permission
+        # check below rather than an ownership filter (agents are shared by design).
         agent = await Agent.get_by_name(db, new_agent_namespace, new_agent_name)
         if not agent:
             raise HTTPException(
                 status_code=404,
                 detail=f"Agent '{new_agent_namespace}/{new_agent_name}' not found",
             )
+        _chat_perm = f"sinas.agents/{new_agent_namespace}/{new_agent_name}.chat:all"
+        if not check_permission(permissions, _chat_perm):
+            set_permission_used(request, _chat_perm, has_perm=False)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized to chat with agent '{new_agent_namespace}/{new_agent_name}'",
+            )
 
         webhook.agent_namespace = new_agent_namespace
         webhook.agent_name = new_agent_name
 
+    # `is not None` can't express "clear this field" — for optional fields that
+    # a user can legitimately unset, distinguish "absent from the request" from
+    # "explicitly sent as null" via the fields actually provided. Without this,
+    # clearing a session key or turning dedup off was a silent no-op that still
+    # reported success.
+    provided = webhook_data.model_fields_set
+
     if webhook_data.message_template is not None:
         webhook.message_template = webhook_data.message_template
-    if webhook_data.session_key_template is not None:
-        webhook.session_key_template = webhook_data.session_key_template
+    if "session_key_template" in provided:
+        webhook.session_key_template = webhook_data.session_key_template or None
 
     if webhook_data.http_method is not None:
         webhook.http_method = webhook_data.http_method
@@ -242,8 +275,8 @@ async def update_webhook(
         webhook.requires_auth = webhook_data.requires_auth
     if webhook_data.response_mode is not None:
         webhook.response_mode = webhook_data.response_mode
-    if webhook_data.dedup is not None:
-        webhook.dedup = webhook_data.dedup.model_dump()
+    if "dedup" in provided:
+        webhook.dedup = webhook_data.dedup.model_dump() if webhook_data.dedup else None
 
     # Validate resulting target configuration
     if webhook.target_type == "function":

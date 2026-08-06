@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient, API_BASE_URL } from '../lib/api';
+import { apiClient, API_BASE_URL, getApiErrorMessage } from '../lib/api';
 import { ArrowLeft, Save, Trash2 } from 'lucide-react';
 import { ApiUsage } from '../components/ApiUsage';
 
@@ -93,7 +93,9 @@ export function WebhookEditor() {
         payload.agent_namespace = agentNamespace;
         payload.agent_name = agentName;
         payload.message_template = data.message_template;
-        payload.session_key_template = data.session_key_template || null;
+        // '' rather than null: the API treats null as 'leave unchanged',
+        // so sending null made clearing the field a silent no-op.
+        payload.session_key_template = data.session_key_template || '';
       } else {
         const [namespace, name] = data.function_name.split('/');
         payload.function_namespace = namespace;
@@ -570,7 +572,7 @@ print(result["execution_id"], result["result"])`,
 
         {saveMutation.isError && (
           <div className="p-4 bg-red-900/20 border border-red-800/30 rounded-lg text-sm text-red-400">
-            Failed to save webhook. Please check your configuration.
+            {getApiErrorMessage(saveMutation.error, 'Failed to save webhook. Please check your configuration.')}
           </div>
         )}
 

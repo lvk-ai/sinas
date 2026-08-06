@@ -39,7 +39,13 @@ def _build_raw_response(result: Any) -> tuple[Response, dict[str, Any]]:
 
     if isinstance(result, dict) and any(k in result for k in RAW_CONTROL_KEYS):
         raw_status = result.get("_status", 200)
-        status = raw_status if isinstance(raw_status, int) else 200
+        # `isinstance(True, int)` is True in Python, so a bool would slip through
+        # and become status 1. Range-check as well — an out-of-range code raises
+        # inside Starlette, after the handler has returned.
+        if isinstance(raw_status, int) and not isinstance(raw_status, bool) and 100 <= raw_status <= 599:
+            status = raw_status
+        else:
+            status = 200
         raw_headers = result.get("_headers")
         if isinstance(raw_headers, dict):
             headers = {str(k): str(v) for k, v in raw_headers.items()}
@@ -47,9 +53,21 @@ def _build_raw_response(result: Any) -> tuple[Response, dict[str, Any]]:
 
     cache_entry = {"__raw__": {"status": status, "headers": headers, "body": body}}
 
+    return _raw_response(status, headers, body), cache_entry
+
+
+def _raw_response(status: int, headers: dict[str, str], body: Any) -> Response:
+    """Build the response, honouring status codes that must not carry a body.
+
+    204/304 (and 1xx) are body-less per RFC 9110; emitting one makes h11 raise a
+    protocol error *after* the handler returns, so the client sees a truncated
+    response instead of the status the function asked for.
+    """
+    if status in (204, 304) or 100 <= status < 200:
+        return Response(status_code=status, headers=headers)
     if isinstance(body, str):
-        return PlainTextResponse(body, status_code=status, headers=headers), cache_entry
-    return JSONResponse(body, status_code=status, headers=headers), cache_entry
+        return PlainTextResponse(body, status_code=status, headers=headers)
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def _replay_cached(cached: str) -> Response:
@@ -57,12 +75,7 @@ def _replay_cached(cached: str) -> Response:
     parsed = json.loads(cached)
     if isinstance(parsed, dict) and "__raw__" in parsed:
         raw = parsed["__raw__"]
-        body = raw.get("body")
-        status = raw.get("status", 200)
-        headers = raw.get("headers") or {}
-        if isinstance(body, str):
-            return PlainTextResponse(body, status_code=status, headers=headers)
-        return JSONResponse(body, status_code=status, headers=headers)
+        return _raw_response(raw.get("status", 200), raw.get("headers") or {}, raw.get("body"))
     return JSONResponse(parsed, status_code=200)
 
 
@@ -81,8 +94,11 @@ async def _execute_agent_webhook(
     from app.models.chat import Chat
     from app.models.user import User
     from app.services.message_service import MessageService
-    from app.services.template_renderer import render_webhook_template
+    from app.services.template_renderer import render_webhook_template_checked
 
+    # Not scoped by user_id: agents are shared by design (`chat:all` and
+    # `read:all` are default grants), unlike functions. Reachability is enforced
+    # by the permission check below, not by an ownership filter.
     agent_namespace = webhook.agent_namespace or "default"
     agent = await Agent.get_by_name(db, agent_namespace, webhook.agent_name)
     if not agent:
@@ -93,23 +109,65 @@ async def _execute_agent_webhook(
 
     # Render templates against the request payload (defaults merged in)
     context = final_input if isinstance(final_input, dict) else {"input": final_input}
-    message = render_webhook_template(webhook.message_template or "", context).strip()
-    if not message:
+    message, msg_had_undefined = render_webhook_template_checked(
+        webhook.message_template or "", context
+    )
+    message = message.strip()
+    # Fall back on a PARTIAL render too, not just an empty one: 'New issue {{a}}:
+    # {{b}}' against an unexpected payload renders 'New issue :' — non-empty, but
+    # it would invoke (and bill) the agent with no information about the event.
+    if not message or msg_had_undefined:
         logger.warning(
-            "Webhook %s: message template rendered empty, falling back to raw payload",
+            "Webhook %s: message template did not fully render (empty=%s, undefined=%s); "
+            "falling back to raw payload",
             webhook.path,
+            not message,
+            msg_had_undefined,
         )
         message = json.dumps(context)
 
     session_key: Optional[str] = None
     if webhook.session_key_template:
-        session_key = render_webhook_template(webhook.session_key_template, context).strip() or None
+        rendered_key, key_had_undefined = render_webhook_template_checked(
+            webhook.session_key_template, context
+        )
+        # A partially-rendered key ('jira-') would be shared by every malformed
+        # delivery, merging unrelated events into one conversation. Treat it as
+        # no key at all so each such request gets a fresh chat.
+        if key_had_undefined:
+            logger.warning(
+                "Webhook %s: session key template had undefined variables; "
+                "using a fresh session for this request",
+                webhook.path,
+            )
+            session_key = None
+        else:
+            session_key = rendered_key.strip() or None
 
-    # Look up user (needed for the JWT the agent runs with)
+    # Look up user (needed for the JWT the agent runs with).
+    # `is_active` matters as much as existence: a soft-deleted user still has a
+    # row, and every other auth path rejects them (core/auth.py). Without this a
+    # deactivated user's public webhook would keep firing and keep minting tokens
+    # for them, re-opening the access that deleting them was supposed to revoke.
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=500, detail="Webhook user not found")
+    if not user or not user.is_active:
+        raise HTTPException(status_code=403, detail="Webhook owner is no longer active")
+
+    # Re-check the owner's access to the target on every request. Permissions
+    # granted at creation can be narrowed later, and an unauthenticated webhook
+    # performs no caller-side permission check at all — so without this, a
+    # long-lived public endpoint would keep running on revoked authority.
+    from app.core.auth import get_user_permissions
+
+    owner_permissions = await get_user_permissions(db, user_id)
+    chat_perm = f"sinas.agents/{agent_namespace}/{webhook.agent_name}.chat:all"
+    if not check_permission(owner_permissions, chat_perm):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Webhook owner is no longer authorized to chat with agent '{agent_namespace}/{webhook.agent_name}'",
+        )
+
     token = create_access_token(user_id=user_id, email=user.email)
 
     # Resolve or create the chat (session-key continuity, like agent invoke)
@@ -252,30 +310,40 @@ async def execute_webhook(
                 db=db,
             )
 
-            # Check permission on the target resource
+            # Triggering a webhook runs as the webhook's OWNER (their token, their
+            # tools, their secrets), so the question is "may this caller trigger
+            # this webhook?" — not "may this caller use the target resource?".
+            # Answering the latter is unsafe: `sinas.agents/*/*.chat:all` is a
+            # default grant for every user, so a target-permission check would
+            # let any authenticated user drive someone else's webhook as them.
+            # Ownership is therefore required unconditionally.
+            if str(webhook.user_id) != user_id:
+                set_permission_used(request, f"webhook.execute:own:{webhook.path}", has_perm=False)
+                raise HTTPException(
+                    status_code=403, detail=f"Not authorized to execute webhook '{path}'"
+                )
+
+            # Defence in depth: the caller is the owner, but their access to the
+            # target may have been narrowed since the webhook was created, so the
+            # target permission is re-checked on every request rather than trusted
+            # from creation time.
             if is_agent_target:
                 target_perm = (
-                    f"sinas.agents/{webhook.agent_namespace}/{webhook.agent_name}.chat:own"
-                )
-                target_perm_all = (
                     f"sinas.agents/{webhook.agent_namespace}/{webhook.agent_name}.chat:all"
                 )
             else:
                 target_perm = f"sinas.functions/{webhook.function_namespace}/{webhook.function_name}.execute:own"
                 target_perm_all = f"sinas.functions/{webhook.function_namespace}/{webhook.function_name}.execute:all"
+                if check_permission(permissions, target_perm_all):
+                    target_perm = target_perm_all
 
-            has_permission = check_permission(permissions, target_perm_all) or (
-                check_permission(permissions, target_perm) and str(webhook.user_id) == user_id
-            )
-
-            if not has_permission:
+            if not check_permission(permissions, target_perm):
                 set_permission_used(request, target_perm, has_perm=False)
-                raise HTTPException(status_code=403, detail=f"Not authorized to execute webhook '{path}'")
+                raise HTTPException(
+                    status_code=403, detail=f"Not authorized to execute webhook '{path}'"
+                )
 
-            set_permission_used(
-                request,
-                target_perm_all if check_permission(permissions, target_perm_all) else target_perm,
-            )
+            set_permission_used(request, target_perm)
         except HTTPException:
             raise
         except Exception as e:
@@ -316,6 +384,17 @@ async def execute_webhook(
             if is_dup:
                 if cached:
                     return _replay_cached(cached)
+                # Duplicate arrived before the original finished (or the mode
+                # never caches: the async agent path stores no result). A JSON
+                # envelope would be wrong for the two modes that exist to
+                # control their own response — raw mode owes the provider a
+                # verbatim body (Slack's url_verification handshake fails
+                # otherwise), and async owes a 202. Answer in the shape the
+                # mode promises.
+                if webhook.response_mode == "raw":
+                    return Response(status_code=204)
+                if is_agent_target and webhook.response_mode == "async":
+                    return JSONResponse({"deduplicated": True}, status_code=202)
                 return JSONResponse({"deduplicated": True}, status_code=200)
 
         # Agent target
