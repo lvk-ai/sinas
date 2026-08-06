@@ -17,4 +17,4 @@ Bump the version here and nowhere else. The runtime (`app/main.py`,
 re-exports this value.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

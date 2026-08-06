@@ -1,4 +1,5 @@
 """Shared test fixtures for SINAS backend tests."""
+import os
 import uuid
 from collections.abc import AsyncGenerator
 
@@ -17,7 +18,27 @@ from app.models.user import Role, RolePermission, User, UserRole
 # Engine is created per-fixture to avoid event loop conflicts.
 # ---------------------------------------------------------------------------
 
-_test_db_url = f"postgresql+asyncpg://{settings.database_user}:{settings.database_password}@localhost:5433/{settings.database_name}"
+_test_db_url = os.environ.get(
+    "TEST_DATABASE_URL",
+    f"postgresql+asyncpg://{settings.database_user}:{settings.database_password}@localhost:5433/{settings.database_name}",
+)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_redis_client() -> AsyncGenerator[None, None]:
+    """The Redis client is cached at module level and binds to the event loop
+    that first used it; each test runs in a fresh loop, so drop it per test."""
+    import app.core.redis as redis_module
+
+    yield
+    if redis_module._redis_client is not None:
+        try:
+            # Drop rate-limit counters etc. so tests don't bleed into each other
+            await redis_module._redis_client.flushdb()
+            await redis_module._redis_client.aclose()
+        except Exception:
+            pass
+        redis_module._redis_client = None
 
 
 @pytest_asyncio.fixture
@@ -39,13 +60,18 @@ async def db() -> AsyncGenerator[AsyncSession, None]:
 async def app(db: AsyncSession):
     """Create a FastAPI app with the test DB session injected."""
     from app.main import app as _app
+    from app.main import management_app
 
     async def _override_get_db():
         yield db
 
+    # /api/v1 is a mounted sub-application; dependency overrides do not
+    # propagate from the parent app, so both apps need the override
     _app.dependency_overrides[get_db] = _override_get_db
+    management_app.dependency_overrides[get_db] = _override_get_db
     yield _app
     _app.dependency_overrides.clear()
+    management_app.dependency_overrides.clear()
 
 
 @pytest_asyncio.fixture
@@ -71,20 +97,28 @@ async def test_role(db: AsyncSession) -> Role:
     await db.flush()
     await db.refresh(role)
 
+    # Create endpoints check flat keys (sinas.<resource>.create:own); read/update/
+    # delete go through PermissionMixin which builds namespaced keys
+    # (sinas.<resource>/*/*.<action>:scope) for namespaced resources.
     for perm_key in [
-        "sinas.agents.read:all",
         "sinas.agents.create:own",
-        "sinas.agents.update:own",
-        "sinas.agents.delete:own",
-        "sinas.functions.read:all",
+        "sinas.agents/*/*.read:all",
+        "sinas.agents/*/*.update:own",
+        "sinas.agents/*/*.delete:own",
         "sinas.functions.create:own",
-        "sinas.functions.update:own",
-        "sinas.functions.delete:own",
-        "sinas.queries.read:all",
+        "sinas.functions/*/*.read:all",
+        "sinas.functions/*/*.update:own",
+        "sinas.functions/*/*.delete:own",
         "sinas.queries.create:own",
-        "sinas.queries.update:own",
-        "sinas.queries.delete:own",
+        "sinas.queries/*/*.read:all",
+        "sinas.queries/*/*.update:own",
+        "sinas.queries/*/*.delete:own",
         "sinas.users.read:own",
+        # Flat read keys kept alongside the namespaced ones: the
+        # /auth/check-permissions tests assert on these exact keys
+        "sinas.agents.read:all",
+        "sinas.functions.read:all",
+        "sinas.queries.read:all",
     ]:
         db.add(RolePermission(role_id=role.id, permission_key=perm_key, permission_value=True))
     await db.flush()

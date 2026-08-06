@@ -41,7 +41,10 @@ class ContainerPool:
     """
 
     def __init__(self):
-        self.client = docker.from_env()
+        # Docker client and networks are resolved lazily so this module can be
+        # imported (and the singleton constructed) in socket-free deployments
+        # (sandbox_executor != "docker_pool", e.g. k8s or single-container).
+        self._client = None
         self.idle: deque[PooledContainer] = deque()
         self.in_use: dict[str, PooledContainer] = {}
         self._creating_names: set[str] = set()  # names currently being created (race guard)
@@ -50,8 +53,26 @@ class ContainerPool:
         self._replenish_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._replenish_event = asyncio.Event()
-        self.docker_network = self._detect_network()
-        self.sandbox_network = self._ensure_sandbox_network()
+        self._docker_network: Optional[str] = None
+        self._sandbox_network: Optional[str] = None
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
+
+    @property
+    def docker_network(self) -> str:
+        if self._docker_network is None:
+            self._docker_network = self._detect_network()
+        return self._docker_network
+
+    @property
+    def sandbox_network(self) -> str:
+        if self._sandbox_network is None:
+            self._sandbox_network = self._ensure_sandbox_network()
+        return self._sandbox_network
 
     def _detect_network(self) -> str:
         """Auto-detect Docker network."""
@@ -376,6 +397,7 @@ class ContainerPool:
         chat_id: Optional[str],
         db: AsyncSession,
         timeout: Optional[int] = None,
+        user_custom_fields: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Execute a function in a pooled container.
@@ -427,6 +449,7 @@ class ContainerPool:
                 "context": {
                     "user_id": user_id,
                     "user_email": user_email,
+                    "user_custom_fields": user_custom_fields or {},
                     "access_token": access_token,
                     "execution_id": execution_id,
                     "trigger_type": trigger_type,

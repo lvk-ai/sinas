@@ -17,11 +17,55 @@ DELETE /api/v1/connectors/{namespace}/{name}                     # Delete connec
 POST   /api/v1/connectors/parse-openapi                          # Parse OpenAPI spec (no connector required)
 POST   /api/v1/connectors/{namespace}/{name}/import-openapi      # Import operations from OpenAPI spec into connector
 POST   /api/v1/connectors/{namespace}/{name}/test/{operation}    # Test an operation
+POST   /api/v1/connectors/{namespace}/{name}/oauth/authorize     # Begin per-user OAuth flow (returns provider URL)
+GET    /api/v1/connectors/{namespace}/{name}/oauth/status        # Current user's OAuth connection status
+DELETE /api/v1/connectors/{namespace}/{name}/oauth/token         # Disconnect (delete the user's stored token)
 ```
 
-**Auth types:** `bearer`, `basic`, `api_key`, `sinas_token` (forwards caller's JWT), `none`
+**Auth types:** `bearer`, `basic`, `api_key`, `oauth2_client_credentials`, `oauth2_authorization_code`, `sinas_token` (forwards caller's JWT), `none`
 
 Auth is resolved from the Secrets store. Private secrets override shared for the calling user — enabling multi-tenant patterns where each user can have their own API key for the same connector.
+
+An `api_key` can be sent as a header (default; `header` names it, default `X-Api-Key`) or as a query parameter (`position: query` + `paramName`, default `api_key`).
+
+Importing an OpenAPI spec also reads its `securitySchemes` and pre-fills a suggested auth config.
+
+## OAuth 2.0
+
+Two grants are supported. In both, `secret` names the Secret holding the **client secret** — the secret value itself never lives in connector config.
+
+**Client credentials** (`oauth2_client_credentials`) — service-to-service. Sinas fetches a token from `tokenUrl`, caches it in-process until shortly before expiry, and refreshes automatically:
+
+```yaml
+connectors:
+  - name: analytics-api
+    namespace: default
+    baseUrl: https://api.example.com
+    auth:
+      type: oauth2_client_credentials
+      tokenUrl: https://auth.example.com/oauth/token
+      clientId: my-client-id
+      secret: ANALYTICS_CLIENT_SECRET        # Secret holding the client secret
+      scopes: [read:stats]
+      clientAuthMethod: body                 # "body" (client_secret_post) or "basic" (client_secret_basic)
+      tokenParams: { audience: "https://api.example.com" }   # optional extra token-request params
+```
+
+**Authorization code, per user** (`oauth2_authorization_code`) — the connector acts on behalf of the individual user. Each user clicks **Connect Account** in the console, consents at the provider, and gets their own encrypted token row (PKCE-protected; refreshed automatically on expiry):
+
+```yaml
+    auth:
+      type: oauth2_authorization_code
+      authorizeUrl: https://provider.example.com/oauth/authorize
+      tokenUrl: https://provider.example.com/oauth/token
+      clientId: my-client-id
+      secret: PROVIDER_CLIENT_SECRET
+      scopes: [read:user]
+```
+
+Register this **redirect URI** with the provider (must match exactly): `https://<your-domain>/auth/connectors/oauth/callback`
+
+If a user has not connected (or their authorization expired with no refresh token), operations fail with an explicit "reconnect" error rather than sending an unauthenticated request. The flow is bound to the initiating browser via an HttpOnly cookie; set `OAUTH_BIND_BROWSER_SESSION=false` only in split-origin local dev (console and API on different ports).
 
 **Agent configuration:**
 

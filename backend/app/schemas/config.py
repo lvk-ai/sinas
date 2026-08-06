@@ -37,6 +37,14 @@ class UserPermissionConfig(BaseModel):
     value: bool
 
 
+class UserIdentityConfig(BaseModel):
+    """External identity linked to a user"""
+
+    provider: str
+    subject: str
+    metadata: Optional[dict[str, Any]] = None
+
+
 class UserConfig(BaseModel):
     """User configuration"""
 
@@ -44,6 +52,8 @@ class UserConfig(BaseModel):
     isActive: bool = True
     roles: list[str] = Field(default_factory=list)
     permissions: list[UserPermissionConfig] = Field(default_factory=list)
+    customFields: Optional[dict[str, Any]] = None
+    identities: list[UserIdentityConfig] = Field(default_factory=list)
 
 
 class LLMProviderConfig(BaseModel):
