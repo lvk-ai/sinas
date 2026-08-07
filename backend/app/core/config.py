@@ -191,6 +191,22 @@ class Settings(BaseSettings):
     sandbox_max_executions: int = 100  # Recycle container after this many executions
     sandbox_acquire_timeout: int = 30  # Seconds to wait for a container
 
+    # Optional platform features. Both default to on (no change for existing
+    # deployments); turning them off removes capability rather than hiding it,
+    # so the affected endpoints reject explicitly instead of failing oddly.
+    #
+    # code_execution_enabled=False disables ALL execution of user-supplied code:
+    # Functions and the agent `codeExecution` tool. Pair it with
+    # SANDBOX_EXECUTOR=disabled for the lightest deployment — no sandbox pool,
+    # no per-execution pods, no executor image needed.
+    code_execution_enabled: bool = True
+    # builtin_database_enabled=False skips creating the `sinas_data` database
+    # and its default DatabaseConnection record on startup. This is about not
+    # provisioning a data store the operator never asked for (they bring their
+    # own connections); it does NOT affect the platform's own Postgres, and an
+    # already-created record is left alone.
+    builtin_database_enabled: bool = True
+
     # Package management
     allow_package_installation: bool = True
     allowed_packages: Optional[str] = None  # Comma-separated whitelist, None = all allowed

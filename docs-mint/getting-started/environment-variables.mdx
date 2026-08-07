@@ -69,6 +69,16 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `MAX_EXECUTION_DEPTH` | _(= workers)_ | Max nesting depth for execution chains (a function/agent invoking another execution). A deeper call is rejected fast instead of deadlocking the shared pool. Defaults to `DEFAULT_WORKER_COUNT`; `0` disables. |
 | `SHARED_POOL_RESERVE` | `0` | Shared-worker slots reserved for nested calls so a parent waiting on a child can't starve the pool. `0` = off. For full single-chain safety set to `MAX_EXECUTION_DEPTH - 1`. |
 
+## Optional Features
+
+Both default on. Turning one off removes the capability — affected endpoints
+reject explicitly rather than half-working.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CODE_EXECUTION_ENABLED` | `true` | `false` disables **all** execution of user-supplied code: Functions and the agent `codeExecution` tool. The tool is not advertised to the model, function execution is refused at every trigger (API, webhook, schedule, agent, CDC), and sandbox/shared-worker startup is skipped entirely — no pool, no per-execution pods, no executor image. The single biggest footprint reduction available. |
+| `BUILTIN_DATABASE_ENABLED` | `true` | `false` skips creating the `sinas_data` database and its default Database Connection at startup, for deployments that only use their own connections. Does **not** affect the platform's own PostgreSQL, and an already-created database and record are left untouched (so the toggle is reversible and non-destructive). |
+
 ## Executors
 
 How Sinas runs user code. `SANDBOX_EXECUTOR` handles untrusted code

@@ -229,7 +229,7 @@ async def function_worker_startup(ctx: dict) -> None:
     # Discover shared worker containers (created by scheduler).
     # Retry a few times — the scheduler may still be starting up.
     # Skipped for non-Docker executors (k8s / single-container).
-    if settings.trusted_executor == "docker_shared":
+    if settings.code_execution_enabled and settings.trusted_executor == "docker_shared":
         from app.services.shared_worker_manager import shared_worker_manager
 
         for attempt in range(10):
@@ -244,7 +244,7 @@ async def function_worker_startup(ctx: dict) -> None:
         print(f"✅ Discovered {len(shared_worker_manager.workers)} shared containers")
 
     # Discover existing sandbox containers (created by backend leader)
-    if settings.sandbox_executor == "docker_pool":
+    if settings.code_execution_enabled and settings.sandbox_executor == "docker_pool":
         from app.services.container_pool import container_pool
 
         await container_pool._discover_existing_containers()
@@ -286,7 +286,7 @@ async def agent_worker_startup(ctx: dict) -> None:
     from app.core.database import AsyncSessionLocal  # noqa: F401
 
     # Discover sandbox containers (needed for code execution tool)
-    if settings.sandbox_executor == "docker_pool":
+    if settings.code_execution_enabled and settings.sandbox_executor == "docker_pool":
         from app.services.container_pool import container_pool
 
         await container_pool._discover_existing_containers()
