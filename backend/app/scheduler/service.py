@@ -52,6 +52,17 @@ async def _maintain_tool_result_partitions() -> None:
 
 async def _initialize_builtin_database() -> None:
     """Ensure the sinas_data database and its Database Connection record exist."""
+    if not settings.builtin_database_enabled:
+        # Operators who bring their own connections shouldn't have a data store
+        # provisioned for them. Only creation is skipped — an already-created
+        # sinas_data database and its record are left untouched, so toggling
+        # this off is not destructive and can be reversed.
+        logger.info(
+            "Built-in database disabled (BUILTIN_DATABASE_ENABLED=false) — "
+            "not creating sinas_data or its Database Connection"
+        )
+        return
+
     direct_host = settings.database_direct_host or settings.database_host
     try:
         conn = await asyncpg.connect(
@@ -241,25 +252,34 @@ async def main() -> None:
     await _initialize_builtin_database()
 
     # --- Sandbox containers ---
-    async with AsyncSessionLocal() as db:
-        if settings.sandbox_executor == "docker_pool":
-            await container_pool.initialize(db)
-        elif settings.sandbox_executor == "docker_ephemeral":
-            # No warm pool — untrusted code runs in a fresh container per
-            # execution. Pre-build the baked sandbox image so the first
-            # execution doesn't pay the build (it self-corrects otherwise).
-            from app.services.sandbox_image import build_sandbox_image
+    # Skipped entirely when code execution is off: no warm pool, no baked image
+    # build, no shared workers. This is where the footprint saving actually
+    # comes from — the executors are the heavy part, not the API process.
+    if not settings.code_execution_enabled:
+        logger.info(
+            "Code execution disabled (CODE_EXECUTION_ENABLED=false) — "
+            "skipping sandbox and shared-worker initialization"
+        )
+    else:
+        async with AsyncSessionLocal() as db:
+            if settings.sandbox_executor == "docker_pool":
+                await container_pool.initialize(db)
+            elif settings.sandbox_executor == "docker_ephemeral":
+                # No warm pool — untrusted code runs in a fresh container per
+                # execution. Pre-build the baked sandbox image so the first
+                # execution doesn't pay the build (it self-corrects otherwise).
+                from app.services.sandbox_image import build_sandbox_image
 
-            try:
-                await build_sandbox_image(db)
-            except Exception as e:
-                logger.warning(
-                    "Sandbox image pre-build failed (will build on demand): %s", e
-                )
+                try:
+                    await build_sandbox_image(db)
+                except Exception as e:
+                    logger.warning(
+                        "Sandbox image pre-build failed (will build on demand): %s", e
+                    )
 
-    # --- Shared containers ---
-    if settings.trusted_executor == "docker_shared":
-        await shared_worker_manager.initialize()
+        # --- Shared containers ---
+        if settings.trusted_executor == "docker_shared":
+            await shared_worker_manager.initialize()
 
     # --- APScheduler ---
     await scheduler.start()

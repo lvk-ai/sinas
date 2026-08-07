@@ -186,6 +186,20 @@ smtp:
   domain: ""
   ipv4: ""
 
+## Optional platform features. Both default on — turning one off removes the
+## capability (endpoints reject explicitly rather than failing oddly).
+features:
+  ## false disables ALL user-code execution: Functions and the agent
+  ## codeExecution tool. Also skips sandbox/shared-worker startup entirely, so
+  ## no pool, no per-execution pods, and no executor image is needed — the
+  ## biggest single footprint saving available.
+  codeExecution: true
+  ## false skips creating the `sinas_data` database and its default Database
+  ## Connection on startup, for operators who only use their own connections.
+  ## Does NOT affect the platform's own Postgres, and leaves an already-created
+  ## record untouched.
+  builtinDatabase: true
+
 ## Extra environment variables appended to every sinas service (backend,
 ## queue workers, scheduler, cdc-worker). Any backend Settings knob
 ## (app/core/config.py) can be set here without a chart change, e.g.:

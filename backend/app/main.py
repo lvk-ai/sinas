@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
     # endpoints can report accurate state.  The workers/pool are *created* by
     # the arq worker process or explicit scale calls; here we only discover.
     # Skipped entirely for non-Docker executors (k8s / single-container).
-    if settings.sandbox_executor == "docker_pool":
+    if settings.code_execution_enabled and settings.sandbox_executor == "docker_pool":
         try:
             from app.services.container_pool import container_pool
 
@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️  Container pool discovery skipped: {e}")
 
-    if settings.trusted_executor == "docker_shared":
+    if settings.code_execution_enabled and settings.trusted_executor == "docker_shared":
         try:
             from app.services.shared_worker_manager import shared_worker_manager
 

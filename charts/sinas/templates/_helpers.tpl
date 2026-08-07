@@ -119,6 +119,10 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
       name: {{ .Release.Name }}-secrets
       key: clickhouse-password
 {{- end }}
+- name: CODE_EXECUTION_ENABLED
+  value: {{ .Values.features.codeExecution | quote }}
+- name: BUILTIN_DATABASE_ENABLED
+  value: {{ .Values.features.builtinDatabase | quote }}
 - name: BACKEND_PORT
   value: "8000"
 {{- with .Values.extraEnv }}
