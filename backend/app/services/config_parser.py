@@ -434,17 +434,29 @@ class ConfigParser:
 
         # Validate webhook references
         for i, webhook in enumerate(spec.get("webhooks", [])):
-            # Build function reference as namespace/name
-            func_namespace = webhook.get("functionNamespace", "default")
-            func_name = webhook["functionName"]
-            func_ref = f"{func_namespace}/{func_name}"
-            if not _ref_matches_any(func_ref, all_function_names):
-                errors.append(
-                    ConfigValidationError(
-                        path=f"spec.webhooks[{i}].functionName",
-                        message=f"Referenced function '{func_ref}' not defined",
+            if webhook.get("targetType", "function") == "agent":
+                agent_ref = webhook.get("agentName") or ""
+                if "/" not in agent_ref:
+                    agent_ref = f"default/{agent_ref}"
+                if not _ref_matches_any(agent_ref, all_agent_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.webhooks[{i}].agentName",
+                            message=f"Referenced agent '{agent_ref}' not defined",
+                        )
                     )
-                )
+            else:
+                # functionName may be "namespace/name" or a bare name
+                func_ref = webhook.get("functionName") or ""
+                if "/" not in func_ref:
+                    func_ref = f"{webhook.get('functionNamespace', 'default')}/{func_ref}"
+                if not _ref_matches_any(func_ref, all_function_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.webhooks[{i}].functionName",
+                            message=f"Referenced function '{func_ref}' not defined",
+                        )
+                    )
 
         # Pipeline names (config + database) for schedule/trigger target checks
         pipeline_names = {
@@ -484,11 +496,10 @@ class ConfigParser:
                         )
                     )
             else:
-                func_namespace = schedule.get("functionNamespace", "default")
-                func_name = schedule.get("functionName")
-                func_ref = f"{func_namespace}/{func_name}"
-                if "/" in (func_name or ""):
-                    func_ref = func_name
+                # functionName may be "namespace/name" or a bare name
+                func_ref = schedule.get("functionName") or ""
+                if "/" not in func_ref:
+                    func_ref = f"{schedule.get('functionNamespace', 'default')}/{func_ref}"
                 if not _ref_matches_any(func_ref, all_function_names):
                     errors.append(
                         ConfigValidationError(
