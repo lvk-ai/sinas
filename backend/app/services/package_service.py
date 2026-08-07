@@ -158,6 +158,10 @@ class PackageService:
 
         # Single commit for everything
         await self.db.commit()
+        # auto_commit=False means the apply service left its notifications
+        # queued for us; without this a package's schedules never reach the
+        # running scheduler and its CDC triggers aren't picked up until restart.
+        await apply_service.flush_notifications()
         await self.db.refresh(package)
 
         return package, result

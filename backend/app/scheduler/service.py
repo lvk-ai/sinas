@@ -211,7 +211,9 @@ async def main() -> None:
                     config_yaml, db=db, strict=False
                 )
 
-                if not validation.valid:
+                # `is_valid`, not `valid`: the wrong name raised AttributeError
+                # here, so AUTO_APPLY_CONFIG=true crashed on every boot.
+                if not validation.is_valid:
                     logger.error("❌ Config validation failed:")
                     for error in validation.errors:
                         logger.error(f"  - {error.path}: {error.message}")
@@ -219,8 +221,10 @@ async def main() -> None:
 
                 if validation.warnings:
                     logger.warning("⚠️  Config validation warnings:")
+                    # warnings are plain strings (errors are the objects with
+                    # .path/.message) — treating them as objects also crashed.
                     for warning in validation.warnings:
-                        logger.warning(f"  - {warning.path}: {warning.message}")
+                        logger.warning(f"  - {warning}")
 
                 apply_service = ConfigApplyService(
                     db, config.metadata.name, owner_user_id=owner_user_id

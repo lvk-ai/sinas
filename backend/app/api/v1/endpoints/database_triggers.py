@@ -31,6 +31,26 @@ async def _notify_cdc(action: str, trigger_id: str) -> None:
     await redis.publish(CDC_CHANNEL, json.dumps({"action": action, "trigger_id": trigger_id}))
 
 
+
+async def _resolve_trigger(db: AsyncSession, name: str, user_id, has_all: bool):
+    """Resolve a trigger by name for this caller.
+
+    Trigger names are unique per (user_id, name), NOT globally — so selecting on
+    the name alone raised MultipleResultsFound (a 500) the moment two users
+    picked the same name, e.g. "daily-sync". Scope to the caller unless they
+    hold the :all permission, and prefer their own row when several exist.
+    Scoping also means another user's trigger reads as 404 rather than 403, so
+    the endpoint stops disclosing which names exist.
+    """
+    query = select(DatabaseTrigger).where(DatabaseTrigger.name == name)
+    if not has_all:
+        query = query.where(DatabaseTrigger.user_id == user_id)
+    rows = (await db.execute(query)).scalars().all()
+    if not rows:
+        return None
+    return next((t for t in rows if str(t.user_id) == str(user_id)), rows[0])
+
+
 @router.post("", response_model=DatabaseTriggerResponse, status_code=status.HTTP_201_CREATED)
 async def create_database_trigger(
     request: Request,
@@ -138,8 +158,8 @@ async def get_database_trigger(
     """Get a specific database trigger by name."""
     user_id, permissions = current_user_data
 
-    result = await db.execute(select(DatabaseTrigger).where(DatabaseTrigger.name == name))
-    trigger = result.scalar_one_or_none()
+    has_all = check_permission(permissions, "sinas.database_triggers.read:all")
+    trigger = await _resolve_trigger(db, name, user_id, has_all)
 
     if not trigger:
         raise HTTPException(status_code=404, detail=f"Database trigger '{name}' not found")
@@ -166,8 +186,8 @@ async def update_database_trigger(
     """Update a database trigger."""
     user_id, permissions = current_user_data
 
-    result = await db.execute(select(DatabaseTrigger).where(DatabaseTrigger.name == name))
-    trigger = result.scalar_one_or_none()
+    has_all = check_permission(permissions, "sinas.database_triggers.update:all")
+    trigger = await _resolve_trigger(db, name, user_id, has_all)
 
     if not trigger:
         raise HTTPException(status_code=404, detail=f"Database trigger '{name}' not found")
@@ -217,8 +237,8 @@ async def delete_database_trigger(
     """Delete a database trigger."""
     user_id, permissions = current_user_data
 
-    result = await db.execute(select(DatabaseTrigger).where(DatabaseTrigger.name == name))
-    trigger = result.scalar_one_or_none()
+    has_all = check_permission(permissions, "sinas.database_triggers.delete:all")
+    trigger = await _resolve_trigger(db, name, user_id, has_all)
 
     if not trigger:
         raise HTTPException(status_code=404, detail=f"Database trigger '{name}' not found")
