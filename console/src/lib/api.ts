@@ -77,6 +77,11 @@ import type {
   QueryCreate,
   QueryUpdate,
   QueryExecuteResponse,
+  Pipeline,
+  PipelineCreate,
+  PipelineUpdate,
+  PipelineRun,
+  PipelineRunOutcome,
 } from '../types';
 
 // Auto-detect API base URL based on environment
@@ -1002,6 +1007,51 @@ class APIClient {
 
   async executeQuery(namespace: string, name: string, input: Record<string, any> = {}): Promise<QueryExecuteResponse> {
     const response = await this.configClient.post(`/queries/${namespace}/${name}/execute`, { input });
+    return response.data;
+  }
+
+  // Pipelines
+  async listPipelines(): Promise<Pipeline[]> {
+    const response = await this.configClient.get('/pipelines');
+    return response.data;
+  }
+
+  async getPipeline(namespace: string, name: string): Promise<Pipeline> {
+    const response = await this.configClient.get(`/pipelines/${namespace}/${name}`);
+    return response.data;
+  }
+
+  async createPipeline(data: PipelineCreate): Promise<Pipeline> {
+    const response = await this.configClient.post('/pipelines', data);
+    return response.data;
+  }
+
+  async updatePipeline(namespace: string, name: string, data: PipelineUpdate): Promise<Pipeline> {
+    const response = await this.configClient.put(`/pipelines/${namespace}/${name}`, data);
+    return response.data;
+  }
+
+  async deletePipeline(namespace: string, name: string): Promise<void> {
+    await this.configClient.delete(`/pipelines/${namespace}/${name}`);
+  }
+
+  async runPipeline(
+    namespace: string,
+    name: string,
+    input: Record<string, any> = {},
+    mode: 'sync' | 'async' = 'sync'
+  ): Promise<PipelineRunOutcome> {
+    const response = await this.runtimeClient.post(`/pipelines/${namespace}/${name}/run`, { input, mode });
+    return response.data;
+  }
+
+  async listPipelineRuns(namespace: string, name: string, limit: number = 50): Promise<PipelineRun[]> {
+    const response = await this.runtimeClient.get(`/pipelines/${namespace}/${name}/runs`, { params: { limit } });
+    return response.data;
+  }
+
+  async replayPipelineRun(runId: string): Promise<{ run_id: string; status: string }> {
+    const response = await this.runtimeClient.post(`/pipelines/runs/${runId}/replay`);
     return response.data;
   }
 

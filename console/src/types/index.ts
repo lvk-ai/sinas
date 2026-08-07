@@ -1221,3 +1221,89 @@ export interface FileSearchResult {
   version: number;
   matches: FileSearchMatch[];
 }
+
+// Pipelines
+export interface PipelineStep {
+  name: string;
+  type: 'connector' | 'function' | 'agent' | 'query' | 'load';
+  [key: string]: any; // per-type fields + `.$` mapping keys, edited as JSON
+}
+
+export interface Pipeline {
+  id: string;
+  user_id: string;
+  namespace: string;
+  name: string;
+  description?: string | null;
+  input_schema: Record<string, any>;
+  steps: PipelineStep[];
+  per_user?: { connector: string; disableAfterFailures?: number } | null;
+  as_tool: boolean;
+  tool_description?: string | null;
+  sync_timeout_seconds: number;
+  concurrency?: 'single' | 'parallel' | null;
+  disable_after_failures?: number | null;
+  output_mapping?: Record<string, any> | null;
+  cursor_value?: string | null;
+  error_message?: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at?: string | null;
+}
+
+export interface PipelineCreate {
+  namespace: string;
+  name: string;
+  description?: string | null;
+  input_schema?: Record<string, any> | null;
+  steps: PipelineStep[];
+  per_user?: { connector: string; disableAfterFailures?: number } | null;
+  as_tool?: boolean;
+  tool_description?: string | null;
+  sync_timeout_seconds?: number;
+  concurrency?: 'single' | 'parallel' | null;
+  disable_after_failures?: number | null;
+  output_mapping?: Record<string, any> | null;
+}
+
+export interface PipelineUpdate extends Partial<PipelineCreate> {
+  is_active?: boolean;
+}
+
+export interface PipelineRunStepSummary {
+  name: string;
+  type: string;
+  status: string;
+  startedAt?: string;
+  durationMs?: number;
+  executionId?: string;
+  chatId?: string;
+  error?: string;
+}
+
+export interface PipelineRun {
+  id: string;
+  run_id: string;
+  pipeline_id: string;
+  user_id: string;
+  trigger_type: string;
+  trigger_id?: string | null;
+  status: 'running' | 'succeeded' | 'failed' | 'timed_out' | string;
+  input?: Record<string, any> | null;
+  steps: PipelineRunStepSummary[];
+  error?: string | null;
+  cursor_before?: string | null;
+  cursor_after?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+}
+
+export interface PipelineRunOutcome {
+  run_id: string;
+  status: string;
+  output?: any;
+  error?: string | null;
+  steps?: PipelineRunStepSummary[];
+  duration_ms?: number | null;
+}
