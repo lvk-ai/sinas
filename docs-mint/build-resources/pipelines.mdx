@@ -115,6 +115,12 @@ Pipelines don't embed trigger config. Instead:
 
 - **Schedules**: `scheduleType: pipeline` + `pipelineName: ns/name` — the
   standard way to poll ("every 2 minutes, run the Gmail pipeline").
+- **Webhooks**: `targetType: pipeline` + `pipelineName` — the request payload
+  (merged over `defaultValues`) becomes the pipeline input, running as the
+  webhook's owner. `responseMode: sync` waits and returns
+  `{success, run_id, output}`; `async` returns `202 {run_id}`. `raw` stays
+  function-only. Webhook events are single occurrences, so perUser pipelines
+  do **not** fan out here — the event runs once, as the owner.
 - **Database triggers (CDC)**: `targetType: pipeline` + `pipelineName` — the
   changed rows become the pipeline input.
 - **Manual / API**:

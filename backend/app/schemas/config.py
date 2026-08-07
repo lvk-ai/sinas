@@ -238,9 +238,10 @@ class WebhookConfig(BaseModel):
     """Webhook configuration"""
 
     path: str
-    targetType: str = "function"  # "function" or "agent"
+    targetType: str = "function"  # "function", "agent", or "pipeline"
     functionName: Optional[str] = None  # for function targets ("namespace/name" or "name")
     agentName: Optional[str] = None  # for agent targets (namespace/name)
+    pipelineName: Optional[str] = None  # for pipeline targets (namespace/name)
     messageTemplate: Optional[str] = None  # Jinja2, rendered against the request payload
     sessionKeyTemplate: Optional[str] = None  # Jinja2, optional conversation continuity key
     httpMethod: str = "POST"
@@ -253,13 +254,18 @@ class WebhookConfig(BaseModel):
     @validator("dedup", always=True)
     def validate_target(cls, v, values):
         target_type = values.get("targetType", "function")
-        if target_type not in ("function", "agent"):
-            raise ValueError("targetType must be 'function' or 'agent'")
+        if target_type not in ("function", "agent", "pipeline"):
+            raise ValueError("targetType must be 'function', 'agent', or 'pipeline'")
         if values.get("responseMode") not in ("sync", "async", "raw"):
             raise ValueError("responseMode must be 'sync', 'async', or 'raw'")
         if target_type == "function":
             if not values.get("functionName"):
                 raise ValueError("functionName is required for function-target webhooks")
+        elif target_type == "pipeline":
+            if not values.get("pipelineName"):
+                raise ValueError("pipelineName is required for pipeline-target webhooks")
+            if values.get("responseMode") == "raw":
+                raise ValueError("responseMode 'raw' is only supported for function-target webhooks")
         else:
             if not values.get("agentName"):
                 raise ValueError("agentName is required for agent-target webhooks")

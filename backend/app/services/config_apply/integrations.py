@@ -58,12 +58,19 @@ async def apply_webhooks(
             # Parse target references (may be "namespace/name" or just "name")
             func_ns, func_name = "default", None
             agent_ns, agent_name = None, None
+            pipeline_ns, pipeline_name = None, None
             if target_type == "agent":
                 agent_ref = webhook_config.agentName or ""
                 if "/" in agent_ref:
                     agent_ns, agent_name = agent_ref.split("/", 1)
                 else:
                     agent_ns, agent_name = "default", agent_ref
+            elif target_type == "pipeline":
+                pipeline_ref = getattr(webhook_config, "pipelineName", None) or ""
+                if "/" in pipeline_ref:
+                    pipeline_ns, pipeline_name = pipeline_ref.split("/", 1)
+                else:
+                    pipeline_ns, pipeline_name = "default", pipeline_ref
             else:
                 func_ref = webhook_config.functionName or ""
                 if "/" in func_ref:
@@ -77,6 +84,7 @@ async def apply_webhooks(
                     "target_type": target_type,
                     "function_name": webhook_config.functionName,
                     "agent_name": webhook_config.agentName,
+                    "pipeline_name": getattr(webhook_config, "pipelineName", None),
                     "message_template": webhook_config.messageTemplate,
                     "session_key_template": webhook_config.sessionKeyTemplate,
                     "http_method": webhook_config.httpMethod,
@@ -98,6 +106,8 @@ async def apply_webhooks(
                     existing.function_name = func_name
                     existing.agent_namespace = agent_ns
                     existing.agent_name = agent_name
+                    existing.pipeline_namespace = pipeline_ns
+                    existing.pipeline_name = pipeline_name
                     existing.message_template = webhook_config.messageTemplate
                     existing.session_key_template = webhook_config.sessionKeyTemplate
                     existing.http_method = webhook_config.httpMethod
@@ -127,6 +137,8 @@ async def apply_webhooks(
                         function_name=func_name,
                         agent_namespace=agent_ns,
                         agent_name=agent_name,
+                        pipeline_namespace=pipeline_ns,
+                        pipeline_name=pipeline_name,
                         message_template=webhook_config.messageTemplate,
                         session_key_template=webhook_config.sessionKeyTemplate,
                         user_id=owner_user_id,

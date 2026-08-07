@@ -370,3 +370,87 @@ def test_serialize_pipeline_round_trips_dollar_keys():
     cfg = PipelineConfig.model_validate(out)
     assert cfg.output_mapping() == {"output.$": "steps.fetch.output.body"}
     assert cfg.steps == pipeline.steps
+
+
+# ---------------------------------------------------------------------------
+# Webhook pipeline target (post-#111)
+# ---------------------------------------------------------------------------
+
+
+def test_webhook_schema_pipeline_target_requires_name():
+    from app.schemas.webhook import WebhookCreate
+
+    with pytest.raises(ValueError, match="pipeline_name is required"):
+        WebhookCreate(path="x", target_type="pipeline")
+
+
+def test_webhook_schema_pipeline_target_rejects_raw():
+    from app.schemas.webhook import WebhookCreate
+
+    with pytest.raises(ValueError, match="raw"):
+        WebhookCreate(
+            path="x", target_type="pipeline", pipeline_name="p", response_mode="raw"
+        )
+
+
+def test_webhook_schema_pipeline_target_valid():
+    from app.schemas.webhook import WebhookCreate
+
+    hook = WebhookCreate(
+        path="crm/contact-updated",
+        target_type="pipeline",
+        pipeline_namespace="crm",
+        pipeline_name="upsert-contact",
+        response_mode="async",
+    )
+    assert hook.pipeline_namespace == "crm"
+    # message_template is an agent-target concern only
+    assert hook.message_template is None
+
+
+def test_webhook_config_pipeline_target_round_trip():
+    import types
+
+    from app.schemas.config import WebhookConfig
+    from app.services.resource_serializers import serialize_webhook
+
+    cfg = WebhookConfig.model_validate({
+        "path": "crm/contact-updated",
+        "targetType": "pipeline",
+        "pipelineName": "crm/upsert-contact",
+        "responseMode": "async",
+        "requiresAuth": False,
+    })
+    assert cfg.pipelineName == "crm/upsert-contact"
+
+    webhook = types.SimpleNamespace(
+        path="crm/contact-updated",
+        target_type="pipeline",
+        function_namespace="default",
+        function_name=None,
+        agent_namespace=None,
+        agent_name=None,
+        pipeline_namespace="crm",
+        pipeline_name="upsert-contact",
+        message_template=None,
+        session_key_template=None,
+        http_method="POST",
+        requires_auth=False,
+        description=None,
+        default_values=None,
+        response_mode="async",
+        dedup=None,
+    )
+    out = serialize_webhook(webhook)
+    assert out["targetType"] == "pipeline"
+    assert out["pipelineName"] == "crm/upsert-contact"
+    assert "functionName" not in out and "agentName" not in out
+    # Export parses back through the config schema
+    WebhookConfig.model_validate(out)
+
+
+def test_webhook_config_pipeline_target_requires_pipeline_name():
+    from app.schemas.config import WebhookConfig
+
+    with pytest.raises(ValueError, match="pipelineName"):
+        WebhookConfig.model_validate({"path": "x", "targetType": "pipeline"})

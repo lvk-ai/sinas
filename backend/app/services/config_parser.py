@@ -432,9 +432,33 @@ class ConfigParser:
                         )
                     )
 
+        # Pipeline names (config + database) for webhook/schedule/trigger target checks
+        pipeline_names = {
+            f"{p.get('namespace', 'default')}/{p['name']}" for p in spec.get("pipelines", [])
+        }
+        db_pipeline_names: set[str] = set()
+        if db:
+            from app.models.pipeline import Pipeline as PipelineModel
+
+            result = await db.execute(select(PipelineModel.namespace, PipelineModel.name))
+            db_pipeline_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
+        all_pipeline_names = pipeline_names | db_pipeline_names
+
         # Validate webhook references
         for i, webhook in enumerate(spec.get("webhooks", [])):
-            if webhook.get("targetType", "function") == "agent":
+            webhook_target = webhook.get("targetType", "function")
+            if webhook_target == "pipeline":
+                pipeline_ref = webhook.get("pipelineName") or ""
+                if "/" not in pipeline_ref:
+                    pipeline_ref = f"default/{pipeline_ref}"
+                if not _ref_matches_any(pipeline_ref, all_pipeline_names):
+                    errors.append(
+                        ConfigValidationError(
+                            path=f"spec.webhooks[{i}].pipelineName",
+                            message=f"Referenced pipeline '{pipeline_ref}' not defined",
+                        )
+                    )
+            elif webhook_target == "agent":
                 agent_ref = webhook.get("agentName") or ""
                 if "/" not in agent_ref:
                     agent_ref = f"default/{agent_ref}"
@@ -457,18 +481,6 @@ class ConfigParser:
                             message=f"Referenced function '{func_ref}' not defined",
                         )
                     )
-
-        # Pipeline names (config + database) for schedule/trigger target checks
-        pipeline_names = {
-            f"{p.get('namespace', 'default')}/{p['name']}" for p in spec.get("pipelines", [])
-        }
-        db_pipeline_names: set[str] = set()
-        if db:
-            from app.models.pipeline import Pipeline as PipelineModel
-
-            result = await db.execute(select(PipelineModel.namespace, PipelineModel.name))
-            db_pipeline_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
-        all_pipeline_names = pipeline_names | db_pipeline_names
 
         # Validate schedule references (target depends on scheduleType)
         for i, schedule in enumerate(spec.get("schedules", [])):

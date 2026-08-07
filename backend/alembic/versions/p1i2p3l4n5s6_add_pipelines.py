@@ -2,7 +2,7 @@
 agents.enabled_pipelines; database_triggers pipeline targets
 
 Revision ID: p1i2p3l4n5s6
-Revises: 70ea30af567e
+Revises: w2a3b4t5g6t7
 Create Date: 2026-07-28
 """
 import sqlalchemy as sa
@@ -10,7 +10,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "p1i2p3l4n5s6"
-down_revision = "70ea30af567e"
+down_revision = "w2a3b4t5g6t7"
 branch_labels = None
 depends_on = None
 
@@ -118,6 +118,10 @@ def upgrade() -> None:
         sa.Column("enabled_pipelines", sa.JSON(), nullable=False, server_default="[]"),
     )
 
+    # Webhooks gain a pipeline target (third target_type value, after #111's "agent")
+    op.add_column("webhooks", sa.Column("pipeline_namespace", sa.String(255), nullable=True))
+    op.add_column("webhooks", sa.Column("pipeline_name", sa.String(255), nullable=True))
+
     # Database triggers (CDC) gain a pipeline target
     op.add_column(
         "database_triggers",
@@ -130,6 +134,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_column("webhooks", "pipeline_name")
+    op.drop_column("webhooks", "pipeline_namespace")
     op.alter_column("database_triggers", "function_name", existing_type=sa.String(255), nullable=False)
     op.drop_column("database_triggers", "pipeline_name")
     op.drop_column("database_triggers", "pipeline_namespace")

@@ -129,6 +129,9 @@ def serialize_webhook(webhook) -> dict:
         "agentName": f"{webhook.agent_namespace}/{webhook.agent_name}"
         if target_type == "agent"
         else None,
+        "pipelineName": f"{webhook.pipeline_namespace or 'default'}/{webhook.pipeline_name}"
+        if target_type == "pipeline"
+        else None,
         "messageTemplate": webhook.message_template if target_type == "agent" else None,
         "sessionKeyTemplate": webhook.session_key_template if target_type == "agent" else None,
         "httpMethod": webhook.http_method,

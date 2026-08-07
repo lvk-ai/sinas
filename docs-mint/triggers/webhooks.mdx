@@ -84,6 +84,25 @@ webhooks:
 
 Function-target webhooks in YAML are unchanged (`functionName: namespace/name`); `responseMode: raw` is available for them as well.
 
+## Pipeline targets
+
+A webhook can fire a [pipeline](/build-resources/pipelines): the request payload (merged over `defaultValues`) becomes the pipeline's run input, executed as the webhook's owner.
+
+- `sync` runs the pipeline inline (bounded by the pipeline's `syncTimeoutSeconds`) and returns `{"success": true, "run_id": ..., "output": ...}`; a failed run returns `500` with the `run_id` of the replayable run record
+- `async` returns `202` with `{"run_id": ...}` — use this for provider webhooks and slow pipelines (e.g. ones containing agent steps)
+- `raw` is not supported for pipeline targets
+- For authenticated webhooks the caller must own the webhook and hold `sinas.pipelines/{ns}/{name}.run`
+- A webhook event is a single occurrence, so `perUser` pipelines do **not** fan out here — that behavior belongs to schedules and manual `?allUsers=true` runs
+
+```yaml
+webhooks:
+  - path: crm/contact-updated
+    targetType: pipeline
+    pipelineName: crm/upsert-contact
+    responseMode: async
+    requiresAuth: false
+```
+
 **Example (function target):**
 
 ```bash
