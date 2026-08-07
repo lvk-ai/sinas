@@ -559,6 +559,12 @@ async def connector_oauth_callback(
     ok = await connector_service.exchange_authorization_code(
         db=db, connector=connector, user_id=ctx["user_id"], code=code, code_verifier=ctx["code_verifier"],
     )
+    if ok:
+        # Re-credentialing is the recovery point for perUser pipelines that
+        # skip-listed this user after consecutive failures.
+        from app.services.pipeline_runner import reset_user_failure_state
+
+        await reset_user_failure_state(db, ctx["user_id"], connector_id=connector.id)
     result = _oauth_result_page(
         ok,
         f"Connected {connector.namespace}/{connector.name}." if ok

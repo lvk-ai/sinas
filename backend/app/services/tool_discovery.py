@@ -284,6 +284,16 @@ async def get_available_tools(
         )
         tools.extend(connector_tools)
 
+    # Get pipeline tools (only if list has items - opt-in)
+    enabled_pipelines = getattr(agent, "enabled_pipelines", None) or []
+    if enabled_pipelines:
+        from app.services.pipeline_tools import PipelineToolConverter
+
+        pipeline_tools = await PipelineToolConverter().get_available_pipelines(
+            db=db, user_id=user_id, enabled_pipelines=enabled_pipelines
+        )
+        tools.extend(pipeline_tools)
+
     # Add built-in retrieve_tool_result tool (always available).
     # The description is deliberately strict: agents (especially Claude) tend
     # to invent ids if the description is vague, then the result lookup

@@ -52,6 +52,28 @@ async def create_webhook(
                 status_code=404,
                 detail=f"Function '{webhook_data.function_namespace}.{webhook_data.function_name}' not found",
             )
+    elif webhook_data.target_type == "pipeline":
+        from app.models.pipeline import Pipeline
+
+        pipeline = await Pipeline.get_by_name(
+            db, webhook_data.pipeline_namespace, webhook_data.pipeline_name
+        )
+        if not pipeline:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pipeline '{webhook_data.pipeline_namespace}/{webhook_data.pipeline_name}' not found",
+            )
+        # Fail fast if the creator can't run the target (authoritative check is
+        # at execution time, same rationale as agent targets below).
+        _run_perm = (
+            f"sinas.pipelines/{webhook_data.pipeline_namespace}/{webhook_data.pipeline_name}.run:own"
+        )
+        if not check_permission(permissions, _run_perm):
+            set_permission_used(request, _run_perm, has_perm=False)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized to run pipeline '{webhook_data.pipeline_namespace}/{webhook_data.pipeline_name}'",
+            )
     else:
         # Agents are shared by design (chat:all/read:all are default grants), so
         # the lookup is intentionally not ownership-scoped — the permission check
@@ -86,6 +108,8 @@ async def create_webhook(
         function_name=webhook_data.function_name,
         agent_namespace=webhook_data.agent_namespace if webhook_data.target_type == "agent" else None,
         agent_name=webhook_data.agent_name,
+        pipeline_namespace=webhook_data.pipeline_namespace if webhook_data.target_type == "pipeline" else None,
+        pipeline_name=webhook_data.pipeline_name,
         message_template=webhook_data.message_template,
         session_key_template=webhook_data.session_key_template,
         http_method=webhook_data.http_method,
@@ -251,6 +275,37 @@ async def update_webhook(
         webhook.agent_namespace = new_agent_namespace
         webhook.agent_name = new_agent_name
 
+    if webhook_data.pipeline_namespace is not None or webhook_data.pipeline_name is not None:
+        from app.models.pipeline import Pipeline
+
+        new_pipeline_namespace = (
+            webhook_data.pipeline_namespace
+            if webhook_data.pipeline_namespace is not None
+            else (webhook.pipeline_namespace or "default")
+        )
+        new_pipeline_name = (
+            webhook_data.pipeline_name
+            if webhook_data.pipeline_name is not None
+            else webhook.pipeline_name
+        )
+
+        pipeline = await Pipeline.get_by_name(db, new_pipeline_namespace, new_pipeline_name)
+        if not pipeline:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pipeline '{new_pipeline_namespace}/{new_pipeline_name}' not found",
+            )
+        _run_perm = f"sinas.pipelines/{new_pipeline_namespace}/{new_pipeline_name}.run:own"
+        if not check_permission(permissions, _run_perm):
+            set_permission_used(request, _run_perm, has_perm=False)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not authorized to run pipeline '{new_pipeline_namespace}/{new_pipeline_name}'",
+            )
+
+        webhook.pipeline_namespace = new_pipeline_namespace
+        webhook.pipeline_name = new_pipeline_name
+
     # `is not None` can't express "clear this field" — for optional fields that
     # a user can legitimately unset, distinguish "absent from the request" from
     # "explicitly sent as null" via the fields actually provided. Without this,
@@ -286,6 +341,16 @@ async def update_webhook(
             )
         if webhook.response_mode not in ("sync", "async", "raw"):
             raise HTTPException(status_code=400, detail="Invalid response_mode")
+    elif webhook.target_type == "pipeline":
+        if not webhook.pipeline_name:
+            raise HTTPException(
+                status_code=400, detail="pipeline_name is required for pipeline-target webhooks"
+            )
+        if webhook.response_mode == "raw":
+            raise HTTPException(
+                status_code=400,
+                detail="response_mode 'raw' is only supported for function-target webhooks",
+            )
     else:
         if not webhook.agent_name or not webhook.message_template:
             raise HTTPException(

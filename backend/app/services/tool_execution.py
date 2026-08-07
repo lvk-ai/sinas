@@ -247,6 +247,8 @@ def tool_name_to_status_key(tool_name: str) -> str:
         return "skill:" + tool_name[len("get_skill_"):].replace("__", "/", 1)
     if tool_name.startswith("query_"):
         return "query:" + tool_name[len("query_"):].replace("__", "/", 1)
+    if tool_name.startswith("pipeline_"):
+        return "pipeline:" + tool_name[len("pipeline_"):].replace("__", "/", 1)
     if tool_name.startswith("search_collection_"):
         return "collection:" + tool_name[len("search_collection_"):].replace("__", "/", 1)
     if tool_name.startswith("get_file_"):
@@ -287,6 +289,9 @@ def build_tool_status(tool_name: str, arguments: dict, status_templates: dict[st
     if key.startswith("query:"):
         ref = key[6:]
         return f"Running query {ref.split('/')[-1].replace('_', ' ')}"
+    if key.startswith("pipeline:"):
+        ref = key[9:]
+        return f"Running pipeline {ref.split('/')[-1].replace('_', ' ')}"
     if key.startswith("collection:"):
         if tool_name.startswith("write_file_"):
             return "Writing file"
@@ -777,6 +782,28 @@ async def execute_single_tool(
                     metadata=tool_metadata,
                 )
                 logger.debug(f"Collection tool completed in {time.time() - start_time:.3f}s: {tool_name}")
+            elif tool_metadata.get("type") == "pipeline":
+                start_time = time.time()
+                from app.services.pipeline_tools import PipelineToolConverter
+
+                enabled_pipeline_list = []
+                if chat and chat.agent_id:
+                    result_agent = await db.execute(
+                        select(Agent).where(Agent.id == chat.agent_id)
+                    )
+                    chat_agent = result_agent.scalar_one_or_none()
+                    if chat_agent:
+                        enabled_pipeline_list = chat_agent.enabled_pipelines or []
+
+                result = await PipelineToolConverter().execute_pipeline_tool(
+                    db=db,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    user_id=user_id,
+                    user_token=user_token,
+                    enabled_pipelines=enabled_pipeline_list,
+                )
+                logger.debug(f"Pipeline tool completed in {time.time() - start_time:.3f}s: {tool_name}")
             elif tool_metadata.get("type") == "connector":
                 start_time = time.time()
                 connector_tool_converter = ConnectorToolConverter()

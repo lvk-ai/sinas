@@ -15,7 +15,7 @@ class DedupConfig(BaseModel):
 
 class WebhookCreate(BaseModel):
     path: str = Field(..., min_length=1, max_length=255, pattern=r"^[a-zA-Z0-9_/-]+$")
-    target_type: Literal["function", "agent"] = "function"
+    target_type: Literal["function", "agent", "pipeline"] = "function"
     function_namespace: str = Field(
         default="default", min_length=1, max_length=255, pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$"
     )
@@ -24,6 +24,10 @@ class WebhookCreate(BaseModel):
         default="default", min_length=1, max_length=255, pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$"
     )
     agent_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    pipeline_namespace: str = Field(
+        default="default", min_length=1, max_length=255, pattern=r"^[a-zA-Z_][a-zA-Z0-9_-]*$"
+    )
+    pipeline_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     message_template: Optional[str] = None
     session_key_template: Optional[str] = Field(default=None, max_length=500)
     http_method: HTTPMethod = HTTPMethod.POST
@@ -38,6 +42,11 @@ class WebhookCreate(BaseModel):
         if self.target_type == "function":
             if not self.function_name:
                 raise ValueError("function_name is required for function-target webhooks")
+        elif self.target_type == "pipeline":
+            if not self.pipeline_name:
+                raise ValueError("pipeline_name is required for pipeline-target webhooks")
+            if self.response_mode == "raw":
+                raise ValueError("response_mode 'raw' is only supported for function-target webhooks")
         else:  # agent
             if not self.agent_name:
                 raise ValueError("agent_name is required for agent-target webhooks")
@@ -49,11 +58,13 @@ class WebhookCreate(BaseModel):
 
 
 class WebhookUpdate(BaseModel):
-    target_type: Optional[Literal["function", "agent"]] = None
+    target_type: Optional[Literal["function", "agent", "pipeline"]] = None
     function_namespace: Optional[str] = None
     function_name: Optional[str] = None
     agent_namespace: Optional[str] = None
     agent_name: Optional[str] = None
+    pipeline_namespace: Optional[str] = None
+    pipeline_name: Optional[str] = None
     message_template: Optional[str] = None
     session_key_template: Optional[str] = None
     http_method: Optional[HTTPMethod] = None
@@ -73,6 +84,8 @@ class WebhookResponse(BaseModel):
     function_name: Optional[str]
     agent_namespace: Optional[str]
     agent_name: Optional[str]
+    pipeline_namespace: Optional[str]
+    pipeline_name: Optional[str]
     message_template: Optional[str]
     session_key_template: Optional[str]
     http_method: HTTPMethod

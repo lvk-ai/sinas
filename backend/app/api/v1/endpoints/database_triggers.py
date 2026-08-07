@@ -90,15 +90,27 @@ async def create_database_trigger(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Database connection not found or inactive")
 
-    # Validate function exists
-    target_func = await Function.get_by_name(
-        db, trigger_data.function_namespace, trigger_data.function_name, user_id
-    )
-    if not target_func:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Function '{trigger_data.function_namespace}/{trigger_data.function_name}' not found",
+    # Validate the target exists
+    if trigger_data.target_type == "pipeline":
+        from app.models.pipeline import Pipeline
+
+        target_pipeline = await Pipeline.get_by_name(
+            db, trigger_data.pipeline_namespace, trigger_data.pipeline_name
         )
+        if not target_pipeline:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pipeline '{trigger_data.pipeline_namespace}/{trigger_data.pipeline_name}' not found",
+            )
+    else:
+        target_func = await Function.get_by_name(
+            db, trigger_data.function_namespace, trigger_data.function_name, user_id
+        )
+        if not target_func:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Function '{trigger_data.function_namespace}/{trigger_data.function_name}' not found",
+            )
 
     trigger = DatabaseTrigger(
         user_id=user_id,
@@ -107,8 +119,11 @@ async def create_database_trigger(
         schema_name=trigger_data.schema_name,
         table_name=trigger_data.table_name,
         operations=trigger_data.operations,
+        target_type=trigger_data.target_type,
         function_namespace=trigger_data.function_namespace,
         function_name=trigger_data.function_name,
+        pipeline_namespace=trigger_data.pipeline_namespace if trigger_data.target_type == "pipeline" else None,
+        pipeline_name=trigger_data.pipeline_name,
         poll_column=trigger_data.poll_column,
         poll_interval_seconds=trigger_data.poll_interval_seconds,
         batch_size=trigger_data.batch_size,
@@ -206,10 +221,20 @@ async def update_database_trigger(
         trigger.name = trigger_data.name
     if trigger_data.operations is not None:
         trigger.operations = trigger_data.operations
+    if trigger_data.target_type is not None:
+        trigger.target_type = trigger_data.target_type
     if trigger_data.function_namespace is not None:
         trigger.function_namespace = trigger_data.function_namespace
     if trigger_data.function_name is not None:
         trigger.function_name = trigger_data.function_name
+    if trigger_data.pipeline_namespace is not None:
+        trigger.pipeline_namespace = trigger_data.pipeline_namespace
+    if trigger_data.pipeline_name is not None:
+        trigger.pipeline_name = trigger_data.pipeline_name
+    if trigger.target_type == "pipeline" and not trigger.pipeline_name:
+        raise HTTPException(status_code=400, detail="pipeline_name is required for pipeline-target triggers")
+    if trigger.target_type == "function" and not trigger.function_name:
+        raise HTTPException(status_code=400, detail="function_name is required for function-target triggers")
     if trigger_data.poll_column is not None:
         trigger.poll_column = trigger_data.poll_column
     if trigger_data.poll_interval_seconds is not None:

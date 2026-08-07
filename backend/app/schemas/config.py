@@ -208,6 +208,7 @@ class AgentConfig(BaseModel):
     enabledCollections: list[Union[str, EnabledCollectionConfigYaml]] = Field(default_factory=list)
     enabledComponents: list[str] = Field(default_factory=list)  # List of "namespace/name" component refs
     enabledConnectors: list[dict[str, Any]] = Field(default_factory=list)  # [{"connector": "ns/name", "operations": [...]}]
+    enabledPipelines: list[str] = Field(default_factory=list)  # List of "namespace/name" pipeline refs (asTool)
     inputSchema: Optional[dict[str, Any]] = None
     outputSchema: Optional[dict[str, Any]] = None
     initialMessages: Optional[list[dict[str, str]]] = None
@@ -237,9 +238,10 @@ class WebhookConfig(BaseModel):
     """Webhook configuration"""
 
     path: str
-    targetType: str = "function"  # "function" or "agent"
+    targetType: str = "function"  # "function", "agent", or "pipeline"
     functionName: Optional[str] = None  # for function targets ("namespace/name" or "name")
     agentName: Optional[str] = None  # for agent targets (namespace/name)
+    pipelineName: Optional[str] = None  # for pipeline targets (namespace/name)
     messageTemplate: Optional[str] = None  # Jinja2, rendered against the request payload
     sessionKeyTemplate: Optional[str] = None  # Jinja2, optional conversation continuity key
     httpMethod: str = "POST"
@@ -252,13 +254,18 @@ class WebhookConfig(BaseModel):
     @validator("dedup", always=True)
     def validate_target(cls, v, values):
         target_type = values.get("targetType", "function")
-        if target_type not in ("function", "agent"):
-            raise ValueError("targetType must be 'function' or 'agent'")
+        if target_type not in ("function", "agent", "pipeline"):
+            raise ValueError("targetType must be 'function', 'agent', or 'pipeline'")
         if values.get("responseMode") not in ("sync", "async", "raw"):
             raise ValueError("responseMode must be 'sync', 'async', or 'raw'")
         if target_type == "function":
             if not values.get("functionName"):
                 raise ValueError("functionName is required for function-target webhooks")
+        elif target_type == "pipeline":
+            if not values.get("pipelineName"):
+                raise ValueError("pipelineName is required for pipeline-target webhooks")
+            if values.get("responseMode") == "raw":
+                raise ValueError("responseMode 'raw' is only supported for function-target webhooks")
         else:
             if not values.get("agentName"):
                 raise ValueError("agentName is required for agent-target webhooks")
@@ -273,9 +280,10 @@ class ScheduleConfig(BaseModel):
     """Schedule configuration"""
 
     name: str
-    scheduleType: str = "function"  # "function" or "agent"
+    scheduleType: str = "function"  # "function", "agent", or "pipeline"
     functionName: Optional[str] = None  # for function schedules
     agentName: Optional[str] = None  # for agent schedules (namespace/name)
+    pipelineName: Optional[str] = None  # for pipeline schedules (namespace/name)
     content: Optional[str] = None  # message content for agent schedules
     description: Optional[str] = None
     cronExpression: str
@@ -292,6 +300,8 @@ class ScheduleConfig(BaseModel):
             raise ValueError("agentName is required for agent schedules")
         if schedule_type == "agent" and not values.get("content"):
             raise ValueError("content is required for agent schedules")
+        if schedule_type == "pipeline" and not values.get("pipelineName"):
+            raise ValueError("pipelineName is required for pipeline schedules")
         return v
 
 
@@ -363,11 +373,28 @@ class DatabaseTriggerConfig(BaseModel):
     schemaName: str = "public"
     tableName: str
     operations: list[str] = Field(default=["INSERT", "UPDATE"])
-    functionName: str  # "namespace/name" format
+    targetType: str = "function"  # "function" or "pipeline"
+    functionName: Optional[str] = None  # "namespace/name" format (function targets)
+    pipelineName: Optional[str] = None  # "namespace/name" format (pipeline targets)
     pollColumn: str
     pollIntervalSeconds: int = 10
     batchSize: int = 100
     isActive: bool = True
+
+    @validator("targetType")
+    def validate_target_type(cls, v):
+        if v not in ("function", "pipeline"):
+            raise ValueError("targetType must be 'function' or 'pipeline'")
+        return v
+
+    @validator("isActive", always=True)
+    def validate_target(cls, v, values):
+        if values.get("targetType", "function") == "pipeline":
+            if not values.get("pipelineName"):
+                raise ValueError("pipelineName is required for pipeline-target triggers")
+        elif not values.get("functionName"):
+            raise ValueError("functionName is required for function-target triggers")
+        return v
 
     @validator("operations")
     def validate_operations(cls, v):
@@ -455,6 +482,40 @@ class ConnectorConfig(BaseModel):
     operations: list[ConnectorOperationConfig] = Field(default_factory=list)
 
 
+class PipelineConfig(BaseModel):
+    """Pipeline configuration (see ADR 2026-07-28-pipelines-triggers-and-linear-steps).
+
+    `steps` and `perUser` are passed through verbatim — camelCase keys and `.$`
+    mapping keys are data (one representation across YAML/API/DB); shape is
+    validated by validate_pipeline_definition at apply time.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    namespace: str = "default"
+    name: str
+    description: Optional[str] = None
+    inputSchema: Optional[dict[str, Any]] = None
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    perUser: Optional[dict[str, Any]] = None
+    asTool: bool = False
+    toolDescription: Optional[str] = None
+    syncTimeoutSeconds: int = 120
+    concurrency: Optional[str] = None  # "single" | "parallel" | None (auto)
+    disableAfterFailures: Optional[int] = None
+    output: Optional[Any] = None
+    outputExpr: Optional[str] = Field(default=None, alias="output.$")
+    isActive: bool = True
+
+    def output_mapping(self) -> Optional[dict[str, Any]]:
+        """Build the stored output-mapping dict from the YAML-level fields."""
+        if self.outputExpr is not None:
+            return {"output.$": self.outputExpr}
+        if self.output is not None:
+            return {"output": self.output}
+        return None
+
+
 class DependencyConfig(BaseModel):
     """Python dependency configuration"""
 
@@ -506,6 +567,7 @@ class ConfigSpec(BaseModel):
     components: list[ComponentConfig] = Field(default_factory=list)
     functions: list[FunctionConfig] = Field(default_factory=list)
     queries: list[QueryConfig] = Field(default_factory=list)
+    pipelines: list[PipelineConfig] = Field(default_factory=list)
     collections: list[CollectionConfig] = Field(default_factory=list)
     templates: list[TemplateConfig] = Field(default_factory=list)
     stores: list[StoreConfig] = Field(default_factory=list)

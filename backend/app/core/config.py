@@ -239,6 +239,12 @@ class Settings(BaseSettings):
     queue_max_retries: int = 3
     queue_retry_delay: int = 10
 
+    # Pipeline runs (see ADR 2026-07-28-pipelines-triggers-and-linear-steps).
+    # Runs are await-heavy orchestration → high concurrency is cheap.
+    queue_pipeline_concurrency: int = 50
+    pipeline_job_timeout: int = 1800  # hard ceiling for one queued run (incl. agent steps)
+    pipeline_run_retention_days: int = 30  # pipeline_runs rows older than this are pruned
+
     # Agent job settings
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)

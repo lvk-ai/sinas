@@ -149,6 +149,9 @@ async def apply_agents(
                     "enabled_connectors": agent_config.enabledConnectors
                     if agent_config.enabledConnectors
                     else [],
+                    "enabled_pipelines": sorted(agent_config.enabledPipelines)
+                    if agent_config.enabledPipelines
+                    else [],
                     "input_schema": agent_config.inputSchema or {},
                     "output_schema": agent_config.outputSchema or {},
                     "initial_messages": agent_config.initialMessages or [],
@@ -199,6 +202,7 @@ async def apply_agents(
                     existing.enabled_collections = normalized_collections
                     existing.enabled_components = agent_config.enabledComponents
                     existing.enabled_connectors = agent_config.enabledConnectors
+                    existing.enabled_pipelines = agent_config.enabledPipelines
                     existing.input_schema = agent_config.inputSchema or {}
                     existing.output_schema = agent_config.outputSchema or {}
                     existing.initial_messages = agent_config.initialMessages
@@ -260,6 +264,7 @@ async def apply_agents(
                         enabled_collections=normalized_collections,
                         enabled_components=agent_config.enabledComponents,
                         enabled_connectors=agent_config.enabledConnectors,
+                        enabled_pipelines=agent_config.enabledPipelines,
                         hooks=agent_config.hooks,
                         icon=agent_config.icon,
                         is_default=agent_config.isDefault,

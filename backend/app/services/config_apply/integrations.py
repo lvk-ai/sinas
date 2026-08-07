@@ -58,12 +58,19 @@ async def apply_webhooks(
             # Parse target references (may be "namespace/name" or just "name")
             func_ns, func_name = "default", None
             agent_ns, agent_name = None, None
+            pipeline_ns, pipeline_name = None, None
             if target_type == "agent":
                 agent_ref = webhook_config.agentName or ""
                 if "/" in agent_ref:
                     agent_ns, agent_name = agent_ref.split("/", 1)
                 else:
                     agent_ns, agent_name = "default", agent_ref
+            elif target_type == "pipeline":
+                pipeline_ref = getattr(webhook_config, "pipelineName", None) or ""
+                if "/" in pipeline_ref:
+                    pipeline_ns, pipeline_name = pipeline_ref.split("/", 1)
+                else:
+                    pipeline_ns, pipeline_name = "default", pipeline_ref
             else:
                 func_ref = webhook_config.functionName or ""
                 if "/" in func_ref:
@@ -77,6 +84,7 @@ async def apply_webhooks(
                     "target_type": target_type,
                     "function_name": webhook_config.functionName,
                     "agent_name": webhook_config.agentName,
+                    "pipeline_name": getattr(webhook_config, "pipelineName", None),
                     "message_template": webhook_config.messageTemplate,
                     "session_key_template": webhook_config.sessionKeyTemplate,
                     "http_method": webhook_config.httpMethod,
@@ -98,6 +106,8 @@ async def apply_webhooks(
                     existing.function_name = func_name
                     existing.agent_namespace = agent_ns
                     existing.agent_name = agent_name
+                    existing.pipeline_namespace = pipeline_ns
+                    existing.pipeline_name = pipeline_name
                     existing.message_template = webhook_config.messageTemplate
                     existing.session_key_template = webhook_config.sessionKeyTemplate
                     existing.http_method = webhook_config.httpMethod
@@ -127,6 +137,8 @@ async def apply_webhooks(
                         function_name=func_name,
                         agent_namespace=agent_ns,
                         agent_name=agent_name,
+                        pipeline_namespace=pipeline_ns,
+                        pipeline_name=pipeline_name,
                         message_template=webhook_config.messageTemplate,
                         session_key_template=webhook_config.sessionKeyTemplate,
                         user_id=owner_user_id,
@@ -254,6 +266,12 @@ async def apply_schedules(
                     target_namespace, target_name = agent_ref.split("/", 1)
                 else:
                     target_namespace, target_name = "default", agent_ref
+            elif schedule_type == "pipeline":
+                pipeline_ref = schedule_config.pipelineName or ""
+                if "/" in pipeline_ref:
+                    target_namespace, target_name = pipeline_ref.split("/", 1)
+                else:
+                    target_namespace, target_name = "default", pipeline_ref
             else:
                 func_ref = schedule_config.functionName or ""
                 if "/" in func_ref:
@@ -356,12 +374,22 @@ async def apply_database_triggers(
                 )
                 continue
 
-            # Parse function name (namespace/name format)
-            func_ref = trigger_config.functionName
+            # Parse target refs (namespace/name format)
+            target_type = getattr(trigger_config, "targetType", "function")
+            func_ref = trigger_config.functionName or ""
             if "/" in func_ref:
                 func_namespace, func_name = func_ref.split("/", 1)
-            else:
+            elif func_ref:
                 func_namespace, func_name = "default", func_ref
+            else:
+                func_namespace, func_name = "default", None
+            pipeline_ref = getattr(trigger_config, "pipelineName", None) or ""
+            if "/" in pipeline_ref:
+                pipeline_namespace, pipeline_name = pipeline_ref.split("/", 1)
+            elif pipeline_ref:
+                pipeline_namespace, pipeline_name = "default", pipeline_ref
+            else:
+                pipeline_namespace, pipeline_name = None, None
 
             # Look for existing trigger
             stmt = select(DatabaseTrigger).where(DatabaseTrigger.name == trigger_config.name)
@@ -375,8 +403,11 @@ async def apply_database_triggers(
                     "schema_name": trigger_config.schemaName,
                     "table_name": trigger_config.tableName,
                     "operations": trigger_config.operations,
+                    "target_type": target_type,
                     "function_namespace": func_namespace,
                     "function_name": func_name,
+                    "pipeline_namespace": pipeline_namespace,
+                    "pipeline_name": pipeline_name,
                     "poll_column": trigger_config.pollColumn,
                     "poll_interval_seconds": trigger_config.pollIntervalSeconds,
                     "batch_size": trigger_config.batchSize,
@@ -393,8 +424,11 @@ async def apply_database_triggers(
                     existing.schema_name = trigger_config.schemaName
                     existing.table_name = trigger_config.tableName
                     existing.operations = trigger_config.operations
+                    existing.target_type = target_type
                     existing.function_namespace = func_namespace
                     existing.function_name = func_name
+                    existing.pipeline_namespace = pipeline_namespace
+                    existing.pipeline_name = pipeline_name
                     existing.poll_column = trigger_config.pollColumn
                     existing.poll_interval_seconds = trigger_config.pollIntervalSeconds
                     existing.batch_size = trigger_config.batchSize
@@ -411,8 +445,11 @@ async def apply_database_triggers(
                         schema_name=trigger_config.schemaName,
                         table_name=trigger_config.tableName,
                         operations=trigger_config.operations,
+                        target_type=target_type,
                         function_namespace=func_namespace,
                         function_name=func_name,
+                        pipeline_namespace=pipeline_namespace,
+                        pipeline_name=pipeline_name,
                         poll_column=trigger_config.pollColumn,
                         poll_interval_seconds=trigger_config.pollIntervalSeconds,
                         batch_size=trigger_config.batchSize,

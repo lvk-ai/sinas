@@ -29,6 +29,7 @@ import {
   HardDrive,
   KeyRound,
   Plug,
+  Workflow,
 } from 'lucide-react';
 import { useState } from 'react';
 
@@ -56,6 +57,7 @@ const navigationSections = [
       { name: 'Databases', href: '/database-connections', icon: Cable },
       { name: 'Templates', href: '/templates', icon: FileText },
       { name: 'Connectors', href: '/connectors', icon: Plug },
+      { name: 'Pipelines', href: '/pipelines', icon: Workflow },
       { name: 'Secrets', href: '/secrets', icon: KeyRound },
     ],
   },

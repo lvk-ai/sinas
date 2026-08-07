@@ -255,6 +255,106 @@ async def _execute_agent_webhook(
     return response
 
 
+async def _execute_pipeline_webhook(
+    webhook: Webhook,
+    request: Request,
+    user_id: str,
+    final_input: Any,
+    req_headers: dict[str, str],
+):
+    """Execute a pipeline-target webhook: the request payload becomes the run
+    input, executing as the webhook's owner. `sync` waits for the outcome,
+    `async` enqueues one run and returns 202. No perUser fan-out here — a
+    webhook event is a single occurrence, not a poll tick; fan-out stays with
+    schedules and manual ?allUsers runs."""
+    import asyncio as _asyncio
+
+    from app.api.runtime.endpoints.functions import _resolve_child_depth
+    from app.models.pipeline import Pipeline
+    from app.services import pipeline_runner
+    from app.services.pipeline_runner import PipelineBusyError
+
+    from app.core.database import AsyncSessionLocal
+
+    pipeline_namespace = webhook.pipeline_namespace or "default"
+    async with AsyncSessionLocal() as db:
+        pipeline = await Pipeline.get_by_name(db, pipeline_namespace, webhook.pipeline_name)
+        if not pipeline or not pipeline.is_active:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Webhook target pipeline '{pipeline_namespace}/{webhook.pipeline_name}' not found or inactive",
+            )
+        pipeline_id = str(pipeline.id)
+        sync_timeout = pipeline.sync_timeout_seconds
+
+    run_input = final_input if isinstance(final_input, dict) else {"input": final_input}
+
+    if webhook.response_mode == "async":
+        job_id = await queue_service.enqueue_pipeline_run(
+            pipeline_id=pipeline_id,
+            run_input=run_input,
+            trigger_type=TriggerType.WEBHOOK.value,
+            trigger_id=str(webhook.id),
+            user_id=user_id,
+        )
+        return JSONResponse({"run_id": job_id}, status_code=202)
+
+    token = await pipeline_runner.mint_run_token(user_id)
+    if not token:
+        raise HTTPException(status_code=500, detail="Webhook user not found")
+
+    try:
+        outcome = await _asyncio.wait_for(
+            pipeline_runner.run_pipeline(
+                pipeline_id,
+                run_input,
+                trigger_type=TriggerType.WEBHOOK.value,
+                trigger_id=str(webhook.id),
+                user_id=user_id,
+                user_token=token,
+                exec_depth=_resolve_child_depth(request),
+                sync=True,
+            ),
+            timeout=sync_timeout,
+        )
+    except PipelineBusyError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A run of this pipeline is already in progress (run_id={e.active_run_id})",
+        )
+    except _asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Pipeline run exceeded syncTimeoutSeconds ({sync_timeout}s). "
+                "Completed steps had side effects; use response_mode 'async' for long runs."
+            ),
+        )
+
+    if outcome["status"] != "succeeded":
+        # The run record is the dead letter; surface its id, never mask failure.
+        return JSONResponse(
+            {"success": False, "run_id": outcome["run_id"], "error": outcome.get("error")},
+            status_code=500,
+        )
+
+    response = {"success": True, "run_id": outcome["run_id"], "output": outcome["output"]}
+
+    if webhook.dedup:
+        try:
+            await store_result(
+                webhook_id=str(webhook.id),
+                body=final_input if isinstance(final_input, dict) else {},
+                headers=req_headers,
+                dedup_config=webhook.dedup,
+                result=json.dumps(response, default=str),
+            )
+        except Exception:
+            pass  # Non-critical
+
+    return response
+
+
 @router.api_route(
     "/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -264,7 +364,7 @@ async def execute_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute webhook by triggering the associated function or agent."""
+    """Execute webhook by triggering the associated function, agent, or pipeline."""
     # Look up webhook configuration
     result = await db.execute(
         select(Webhook).where(
@@ -284,6 +384,7 @@ async def execute_webhook(
         )
 
     is_agent_target = webhook.target_type == "agent"
+    is_pipeline_target = webhook.target_type == "pipeline"
 
     # Authenticate if required
     user_id: Optional[str] = None
@@ -331,6 +432,11 @@ async def execute_webhook(
                 target_perm = (
                     f"sinas.agents/{webhook.agent_namespace}/{webhook.agent_name}.chat:all"
                 )
+            elif is_pipeline_target:
+                target_perm = f"sinas.pipelines/{webhook.pipeline_namespace or 'default'}/{webhook.pipeline_name}.run:own"
+                target_perm_all = f"sinas.pipelines/{webhook.pipeline_namespace or 'default'}/{webhook.pipeline_name}.run:all"
+                if check_permission(permissions, target_perm_all):
+                    target_perm = target_perm_all
             else:
                 target_perm = f"sinas.functions/{webhook.function_namespace}/{webhook.function_name}.execute:own"
                 target_perm_all = f"sinas.functions/{webhook.function_namespace}/{webhook.function_name}.execute:all"
@@ -393,9 +499,19 @@ async def execute_webhook(
                 # mode promises.
                 if webhook.response_mode == "raw":
                     return Response(status_code=204)
-                if is_agent_target and webhook.response_mode == "async":
+                if (is_agent_target or is_pipeline_target) and webhook.response_mode == "async":
                     return JSONResponse({"deduplicated": True}, status_code=202)
                 return JSONResponse({"deduplicated": True}, status_code=200)
+
+        # Pipeline target
+        if is_pipeline_target:
+            return await _execute_pipeline_webhook(
+                webhook=webhook,
+                request=request,
+                user_id=user_id,
+                final_input=final_input,
+                req_headers=req_headers,
+            )
 
         # Agent target
         if is_agent_target:
