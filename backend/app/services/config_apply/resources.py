@@ -150,7 +150,16 @@ async def apply_secrets(
     for secret_config in secrets:
         resource_name = secret_config.name
         try:
-            stmt = select(Secret).where(Secret.name == secret_config.name)
+            # Scope to shared secrets. Config declares platform-level secrets,
+            # while `private` rows are per-user overrides (see
+            # connector_service._resolve_secret_value). Matching on name alone
+            # could select — and then overwrite the value of — another user's
+            # private secret. Shared names are globally unique (partial unique
+            # index on name where visibility='shared'), so this stays a
+            # single-row lookup.
+            stmt = select(Secret).where(
+                Secret.name == secret_config.name, Secret.visibility == "shared"
+            )
             result = await db.execute(stmt)
             existing = result.scalar_one_or_none()
 
@@ -198,6 +207,10 @@ async def apply_secrets(
                     secret = Secret(
                         user_id=owner_user_id,
                         name=secret_config.name,
+                        # Explicit rather than relying on the model default:
+                        # visibility decides who can read this, so it should be
+                        # stated at the point of creation, not inherited.
+                        visibility="shared",
                         encrypted_value=encryption_service.encrypt(secret_config.value),
                         description=secret_config.description,
                         managed_by=managed_by,

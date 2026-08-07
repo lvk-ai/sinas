@@ -64,6 +64,12 @@ class ConfigApplyService:
         self.skip_resource_types = skip_resource_types or set()
         self.summary = ConfigApplySummary()
         self.changes: list[ResourceChange] = []
+        # Post-commit notifications. Collected during apply and published only
+        # after the transaction commits, so a worker can never observe an event
+        # for a row it cannot read yet. When auto_commit is False the caller
+        # owns the commit and must call flush_notifications() itself.
+        self._pending_scheduler: list[tuple[str, str]] = []
+        self._pending_cdc_reload = False
         self.errors: list[str] = []
         self.warnings: list[str] = []
 
@@ -115,6 +121,37 @@ class ConfigApplyService:
         summary_field = action_field_map.get(action, action)
         summary_dict = getattr(self.summary, summary_field)
         summary_dict[resource_type] = summary_dict.get(resource_type, 0) + 1
+
+
+    async def flush_notifications(self) -> None:
+        """Publish queued events to the scheduler and CDC workers.
+
+        Call AFTER the transaction commits. Callers that pass auto_commit=False
+        (package install, for one) own their commit and must call this, or
+        config-applied schedules never reach the running scheduler and CDC
+        triggers are not picked up until a restart. Best-effort throughout: a
+        notification failure must not fail an apply that already committed.
+        """
+        import json
+
+        from app.core.redis import get_redis
+
+        pending_jobs, self._pending_scheduler = self._pending_scheduler, []
+        cdc_reload, self._pending_cdc_reload = self._pending_cdc_reload, False
+        if not pending_jobs and not cdc_reload:
+            return
+        try:
+            redis = await get_redis()
+            for action, job_id in pending_jobs:
+                await redis.publish(
+                    "sinas:scheduler:jobs", json.dumps({"action": action, "job_id": job_id})
+                )
+            if cdc_reload:
+                await redis.publish(
+                    "sinas:cdc:triggers", json.dumps({"action": "reload", "trigger_id": ""})
+                )
+        except Exception as e:
+            logger.warning(f"Failed to publish config-apply notifications: {e}")
 
     async def apply_config(self, config: SinasConfig, dry_run: bool = False) -> ConfigApplyResponse:
         """
@@ -246,6 +283,9 @@ class ConfigApplyService:
                 await apply_schedules(
                     **common_with_owner,
                     schedules=config.spec.schedules,
+                    notify_scheduler=lambda action, job_id: self._pending_scheduler.append(
+                        (action, job_id)
+                    ),
                 )
             if "databaseTriggers" not in self.skip_resource_types:
                 await apply_database_triggers(
@@ -253,26 +293,11 @@ class ConfigApplyService:
                     triggers=config.spec.databaseTriggers,
                 )
 
-            if not dry_run and self.auto_commit:
-                await self.db.commit()
-                # Notify the CDC worker so database triggers created/updated via
-                # config apply (e.g. a Package install) are picked up without a
-                # restart — the REST endpoint notifies per-trigger, this path
-                # did not. One reconcile signal; the worker diffs running poll
-                # tasks against active triggers. Best-effort: never fail the
-                # apply on a notify error.
-                try:
-                    import json
-
-                    from app.core.redis import get_redis
-
-                    redis = await get_redis()
-                    await redis.publish(
-                        "sinas:cdc:triggers",
-                        json.dumps({"action": "reload", "trigger_id": ""}),
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to notify CDC after config apply: {e}")
+            if not dry_run:
+                self._pending_cdc_reload = True
+                if self.auto_commit:
+                    await self.db.commit()
+                    await self.flush_notifications()
 
             return ConfigApplyResponse(
                 success=True,

@@ -237,6 +237,7 @@ async def apply_schedules(
     track_change: Any,
     errors: list[str],
     warnings: list[str],
+    notify_scheduler: Any = None,
 ) -> None:
     """Apply schedule configurations"""
     for schedule_config in schedules:
@@ -288,6 +289,11 @@ async def apply_schedules(
                     existing.input_data = schedule_config.inputData
                     existing.is_active = schedule_config.isActive
                     existing.config_checksum = config_hash
+                    if notify_scheduler:
+                        # Without this the running scheduler never learns about
+                        # config-applied schedules and keeps the old cron (or
+                        # none) until it restarts.
+                        notify_scheduler("update", str(existing.id))
 
                 track_change("update", "schedules", schedule_config.name)
 
@@ -309,6 +315,11 @@ async def apply_schedules(
                         config_checksum=config_hash,
                     )
                     db.add(new_schedule)
+                    if notify_scheduler:
+                        # flush to obtain the generated id; the event itself is
+                        # published only after the transaction commits.
+                        await db.flush()
+                        notify_scheduler("create", str(new_schedule.id))
 
                 track_change("create", "schedules", schedule_config.name)
 
