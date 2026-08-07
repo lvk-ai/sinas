@@ -248,6 +248,14 @@ class FunctionExecutor:
         embedded in the per-execution access token so a nested call can
         compute its own depth and be bounded by settings.max_execution_depth.
         """
+        # Single choke point for every trigger type (API, webhook, schedule,
+        # agent tool, CDC), so one guard disables user-code execution platform
+        # wide rather than each entry point remembering to check.
+        if not settings.code_execution_enabled:
+            raise FunctionExecutionError(
+                "Function execution is disabled on this deployment "
+                "(CODE_EXECUTION_ENABLED=false)."
+            )
         async with AsyncSessionLocal() as db:
             # Get user info for context
             from app.core.auth import create_access_token
