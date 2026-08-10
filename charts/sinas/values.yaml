@@ -62,7 +62,7 @@ registry:
 postgres:
   user: postgres
   database: sinas
-  password: ""
+  password: ""  # required — install fails if empty
   storage: 5Gi
 
 ## Redis
