@@ -25,6 +25,7 @@ from app.models.database_connection import DatabaseConnection
 from app.models.schedule import ScheduledJob
 from app.models.user import Role, User, UserRole
 from app.scheduler.jobs.cleanup_expired_chats import cleanup_expired_chats
+from app.scheduler.jobs.poll_provider_batches import poll_provider_batches
 from app.services.config_apply import ConfigApplyService
 from app.services.config_parser import ConfigParser
 from app.services.container_pool import container_pool
@@ -306,6 +307,16 @@ async def main() -> None:
         replace_existing=True,
     )
     logger.info("Registered system job: cleanup_expired_chats (every 1h)")
+
+    scheduler.scheduler.add_job(
+        func=poll_provider_batches,
+        trigger="interval",
+        minutes=1,
+        id="system:poll_provider_batches",
+        name="Poll provider-native LLM batches",
+        replace_existing=True,
+    )
+    logger.info("Registered system job: poll_provider_batches (every 1m)")
 
     # Ensure tool_call_results partitions exist
     await _maintain_tool_result_partitions()

@@ -1,4 +1,5 @@
 """OpenAI LLM provider implementation."""
+import json
 from collections.abc import AsyncIterator
 from typing import Any, Optional
 
@@ -8,6 +9,8 @@ from .base import BaseLLMProvider
 
 
 class OpenAIProvider(BaseLLMProvider):
+    supports_batch = True
+
     """OpenAI API provider."""
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
@@ -176,3 +179,92 @@ class OpenAIProvider(BaseLLMProvider):
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens,
         }
+
+    # ── Batch API ─────────────────────────────────────────────────────────
+
+    async def submit_batch(self, requests: list[dict[str, Any]]) -> str:
+        lines = []
+        for req in requests:
+            body = self._prepare_params(
+                model=req["model"],
+                messages=req["messages"],
+                temperature=req.get("temperature", 0.7),
+                max_tokens=req.get("max_tokens"),
+                tools=None,
+                kwargs={},
+            )
+            lines.append(json.dumps({
+                "custom_id": req["custom_id"],
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": body,
+            }))
+        jsonl = ("\n".join(lines) + "\n").encode("utf-8")
+
+        input_file = await self.client.files.create(
+            file=("batch.jsonl", jsonl), purpose="batch"
+        )
+        batch = await self.client.batches.create(
+            input_file_id=input_file.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+        return batch.id
+
+    async def get_batch_status(self, provider_batch_id: str) -> dict[str, Any]:
+        batch = await self.client.batches.retrieve(provider_batch_id)
+        return {
+            "status": batch.status,
+            "ended": batch.status in ("completed", "failed", "expired", "cancelled"),
+        }
+
+    async def fetch_batch_results(self, provider_batch_id: str) -> list[dict[str, Any]]:
+        batch = await self.client.batches.retrieve(provider_batch_id)
+        results: list[dict[str, Any]] = []
+        # A cancelled/expired batch still exposes results for the completed
+        # portion via output_file_id; the rest surfaces via error_file_id or
+        # is simply absent (the poller fails leftovers explicitly).
+        expired = batch.status == "expired"
+
+        for file_id, is_error_file in (
+            (batch.output_file_id, False),
+            (batch.error_file_id, True),
+        ):
+            if not file_id:
+                continue
+            content = await self.client.files.content(file_id)
+            for line in content.text.splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                item: dict[str, Any] = {
+                    "custom_id": entry.get("custom_id"),
+                    "status": "errored" if is_error_file else "succeeded",
+                    "content": None,
+                    "usage": None,
+                    "error": None,
+                }
+                response = entry.get("response") or {}
+                body = response.get("body") or {}
+                if not is_error_file and response.get("status_code") == 200:
+                    choices = body.get("choices") or []
+                    if choices:
+                        item["content"] = (choices[0].get("message") or {}).get("content")
+                    usage = body.get("usage") or {}
+                    details = usage.get("prompt_tokens_details") or {}
+                    item["usage"] = {
+                        "prompt_tokens": usage.get("prompt_tokens", 0) or 0,
+                        "completion_tokens": usage.get("completion_tokens", 0) or 0,
+                        "total_tokens": usage.get("total_tokens", 0) or 0,
+                        "cache_read_tokens": details.get("cached_tokens", 0) or 0,
+                        "cache_write_tokens": 0,
+                    }
+                else:
+                    item["status"] = "expired" if expired else "errored"
+                    error = entry.get("error") or body.get("error") or response.get("status_code")
+                    item["error"] = "provider_batch_expired" if expired else str(error)
+                results.append(item)
+        return results
+
+    async def cancel_batch(self, provider_batch_id: str) -> None:
+        await self.client.batches.cancel(provider_batch_id)
