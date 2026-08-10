@@ -10,6 +10,8 @@ from .base import BaseLLMProvider
 class AnthropicProvider(BaseLLMProvider):
     """Anthropic (Claude) API provider."""
 
+    supports_batch = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -479,3 +481,72 @@ class AnthropicProvider(BaseLLMProvider):
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
         }
+
+    # ── Message Batches API ───────────────────────────────────────────────
+
+    def _build_batch_params(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Build per-request params for a batch item — same conversion and
+        cache-control path as complete()/stream(), minus tools (batch mode
+        is tool-less by contract)."""
+        system_message, filtered_messages = self._convert_messages_to_anthropic(
+            request["messages"]
+        )
+        temperature = request.get("temperature")
+        params: dict[str, Any] = {
+            "model": request["model"],
+            "messages": filtered_messages,
+            "temperature": temperature if temperature is not None else 1.0,
+            "max_tokens": request.get("max_tokens") or 16384,
+        }
+        if system_message:
+            params["system"] = system_message
+        if self.enable_prompt_caching:
+            # Batch requests sharing an agent's system prompt can still land
+            # opportunistic cache hits — the discounts stack.
+            self._apply_cache_control(params)
+        return params
+
+    async def submit_batch(self, requests: list[dict[str, Any]]) -> str:
+        batch = await self.client.messages.batches.create(
+            requests=[
+                {"custom_id": req["custom_id"], "params": self._build_batch_params(req)}
+                for req in requests
+            ]
+        )
+        return batch.id
+
+    async def get_batch_status(self, provider_batch_id: str) -> dict[str, Any]:
+        batch = await self.client.messages.batches.retrieve(provider_batch_id)
+        return {
+            "status": batch.processing_status,
+            "ended": batch.processing_status == "ended",
+        }
+
+    async def fetch_batch_results(self, provider_batch_id: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        # SDK-normalized statuses: succeeded | errored | canceled | expired
+        status_map = {"canceled": "cancelled"}
+        async for entry in await self.client.messages.batches.results(provider_batch_id):
+            result_type = entry.result.type
+            item: dict[str, Any] = {
+                "custom_id": entry.custom_id,
+                "status": status_map.get(result_type, result_type),
+                "content": None,
+                "usage": None,
+                "error": None,
+            }
+            if result_type == "succeeded":
+                message = entry.result.message
+                item["content"] = "".join(
+                    block.text for block in message.content if block.type == "text"
+                )
+                item["usage"] = self.extract_usage(message)
+            elif result_type == "errored":
+                item["error"] = str(entry.result.error)
+            elif result_type == "expired":
+                item["error"] = "provider_batch_expired"
+            results.append(item)
+        return results
+
+    async def cancel_batch(self, provider_batch_id: str) -> None:
+        await self.client.messages.batches.cancel(provider_batch_id)
