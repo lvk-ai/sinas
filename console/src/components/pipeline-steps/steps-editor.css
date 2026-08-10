@@ -1,0 +1,369 @@
+/* Console theme for PipelineStepsEditor (`pse-*` semantic classes).
+   The component ships no styling of its own — Studio (or any other app)
+   lifts model.ts + PipelineStepsEditor.tsx verbatim and writes its own
+   version of this file against its design tokens. */
+
+.pse {
+  display: flex;
+  flex-direction: column;
+}
+
+.pse-step-slot,
+.pse-add {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.pse-connector-line {
+  width: 2px;
+  height: 14px;
+  margin-left: 26px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.pse-step {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.pse-step-invalid {
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.pse-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.pse-step-index {
+  font-size: 11px;
+  color: #6b7280;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  min-width: 14px;
+  text-align: center;
+}
+
+.pse-type-select {
+  width: 110px;
+  flex-shrink: 0;
+}
+
+.pse-step-name {
+  width: 150px;
+  flex-shrink: 0;
+}
+
+.pse-step-summary {
+  font-size: 12px;
+  color: #9ca3af;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pse-extra-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(234, 179, 8, 0.15);
+  color: #eab308;
+  flex-shrink: 0;
+}
+
+.pse-step-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.pse-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 5px;
+  color: #6b7280;
+  transition: color 0.1s, background 0.1s;
+}
+
+.pse-icon-btn:hover:not(:disabled) {
+  color: #d1d5db;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.pse-icon-btn:disabled {
+  opacity: 0.3;
+}
+
+.pse-icon-btn.pse-danger:hover {
+  color: #f87171;
+}
+
+.pse-icon-btn.pse-active {
+  color: #60a5fa;
+  background: rgba(96, 165, 250, 0.1);
+}
+
+.pse-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 12px 12px 34px;
+}
+
+.pse-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.pse-grid-3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+
+.pse-inline-fields {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.pse-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.pse-label {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.pse-hint {
+  font-size: 10.5px;
+  color: #6b7280;
+}
+
+.pse-error {
+  font-size: 11px;
+  color: #f87171;
+}
+
+.pse-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 12px 6px 34px;
+}
+
+.pse-input {
+  background: #111111;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 6px;
+  color: #ededed;
+  font-size: 12.5px;
+  padding: 5px 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.pse-input:focus {
+  outline: none;
+  border-color: rgba(96, 165, 250, 0.5);
+}
+
+.pse-input.pse-invalid {
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.pse-mono {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.pse-narrow {
+  width: 90px;
+}
+
+.pse-json {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+/* Mapping rows */
+.pse-mapping {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pse-mapping-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pse-mapping-key {
+  width: 170px;
+  flex-shrink: 0;
+}
+
+.pse-mapping-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pse-kind-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  color: #9ca3af;
+  flex-shrink: 0;
+  background: #111111;
+}
+
+.pse-kind-toggle.pse-kind-expr {
+  color: #60a5fa;
+  border-color: rgba(96, 165, 250, 0.4);
+  background: rgba(96, 165, 250, 0.08);
+}
+
+.pse-type-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(52, 211, 153, 0.12);
+  color: #34d399;
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.pse-add-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: #9ca3af;
+  padding: 3px 6px;
+  border-radius: 5px;
+  align-self: flex-start;
+}
+
+.pse-add-row:hover {
+  color: #d1d5db;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* Sections (input / cursor / message) */
+.pse-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding-top: 8px;
+}
+
+.pse-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pse-section-title {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #d1d5db;
+}
+
+.pse-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.pse-mode-tabs {
+  display: inline-flex;
+  gap: 1px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  padding: 2px;
+  margin-left: auto;
+}
+
+.pse-mode-tab {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  color: #9ca3af;
+}
+
+.pse-mode-tab.pse-active {
+  background: rgba(255, 255, 255, 0.09);
+  color: #f3f4f6;
+}
+
+/* Add-step */
+.pse-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  font-size: 12.5px;
+  color: #9ca3af;
+  border: 1px dashed rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 7px 14px;
+  margin-left: 10px;
+}
+
+.pse-add-btn:hover {
+  color: #e5e7eb;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.pse-add-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #161616;
+  padding: 4px;
+  margin-left: 10px;
+  max-width: 460px;
+}
+
+.pse-add-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+
+.pse-add-option:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.pse-add-label {
+  font-size: 12.5px;
+  color: #e5e7eb;
+}
