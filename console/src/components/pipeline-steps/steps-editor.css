@@ -37,6 +37,14 @@
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
+  /* Flex items default to min-width:auto, so a long step name or summary could
+     push the row wider than its container. */
+  min-width: 0;
+  overflow: hidden;
+}
+
+.pse-step-head > * {
+  min-width: 0;
 }
 
 .pse-step-index {
@@ -47,14 +55,18 @@
   text-align: center;
 }
 
-.pse-type-select {
-  width: 110px;
-  flex-shrink: 0;
+/* Compound selector so these beat `.pse-input { width: 100% }` (defined later
+   with equal specificity — plain `.pse-type-select` lost the cascade and the
+   row overflowed its card). flex-basis rather than width so the row can still
+   compress on narrow viewports. */
+.pse-input.pse-type-select {
+  flex: 0 1 130px;
+  min-width: 90px;
 }
 
-.pse-step-name {
-  width: 150px;
-  flex-shrink: 0;
+.pse-input.pse-step-name {
+  flex: 1 1 150px;
+  min-width: 90px;
 }
 
 .pse-step-summary {
@@ -81,6 +93,9 @@
   align-items: center;
   gap: 2px;
   margin-left: auto;
+  /* the head's `> * { min-width: 0 }` would otherwise let the icon buttons
+     squash before the text inputs do */
+  flex-shrink: 0;
 }
 
 .pse-icon-btn {
@@ -189,8 +204,10 @@
   font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
-.pse-narrow {
+.pse-input.pse-narrow {
+  flex: 0 1 90px;
   width: 90px;
+  max-width: 100%;
 }
 
 .pse-json {
@@ -211,9 +228,9 @@
   gap: 6px;
 }
 
-.pse-mapping-key {
-  width: 170px;
-  flex-shrink: 0;
+.pse-input.pse-mapping-key {
+  flex: 0 1 170px;
+  min-width: 100px;
 }
 
 .pse-mapping-value {
