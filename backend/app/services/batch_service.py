@@ -388,6 +388,14 @@ async def submit_agent_batch(
         batch.status = BatchStatus.RUNNING
         await db.commit()
 
+        # Metering: queue-mode children are counted at the agent leaf in
+        # message_service when each turn runs; provider-mode children never
+        # pass through it, so count the whole batch at submission — this is
+        # the moment the work is irrevocably bought from the provider.
+        from app.services import metering
+
+        await metering.record(metering.OperationKind.AGENT, n=len(requests))
+
         logger.info(
             "Submitted provider batch %s (%d requests) as %s via %s",
             batch.id, len(requests), provider_batch_id, provider_row.name,

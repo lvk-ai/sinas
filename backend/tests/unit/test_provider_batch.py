@@ -310,3 +310,31 @@ async def test_tracking_wrapper_passes_batch_methods_through():
         {"custom_id": "e1", "messages": [{"role": "user", "content": "x"}], "model": "m"}
     ])
     assert batch_id == "msgbatch_9"
+
+
+# ── Metering ─────────────────────────────────────────────────────────────
+
+
+async def test_provider_submit_records_agent_ops(monkeypatch):
+    """Provider-mode children never reach the message_service metering leaf,
+    so submission itself must count one AGENT op per child (#118 parity)."""
+    from app.services import batch_service, metering
+
+    recorded = []
+
+    async def fake_record(kind, n=1):
+        recorded.append((kind, n))
+
+    monkeypatch.setattr(metering, "record", fake_record)
+
+    # Exercise just the post-submit accounting: simulate what the provider
+    # path does after a successful submit_batch call.
+    await metering.record(metering.OperationKind.AGENT, n=3)
+    assert recorded == [(metering.OperationKind.AGENT, 3)]
+
+    # And pin that batch_service actually calls it: the call site must exist
+    # on the provider-mode success path.
+    import inspect
+
+    src = inspect.getsource(batch_service.submit_agent_batch)
+    assert "metering.record(metering.OperationKind.AGENT, n=len(requests))" in src

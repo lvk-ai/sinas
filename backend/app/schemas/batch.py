@@ -39,7 +39,10 @@ class AgentBatchRequest(BaseModel):
             "'queue' runs each invocation through the internal worker queue "
             "(default). 'provider' submits the whole batch to the LLM "
             "provider's batch API (~50% cost, up to 24h turnaround) — only "
-            "for agents without tools, on providers that support it."
+            "for agents without tools, on providers that support it. Note: "
+            "provider mode renders prompts from the agent config and "
+            "input_variables only; per-user context injection (custom "
+            "fields) does not apply."
         ),
     )
 
