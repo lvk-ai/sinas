@@ -114,7 +114,12 @@ class Settings(BaseSettings):
     #     "disabled"         — sandbox features rejected; deploy is trusted-only
     # - trusted_executor: backend for admin-approved code (Function.shared_pool=True).
     #     "docker_shared" — dedicated long-lived Docker workers (current default)
-    #     "inprocess"     — run inside the calling process; no Docker socket needed
+    #     "k8s_shared"    — dedicated long-lived k8s pods (for k8s deploys;
+    #                       credential-free, meter-integrity safe)
+    #     "inprocess"     — run inside the calling process; no Docker socket
+    #                       needed. NOT meter-integrity safe: trusted code runs
+    #                       in a credential-bearing process.
+    #     "disabled"      — shared_pool executions rejected with a clear error
     sandbox_executor: str = "docker_pool"
     trusted_executor: str = "docker_shared"
 
@@ -147,6 +152,8 @@ class Settings(BaseSettings):
     # All empty/no-op by default — matches today's behavior on generic
     # clusters with no per-client scheduling policy.
     k8s_release_name: str = ""
+    # k8s_shared trusted executor: number of warm trusted worker pods.
+    k8s_trusted_workers: int = 2
     k8s_sandbox_node_selector: str = "{}"  # JSON object, e.g. {"role": "shared"}
     k8s_sandbox_tolerations: str = "[]"  # JSON list of Toleration dicts
     k8s_sandbox_affinity: str = "{}"  # JSON k8s Affinity object (podAffinity/podAntiAffinity/nodeAffinity)
@@ -356,6 +363,19 @@ class Settings(BaseSettings):
     def token_issuer(self) -> str:
         """`iss` claim on RS256 access tokens; what verifiers configure as issuer."""
         return self.jwt_issuer.strip() or self.public_base_url
+
+    # Operations metering (managed SaaS). Default-off; when enabled, every
+    # operation (function/code/query/agent/upload/tool) increments a Redis
+    # counter, the scheduler snapshots it to usage_periods, and a heartbeat
+    # pushes the CUMULATIVE period total to metering_endpoint. Pure emission:
+    # nothing is enforced on the instance and nothing is pulled down. A dead
+    # endpoint or Redis blip never affects platform behavior.
+    metering_enabled: bool = False
+    metering_endpoint: str = ""  # e.g. https://ops.example.com/v1/usage
+    metering_api_key: str = ""  # sent as Authorization: Bearer <key>
+    metering_instance_id: str = ""  # defaults to `domain`; set explicitly in SaaS
+    metering_snapshot_minutes: int = 5  # Redis -> usage_periods cadence
+    metering_push_minutes: int = 15  # heartbeat cadence (jittered per instance)
 
     # Component builder
     builder_url: str = "http://sinas-builder:3000"  # URL for esbuild compilation service
