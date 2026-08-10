@@ -4,9 +4,13 @@ import { Code, Plus, Trash2, Edit2, PackageOpen, ChevronDown, ChevronRight, Sear
 import { useState, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { SchemaFormField } from '../components/SchemaFormField';
+import { useAuth } from '../lib/auth-context';
 
 export function Functions() {
   const queryClient = useQueryClient();
+  const { instanceInfo } = useAuth();
+  // Absent flag (older backend) = enabled; only an explicit false greys out.
+  const codeExecutionEnabled = instanceInfo?.features?.code_execution !== false;
   const [showDependencyModal, setShowDependencyModal] = useState(false);
   const [dependencyName, setDependencyName] = useState('');
   const [dependencyVersion, setDependencyVersion] = useState('');
@@ -175,12 +179,24 @@ export function Functions() {
             <PackageOpen className="w-5 h-5 mr-2" />
             Dependencies
           </button>
-          <Link to="/functions/new/new" className="btn btn-primary flex items-center">
+          <Link
+            to="/functions/new/new"
+            className={`btn btn-primary flex items-center ${!codeExecutionEnabled ? 'opacity-40 pointer-events-none' : ''}`}
+            aria-disabled={!codeExecutionEnabled}
+          >
             <Plus className="w-5 h-5 mr-2" />
             New Function
           </Link>
         </div>
       </div>
+
+      {!codeExecutionEnabled && (
+        <div className="px-4 py-3 rounded-md bg-yellow-900/20 border border-yellow-800/30 text-sm text-yellow-400">
+          Code execution is disabled on this deployment
+          (<span className="font-mono">CODE_EXECUTION_ENABLED=false</span>).
+          Functions can be viewed but not created or executed.
+        </div>
+      )}
 
       {/* Search Bar */}
       {functions && functions.length > 0 && (
@@ -303,9 +319,9 @@ export function Functions() {
                   <div className="flex items-center gap-1 flex-shrink-0">
                     <button
                       onClick={() => handleExecute(func)}
-                      disabled={executeMutation.isPending}
-                      className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-green-400 bg-green-900/20 hover:bg-green-900/30 rounded-md transition-colors"
-                      title="Execute function"
+                      disabled={executeMutation.isPending || !codeExecutionEnabled}
+                      className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-green-400 bg-green-900/20 hover:bg-green-900/30 rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      title={codeExecutionEnabled ? 'Execute function' : 'Code execution is disabled on this deployment (CODE_EXECUTION_ENABLED=false)'}
                     >
                       <Play className="w-4 h-4 mr-1.5" />
                       Run

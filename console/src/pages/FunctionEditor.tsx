@@ -7,6 +7,7 @@ import CodeEditor from '@uiw/react-textarea-code-editor';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { SchemaFormField } from '../components/SchemaFormField';
 import { ApiUsage } from '../components/ApiUsage';
+import { useAuth } from '../lib/auth-context';
 
 const SCHEMA_PRESETS: Record<string, { label: string; input: any; output: any }> = {
   'pre-upload-filter': {
@@ -123,6 +124,8 @@ export function FunctionEditor() {
   const { namespace, name } = useParams<{ namespace: string; name: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { instanceInfo } = useAuth();
+  const codeExecutionEnabled = instanceInfo?.features?.code_execution !== false;
   const isNew = namespace === 'new';
 
   const [formData, setFormData] = useState({
@@ -669,8 +672,9 @@ print(details["status"], details["output_data"])`,
                       testMutation.mutate(testInputParams);
                       setTimeout(() => testResultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 100);
                     }}
-                    disabled={testMutation.isPending}
-                    className="btn btn-primary flex items-center text-sm py-1.5 px-3"
+                    disabled={testMutation.isPending || !codeExecutionEnabled}
+                    className="btn btn-primary flex items-center text-sm py-1.5 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={codeExecutionEnabled ? undefined : 'Code execution is disabled on this deployment (CODE_EXECUTION_ENABLED=false)'}
                   >
                     {testMutation.isPending ? (
                       <><Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> Running...</>

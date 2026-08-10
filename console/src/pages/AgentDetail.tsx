@@ -6,10 +6,13 @@ import { ArrowLeft, Save, Trash2, Loader2, Bot } from 'lucide-react';
 import type { AgentUpdate } from '../types';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { ApiUsage } from '../components/ApiUsage';
+import { useAuth } from '../lib/auth-context';
 
 export function AgentDetail() {
   const { namespace, name } = useParams<{ namespace: string; name: string }>();
   const navigate = useNavigate();
+  const { instanceInfo } = useAuth();
+  const codeExecutionEnabled = instanceInfo?.features?.code_execution !== false;
   const queryClient = useQueryClient();
 
   const { data: agent, isLoading } = useQuery({
@@ -1805,7 +1808,14 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                     };
 
                     const simpleTools = [
-                      { key: 'codeExecution', label: 'Code Execution', desc: 'Generate and run Python in sandboxed containers.' },
+                      {
+                        key: 'codeExecution',
+                        label: 'Code Execution',
+                        desc: codeExecutionEnabled
+                          ? 'Generate and run Python in sandboxed containers.'
+                          : 'Disabled on this deployment (CODE_EXECUTION_ENABLED=false).',
+                        disabled: !codeExecutionEnabled,
+                      },
                       { key: 'configIntrospection', label: 'Config Introspection', desc: 'Read-only access to inspect the current configuration: list resource types, browse agents/queries/functions, read full details.' },
                       { key: 'packageManagement', label: 'Package Management', desc: 'Validate, preview, install/uninstall Sinas packages. Requires approval for writes.' },
                     ];
@@ -1815,11 +1825,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                         {simpleTools.map((tool) => (
                           <label
                             key={tool.key}
-                            className="flex items-start gap-3 p-2.5 hover:bg-hover rounded cursor-pointer"
+                            className={`flex items-start gap-3 p-2.5 rounded ${(tool as any).disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-hover cursor-pointer'}`}
                           >
                             <input
                               type="checkbox"
                               checked={isToolEnabled(tool.key)}
+                              disabled={(tool as any).disabled}
                               onChange={(e) => toggleTool(tool.key, e.target.checked)}
                               className="mt-0.5 w-4 h-4 text-primary-600 border-line rounded focus:ring-primary-500"
                             />
