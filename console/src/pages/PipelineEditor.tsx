@@ -9,25 +9,9 @@ import {
 } from 'lucide-react';
 import CodeEditor from '@uiw/react-textarea-code-editor';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
+import { PipelineStepsEditor } from '../components/pipeline-steps/PipelineStepsEditor';
+import type { Step } from '../components/pipeline-steps/model';
 import type { PipelineRun, PipelineRunOutcome } from '../types';
-
-const STEPS_PLACEHOLDER = `[
-  {
-    "name": "fetch",
-    "type": "connector",
-    "connector": "google/gmail",
-    "operation": "list-history",
-    "input": { "userId": "me", "startHistoryId.$": "cursor" },
-    "cursor": { "param": "startHistoryId", "path": "body.historyId" },
-    "retry": { "maxAttempts": 3, "backoff": "exponential" }
-  },
-  {
-    "name": "extract",
-    "type": "function",
-    "function": "gmail/extract-messages",
-    "input.$": "steps.fetch.output.body"
-  }
-]`;
 
 const codeEditorStyle = {
   fontSize: 13,
@@ -142,7 +126,9 @@ export function PipelineEditor() {
     per_user_disable_after: '' as string,
     is_active: true,
   });
-  const [stepsText, setStepsText] = useState('');
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [stepsJsonMode, setStepsJsonMode] = useState(false);
+  const [stepsText, setStepsText] = useState('[]');
   const [outputMappingText, setOutputMappingText] = useState('');
   const [inputSchema, setInputSchema] = useState<any>({});
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -168,6 +154,44 @@ export function PipelineEditor() {
       q.state.data?.some((r: PipelineRun) => r.status === 'running') ? 3000 : false,
   });
 
+  // Resource suggestions for the steps editor (best-effort; free text allowed)
+  const { data: connectorsData } = useQuery({
+    queryKey: ['connectors'],
+    queryFn: () => apiClient.listConnectors(),
+    retry: false,
+  });
+  const { data: functionsData } = useQuery({
+    queryKey: ['functions'],
+    queryFn: () => apiClient.listFunctions(),
+    retry: false,
+  });
+  const { data: agentsData } = useQuery({
+    queryKey: ['agents'],
+    queryFn: () => apiClient.listAgents(),
+    retry: false,
+  });
+  const { data: queriesData } = useQuery({
+    queryKey: ['queries'],
+    queryFn: () => apiClient.listQueries(),
+    retry: false,
+  });
+  const { data: connectionsData } = useQuery({
+    queryKey: ['databaseConnections'],
+    queryFn: () => apiClient.listDatabaseConnections(),
+    retry: false,
+  });
+
+  const stepResources = {
+    connectors: (connectorsData || []).map((c: any) => ({
+      ref: `${c.namespace}/${c.name}`,
+      operations: (c.operations || []).map((op: any) => op.name).filter(Boolean),
+    })),
+    functions: (functionsData || []).map((f: any) => `${f.namespace}/${f.name}`),
+    agents: (agentsData || []).map((a: any) => `${a.namespace}/${a.name}`),
+    queries: (queriesData || []).map((q: any) => `${q.namespace}/${q.name}`),
+    connections: (connectionsData || []).map((c: any) => c.name),
+  };
+
   useEffect(() => {
     if (pipeline) {
       setFormData({
@@ -184,6 +208,7 @@ export function PipelineEditor() {
         per_user_disable_after: pipeline.per_user?.disableAfterFailures?.toString() || '',
         is_active: pipeline.is_active,
       });
+      setSteps((pipeline.steps || []) as Step[]);
       setStepsText(JSON.stringify(pipeline.steps, null, 2));
       setOutputMappingText(pipeline.output_mapping ? JSON.stringify(pipeline.output_mapping, null, 2) : '');
       setInputSchema(pipeline.input_schema || {});
@@ -191,11 +216,13 @@ export function PipelineEditor() {
   }, [pipeline]);
 
   const buildPayload = () => {
-    let steps: any;
-    try {
-      steps = JSON.parse(stepsText);
-    } catch (e: any) {
-      throw new Error(`Steps is not valid JSON: ${e.message}`);
+    let stepsPayload: any = steps;
+    if (stepsJsonMode) {
+      try {
+        stepsPayload = JSON.parse(stepsText);
+      } catch (e: any) {
+        throw new Error(`Steps is not valid JSON: ${e.message}`);
+      }
     }
     let outputMapping: any = null;
     if (outputMappingText.trim()) {
@@ -210,7 +237,7 @@ export function PipelineEditor() {
       name: formData.name,
       description: formData.description || null,
       input_schema: inputSchema,
-      steps,
+      steps: stepsPayload,
       per_user: formData.per_user_enabled
         ? {
             connector: formData.per_user_connector,
@@ -406,22 +433,51 @@ export function PipelineEditor() {
         </div>
 
         <div className="card space-y-3">
-          <div>
-            <h3 className="text-sm font-medium text-gray-300">Steps</h3>
-            <p className="text-xs text-gray-500 mt-0.5">
-              JSON array of typed steps. Keys ending in <code className="font-mono">.$</code> are JMESPath
-              expressions over {'{'}input, steps.&lt;name&gt;.output, cursor, run{'}'}.
-            </p>
+          <div className="flex items-start justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-gray-300">Steps</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Values marked <span className="font-mono">&fnof;x</span> are JMESPath expressions over{' '}
+                {'{'}input, steps.&lt;name&gt;.output, cursor, run{'}'}.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm text-xs"
+              onClick={() => {
+                setSaveError(null);
+                if (stepsJsonMode) {
+                  try {
+                    setSteps(JSON.parse(stepsText));
+                    setStepsJsonMode(false);
+                  } catch (e: any) {
+                    setSaveError(`Steps is not valid JSON: ${e.message}`);
+                  }
+                } else {
+                  setStepsText(JSON.stringify(steps, null, 2));
+                  setStepsJsonMode(true);
+                }
+              }}
+            >
+              {stepsJsonMode ? 'Visual editor' : 'Edit as JSON'}
+            </button>
           </div>
-          <CodeEditor
-            value={stepsText}
-            language="json"
-            placeholder={STEPS_PLACEHOLDER}
-            onChange={(e) => { setSaveError(null); setStepsText(e.target.value); }}
-            padding={12}
-            data-color-mode="dark"
-            style={{ ...codeEditorStyle, minHeight: 220 }}
-          />
+          {stepsJsonMode ? (
+            <CodeEditor
+              value={stepsText}
+              language="json"
+              onChange={(e) => { setSaveError(null); setStepsText(e.target.value); }}
+              padding={12}
+              data-color-mode="dark"
+              style={{ ...codeEditorStyle, minHeight: 220 }}
+            />
+          ) : (
+            <PipelineStepsEditor
+              steps={steps}
+              onChange={(next) => { setSaveError(null); setSteps(next); }}
+              resources={stepResources}
+            />
+          )}
         </div>
 
         <div className="card space-y-4">
