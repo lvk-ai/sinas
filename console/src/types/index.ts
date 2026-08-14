@@ -253,6 +253,7 @@ export interface Agent {
   enabled_collections: EnabledCollectionConfig[];
   enabled_components: string[];
   enabled_connectors: EnabledConnectorConfig[];
+  enabled_pipelines: string[];
   hooks: AgentHooks | null;
   status_templates: Record<string, string>;
   icon: string | null;
@@ -287,6 +288,7 @@ export interface AgentCreate {
   enabled_stores?: EnabledStoreConfig[];
   enabled_collections?: EnabledCollectionConfig[];
   enabled_connectors?: EnabledConnectorConfig[];
+  enabled_pipelines?: string[];
   hooks?: AgentHooks;
   icon?: string;
   is_default?: boolean;
@@ -317,6 +319,7 @@ export interface AgentUpdate {
   enabled_collections?: EnabledCollectionConfig[];
   enabled_components?: string[];
   enabled_connectors?: EnabledConnectorConfig[];
+  enabled_pipelines?: string[];
   hooks?: AgentHooks;
   status_templates?: Record<string, string>;
   icon?: string;
