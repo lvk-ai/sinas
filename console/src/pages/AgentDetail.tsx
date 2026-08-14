@@ -69,6 +69,12 @@ export function AgentDetail() {
     retry: false,
   });
 
+  const { data: pipelines } = useQuery({
+    queryKey: ['pipelines'],
+    queryFn: () => apiClient.listPipelines(),
+    retry: false,
+  });
+
   const { data: databaseConnections } = useQuery({
     queryKey: ['databaseConnections'],
     queryFn: () => apiClient.listDatabaseConnections(),
@@ -82,7 +88,7 @@ export function AgentDetail() {
     retry: false,
   });
 
-  const [toolsTab, setToolsTab] = useState<'assistants' | 'skills' | 'functions' | 'queries' | 'states' | 'collections' | 'components' | 'connectors' | 'hooks' | 'status' | 'platform'>('assistants');
+  const [toolsTab, setToolsTab] = useState<'assistants' | 'skills' | 'functions' | 'queries' | 'states' | 'collections' | 'components' | 'connectors' | 'pipelines' | 'hooks' | 'status' | 'platform'>('assistants');
   const [expandedFunctionParams, setExpandedFunctionParams] = useState<Set<string>>(new Set());
   const [expandedConnectorParams, setExpandedConnectorParams] = useState<Set<string>>(new Set());
   const [iconMode, setIconMode] = useState<'collection' | 'url'>('collection');
@@ -117,6 +123,7 @@ export function AgentDetail() {
         enabled_collections: agent.enabled_collections || [],
         enabled_components: agent.enabled_components || [],
         enabled_connectors: agent.enabled_connectors || [],
+        enabled_pipelines: agent.enabled_pipelines || [],
         hooks: agent.hooks || { on_user_message: [], on_assistant_message: [] },
         status_templates: agent.status_templates || {},
         icon: agent.icon || undefined,
@@ -782,6 +789,17 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
             </button>
             <button
               type="button"
+              onClick={() => setToolsTab('pipelines')}
+              className={`px-4 py-2 text-sm font-medium transition-colors ${
+                toolsTab === 'pipelines'
+                  ? 'text-primary-600 border-b-2 border-primary-600'
+                  : 'text-gray-400 hover:text-gray-100'
+              }`}
+            >
+              Pipelines
+            </button>
+            <button
+              type="button"
               onClick={() => setToolsTab('hooks')}
               className={`px-4 py-2 text-sm font-medium transition-colors ${
                 toolsTab === 'hooks'
@@ -1338,6 +1356,65 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                     <p className="text-sm text-gray-500">No queries available. Create queries first.</p>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* Pipelines Tab */}
+            {toolsTab === 'pipelines' && (
+              <div>
+                <p className="text-xs text-gray-500 mb-3">
+                  Enable pipelines exposed as tools (asTool) — one semantic tool per pipeline,
+                  executed inline within the pipeline's sync timeout
+                </p>
+                {(() => {
+                  const toolPipelines = (pipelines || []).filter((p: any) => p.as_tool);
+                  return toolPipelines.length > 0 ? (
+                    <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-64 overflow-y-auto">
+                      {toolPipelines.map((pipeline: any) => {
+                        const pipelineRef = `${pipeline.namespace}/${pipeline.name}`;
+                        return (
+                          <label
+                            key={pipelineRef}
+                            className="flex items-start p-2 hover:bg-hover rounded cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={(formData.enabled_pipelines || agent.enabled_pipelines || []).includes(pipelineRef)}
+                              onChange={(e) => {
+                                const current = formData.enabled_pipelines || agent.enabled_pipelines || [];
+                                const updated = e.target.checked
+                                  ? [...current, pipelineRef]
+                                  : current.filter((ref: string) => ref !== pipelineRef);
+                                setFormData({ ...formData, enabled_pipelines: updated });
+                              }}
+                              className="mt-1 w-4 h-4 text-primary-600 border-line rounded focus:ring-primary-500"
+                            />
+                            <div className="ml-3 flex-1">
+                              <span className="text-sm font-medium text-gray-100 font-mono">{pipelineRef}</span>
+                              {!pipeline.is_active && (
+                                <span className="ml-2 px-1.5 py-0.5 text-xs font-medium rounded bg-red-900/30 text-red-400">
+                                  inactive
+                                </span>
+                              )}
+                              {(pipeline.tool_description || pipeline.description) && (
+                                <p className="text-xs text-gray-400 mt-0.5">
+                                  {pipeline.tool_description || pipeline.description}
+                                </p>
+                              )}
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="bg-surface-0 rounded-lg p-3 border border-line-soft">
+                      <p className="text-sm text-gray-500">
+                        No tool-exposed pipelines available. Mark a pipeline with "Expose as an
+                        agent tool" (asTool) in the pipeline editor first.
+                      </p>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
