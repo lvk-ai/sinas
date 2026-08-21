@@ -204,8 +204,10 @@
   font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
+/* No flex shorthand here: pse-narrow lives inside .pse-field COLUMNS, where
+   a flex-basis becomes height (the "weirdly big number input" bug). The
+   compound selector alone outranks `.pse-input { width: 100% }`. */
 .pse-input.pse-narrow {
-  flex: 0 1 90px;
   width: 90px;
   max-width: 100%;
 }

@@ -501,11 +501,13 @@ export interface EnabledConnectorConfig {
 export interface Webhook {
   id: string;
   path: string;
-  target_type: 'function' | 'agent';
+  target_type: 'function' | 'agent' | 'pipeline';
   function_namespace: string;
   function_name: string | null;
   agent_namespace: string | null;
   agent_name: string | null;
+  pipeline_namespace?: string | null;
+  pipeline_name?: string | null;
   message_template: string | null;
   session_key_template: string | null;
   http_method: string;
@@ -521,7 +523,7 @@ export interface Webhook {
 
 export interface WebhookCreate {
   path: string;
-  target_type?: 'function' | 'agent';
+  target_type?: 'function' | 'agent' | 'pipeline';
   function_namespace?: string;
   function_name?: string;
   agent_namespace?: string;
@@ -537,7 +539,7 @@ export interface WebhookCreate {
 }
 
 export interface WebhookUpdate {
-  target_type?: 'function' | 'agent';
+  target_type?: 'function' | 'agent' | 'pipeline';
   function_namespace?: string;
   function_name?: string;
   agent_namespace?: string;
@@ -1179,8 +1181,11 @@ export interface DatabaseTrigger {
   schema_name: string;
   table_name: string;
   operations: string[];
+  target_type?: 'function' | 'pipeline';
   function_namespace: string;
   function_name: string;
+  pipeline_namespace?: string | null;
+  pipeline_name?: string | null;
   poll_column: string;
   poll_interval_seconds: number;
   batch_size: number;

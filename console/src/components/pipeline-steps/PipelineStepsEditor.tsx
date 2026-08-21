@@ -47,10 +47,13 @@ export interface PipelineStepsEditorProps {
   resources?: StepResources;
 }
 
-let datalistSeq = 0;
+const CUSTOM_SENTINEL = '\u0000custom';
 
-/** Text input with optional <datalist> suggestions — free text always allowed,
- * so missing resources never block editing (install order, cross-package refs). */
+/** Resource picker: a real dropdown when we know the options (datalist was
+ * invisible-until-you-type and unreliable in Safari — users thought they had
+ * to hand-type refs), with a Custom… escape and free text as the fallback,
+ * so missing resources never block editing (install order, cross-package
+ * refs). A current value that is not in the catalog stays selectable. */
 function SuggestInput({
   value, onChange, options, placeholder, mono = true, invalid = false,
 }: {
@@ -61,24 +64,45 @@ function SuggestInput({
   mono?: boolean;
   invalid?: boolean;
 }) {
-  const [listId] = useState(() => `pse-dl-${++datalistSeq}`);
-  return (
-    <>
+  const [customMode, setCustomMode] = useState(false);
+  const cls = `pse-input${mono ? ' pse-mono' : ''}${invalid ? ' pse-invalid' : ''}`;
+
+  if (!options?.length || customMode) {
+    return (
       <input
-        className={`pse-input${mono ? ' pse-mono' : ''}${invalid ? ' pse-invalid' : ''}`}
+        className={cls}
         value={value}
         placeholder={placeholder}
+        autoFocus={customMode}
         onChange={(e) => onChange(e.target.value)}
-        list={options?.length ? listId : undefined}
+        onBlur={() => {
+          // Re-offer the dropdown once the custom value matches a known ref
+          if (options?.includes(value)) setCustomMode(false);
+        }}
       />
-      {options && options.length > 0 && (
-        <datalist id={listId}>
-          {options.map((o) => (
-            <option key={o} value={o} />
-          ))}
-        </datalist>
-      )}
-    </>
+    );
+  }
+
+  const known = options.includes(value);
+  return (
+    <select
+      className={cls}
+      value={known || value === '' ? value : value}
+      onChange={(e) => {
+        if (e.target.value === CUSTOM_SENTINEL) {
+          setCustomMode(true);
+          return;
+        }
+        onChange(e.target.value);
+      }}
+    >
+      <option value="">{placeholder || 'Select…'}</option>
+      {!known && value !== '' && <option value={value}>{value} (not found)</option>}
+      {options.map((o) => (
+        <option key={o} value={o}>{o}</option>
+      ))}
+      <option value={CUSTOM_SENTINEL}>Custom…</option>
+    </select>
   );
 }
 
@@ -170,6 +194,12 @@ function InputEditor({
   // the only sticky UI state is "show me the JSON anyway".
   const naturalMode = deriveInputMode(step);
   const [jsonOverride, setJsonOverride] = useState(false);
+  // Mode switches STASH the value being left behind instead of destroying
+  // it (the spec forbids a step carrying both `input` and `input.$`, so the
+  // memory lives here in UI state): Expression -> Fields -> Expression
+  // round-trips the exact expression, and vice versa.
+  const [stashedExpr, setStashedExpr] = useState<string | null>(null);
+  const [stashedFields, setStashedFields] = useState<Record<string, any> | null>(null);
   const [jsonText, setJsonText] = useState('');
   const [jsonError, setJsonError] = useState<string | null>(null);
   const effectiveMode: 'fields' | 'expression' | 'json' =
@@ -185,12 +215,14 @@ function InputEditor({
     }
     setJsonOverride(false);
     if (next === 'expression' && step['input.$'] === undefined) {
+      if (step.input && Object.keys(step.input).length) setStashedFields(step.input);
       let s = setStepKey(steps, index, 'input', undefined);
-      s = setStepKey(s, index, 'input.$', '');
+      s = setStepKey(s, index, 'input.$', stashedExpr ?? '');
       onSteps(s);
     } else if (next === 'fields' && step['input.$'] !== undefined) {
+      if (step['input.$']) setStashedExpr(step['input.$']);
       let s = setStepKey(steps, index, 'input.$', undefined);
-      s = setStepKey(s, index, 'input', {});
+      s = setStepKey(s, index, 'input', stashedFields ?? {});
       onSteps(s);
     }
   };

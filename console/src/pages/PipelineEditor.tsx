@@ -567,7 +567,7 @@ export function PipelineEditor() {
         <div className="card space-y-4">
           <h3 className="text-sm font-medium text-gray-300">Run now</h3>
           <div className="flex gap-3 items-start">
-            <div className="flex-1">
+            <div className="flex-1 min-w-0">
               <CodeEditor
                 value={runInputText}
                 language="json"
@@ -577,7 +577,9 @@ export function PipelineEditor() {
                 style={{ ...codeEditorStyle, minHeight: 40 }}
               />
             </div>
-            <select value={runMode} onChange={(e) => setRunMode(e.target.value as any)} className="input">
+            {/* .input is width:100%; unconstrained inside a flex row its basis
+                crushes the flex-1 editor to nothing */}
+            <select value={runMode} onChange={(e) => setRunMode(e.target.value as any)} className="input" style={{ width: '7rem', flexShrink: 0 }}>
               <option value="sync">sync</option>
               <option value="async">async</option>
             </select>

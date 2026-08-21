@@ -13,9 +13,10 @@ export function WebhookEditor() {
 
   const [formData, setFormData] = useState({
     path: '',
-    target_type: 'function' as 'function' | 'agent',
+    target_type: 'function' as 'function' | 'agent' | 'pipeline',
     function_name: '',
     agent_name: '',
+    pipeline_name: '',
     message_template: '',
     session_key_template: '',
     http_method: 'POST',
@@ -46,6 +47,9 @@ export function WebhookEditor() {
         function_name: webhook.function_namespace && webhook.function_name
           ? `${webhook.function_namespace}/${webhook.function_name}`
           : '',
+        pipeline_name: webhook.pipeline_namespace && webhook.pipeline_name
+          ? `${webhook.pipeline_namespace}/${webhook.pipeline_name}`
+          : '',
         agent_name: webhook.agent_namespace && webhook.agent_name
           ? `${webhook.agent_namespace}/${webhook.agent_name}`
           : '',
@@ -68,6 +72,11 @@ export function WebhookEditor() {
     queryKey: ['functions'],
     queryFn: () => apiClient.listFunctions(),
     retry: false,
+  });
+
+  const { data: pipelines } = useQuery({
+    queryKey: ['pipelines'],
+    queryFn: () => apiClient.listPipelines(),
   });
 
   const { data: agents } = useQuery({
@@ -96,6 +105,10 @@ export function WebhookEditor() {
         // '' rather than null: the API treats null as 'leave unchanged',
         // so sending null made clearing the field a silent no-op.
         payload.session_key_template = data.session_key_template || '';
+      } else if (data.target_type === 'pipeline') {
+        const [pipelineNamespace, pipelineName] = data.pipeline_name.split('/');
+        payload.pipeline_namespace = pipelineNamespace;
+        payload.pipeline_name = pipelineName;
       } else {
         const [namespace, name] = data.function_name.split('/');
         payload.function_namespace = namespace;
@@ -273,13 +286,52 @@ print(result["execution_id"], result["result"])`,
                       : 'bg-surface-1 text-gray-300 hover:bg-hover'}`}>
                   Agent
                 </button>
+                <button type="button"
+                  onClick={() => setFormData({
+                    ...formData,
+                    target_type: 'pipeline',
+                    function_name: '',
+                    agent_name: '',
+                    message_template: '',
+                    session_key_template: '',
+                    // raw is function-only
+                    response_mode: formData.response_mode === 'raw' ? 'sync' : formData.response_mode,
+                  })}
+                  className={`px-4 py-2 text-sm font-medium border-l border-line ${
+                    formData.target_type === 'pipeline'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-surface-1 text-gray-300 hover:bg-hover'}`}>
+                  Pipeline
+                </button>
               </div>
               <p className="text-xs text-gray-500 mt-1">
-                Execute a function, or send a message to an agent
+                Execute a function, send a message to an agent, or fire a pipeline
               </p>
             </div>
 
-            {formData.target_type === 'function' ? (
+            {formData.target_type === 'pipeline' ? (
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Pipeline to Fire *
+                </label>
+                <select
+                  value={formData.pipeline_name}
+                  onChange={(e) => setFormData({ ...formData, pipeline_name: e.target.value })}
+                  required
+                  className="input"
+                >
+                  <option value="">Select a pipeline...</option>
+                  {pipelines?.map((p: any) => (
+                    <option key={p.id} value={`${p.namespace}/${p.name}`}>
+                      {p.namespace}/{p.name}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  The webhook payload becomes the run input
+                </p>
+              </div>
+            ) : formData.target_type === 'function' ? (
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
                   Function to Execute *

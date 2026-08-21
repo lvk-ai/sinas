@@ -14,7 +14,7 @@ export function ScheduleEditor() {
 
   const [formData, setFormData] = useState({
     name: '',
-    schedule_type: 'function' as 'function' | 'agent',
+    schedule_type: 'function' as 'function' | 'agent' | 'pipeline',
     target_namespace: 'default',
     target_name: '',
     description: '',
@@ -63,6 +63,11 @@ export function ScheduleEditor() {
     }
   }, [schedule, isNew]);
 
+  const { data: pipelines } = useQuery({
+    queryKey: ['pipelines'],
+    queryFn: () => apiClient.listPipelines(),
+  });
+
   // Find selected target to get its input_schema
   const selectedTarget = useMemo(() => {
     if (!formData.target_name) return null;
@@ -71,13 +76,18 @@ export function ScheduleEditor() {
       return functions.find((f: any) =>
         f.namespace === formData.target_namespace && f.name === formData.target_name
       ) || null;
+    } else if (formData.schedule_type === 'pipeline') {
+      if (!pipelines) return null;
+      return pipelines.find((p: any) =>
+        p.namespace === formData.target_namespace && p.name === formData.target_name
+      ) || null;
     } else {
       if (!agents) return null;
       return agents.find((a: any) =>
         a.namespace === formData.target_namespace && a.name === formData.target_name
       ) || null;
     }
-  }, [functions, agents, formData.schedule_type, formData.target_namespace, formData.target_name]);
+  }, [functions, agents, pipelines, formData.schedule_type, formData.target_namespace, formData.target_name]);
 
   const inputSchema = selectedTarget?.input_schema;
   const schemaProperties = inputSchema?.properties || {};
@@ -237,11 +247,49 @@ export function ScheduleEditor() {
                 >
                   Agent
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setFormData({ ...formData, schedule_type: 'pipeline', target_namespace: 'default', target_name: '', content: '' })}
+                  className={`px-4 py-2 text-sm font-medium border-l border-line ${
+                    formData.schedule_type === 'pipeline'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-surface-1 text-gray-300 hover:bg-hover'
+                  }`}
+                >
+                  Pipeline
+                </button>
               </div>
             </div>
 
             {/* Target Selection */}
-            {formData.schedule_type === 'function' ? (
+            {formData.schedule_type === 'pipeline' ? (
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Pipeline to Fire *
+                </label>
+                <select
+                  value={formData.target_name ? `${formData.target_namespace}/${formData.target_name}` : ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val) {
+                      const [ns, ...rest] = val.split('/');
+                      setFormData({ ...formData, target_namespace: ns, target_name: rest.join('/') });
+                    } else {
+                      setFormData({ ...formData, target_namespace: 'default', target_name: '' });
+                    }
+                  }}
+                  required
+                  className="input"
+                >
+                  <option value="">Select a pipeline...</option>
+                  {pipelines?.map((p: any) => (
+                    <option key={p.id} value={`${p.namespace}/${p.name}`}>
+                      {p.namespace}/{p.name} {p.description ? `- ${p.description}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : formData.schedule_type === 'function' ? (
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
                   Function to Execute *
@@ -385,7 +433,7 @@ export function ScheduleEditor() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="text-lg font-semibold text-gray-100">
-                {formData.schedule_type === 'function' ? 'Function Input Data' : 'Agent Input Variables'}
+                {formData.schedule_type === 'function' ? 'Function Input Data' : formData.schedule_type === 'pipeline' ? 'Run Input' : 'Agent Input Variables'}
               </h2>
               <p className="text-sm text-gray-400 mt-1">
                 {formData.schedule_type === 'function'
