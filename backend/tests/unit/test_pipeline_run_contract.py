@@ -105,6 +105,10 @@ class TestOutputPersisted:
         )
         await db.refresh(run)
         assert run.output == {"answer": 42}
+        # And the API record schema must actually expose it (it didn't):
+        from app.schemas.pipeline import PipelineRunRecord
+
+        assert PipelineRunRecord.model_validate(run).output == {"answer": 42}
 
     async def test_failure_persists_no_output(self, db, monkeypatch, run_row):
         pipeline, run = run_row

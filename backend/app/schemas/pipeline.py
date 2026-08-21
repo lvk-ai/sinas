@@ -125,6 +125,7 @@ class PipelineRunRecord(BaseModel):
     trigger_id: Optional[str]
     status: str
     input: Optional[dict[str, Any]]
+    output: Optional[Any] = None
     steps: list[dict[str, Any]]
     error: Optional[str]
     cursor_before: Optional[str]
