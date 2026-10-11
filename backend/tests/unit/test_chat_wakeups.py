@@ -373,7 +373,7 @@ def _bg_call(call_id, wait=None, code="print(1)"):
     return {"id": call_id, "type": "function", "function": {"name": "run_in_background", "arguments": json.dumps(args)}}
 
 
-async def _run_round(db, chat, user, tool_calls, monkeypatch, channel="chan-bg"):
+async def _run_round(db, chat, user, tool_calls, monkeypatch, channel="chan-bg", start=None):
     monkeypatch.setattr(settings, "code_execution_enabled", True)
     started = []
 
@@ -381,7 +381,7 @@ async def _run_round(db, chat, user, tool_calls, monkeypatch, channel="chan-bg")
         started.append({"chat_id": chat_id, "code": code, "tool_call_id": tool_call_id, "pending_completion_id": pending_completion_id, "job_id": job_id})
         return {"job_id": job_id or "job-1", "status": "queued", "description": description}
 
-    monkeypatch.setattr(chat_wakeups, "start_background_job", fake_start)
+    monkeypatch.setattr(chat_wakeups, "start_background_job", start or fake_start)
 
     # A round that does not suspend continues with a follow-up model turn.
     class _Provider:
@@ -434,6 +434,39 @@ async def test_wait_true_suspends_the_round_on_a_background_job(db, chat, test_u
     (s,) = started
     assert s["pending_completion_id"] == str(row.id) and s["tool_call_id"] == "call_bg"
     assert s["job_id"] == row.pending["call_bg"]["job_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_cannot_be_queued_completes_its_entry_with_the_error(db, chat, test_user, monkeypatch):
+    """The round is parked on the entry before the job is queued: a queue
+    failure must answer the entry now, not leave the chat waiting for a
+    deadline and a misleading timeout."""
+    completed = []
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("queue down")
+
+    async def fake_complete(pid, tool_call_id, content, *, user_token, resume_channel_id=None):
+        completed.append((pid, tool_call_id, json.loads(content)))
+        return {"status": "completed", "resumed": True}
+
+    monkeypatch.setattr(dc, "complete", fake_complete)
+    chunks, _ = await _run_round(db, chat, test_user, [_bg_call("call_nq", wait=True)], monkeypatch, start=boom)
+    failed = next(c for c in chunks if c.get("type") == "background_job_failed")
+    assert "queue down" in failed["error"]
+    ((pid, tcid, content),) = completed
+    assert tcid == "call_nq" and "queue down" in content["error"]
+    row = (await db.execute(select(PendingCompletion).where(PendingCompletion.chat_id == chat.id))).scalar_one()
+    assert pid == str(row.id)
+
+
+def test_watch_tokens_are_redacted_from_request_logs():
+    from app.middleware.request_logger import redact_path
+
+    assert redact_path("/watch/abc123") == "/watch/[redacted]"
+    assert redact_path("/watch/abc123/extra") == "/watch/[redacted]/extra"
+    assert redact_path("/watch/") == "/watch/"
+    assert redact_path("/chats/x/messages") == "/chats/x/messages"
 
 
 @pytest.mark.asyncio

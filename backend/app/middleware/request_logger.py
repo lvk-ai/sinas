@@ -8,6 +8,19 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.services.clickhouse_logger import clickhouse_logger
 
+# Paths whose last segment is a credential: logged with the secret masked,
+# or anyone who may read request logs could replay it.
+_SECRET_PATH_PREFIXES = ("/watch/",)
+
+
+def redact_path(path: str) -> str:
+    for prefix in _SECRET_PATH_PREFIXES:
+        if path.startswith(prefix) and len(path) > len(prefix):
+            rest = path[len(prefix):]
+            secret, sep, tail = rest.partition("/")
+            return f"{prefix}[redacted]{sep}{tail}" if secret else path
+    return path
+
 
 class RequestLoggerMiddleware:
     """ASGI middleware to log all API requests to ClickHouse with body capture."""
@@ -26,7 +39,7 @@ class RequestLoggerMiddleware:
 
         # Extract request details from scope
         method = scope["method"]
-        path = scope["path"]
+        path = redact_path(scope["path"])
         headers_dict = dict(scope.get("headers", []))
 
         # Decode headers

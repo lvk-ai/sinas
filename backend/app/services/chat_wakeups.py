@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 
 from app.core.config import settings
 from app.models.chat import Chat
@@ -312,8 +312,13 @@ async def handle_watch_delivery(token: str, payload: Any) -> tuple[int, dict[str
             return 404, {"detail": "Unknown watch"}
         if row.cancelled or (row.expires_at and row.expires_at <= _now()):
             return 410, {"detail": "Watch expired or deleted"}
-        row.fired_count = (row.fired_count or 0) + 1
-        row.last_fired_at = _now()
+        # Counted in the database: two simultaneous deliveries must not
+        # both write the same read-then-add value.
+        await db.execute(
+            update(ChatWakeup)
+            .where(ChatWakeup.id == row.id)
+            .values(fired_count=func.coalesce(ChatWakeup.fired_count, 0) + 1, last_fired_at=_now())
+        )
         await db.commit()
         chat_id, watch_id, description, api_key_id = str(row.chat_id), str(row.id), row.note, row.api_key_id
 

@@ -1476,11 +1476,30 @@ class MessageService:
                     from app.services import chat_wakeups
 
                     for tool_call_id, job_id, code, description in background_jobs:
-                        started = await chat_wakeups.start_background_job(
-                            chat_id, user_id, code, description,
-                            tool_call_id=tool_call_id, pending_completion_id=str(row.id),
-                            job_id=job_id,
-                        )
+                        try:
+                            started = await chat_wakeups.start_background_job(
+                                chat_id, user_id, code, description,
+                                tool_call_id=tool_call_id, pending_completion_id=str(row.id),
+                                job_id=job_id,
+                            )
+                        except Exception as e:
+                            # The round is already parked on this entry: a run
+                            # that never started completes it with the queue
+                            # error now, rather than leaving the chat waiting
+                            # for the deadline and a misleading timeout.
+                            logger.exception("Background run %s could not be queued", job_id)
+                            await deferred_completions.complete(
+                                str(row.id), tool_call_id,
+                                json.dumps({"job_id": job_id, "error": f"Background run could not be queued: {e}"}),
+                                user_token=user_token,
+                            )
+                            yield {
+                                "type": "background_job_failed",
+                                "tool_call_id": tool_call_id,
+                                "job_id": job_id,
+                                "error": f"Background run could not be queued: {e}",
+                            }
+                            continue
                         yield {
                             "type": "background_job_started",
                             "tool_call_id": tool_call_id,
