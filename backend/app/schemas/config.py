@@ -736,6 +736,11 @@ class ConfigApplyRequest(BaseModel):
     config: str  # YAML content
     dryRun: bool = False
     force: bool = False
+    # Also remove what this config (same metadata.name) applied earlier but no
+    # longer declares. Opt-in: a config file may be partial. Never removes
+    # secrets, LLM providers, database connections or dependencies, nor
+    # anything edited by hand since (an edit detaches it from the config).
+    prune: bool = False
 
 
 class ConfigValidateRequest(BaseModel):
