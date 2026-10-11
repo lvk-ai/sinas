@@ -214,10 +214,11 @@ class TestResultSpill:
         parsed = json.loads(out)
         assert parsed["_full_result"]["workbench_file"] == "tool_results/q.json"
 
-    def test_pointer_appends_for_non_json_content(self):
+    def test_pointer_wraps_plain_text_so_it_can_be_followed(self):
         out = workbench_refs.attach_spill_pointer("plain text tail", "tool_results/q.txt")
-        assert out.startswith("plain text tail")
-        assert "tool_results/q.txt" in out
+        parsed = json.loads(out)
+        assert parsed["text"] == "plain text tail"
+        assert workbench_refs.spill_pointer(parsed) == "tool_results/q.txt"
 
     def test_pointer_keeps_array_results_valid_json(self):
         from app.services.tool_execution import truncate_tool_result
