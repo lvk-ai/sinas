@@ -68,3 +68,36 @@ async def test_prune_removes_only_this_files_dropped_resources(client, db: Async
         ).order_by(ConfigRevision.id)
     )).scalars().all()
     assert list(actions) == ["create", "delete"]
+
+
+async def test_something_still_used_isnt_removed(client, db: AsyncSession, admin_user):
+    fn, sched = f"f{uuid.uuid4().hex[:6]}", f"s-{uuid.uuid4().hex[:6]}"
+    function = f"    - {{namespace: {NS}, name: {fn}, code: 'def handler(i, c): return {{}}'}}"
+    schedule = f"    - {{name: {sched}, functionName: {NS}/{fn}, cronExpression: '0 3 * * *'}}"
+    head = ["apiVersion: sinas.co/v1", "kind: SinasConfig", "metadata: {name: jobs}", "spec:"]
+    both = "\n".join(head + ["  functions:", function, "  schedules:", schedule]) + "\n"
+    schedule_only = "\n".join(head + ["  functions: []", "  schedules:", schedule]) + "\n"
+    assert (await _apply(client, admin_user, both))["success"]
+    for dry_run in (True, False):
+        result = await _apply(client, admin_user, schedule_only, prune=True, dryRun=dry_run)
+        assert not result["success"], dry_run
+        assert any("still used by schedule" in e and fn in e for e in result["errors"]), result["errors"]
+
+
+async def test_a_collection_with_files_is_kept(client, db: AsyncSession, admin_user):
+    from app.models.file import Collection, File
+
+    coll = f"c{uuid.uuid4().hex[:6]}"
+    doc = lambda colls: "\n".join(  # noqa: E731
+        ["apiVersion: sinas.co/v1", "kind: SinasConfig", "metadata: {name: files}", "spec:",
+         "  collections:" + ("" if colls else " []")]
+        + [f"    - {{namespace: {NS}, name: {c}}}" for c in colls]
+    ) + "\n"
+    assert (await _apply(client, admin_user, doc([coll])))["success"]
+    row = await Collection.get_by_name(db, NS, coll)
+    db.add(File(collection_id=row.id, name="a.txt", user_id=admin_user.id, content_type="text/plain"))
+    await db.flush()
+    result = await _apply(client, admin_user, doc([]), prune=True)
+    assert result["success"] and not result["summary"]["deleted"]
+    assert any("holds 1 file" in w for w in result["warnings"])
+    assert await Collection.get_by_name(db, NS, coll) is not None
