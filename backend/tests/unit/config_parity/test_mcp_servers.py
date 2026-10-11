@@ -308,7 +308,15 @@ class TestHistoryAndExport:
 class TestAgentBinding:
     async def test_config_accepts_string_and_dict_forms(self, db: AsyncSession, admin_user):
         ns = f"ns{_uid()}"
+        # The servers are declared in the same config: like every other
+        # agent reference, a binding to a server that does not exist is
+        # refused (the runtime could only warn about it every turn).
+        servers = [
+            {"namespace": "tools", "name": "tracker", "url": "http://tracker.test/mcp"},
+            {"namespace": "tools", "name": "docs", "url": "http://docs.test/mcp"},
+        ]
         _, result = await _apply(db, admin_user, {
+            "mcpServers": servers,
             "agents": [{
                 "namespace": ns, "name": "helper", "systemPrompt": "x",
                 "enabledMcpServers": ["tools/tracker", {"server": "tools/docs", "tools": ["search_*"]}],
@@ -324,12 +332,19 @@ class TestAgentBinding:
 
         # Changing only the binding is a change (it is part of the hash).
         _, result = await _apply(db, admin_user, {
+            "mcpServers": servers,
             "agents": [{
                 "namespace": ns, "name": "helper", "systemPrompt": "x",
                 "enabledMcpServers": ["tools/tracker"],
             }],
         })
         assert result.success and result.summary.updated == {"agents": 1}
+
+        # And a binding to a server nobody declared or created is refused.
+        _, result = await _apply(db, admin_user, {
+            "agents": [{"namespace": ns, "name": "helper2", "systemPrompt": "x", "enabledMcpServers": ["tools/nope"]}],
+        })
+        assert not result.success and "tools/nope" in result.errors[0]
         stored = (
             await db.execute(select(Agent.enabled_mcp_servers).where(Agent.id == agent.id))
         ).scalar_one()
