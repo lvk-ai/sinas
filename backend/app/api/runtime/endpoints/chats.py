@@ -826,7 +826,7 @@ async def approve_tool_call(
     from app.services import approval_rules
 
     decision = await approval_rules.round_decision(db, pending_approval)
-    channel_id = str(uuid.uuid4())
+    channel_id = approval_rules.round_channel_id(pending_approval)
     if decision is None:
         return JSONResponse(
             status_code=202,
@@ -838,19 +838,6 @@ async def approve_tool_call(
                 "message": "Decision recorded; the round resumes once every requested approval is answered.",
             },
         )
-
-    # An expired sibling counted as rejected above is recorded as such now,
-    # so the expiry sweep has nothing left to resume for this round; the
-    # fixed job id makes a racing sweep a no-op anyway.
-    await db.execute(
-        update(PendingToolApproval)
-        .where(
-            PendingToolApproval.message_id == pending_approval.message_id,
-            PendingToolApproval.approved.is_(None),
-        )
-        .values(approved=False)
-    )
-    await db.commit()
 
     # Extract token and enqueue resume job
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
@@ -866,6 +853,20 @@ async def approve_tool_call(
         rejected_tool_call_ids=decision["rejected_ids"],
         job_id=approval_rules.round_job_id(pending_approval),
     )
+
+    # Queued: an expired sibling counted as rejected above is recorded as
+    # such now, so the expiry sweep has nothing left to resume. Had the
+    # enqueue failed, it stays undecided and the sweep resumes the round
+    # (the fixed job id makes any overlap a no-op).
+    await db.execute(
+        update(PendingToolApproval)
+        .where(
+            PendingToolApproval.message_id == pending_approval.message_id,
+            PendingToolApproval.approved.is_(None),
+        )
+        .values(approved=False)
+    )
+    await db.commit()
 
     return JSONResponse(
         status_code=202,
