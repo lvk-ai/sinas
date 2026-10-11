@@ -519,32 +519,31 @@ async def expire_due(now: Optional[datetime] = None) -> int:
             .with_for_update(skip_locked=True)
         )
         expired = result.scalars().all()
-        for approval in expired:
-            approval.approved = False
-            resolved += 1
-            logger.info(
-                "Expired pending approval %s (tool_call %s) — auto-rejected",
-                approval.id,
-                approval.tool_call_id,
-            )
-        await db.commit()
+        # Expiring the last open ask of a round the user partly approved
+        # resumes it: the approved calls run, the expired ones are answered
+        # as rejected. The resume is queued BEFORE the rows are recorded as
+        # rejected, so a queue failure leaves them for the next sweep to
+        # retry instead of stranding work the user approved. (A round with
+        # nothing approved just stays rejected: the repair on the next turn
+        # covers it, as before.)
+        from app.core.auth import bind_api_key, reset_api_key
 
-        # A round whose last open ask just expired, with other calls the
-        # user had approved, is waiting on nobody now: resume it (the
-        # approved calls run, the expired ones are answered as rejected).
-        # Fully rejected rounds stay as they are — the repair on the next
-        # turn covers them, as before.
-        seen_rounds: set = set()
+        failed_rounds: set = set()
+        queued_rounds: set = set()
         for approval in expired:
-            if approval.message_id in seen_rounds:
+            round_id = approval.message_id
+            if round_id in queued_rounds or round_id in failed_rounds:
                 continue
-            seen_rounds.add(approval.message_id)
             decision = await approval_rules.round_decision(db, approval)
             if not decision or not decision["approved_ids"]:
                 continue
             chat = await db.get(Chat, approval.chat_id)
             if chat is None:
                 continue
+            # The run acts through the key the round ran under (stored with
+            # the approval), not through the owner's full permissions.
+            ctx = approval.conversation_context or {}
+            key_token = bind_api_key(ctx.get("api_key_id"))
             try:
                 await queue_service.enqueue_agent_resume(
                     chat_id=str(chat.id),
@@ -556,7 +555,25 @@ async def expire_due(now: Optional[datetime] = None) -> int:
                     agent=f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_name else None,
                     rejected_tool_call_ids=decision["rejected_ids"],
                 )
+                queued_rounds.add(round_id)
             except Exception:
-                logger.exception("Could not resume the round of expired approval %s", approval.id)
+                failed_rounds.add(round_id)
+                logger.exception(
+                    "Could not resume the round of expired approval %s; the sweep will retry", approval.id
+                )
+            finally:
+                reset_api_key(key_token)
+
+        for approval in expired:
+            if approval.message_id in failed_rounds:
+                continue  # still open: retried by the next sweep
+            approval.approved = False
+            resolved += 1
+            logger.info(
+                "Expired pending approval %s (tool_call %s) — auto-rejected",
+                approval.id,
+                approval.tool_call_id,
+            )
+        await db.commit()
 
     return resolved
