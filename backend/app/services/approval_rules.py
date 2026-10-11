@@ -119,3 +119,46 @@ async def add_session_grant(chat_id: str, tool_name: str) -> None:
     key = f"{_GRANT_PREFIX}{chat_id}"
     await redis.sadd(key, tool_name)
     await redis.expire(key, _GRANT_TTL)
+
+
+# ---------------------------------------------------------------------------
+# One round, several asked calls
+# ---------------------------------------------------------------------------
+
+async def round_decision(db, approval) -> Optional[dict[str, Any]]:
+    """What the round `approval` belongs to has decided, once every asked
+    call in it is decided — None while any is still open.
+
+    Every PendingToolApproval of a round stores the whole round, so resuming
+    on the first decision would run the other asked calls unchecked (and a
+    second decision would run the round again). The round resumes once,
+    with the rejected calls named so they are answered, not executed.
+
+    Returns {"approved_ids": [...], "rejected_ids": [...]}.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.models.pending_approval import PendingToolApproval
+
+    rows = (
+        await db.execute(
+            select(PendingToolApproval).where(
+                PendingToolApproval.chat_id == approval.chat_id,
+                PendingToolApproval.message_id == approval.message_id,
+            )
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    approved_ids: list[str] = []
+    rejected_ids: list[str] = []
+    for row in rows:
+        decided = row.approved
+        if decided is None:
+            if row.expires_at is not None and row.expires_at <= now:
+                decided = False  # the sweep will record it; it can never be approved now
+            else:
+                return None
+        (approved_ids if decided else rejected_ids).append(row.tool_call_id)
+    return {"approved_ids": approved_ids, "rejected_ids": rejected_ids}
