@@ -41,8 +41,11 @@ All sections are optional — include only what you need.
 **Key behaviors:**
 
 - **Idempotent** — Applying the same config twice does nothing. Unchanged resources are skipped (SHA256 checksum comparison).
-- **Config-managed tracking** — Resources created via config are tagged with `managed_by: "config"`. The system won't overwrite resources that were created manually (it warns instead).
-- **Reference validation** — Cross-references (e.g., an agent referencing a function) are validated before applying.
+- **Config-managed tracking** — Resources a config applies are tagged with `managed_by: "config"` and the config's `metadata.name`, so two config files never overwrite each other's resources (the second one warns and skips). A config may take over a resource created by hand; a package never does (except a shared secret, which a package may fill in). Editing a config-managed resource in the console detaches it from the config. **Users** are the exception: they're identity rather than configuration, so config only manages users it created, any config file may update them, and console edits don't detach them.
+- **Operator state is kept** — Fields like `isActive` and `isDefault` are only changed when the config declares them, so re-applying doesn't undo a resource someone switched off in the console.
+- **All or nothing** — If any resource fails, nothing is applied.
+- **Reference validation** — Cross-references (e.g. an agent's functions, a schedule's target) must exist, or be declared in the same config.
+- **Change history** — Changes to every resource kind except users, from any channel, are recorded and can be restored (Admin → Change History, or `GET /api/v1/config/history`).
 - **Sensitive values** — Don't put credentials in config files. Declare them as [Secrets](/build-resources/secrets) and reference them by name (e.g. a connector's `auth.secret`); values are stored encrypted and resolved at runtime.
 - **Dry run** — Set `dryRun: true` to preview changes without applying.
 
@@ -65,8 +68,31 @@ AUTO_APPLY_CONFIG=true
 **Apply via API:**
 
 ```bash
-curl -X POST https://yourdomain.com/api/v1/config/apply \
-  -H "Authorization: Bearer $TOKEN" \
+# jq builds the JSON body, so quotes and newlines in the YAML survive.
+jq -Rs '{config: ., dryRun: false}' config.yaml | curl -X POST https://yourdomain.com/api/v1/config/apply \
+  -H "X-API-Key: $SINAS_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"config\": \"$(cat config.yaml)\", \"dryRun\": false}"
+  -d @-
 ```
+
+The response has `success`, a `summary`, the `changes` and any `errors`. A config that fails validation still answers 200, with `success: false`: check `success`, not just the status code.
+
+## From git (CI/CD)
+
+Keep config files and packages in a folder of your repository, preview them on pull requests and install them on merge, with the [Sinas CLI](https://github.com/sinas-platform/cli/tree/main/packages/cli):
+
+```bash
+export SINAS_URL=https://yourdomain.com
+export SINAS_API_KEY=...                          # from a CI secret
+npx -y @sinas/cli validate sinas/                 # every SinasConfig / SinasPackage under sinas/
+npx -y @sinas/cli preview sinas/ --markdown plan.md
+npx -y @sinas/cli install sinas/ --yes          # add --prune to remove what files dropped
+```
+
+- **API key** — Create a deploy key for CI: Access Control → API Keys → **Make a deploy key**, which links it to the built-in **Deployers** role (`sinas.config.validate:all`, `sinas.config.apply:all`, `sinas.packages.install:all`). Use one key per environment, set an expiry, and keep it in your CI's secrets only: applying config is admin-level, since a config can create roles and assign them.
+- **Files** — Folders are searched recursively; config files are applied before packages, in path order. Give each config file its own `metadata.name`.
+- **Package variables** — Per environment, from `SINAS_VAR_<NAME>` environment variables, a `--vars-file`, or `--var NAME=value`. A missing required variable fails the run.
+- **Plans** — `preview` prints what would change; `--markdown` writes it for a pull request comment, and in GitHub Actions it's added to the job summary. Every error exits 1.
+- **Removals** — By default, removing a resource from a config file doesn't delete it from Sinas (a file may be partial). Pass `--prune` (API: `"prune": true`) to also remove what that config file applied earlier and no longer declares; the plan shows what would go. It never touches another config file's resources or anything edited by hand since, and never removes secrets, LLM providers, database connections or dependencies. It refuses to remove something another resource still uses (a schedule's function, a pipeline step's query, …), and keeps a collection with files or a store with saved state (with a warning): delete those in the console. For a package, an upgrade that no longer ships a resource removes it, with the same exceptions (a shared secret, for example, stays until you delete it). Removals are recorded and can be restored.
+
+The CLI's README has a ready-to-copy GitHub Actions workflow (plan as a PR comment, install on merge, one environment per deployment).

@@ -7,21 +7,31 @@ from app.services.resources.base import ResourceApplier
 
 def _applier_classes() -> list[type[ResourceApplier]]:
     """Every migrated kind, in config dependency order."""
+    from app.services.resources.agents import AgentApplier
     from app.services.resources.collections import CollectionApplier
     from app.services.resources.components import ComponentApplier
     from app.services.resources.connectors import ConnectorApplier
+    from app.services.resources.database_connections import DatabaseConnectionApplier
     from app.services.resources.database_triggers import DatabaseTriggerApplier
+    from app.services.resources.dependencies import DependencyApplier
+    from app.services.resources.functions import FunctionApplier
+    from app.services.resources.llm_providers import LLMProviderApplier
     from app.services.resources.manifests import ManifestApplier
+    from app.services.resources.pipelines import PipelineApplier
+    from app.services.resources.roles import RoleApplier
     from app.services.resources.queries import QueryApplier
     from app.services.resources.schedules import ScheduleApplier
+    from app.services.resources.secrets import SecretApplier
     from app.services.resources.skills import SkillApplier
     from app.services.resources.stores import StoreApplier
     from app.services.resources.templates import TemplateApplier
     from app.services.resources.webhooks import WebhookApplier
 
     return [
-        ConnectorApplier, SkillApplier, QueryApplier, TemplateApplier, CollectionApplier,
-        StoreApplier, ManifestApplier, ComponentApplier, WebhookApplier, ScheduleApplier,
+        RoleApplier, SecretApplier, LLMProviderApplier, DatabaseConnectionApplier, DependencyApplier,
+        ConnectorApplier, FunctionApplier, SkillApplier, QueryApplier, TemplateApplier, CollectionApplier,
+        StoreApplier, ManifestApplier, PipelineApplier, ComponentApplier, AgentApplier,
+        WebhookApplier, ScheduleApplier,
         DatabaseTriggerApplier,
     ]
 

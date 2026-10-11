@@ -389,13 +389,18 @@ class TestUpgradeAndRestore:
 
         _, second = await service.install(_package(pkg, "2.0.0", [keep]), str(admin_user.id))
         assert second.success, second.errors
-        assert second.summary.deleted == {"stores": 1, "collections": 1, "manifests": 1}
+        # The dropped store holds saved state: an upgrade keeps it (with a
+        # warning) instead of deleting what users stored; uninstall removes it.
+        assert second.summary.deleted == {"collections": 1, "manifests": 1}
+        assert any("holds 1 saved state" in w for w in second.warnings)
         for model in (Store, Collection, Manifest):
             assert await _row(db, model, keep) is not None
+        assert await _row(db, Store, drop) is not None
+        for model in (Collection, Manifest):
             assert await _row(db, model, drop) is None
         db.expunge_all()
-        assert (await db.execute(select(State).where(State.store_id == store.id))).first() is None
-        for kind in ("stores", "collections", "manifests"):
+        assert (await db.execute(select(State).where(State.store_id == store.id))).first() is not None
+        for kind in ("collections", "manifests"):
             assert await _actions(db, kind, drop) == ["create", "delete"]
             assert await _actions(db, kind, keep) == ["create"]
 
