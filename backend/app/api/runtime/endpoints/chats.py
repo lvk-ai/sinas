@@ -839,6 +839,19 @@ async def approve_tool_call(
             },
         )
 
+    # An expired sibling counted as rejected above is recorded as such now,
+    # so the expiry sweep has nothing left to resume for this round; the
+    # fixed job id makes a racing sweep a no-op anyway.
+    await db.execute(
+        update(PendingToolApproval)
+        .where(
+            PendingToolApproval.message_id == pending_approval.message_id,
+            PendingToolApproval.approved.is_(None),
+        )
+        .values(approved=False)
+    )
+    await db.commit()
+
     # Extract token and enqueue resume job
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
 
@@ -851,6 +864,7 @@ async def approve_tool_call(
         channel_id=channel_id,
         agent=f"{chat.agent_namespace}/{chat.agent_name}",
         rejected_tool_call_ids=decision["rejected_ids"],
+        job_id=approval_rules.round_job_id(pending_approval),
     )
 
     return JSONResponse(

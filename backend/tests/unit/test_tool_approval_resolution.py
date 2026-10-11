@@ -111,3 +111,25 @@ async def test_an_expired_sibling_counts_as_rejected(client, db, admin_user, mon
     r = await client.post(f"/chats/{chat_id}/approve-tool/{first}", json={"approved": True}, headers=auth_headers(admin_user))
     assert r.json()["resume"] == "queued"
     assert len(calls) == 1 and calls[0]["rejected_tool_call_ids"] == [second]
+
+
+async def test_a_round_resumed_by_the_endpoint_is_not_resumed_again_by_the_sweep(client, db, admin_user, monkeypatch):
+    """Approving after a sibling expired, before the sweep ran: the endpoint
+    records the sibling as rejected and queues under the round's fixed job
+    id, so the sweep finds nothing to resume (and could not queue a second
+    job under that id anyway)."""
+    from app.services import deferred_completions as dc
+
+    calls = _capture(monkeypatch)
+    chat_id, (first, second) = await _pending_round(db, admin_user, datetime.now(UTC) + timedelta(hours=1), asked=2)
+    row = (await db.execute(select(PendingToolApproval).where(PendingToolApproval.tool_call_id == second))).scalar_one()
+    row.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await db.commit()
+    r = await client.post(f"/chats/{chat_id}/approve-tool/{first}", json={"approved": True}, headers=auth_headers(admin_user))
+    assert r.json()["resume"] == "queued" and len(calls) == 1
+    assert calls[0]["job_id"] == f"approval-round-{row.message_id}"
+    await db.refresh(row)
+    assert row.approved is False  # recorded by the endpoint, not left for the sweep
+
+    await dc.expire_due()
+    assert len(calls) == 1
