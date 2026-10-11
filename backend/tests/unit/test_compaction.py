@@ -284,3 +284,25 @@ class TestFollowupUsesWindowing:
         assert [m["tool_call_id"] for m in tools] == ["b0", "b1", "b2"]
         assert all("interrupted" not in m["content"] for m in tools)
 
+
+    @pytest.mark.asyncio
+    async def test_every_steering_message_of_the_turn_is_pinned(self, db, test_user, monkeypatch):
+        chat = Chat(user_id=test_user.id, title="steered")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="THE TASK"))
+        await db.flush()
+        for i in range(4):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"s{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="user", content=f"steer {i}"))  # injected mid-round
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"s{i}", content="{}"))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 3)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        users = [m["content"] for m in sent if m["role"] == "user"]
+        assert users == ["THE TASK", "steer 0", "steer 1", "steer 2", "steer 3"]

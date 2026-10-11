@@ -315,11 +315,13 @@ async def list_tools(
     try:
         tools = await _fetch_tools(db, server, user_id, headers)
     except McpClientError as e:
+        # The lifetime starts when the fetch ENDS: a slow failure must not
+        # be written already expired, or every message reconnects and waits.
         if settings.mcp_tool_list_failure_ttl_seconds > 0:
-            _tool_cache[key] = (now + settings.mcp_tool_list_failure_ttl_seconds, e)
+            _tool_cache[key] = (time.monotonic() + settings.mcp_tool_list_failure_ttl_seconds, e)
         raise
     if settings.mcp_tool_list_ttl_seconds > 0:
-        _tool_cache[key] = (now + settings.mcp_tool_list_ttl_seconds, tools)
+        _tool_cache[key] = (time.monotonic() + settings.mcp_tool_list_ttl_seconds, tools)
     return tools
 
 

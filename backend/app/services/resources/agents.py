@@ -39,7 +39,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
     reference_fields = (
         "llm_provider_name", "enabled_functions", "enabled_skills", "enabled_queries",
         "enabled_stores", "enabled_collections", "enabled_components", "enabled_connectors",
-        "enabled_pipelines", "enabled_agents", "hooks",
+        "enabled_pipelines", "enabled_agents", "hooks", "enabled_mcp_servers",
     )
     # Operator state: a deleted (switched-off) agent stays off, and the
     # default chosen in the console stays the default, unless config says so.
@@ -163,7 +163,6 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         row.enabled_collections = [c.model_dump() for c in spec.enabled_collections]
         row.hooks = dict(spec.hooks) if spec.hooks is not None else None
         row.tool_approvals = dict(spec.tool_approvals) if spec.tool_approvals else None
-        await self._check_mcp_bindings(spec, ctx, current)
         row.enabled_mcp_servers = [b.model_dump() for b in spec.enabled_mcp_servers]
         row.is_default = spec.is_default
 
@@ -231,6 +230,9 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         anything the same config declares (it's applied all-or-nothing)."""
         if spec.llm_provider_name and (current is None or current.llm_provider_name != spec.llm_provider_name):
             await self.check_references(spec, ctx)
+        # MCP bindings are references too, checked here so a preview (dry
+        # run) reports a missing or unreadable server, not only the apply.
+        await self._check_mcp_bindings(spec, ctx, current)
         missing: list[str] = []
         # The stored state in the spec's own spelling (e.g. a bare "lookup"
         # stored long ago reads as "default/lookup"), so an unchanged

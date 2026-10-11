@@ -95,12 +95,18 @@ async def _current_binding_problem(
     if agent is None:
         return None
     ref = f"{namespace}/{name}"
+    bound = False
+    # Discovery unions every binding for a server; so does this check — a
+    # tool one binding allows must not be refused because another lists it
+    # under a different pattern.
     for entry in agent.enabled_mcp_servers or []:
         entry_ref, patterns = _normalize_entry(entry)
         if entry_ref != ref:
             continue
+        bound = True
         if binding_allows(patterns, mcp_tool):
             return None
+    if bound:
         return f"Tool '{mcp_tool}' on MCP server '{ref}' is outside this agent's tool patterns"
     return f"MCP server '{ref}' is no longer enabled for this agent"
 
