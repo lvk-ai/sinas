@@ -5,6 +5,7 @@ before its deadline — the expiry sweep resolves it the same way, so a late
 import pytest
 import uuid
 
+import pytest
 import pytest_asyncio
 from datetime import UTC, datetime, timedelta
 
@@ -179,8 +180,35 @@ async def test_a_round_resumed_by_the_endpoint_is_not_resumed_again_by_the_sweep
     r = await client.post(f"/chats/{chat_id}/approve-tool/{first}", json={"approved": True}, headers=auth_headers(admin_user))
     assert r.json()["resume"] == "queued" and len(calls) == 1
     assert calls[0]["job_id"] == f"approval-round-{row.message_id}"
+    assert calls[0]["channel_id"] == r.json()["channel_id"]
     await db.refresh(row)
     assert row.approved is False  # recorded by the endpoint, not left for the sweep
 
     await dc.expire_due()
     assert len(calls) == 1
+
+
+async def test_every_decision_of_a_round_shares_its_stream_channel(client, db, admin_user, monkeypatch):
+    """Two requests may both complete the round; only one enqueue is kept,
+    so both must hand out the channel that job publishes on."""
+    _capture(monkeypatch)
+    chat_id, (first, second) = await _pending_round(db, admin_user, datetime.now(UTC) + timedelta(hours=1), asked=2)
+    h = auth_headers(admin_user)
+    a = (await client.post(f"/chats/{chat_id}/approve-tool/{first}", json={"approved": True}, headers=h)).json()
+    b = (await client.post(f"/chats/{chat_id}/approve-tool/{second}", json={"approved": True}, headers=h)).json()
+    assert a["channel_id"] == b["channel_id"]
+
+
+async def test_a_failed_enqueue_leaves_the_expired_sibling_for_the_sweep(client, db, admin_user, monkeypatch):
+    async def boom(**kwargs):
+        raise RuntimeError("queue down")
+
+    monkeypatch.setattr(queue_service, "enqueue_agent_resume", boom)
+    chat_id, (first, second) = await _pending_round(db, admin_user, datetime.now(UTC) + timedelta(hours=1), asked=2)
+    row = (await db.execute(select(PendingToolApproval).where(PendingToolApproval.tool_call_id == second))).scalar_one()
+    row.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await db.commit()
+    with pytest.raises(RuntimeError, match="queue down"):  # the test client re-raises server errors
+        await client.post(f"/chats/{chat_id}/approve-tool/{first}", json={"approved": True}, headers=auth_headers(admin_user))
+    await db.refresh(row)
+    assert row.approved is None  # still open: the sweep resumes the round later

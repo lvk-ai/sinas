@@ -167,3 +167,12 @@ async def round_decision(db, approval) -> Optional[dict[str, Any]]:
 def round_job_id(approval) -> str:
     """The one job id a round's resume runs under, whoever queues it."""
     return f"approval-round-{approval.message_id}"
+
+
+def round_channel_id(approval) -> str:
+    """The one stream channel a round's resume publishes on: two requests
+    that both complete the round (or the sweep) hand out the same channel,
+    so whichever enqueue the queue kept, every caller can follow it."""
+    import uuid
+
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:approval-round:{approval.message_id}"))
