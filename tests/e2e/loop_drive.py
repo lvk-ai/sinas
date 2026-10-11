@@ -212,12 +212,29 @@ class Driver:
     def state(self):
         return self.ok(self.c.get(f"/chats/{self.chat_id}", headers=self.h))
 
+    @staticmethod
+    def _json(text):
+        try:
+            value = json.loads(text or "")
+        except (ValueError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
     def setup(self, stub_endpoint):
+        # The stub is never the deployment's default provider: it is bound to
+        # the test agent only, so other chats keep their model when the stub
+        # goes away. On a repeat run the provider's endpoint is refreshed.
+        stub_provider_id = None
         if stub_endpoint:
             provs = self.ok(self.c.get("/api/v1/llm-providers", headers=self.h))
-            if not any(p["name"] == "e2e-stub" for p in provs):
-                self.ok(self.c.post("/api/v1/llm-providers", headers=self.h, json={"name": "e2e-stub", "provider_type": "openai", "api_key": "stub", "api_endpoint": stub_endpoint, "default_model": "stub", "is_default": True}))
-            self.step(1, f"stub provider registered at {stub_endpoint}")
+            existing = next((p for p in provs if p["name"] == "e2e-stub"), None)
+            if existing:
+                stub_provider_id = existing["id"]
+                self.ok(self.c.patch(f"/api/v1/llm-providers/{stub_provider_id}", headers=self.h, json={"api_endpoint": stub_endpoint, "default_model": "stub", "is_active": True}))
+            else:
+                created = self.ok(self.c.post("/api/v1/llm-providers", headers=self.h, json={"name": "e2e-stub", "provider_type": "openai", "api_key": "stub", "api_endpoint": stub_endpoint, "default_model": "stub", "is_default": False}))
+                stub_provider_id = created["id"]
+            self.step(1, f"stub provider at {stub_endpoint} (not the default)")
         else:
             self.step(1, "using the deployment's default provider")
         ns, name = COLLECTION.split("/")
@@ -227,6 +244,9 @@ class Driver:
         self.step(2, f"collection {COLLECTION} ready")
         inst = self.ok(self.c.post("/api/v1/packages/install", headers=self.h, json={"source": PACKAGE.read_text()}))
         self.step(3, f"package installed: {inst['package']['name']} {inst['package']['version']}")
+        if stub_provider_id:
+            self.ok(self.c.put("/api/v1/agents/way-of-working/assistant", headers=self.h, json={"llm_provider_id": stub_provider_id, "model": "stub"}))
+            self.step(3, "test agent bound to the stub provider")
         chat = self.ok(self.c.post("/agents/way-of-working/assistant/chats", headers=self.h, json={"title": "e2e loop drive", "keep_alive": True}))
         self.chat_id = chat["id"]
         self.step(4, f"chat {self.chat_id} (keep_alive)")
@@ -269,15 +289,33 @@ class Driver:
         print("      final reply:", (final or {}).get("content", "")[:160])
         wb = sorted(f["name"] for f in self.ok(self.c.get(f"/chats/{self.chat_id}/workbench/files", headers=self.h)))
         ns, name = COLLECTION.split("/")
-        published = sorted(f["name"] for f in self.ok(self.c.get(f"/files/{ns}/{name}", headers=self.h)))
+        published_files = self.ok(self.c.get(f"/files/{ns}/{name}", headers=self.h))
+        published = sorted(f["name"] for f in published_files)
         cols = [f"{x['namespace']}/{x['name']}" for x in self.ok(self.c.get("/api/v1/collections", headers=self.h))]
         print("      workbench:", wb)
         print("      published:", published)
         failures = []
         if final is None:
             failures.append("no final assistant reply")
-        if not any(n.endswith("summary.md") for n in published):
-            failures.append(f"nothing promoted into {COLLECTION}")
+        # Judge THIS run's promote, not whatever an earlier run left in the
+        # collection: the promote tool result must be a success and the
+        # published file must be at the version that result reports.
+        promote_results = [m for m in msgs if m["role"] == "tool" and m["name"] == "workbench_promote"]
+        failed_tools = [m["name"] for m in msgs if m["role"] == "tool" and "error" in (self._json(m["content"]) or {})]
+        if failed_tools:
+            failures.append(f"tool calls failed this run: {failed_tools}")
+        if not promote_results:
+            failures.append("no workbench_promote ran this run")
+        else:
+            res = self._json(promote_results[-1]["content"]) or {}
+            if "error" in res:
+                failures.append(f"promote failed: {res['error']}")
+            else:
+                target = next((f for f in published_files if f["name"] == res.get("filename")), None)
+                if target is None:
+                    failures.append(f"promoted file {res.get('filename')!r} not found in {COLLECTION}")
+                elif target.get("current_version") != res.get("version"):
+                    failures.append(f"promoted file is at version {target.get('current_version')}, promote reported {res.get('version')}")
         if any(c.startswith("_chat/") for c in cols):
             failures.append("workbench leaked into the collections listing")
         if not self.real:
