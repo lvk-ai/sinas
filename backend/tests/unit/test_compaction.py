@@ -257,3 +257,30 @@ class TestFollowupUsesWindowing:
         assert users == ["THE TASK"]  # pinned; the previous turn's ask stays out
         assert sent[0]["role"] == "user"  # ahead of the windowed tail
         assert [m["tool_call_id"] for m in sent if m["role"] == "tool"] == ["r3", "r4"]
+
+    @pytest.mark.asyncio
+    async def test_window_cutting_a_batch_keeps_its_real_results(self, db, test_user, monkeypatch):
+        """When the window starts inside a batch of tool results, the whole
+        exchange comes back: the call and the batch's earlier results, not
+        synthetic 'interrupted' errors for calls that completed."""
+        chat = Chat(user_id=test_user.id, title="batch")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+            {"id": f"b{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}} for i in range(3)
+        ]))
+        await db.flush()
+        for i in range(3):
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"b{i}", content=json.dumps({"ok": i})))
+            await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="then"))
+        await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 2)  # window: [tool b2, assistant]
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        tools = [m for m in sent if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tools] == ["b0", "b1", "b2"]
+        assert all("interrupted" not in m["content"] for m in tools)
+

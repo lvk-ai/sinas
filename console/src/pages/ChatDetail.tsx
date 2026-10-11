@@ -43,6 +43,11 @@ export function ChatDetail() {
   }
 
   const agentRef = `${chat.agent_namespace}/${chat.agent_name}`;
+  // The panel only makes sense for an agent that has the workbench: without
+  // it, uploads land where no tool or sandbox run will ever see them.
+  const agentHasWorkbench = (agent?.system_tools ?? []).some((t) =>
+    typeof t === 'string' ? t === 'workbench' : t?.name === 'workbench'
+  );
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
@@ -64,15 +69,17 @@ export function ChatDetail() {
             </p>
           </div>
         </div>
-        <button
-          title={showWorkbench ? 'Hide workbench' : 'Show workbench'}
-          onClick={() => setShowWorkbench((v) => !v)}
-          className={`p-2 rounded-lg ${
-            showWorkbench ? 'text-primary-600' : 'text-gray-400 hover:text-gray-100'
-          }`}
-        >
-          <FolderOpen className="w-5 h-5" />
-        </button>
+        {agentHasWorkbench && (
+          <button
+            title={showWorkbench ? 'Hide workbench' : 'Show workbench'}
+            onClick={() => setShowWorkbench((v) => !v)}
+            className={`p-2 rounded-lg ${
+              showWorkbench ? 'text-primary-600' : 'text-gray-400 hover:text-gray-100'
+            }`}
+          >
+            <FolderOpen className="w-5 h-5" />
+          </button>
+        )}
       </div>
 
       {/* Chat component from @sinas/ui, with the workbench tree alongside */}
@@ -92,7 +99,7 @@ export function ChatDetail() {
             style={{ border: 'none', borderRadius: 0, backgroundColor: 'transparent' }}
           />
         </div>
-        {showWorkbench && chatId && (
+        {showWorkbench && agentHasWorkbench && chatId && (
           <WorkbenchPanel chatId={chatId} onClose={() => setShowWorkbench(false)} />
         )}
       </div>

@@ -25,6 +25,7 @@ from app.utils.schema import validate_with_coercion
 from app.services.content_tokens import strip_base64_data, refresh_message_tokens  # noqa: F401 — re-exported
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
+from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -412,7 +413,53 @@ class MessageService:
         self.db.add(message)
         await self.db.commit()
         await self.db.refresh(message)
+        from app.services import chat_steering
+
+        await chat_steering.note_injection(chat_id)
         return message
+
+    async def answer_pending_injections(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        user_token: str,
+        provider: Optional[str],
+        model: Optional[str],
+        temperature: float,
+        max_tokens: Optional[int],
+        tools: list[dict[str, Any]],
+        status_templates: dict[str, str] = {},
+        agent_label: Optional[str] = None,
+        max_rounds: int = 3,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """A turn that ends in plain text has no round boundary left to pick
+        up a message injected while it ran. Before the lock is released, run
+        one more follow-up per batch of injections (bounded) so nothing a
+        user said mid-turn goes unanswered. Caller holds the chat lock and
+        knows the turn did not suspend."""
+        from app.services import chat_steering
+
+        for _ in range(max_rounds):
+            if not await chat_steering.take_injections(chat_id):
+                return
+            yield {"type": "injection_followup"}
+            async for chunk in self._stream_followup_after_tools(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_token=user_token,
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                status_templates=status_templates,
+                agent_label=agent_label,
+                tool_summary="messages injected during the turn",
+            ):
+                yield chunk
+                if chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    return
 
     async def send_message(
         self, chat_id: str, user_id: str, user_token: str, content: str
@@ -529,6 +576,7 @@ class MessageService:
                             "Please use streaming mode to handle approval flow."
                         )
 
+            suspended = False
             async for chunk in self._handle_tool_calls(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -542,7 +590,16 @@ class MessageService:
                 tools=prep["tools"],
                 agent_label=agent_label,
             ):
-                pass
+                if isinstance(chunk, dict) and chunk.get("type") in SUSPENSION_EVENT_TYPES:
+                    suspended = True
+            if not suspended:
+                async for _ in self.answer_pending_injections(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    provider=prep["provider_name"], model=prep["final_model"],
+                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"], agent_label=agent_label,
+                ):
+                    pass
 
             result = await self.db.execute(
                 select(Message)
@@ -591,6 +648,21 @@ class MessageService:
         _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
         _llm_span.end()
 
+        # A message injected while this reply streamed has no boundary left
+        # to be read at: answer it now, still under the lock.
+        answered = False
+        async for _ in self.answer_pending_injections(
+            chat_id=chat_id, user_id=user_id, user_token=user_token,
+            provider=prep["provider_name"], model=prep["final_model"],
+            temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+            tools=prep["tools"], agent_label=agent_label,
+        ):
+            answered = True
+        if answered:
+            result = await self.db.execute(
+                select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+            )
+            return result.scalar_one()
         return assistant_message
 
     async def send_message_stream(
@@ -678,6 +750,7 @@ class MessageService:
         _turn_ctx = trace.set_span_in_context(turn_span)
 
         _turn_output_parts: list[str] = []
+        _ended_early = False  # suspended or interrupted: no follow-through
         try:
             async for chunk in self._stream_response(
                 llm_provider=prep["llm_provider"],
@@ -695,7 +768,22 @@ class MessageService:
             ):
                 if chunk.get("content"):
                     _turn_output_parts.append(chunk["content"])
+                if chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    _ended_early = True
                 yield chunk
+            if not _ended_early:
+                # Anything injected while the final reply streamed would
+                # otherwise sit unanswered until the user speaks again.
+                async for chunk in self.answer_pending_injections(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    provider=prep["provider_name"], model=prep["final_model"],
+                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"], status_templates=prep["status_templates"],
+                    agent_label=agent_label,
+                ):
+                    if chunk.get("content"):
+                        _turn_output_parts.append(chunk["content"])
+                    yield chunk
         except Exception as e:
             print(f"❌ Error during message streaming: {e}", flush=True)
             turn_span.set_status(trace.StatusCode.ERROR, str(e)[:200])

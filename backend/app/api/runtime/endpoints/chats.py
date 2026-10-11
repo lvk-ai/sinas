@@ -812,7 +812,13 @@ async def approve_tool_call(
                 tool_name = tc.get("function", {}).get("name")
                 break
         if tool_name:
-            await approval_rules.add_session_grant(chat_id, tool_name)
+            # The approval is already resolved: a grant that fails to store
+            # must not stop the approved work from resuming (the user is at
+            # worst asked again next time).
+            try:
+                await approval_rules.add_session_grant(chat_id, tool_name)
+            except Exception as e:
+                logger.warning("Session grant for %s in chat %s not stored: %s", tool_name, chat_id, e)
 
     # Extract token and enqueue resume job
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")

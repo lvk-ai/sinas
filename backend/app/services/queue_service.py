@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import timedelta
 import uuid
 from typing import Any, Optional
 
@@ -351,8 +352,16 @@ class QueueService:
         channel_id: str,
         agent: Optional[str] = None,
         job_timeout: Optional[int] = None,
+        defer_seconds: Optional[int] = None,
+        attempt: int = 0,
+        enqueued_at: Optional[float] = None,
     ) -> str:
-        """Enqueue an agent resume job (after tool approval)."""
+        """Enqueue an agent resume job (after tool approval).
+
+        `defer_seconds`/`attempt`: a retry of a continuation that found the
+        chat busy. `enqueued_at` is kept from the first enqueue so an
+        operator interrupt requested after it still stops the retry.
+        """
         pool = await get_arq_pool()
         redis = await get_redis()
 
@@ -381,6 +390,8 @@ class QueueService:
         }
         if job_timeout is not None:
             enqueue_kwargs["_job_timeout"] = job_timeout
+        if defer_seconds:
+            enqueue_kwargs["_defer_by"] = timedelta(seconds=defer_seconds)
 
         await pool.enqueue_job(
             "execute_agent_resume_job",
@@ -395,6 +406,8 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            attempt=attempt,
+            enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
             **enqueue_kwargs,
         )
 
@@ -410,6 +423,9 @@ class QueueService:
         conversation_context: dict[str, Any],
         job_timeout: Optional[int] = None,
         job_id: Optional[str] = None,
+        defer_seconds: Optional[int] = None,
+        attempt: int = 0,
+        enqueued_at: Optional[float] = None,
     ) -> str:
         """Enqueue continuation of a parent suspended on delegations (issue #90).
 
@@ -451,6 +467,8 @@ class QueueService:
         }
         if job_timeout is not None:
             enqueue_kwargs["_job_timeout"] = job_timeout
+        if defer_seconds:
+            enqueue_kwargs["_defer_by"] = timedelta(seconds=defer_seconds)
 
         await pool.enqueue_job(
             "execute_agent_delegate_resume_job",
@@ -464,6 +482,8 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            attempt=attempt,
+            enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
             **enqueue_kwargs,
         )
 
