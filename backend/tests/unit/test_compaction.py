@@ -286,6 +286,40 @@ class TestFollowupUsesWindowing:
 
 
     @pytest.mark.asyncio
+    async def test_window_starting_at_an_injected_message_still_restores_the_batch(self, db, test_user, monkeypatch):
+        """A steering message injected mid-batch sits between the batch's
+        results. When the window opens on it, the results behind it must
+        still find their call before the window."""
+        chat = Chat(user_id=test_user.id, title="batch+steer")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+            {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}} for i in range(3)
+        ]))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id="c0", content=json.dumps({"ok": 0})))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="also check the totals"))  # injected mid-batch
+        await db.flush()
+        for i in (1, 2):
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"c{i}", content=json.dumps({"ok": i})))
+            await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="then"))
+        await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 4)  # window: [user(injected), tool c1, tool c2, assistant]
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        tools = [m for m in sent if m["role"] == "tool"]
+        assert sorted(m["tool_call_id"] for m in tools) == ["c0", "c1", "c2"]
+        assert all("interrupted" not in m["content"] for m in tools)
+        # Results follow their call directly; the injected message comes after the exchange.
+        roles = [m["role"] for m in sent]
+        call_idx = next(i for i, m in enumerate(sent) if m["role"] == "assistant" and m.get("tool_calls"))
+        assert roles[call_idx + 1:call_idx + 4] == ["tool", "tool", "tool"]
+
+    @pytest.mark.asyncio
     async def test_every_steering_message_of_the_turn_is_pinned(self, db, test_user, monkeypatch):
         chat = Chat(user_id=test_user.id, title="steered")
         db.add(chat)
