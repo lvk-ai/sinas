@@ -8,6 +8,7 @@ points at them; no workbench means exactly the old truncate-only behavior.
 """
 import base64
 import json
+import uuid
 
 import pytest
 import pytest_asyncio
@@ -229,6 +230,44 @@ class TestResultSpill:
         assert parsed["_full_result"]["workbench_file"] == "tool_results/q.json"
         assert isinstance(parsed["result"], list) and parsed["result"][-1]["_truncated"] is True
         assert workbench_refs.spill_pointer(parsed) == "tool_results/q.json"
+
+
+    def test_pointer_fits_inside_the_shared_size_cap(self):
+        """The inline copy is truncated with room reserved for the pointer,
+        so the persisted copy (same cap) is never clipped — a clipped copy
+        would lose the pointer other chats follow."""
+        from app.services.tool_execution import truncate_tool_result
+
+        cap = 4000
+        path = "tool_results/big.txt"
+        budget = cap - workbench_refs.spill_pointer_reserve(path)
+        text = "word " * 2000  # plain text: wrapped as {"text": ...}
+        out = workbench_refs.attach_spill_pointer(truncate_tool_result(text, budget), path)
+        assert len(out.encode("utf-8")) <= cap
+        assert workbench_refs.spill_pointer(json.loads(out)) == path
+
+    @pytest.mark.asyncio
+    async def test_store_clip_keeps_the_pointer(self, monkeypatch):
+        from app.services import tool_result_store
+
+        class FakeDb:
+            rows = []
+
+            def add(self, row):
+                self.rows.append(row)
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(tool_result_store, "MAX_RESULT_SIZE", 200)
+        stored = {"text": "x" * 500, "_full_result": {"workbench_file": "tool_results/q.txt", "hint": "read it"}}
+        fake = FakeDb()
+        await tool_result_store.save_tool_result(
+            fake, "call_clip", "some_query", {}, stored, str(uuid.uuid4()), chat_id=str(uuid.uuid4())
+        )
+        (row,) = fake.rows
+        assert row.result["_truncated"] is True
+        assert workbench_refs.spill_pointer(row.result) == "tool_results/q.txt"
 
 
 class TestRetrieveServesSpilledCopy:

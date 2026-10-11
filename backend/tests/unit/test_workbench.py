@@ -1087,8 +1087,71 @@ class TestRoundFour:
         assert (await db.execute(select(File).where(File.collection_id == wb.id))).scalars().all() == []
         assert await get_storage().read(paths[0]) == b"bye"  # bytes removed after the commit, by the caller
 
-    def test_truncating_modes_never_fetch_a_lazy_file(self):
+    @staticmethod
+    def _sandbox_open(tmp_path, lazy):
+        """The sandbox's open() shim, lifted out of the wrapper script and
+        bound to a real directory, with fetches failing loudly."""
+        import os
+        import re
+        import textwrap
+
         from app.services.code_execution import _build_wrapper
 
         wrapper = _build_wrapper("pass", workbench=True)
-        assert 'if "w" in _m or "x" in _m:' in wrapper
+        block = re.search(r"\n    def _wb_open\(.*?\n        return _wb_real_open\(file, \*args, \*\*kwargs\)\n", wrapper, re.S)
+        assert block, "the open() shim must stay in the wrapper"
+        fetched = []
+
+        def workbench_fetch(path, _timeout=120):
+            fetched.append(path)
+            raise AssertionError("fetch must not run for a truncating open")
+
+        ns = {"_os": os, "_wb_root": str(tmp_path), "_wb_lazy_unfetched": lazy,
+              "_wb_real_open": open, "workbench_fetch": workbench_fetch}
+        exec(textwrap.dedent(block.group(0)), ns)
+        return ns["_wb_open"], fetched
+
+    def test_truncating_open_drops_the_lazy_flag_only_once_it_succeeded(self, tmp_path):
+        lazy = {"data.csv"}
+        (tmp_path / "data.csv").write_bytes(b"")  # the stub
+        wb_open, fetched = self._sandbox_open(tmp_path, lazy)
+
+        # Exclusive creation of a file the workbench already has fails like
+        # on any file system — and the stub stays lazy (skipped at copy-out),
+        # or the failed run would save empty bytes over the real file.
+        with pytest.raises(FileExistsError):
+            wb_open(str(tmp_path / "data.csv"), "x+b")
+        assert lazy == {"data.csv"}
+
+        # A failed truncating open keeps the flag too ...
+        lazy.add("missing/dir.txt")
+        with pytest.raises(FileNotFoundError):
+            wb_open(str(tmp_path / "missing/dir.txt"), "w")
+        assert "missing/dir.txt" in lazy
+
+        # ... and a successful one replaces the file without any fetch.
+        with wb_open(str(tmp_path / "data.csv"), "w") as fh:
+            fh.write("new")
+        assert "data.csv" not in lazy
+        assert fetched == []
+        assert (tmp_path / "data.csv").read_text() == "new"
+
+    def test_reading_open_fetches_a_lazy_file_first(self, tmp_path):
+        lazy = {"data.csv"}
+        (tmp_path / "data.csv").write_bytes(b"")
+        wb_open, fetched = self._sandbox_open(tmp_path, lazy)
+        with pytest.raises(AssertionError, match="fetch must not run"):
+            wb_open(str(tmp_path / "data.csv"), "rb")
+        assert fetched == [str(tmp_path / "data.csv")]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_leaves_ordinary_chat_collections_alone(self, db, chat, test_user):
+        """Config apply may create an ordinary collection in `_chat` — even
+        one named like a chat id. Expiry removes workbenches only."""
+        from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
+
+        plain = Collection(namespace="_chat", name=str(chat.id), kind="collection", user_id=test_user.id)
+        db.add(plain)
+        await db.commit()
+        assert await delete_workbenches_for_chats(db, [chat.id]) == []
+        assert (await db.execute(select(Collection).where(Collection.id == plain.id))).scalar_one_or_none() is not None
