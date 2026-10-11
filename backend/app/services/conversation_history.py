@@ -209,17 +209,16 @@ async def build_conversation_history(
             if m.role == "assistant" and m.content and not m.tool_calls:
                 turn_start = i + 1
                 break
-        pinned = []
-        opener = next(
-            (m for m in all_messages[turn_start:window_start_idx] if m.role == "user"), None
-        )
-        if opener is not None:
-            pinned.append(opener)
-        if chat_messages and not any(m.role == "user" for m in chat_messages):
+        # Every user message of the current turn is pinned, not only the
+        # opener: messages injected mid-turn (steering) are read at a round
+        # boundary and must not fall out of the window before the model
+        # has seen them.
+        pinned = [m for m in all_messages[turn_start:window_start_idx] if m.role == "user"]
+        if not pinned and chat_messages and not any(m.role == "user" for m in chat_messages):
             latest_user = next(
                 (m for m in reversed(all_messages[:window_start_idx]) if m.role == "user"), None
             )
-            if latest_user is not None and latest_user is not opener:
+            if latest_user is not None:
                 pinned.append(latest_user)
 
         # Ensure tool call/result pairs aren't split by the window boundary.

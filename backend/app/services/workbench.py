@@ -460,8 +460,12 @@ class WorkbenchTools:
 
         # Checked-out file going back to where it came from → update the source.
         if provenance and provenance.get("collection") == coll_ref and not arguments.get("target_filename"):
+            # Locked before the version is compared: an upload committed in
+            # between must surface as a conflict, not be written over.
             source_file = (
-                await db.execute(select(File).where(File.id == uuid_lib.UUID(provenance["file_id"])))
+                await db.execute(
+                    select(File).where(File.id == uuid_lib.UUID(provenance["file_id"])).with_for_update()
+                )
             ).scalar_one_or_none()
             if source_file and source_file.collection_id == target.id:
                 if source_file.current_version != provenance.get("version"):
@@ -1008,6 +1012,11 @@ async def _write_bytes(
             await db.execute(select(File).where(File.id == existing.id).with_for_update())
         ).scalar_one()
 
+    # The version bump, the bytes and the version row succeed or fail as
+    # one: a storage failure must not leave the file pointing at a version
+    # that was never written when the caller's batch commits. Started
+    # before the row is touched (begin_nested flushes what came before).
+    savepoint = await db.begin_nested()
     if existing:
         existing.current_version += 1
         existing.content_type = content_type
@@ -1028,25 +1037,30 @@ async def _write_bytes(
         db.add(file_record)
         created = True
 
-    await db.flush()
-
-    storage_path = f"{collection.namespace}/{collection.name}/{file_record.id}/v{file_record.current_version}"
     try:
-        await storage.save(storage_path, content)
-    except Exception as e:
-        return {"error": f"Storage write failed: {e}"}
-
-    db.add(
-        FileVersion(
-            file_id=file_record.id,
-            version_number=file_record.current_version,
-            storage_path=storage_path,
-            size_bytes=len(content),
-            hash_sha256=file_hash,
-            uploaded_by=uuid_lib.UUID(user_id),
+        await db.flush()
+        storage_path = f"{collection.namespace}/{collection.name}/{file_record.id}/v{file_record.current_version}"
+        try:
+            await storage.save(storage_path, content)
+        except Exception as e:
+            await savepoint.rollback()
+            return {"error": f"Storage write failed: {e}"}
+        db.add(
+            FileVersion(
+                file_id=file_record.id,
+                version_number=file_record.current_version,
+                storage_path=storage_path,
+                size_bytes=len(content),
+                hash_sha256=file_hash,
+                uploaded_by=uuid_lib.UUID(user_id),
+            )
         )
-    )
-    await db.flush()
+        await db.flush()
+    except Exception:
+        await savepoint.rollback()
+        raise
+    else:
+        await savepoint.commit()
 
     return {
         "filename": file_record.name,
