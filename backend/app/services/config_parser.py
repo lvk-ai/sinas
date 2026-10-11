@@ -138,7 +138,6 @@ class ConfigParser:
         collection_names = {
             f"{c.get('namespace', 'default')}/{c['name']}" for c in spec.get("collections", [])
         }
-        llm_provider_names = {p["name"] for p in spec.get("llmProviders", [])}
         database_connection_names = {c["name"] for c in spec.get("databaseConnections", [])}
         query_names = {
             f"{q.get('namespace', 'default')}/{q['name']}" for q in spec.get("queries", [])
@@ -149,14 +148,12 @@ class ConfigParser:
         db_agent_names: set[str] = set()
         db_skill_names: set[str] = set()
         db_collection_names: set[str] = set()
-        db_llm_provider_names: set[str] = set()
         db_database_connection_names: set[str] = set()
         db_query_names: set[str] = set()
         if db:
             from app.models.agent import Agent
             from app.models.file import Collection
             from app.models.function import Function
-            from app.models.llm_provider import LLMProvider
             from app.models.skill import Skill
             from app.models.user import Role
 
@@ -177,9 +174,6 @@ class ConfigParser:
             result = await db.execute(select(Collection.namespace, Collection.name))
             db_collection_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
 
-            result = await db.execute(select(LLMProvider.name))
-            db_llm_provider_names = {name for (name,) in result.fetchall()}
-
             from app.models.database_connection import DatabaseConnection
             from app.models.query import Query as QueryModel
 
@@ -188,16 +182,6 @@ class ConfigParser:
 
             result = await db.execute(select(QueryModel.namespace, QueryModel.name))
             db_query_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
-
-        store_names = {
-            f"{s.get('namespace', 'default')}/{s['name']}" for s in spec.get("stores", [])
-        }
-        db_store_names: set[str] = set()
-        if db:
-            from app.models.store import Store
-
-            result = await db.execute(select(Store.namespace, Store.name))
-            db_store_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
 
         component_names = {
             f"{c.get('namespace', 'default')}/{c['name']}" for c in spec.get("components", [])
@@ -215,9 +199,7 @@ class ConfigParser:
         all_agent_names = agent_names | db_agent_names
         all_skill_names = skill_names | db_skill_names
         all_collection_names = collection_names | db_collection_names
-        all_store_names = store_names | db_store_names
         all_component_names = component_names | db_component_names
-        all_llm_provider_names = llm_provider_names | db_llm_provider_names
         all_database_connection_names = database_connection_names | db_database_connection_names
         all_query_names = query_names | db_query_names
         # Validate manifest resource references
@@ -253,106 +235,10 @@ class ConfigParser:
                         )
                     )
 
-        # Validate agent references
-        for i, agent in enumerate(spec.get("agents", [])):
-            # Validate LLM provider reference
-            if "llmProviderName" in agent and agent["llmProviderName"]:
-                if not _is_variable_placeholder(agent["llmProviderName"]) and agent["llmProviderName"] not in all_llm_provider_names:
-                    errors.append(
-                        ConfigValidationError(
-                            path=f"spec.agents[{i}].llmProviderName",
-                            message=f"Referenced LLM provider '{agent['llmProviderName']}' not defined",
-                        )
-                    )
-
-            # Validate enabled function references
-            if "enabledFunctions" in agent and agent["enabledFunctions"]:
-                for func_name in agent["enabledFunctions"]:
-                    if not _ref_matches_any(func_name, all_function_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledFunctions",
-                                message=f"Referenced function '{func_name}' not defined",
-                            )
-                        )
-
-            # Validate enabled agent references (for agent calling)
-            if "enabledAgents" in agent and agent["enabledAgents"]:
-                # Build current agent's full name for self-reference check
-                current_agent_ref = f"{agent.get('namespace', 'default')}/{agent['name']}"
-                for agent_ref in agent["enabledAgents"]:
-                    if not _ref_matches_any(agent_ref, all_agent_names) and agent_ref != current_agent_ref:
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledAgents",
-                                message=f"Referenced agent '{agent_ref}' not defined",
-                            )
-                        )
-
-            # Validate enabled skill references
-            if "enabledSkills" in agent and agent["enabledSkills"]:
-                for skill_ref in agent["enabledSkills"]:
-                    # Support both string format and dict format {"skill": "ns/name", "preload": bool}
-                    ref_name = skill_ref["skill"] if isinstance(skill_ref, dict) else skill_ref
-                    if not _ref_matches_any(ref_name, all_skill_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledSkills",
-                                message=f"Referenced skill '{ref_name}' not defined",
-                            )
-                        )
-
-            # Validate enabled query references
-            if "enabledQueries" in agent and agent["enabledQueries"]:
-                for query_ref in agent["enabledQueries"]:
-                    if not _ref_matches_any(query_ref, all_query_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledQueries",
-                                message=f"Referenced query '{query_ref}' not defined",
-                            )
-                        )
-
-            # Validate enabled collection references
-            if "enabledCollections" in agent and agent["enabledCollections"]:
-                for coll_entry in agent["enabledCollections"]:
-                    # Support both string and dict format
-                    if isinstance(coll_entry, str):
-                        coll_ref = coll_entry
-                    elif isinstance(coll_entry, dict):
-                        coll_ref = coll_entry.get("collection", "")
-                    else:
-                        coll_ref = str(coll_entry)
-                    if not _ref_matches_any(coll_ref, all_collection_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledCollections",
-                                message=f"Referenced collection '{coll_ref}' not defined",
-                            )
-                        )
-
-            # Validate enabled component references
-            if "enabledComponents" in agent and agent["enabledComponents"]:
-                for comp_ref in agent["enabledComponents"]:
-                    if not _ref_matches_any(comp_ref, all_component_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledComponents",
-                                message=f"Referenced component '{comp_ref}' not defined",
-                            )
-                        )
-
-            # Validate enabled store references
-            if "enabledStores" in agent and agent["enabledStores"]:
-                for store_entry in agent["enabledStores"]:
-                    store_ref = store_entry if isinstance(store_entry, str) else store_entry.get("store", "")
-                    if not _ref_matches_any(store_ref, all_store_names):
-                        errors.append(
-                            ConfigValidationError(
-                                path=f"spec.agents[{i}].enabledStores",
-                                message=f"Referenced store '{store_ref}' not defined",
-                            )
-                        )
+        # Agent references are checked by the agent applier, on every channel,
+        # for what a write adds: create the agent, its tools, then add them.
+        # Checking every listed one here blocked editing an agent that still
+        # holds an older reference to something since removed.
 
         # Validate component references
         for i, comp in enumerate(spec.get("components", [])):

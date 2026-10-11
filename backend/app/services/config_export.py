@@ -8,7 +8,6 @@ import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.encryption import encryption_service
 from app.models.agent import Agent
 from app.models.component import Component
 from app.models.connector import Connector
@@ -73,6 +72,7 @@ class ConfigExportService:
         config_dict["spec"]["roles"] = await self._export_roles()
         config_dict["spec"]["users"] = await self._export_users()
         config_dict["spec"]["llmProviders"] = await self._export_llm_providers()
+        config_dict["spec"]["databaseConnections"] = await self._export_database_connections()
 
 
         config_dict["spec"]["dependencies"] = await self._export_dependencies()
@@ -98,7 +98,7 @@ class ConfigExportService:
 
     async def _export_roles(self) -> list[dict]:
         """Export roles"""
-        stmt = select(Role)
+        stmt = select(Role).order_by(Role.name)
         if self.managed_only:
             stmt = stmt.where(Role.managed_by == self.managed_by)
 
@@ -115,7 +115,11 @@ class ConfigExportService:
                 role_dict["emailDomain"] = role.email_domain
 
             # Export permissions
-            perm_stmt = select(RolePermission).where(RolePermission.role_id == role.id)
+            perm_stmt = (
+                select(RolePermission)
+                .where(RolePermission.role_id == role.id)
+                .order_by(RolePermission.permission_key)
+            )
             perm_result = await self.db.execute(perm_stmt)
             permissions = perm_result.scalars().all()
             if permissions:
@@ -128,8 +132,8 @@ class ConfigExportService:
         return exported
 
     async def _export_users(self) -> list[dict]:
-        """Export users"""
-        stmt = select(User)
+        """Export users (current role memberships only)."""
+        stmt = select(User).order_by(User.email)
         if self.managed_only:
             stmt = stmt.where(User.managed_by == self.managed_by)
 
@@ -141,17 +145,18 @@ class ConfigExportService:
             # Get user roles
             from app.models.user import UserRole
 
-            member_stmt = select(UserRole).where(UserRole.user_id == user.id)
+            member_stmt = select(UserRole).where(UserRole.user_id == user.id, UserRole.active.is_(True))
             member_result = await self.db.execute(member_stmt)
             memberships = member_result.scalars().all()
 
-            role_stmt = select(Role).where(Role.id.in_([m.role_id for m in memberships]))
+            role_stmt = select(Role).where(Role.id.in_([m.role_id for m in memberships])).order_by(Role.name)
             role_result = await self.db.execute(role_stmt)
             roles = role_result.scalars().all()
 
+            # lastLoginAt is runtime state, not config (the config schema
+            # doesn't even read it); ended memberships aren't roles held.
             user_dict = {
                 "email": user.email,
-                "lastLoginAt": user.last_login_at.isoformat() if user.last_login_at else None,
                 "roles": [r.name for r in roles],
             }
 
@@ -177,36 +182,71 @@ class ConfigExportService:
 
         return exported
 
+    async def _export_database_connections(self) -> list[dict]:
+        """Export database connections (they weren't exported at all), with
+        their annotations. The password only with include_secrets. The
+        built-in connection is the platform's, per instance: left out."""
+        from app.models.database_connection import DatabaseConnection
+        from app.models.table_annotation import TableAnnotation
+        from app.services.resources.database_connections import SYSTEM, DatabaseConnectionApplier
+
+        applier = DatabaseConnectionApplier()
+        stmt = (
+            select(DatabaseConnection)
+            .where(DatabaseConnection.managed_by.is_distinct_from(SYSTEM))
+            .order_by(DatabaseConnection.name)
+        )
+        if self.managed_only:
+            stmt = stmt.where(DatabaseConnection.managed_by == self.managed_by)
+        exported = []
+        for connection in (await self.db.execute(stmt)).scalars().all():
+            entry = applier.spec_from_row(connection).to_config()
+            if self.include_secrets:
+                password = applier.readable_password(connection)
+                if password:
+                    entry["password"] = password
+            annotations = (await self.db.execute(
+                select(TableAnnotation)
+                .where(TableAnnotation.database_connection_id == connection.id)
+                .order_by(TableAnnotation.schema_name, TableAnnotation.table_name, TableAnnotation.column_name)
+            )).scalars().all()
+            if annotations:
+                entry["annotations"] = [
+                    _remove_none_values({
+                        "schemaName": a.schema_name, "tableName": a.table_name,
+                        "columnName": a.column_name, "displayName": a.display_name,
+                        "description": a.description,
+                    })
+                    for a in annotations
+                ]
+            exported.append(entry)
+        return exported
+
     async def _export_llm_providers(self) -> list[dict]:
-        """Export LLM providers"""
-        stmt = select(LLMProvider).where(LLMProvider.is_active == True)
+        """Export LLM providers, switched-off ones included (isActive: false).
+        The key only with include_secrets."""
+        from app.services.resources.llm_providers import LLMProviderApplier
+
+        applier = LLMProviderApplier()
+        stmt = select(LLMProvider).order_by(LLMProvider.name)
         if self.managed_only:
             stmt = stmt.where(LLMProvider.managed_by == self.managed_by)
-
-        result = await self.db.execute(stmt)
-        providers = result.scalars().all()
-
         exported = []
-        for provider in providers:
-            provider_dict = {
-                "name": provider.name,
-                "type": provider.provider_type,
-                "models": provider.config.get("models", []) if provider.config else [],
-                "isActive": provider.is_active,
-            }
-            if provider.api_endpoint:
-                provider_dict["endpoint"] = provider.api_endpoint
-
-            if self.include_secrets and provider.api_key:
-                provider_dict["apiKey"] = encryption_service.decrypt(provider.api_key)
-
+        for provider in (await self.db.execute(stmt)).scalars().all():
+            provider_dict = applier.spec_from_row(provider).to_config()
+            if self.include_secrets:
+                key = applier.readable_key(provider)
+                if key:
+                    provider_dict["apiKey"] = key
             exported.append(provider_dict)
-
         return exported
 
     async def _export_dependencies(self) -> list[dict]:
         """Export Python dependencies."""
-        result = await self.db.execute(select(Dependency))
+        stmt = select(Dependency).order_by(Dependency.package_name)
+        if self.managed_only:
+            stmt = stmt.where(Dependency.managed_by == self.managed_by)
+        result = await self.db.execute(stmt)
         dependencies = result.scalars().all()
 
         exported = []
@@ -221,7 +261,7 @@ class ConfigExportService:
 
     async def _export_secrets(self) -> list[dict]:
         """Export secrets (names and descriptions only, never values)."""
-        stmt = select(Secret)
+        stmt = select(Secret).where(Secret.visibility == "shared").order_by(Secret.name)
         if self.managed_only:
             stmt = stmt.where(Secret.managed_by == self.managed_by)
 
@@ -256,44 +296,38 @@ class ConfigExportService:
         return [serialize_mcp_server(s) for s in result.scalars().all()]
 
     async def _export_pipelines(self) -> list[dict]:
-        """Export pipelines (cursor/failure state is runtime, not exported)."""
+        """Export pipelines, inactive ones included (as isActive: false).
+        Cursor and failure state are runtime, not exported."""
         from app.models.pipeline import Pipeline
         from app.services.resource_serializers import serialize_pipeline
 
-        stmt = select(Pipeline).where(Pipeline.is_active == True)
+        stmt = select(Pipeline).order_by(Pipeline.namespace, Pipeline.name)
         if self.managed_only:
             stmt = stmt.where(Pipeline.managed_by == self.managed_by)
         result = await self.db.execute(stmt)
         return [serialize_pipeline(p) for p in result.scalars().all()]
 
     async def _export_functions(self) -> list[dict]:
-        """Export functions"""
-        stmt = select(Function).where(Function.is_active == True)
+        """Export functions, disabled ones included (as isActive: false):
+        leaving them out dropped them from any instance restored from it."""
+        stmt = select(Function).order_by(Function.namespace, Function.name)
         if self.managed_only:
             stmt = stmt.where(Function.managed_by == self.managed_by)
         result = await self.db.execute(stmt)
         return [serialize_function(f) for f in result.scalars().all()]
 
     async def _export_agents(self) -> list[dict]:
-        """Export agents"""
-        stmt = select(Agent).where(Agent.is_active == True)
+        """Export agents, deleted (switched-off) ones included as isActive: false."""
+        from app.services.resources.agents import provider_name
+
+        stmt = select(Agent).order_by(Agent.namespace, Agent.name)
         if self.managed_only:
             stmt = stmt.where(Agent.managed_by == self.managed_by)
         result = await self.db.execute(stmt)
-        agents = result.scalars().all()
-
-        exported = []
-        for agent in agents:
-            provider_name = None
-            if agent.llm_provider_id:
-                provider_result = await self.db.execute(
-                    select(LLMProvider).where(LLMProvider.id == agent.llm_provider_id)
-                )
-                provider = provider_result.scalar_one_or_none()
-                if provider:
-                    provider_name = provider.name
-            exported.append(serialize_agent(agent, provider_name))
-        return exported
+        return [
+            serialize_agent(agent, await provider_name(self.db, agent.llm_provider_id))
+            for agent in result.scalars().all()
+        ]
 
     async def _export_collections(self) -> list[dict]:
         """Export collections (workbenches are chat-scoped, never exported)."""

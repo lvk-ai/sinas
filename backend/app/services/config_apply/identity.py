@@ -3,127 +3,31 @@ Identity resource appliers: roles, role permissions, users, user roles
 """
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.user import Role, RolePermission, User, UserIdentity, UserRole
-from app.schemas.config import OwnershipSkip, ResourceChange
+from app.models.user import Role, User, UserIdentity, UserRole
+from app.schemas.config import OwnershipSkip
 
 logger = logging.getLogger(__name__)
 
 
-async def apply_roles(
-    db: AsyncSession,
-    roles: list,
-    dry_run: bool,
-    managed_by: str,
-    config_name: str,
-    calculate_hash: Any,
-    track_change: Any,
-    errors: list[str],
-    warnings: list[str],
-    role_ids: dict[str, str],
-) -> None:
-    """Apply role configurations"""
-    for role_config in roles:
-        try:
-            # Check if exists
-            stmt = select(Role).where(Role.name == role_config.name)
-            result = await db.execute(stmt)
-            existing = result.scalar_one_or_none()
+async def _find_user(db: AsyncSession, email: str) -> User | None:
+    """The user whose stored email normalizes to `email` (normalized), as
+    login and the API match: one stored un-normalized by an earlier apply is
+    found, not duplicated. Candidates are narrowed in the database, then
+    compared with normalize_email itself, so every character it strips
+    counts. An exact match wins, then the oldest."""
+    from app.core.auth import normalize_email
 
-            # Calculate hash. Permissions are part of it: without them, a
-            # permission-only change hits the checksum-unchanged `continue`
-            # below and is silently never applied (package upgrades are
-            # mostly permission changes).
-            config_hash = calculate_hash(
-                {
-                    "name": role_config.name,
-                    "description": role_config.description,
-                    "email_domain": role_config.emailDomain,
-                    "permissions": sorted(
-                        (p.key, p.value) for p in (role_config.permissions or [])
-                    ),
-                }
-            )
-
-            if existing:
-                # Check if config-managed
-                if existing.managed_by != managed_by:
-                    warnings.append(
-                        OwnershipSkip(f"Role '{role_config.name}' exists but is not managed by '{managed_by}'. Skipping.")
-                    )
-                    track_change("unchanged", "roles", role_config.name)
-                    role_ids[role_config.name] = str(existing.id)
-                    continue
-
-                # Check if changed
-                if existing.config_checksum == config_hash:
-                    track_change("unchanged", "roles", role_config.name)
-                    role_ids[role_config.name] = str(existing.id)
-                    continue
-
-                # Update
-                if not dry_run:
-                    existing.description = role_config.description
-                    existing.email_domain = role_config.emailDomain
-                    existing.config_checksum = config_hash
-                    existing.updated_at = datetime.utcnow()
-
-                track_change(
-                    "update", "roles", role_config.name, details="Updated role configuration"
-                )
-                role_ids[role_config.name] = str(existing.id)
-
-            else:
-                # Create new
-                if not dry_run:
-                    new_role = Role(
-                        name=role_config.name,
-                        description=role_config.description,
-                        email_domain=role_config.emailDomain,
-                        managed_by=managed_by,
-                        config_name=config_name,
-                        config_checksum=config_hash,
-                    )
-                    db.add(new_role)
-                    await db.flush()
-                    role_ids[role_config.name] = str(new_role.id)
-                else:
-                    role_ids[role_config.name] = "dry-run-id"
-
-                track_change(
-                    "create", "roles", role_config.name, details="Created new role"
-                )
-
-            # Apply permissions
-            if not dry_run and role_config.permissions:
-                await apply_role_permissions(
-                    db, role_ids[role_config.name], role_config.permissions
-                )
-
-        except Exception as e:
-            errors.append(f"Error applying role '{role_config.name}': {str(e)}")
-
-
-async def apply_role_permissions(
-    db: AsyncSession, role_id: str, permissions: list
-) -> None:
-    """Apply permissions to a role"""
-    # Delete existing permissions for this role
-    stmt = delete(RolePermission).where(RolePermission.role_id == role_id)
-    await db.execute(stmt)
-
-    # Add new permissions
-    for perm in permissions:
-        perm_obj = RolePermission(
-            role_id=role_id,
-            permission_key=perm.key,
-            permission_value=perm.value,
-        )
-        db.add(perm_obj)
+    candidates = (await db.execute(
+        select(User)
+        .where(func.lower(User.email).contains(email, autoescape=True))
+        .order_by((User.email == email).desc(), User.created_at)
+    )).scalars().all()
+    return next((u for u in candidates if normalize_email(u.email) == email), None)
 
 
 async def apply_users(
@@ -136,20 +40,19 @@ async def apply_users(
     track_change: Any,
     errors: list[str],
     warnings: list[str],
-    role_ids: dict[str, str],
     user_ids: dict[str, str],
 ) -> None:
-    """Apply user configurations"""
+    """Apply user configurations (roles are applied before, by their applier)."""
     for user_config in users:
         try:
-            stmt = select(User).where(User.email == user_config.email)
-            result = await db.execute(stmt)
-            existing = result.scalar_one_or_none()
+            # Matched as login and the API match (trimmed, any case), so a user
+            # an earlier apply stored un-normalized is found, not duplicated.
+            existing = await _find_user(db, user_config.email)
 
             config_hash = calculate_hash(
                 {
                     "email": user_config.email,
-                    "roles": sorted(user_config.roles),
+                    "roles": sorted(user_config.roles) if user_config.roles is not None else None,
                     "customFields": user_config.customFields,
                     "identities": sorted(
                         ([i.provider, i.subject, i.metadata] for i in user_config.identities),
@@ -173,6 +76,7 @@ async def apply_users(
                     continue
 
                 if not dry_run:
+                    existing.email = user_config.email  # normalized
                     existing.custom_fields = user_config.customFields
                     existing.config_checksum = config_hash
                     existing.updated_at = datetime.utcnow()
@@ -198,10 +102,9 @@ async def apply_users(
                 track_change("create", "users", user_config.email)
 
             # Apply role memberships
-            if not dry_run and user_config.roles:
+            if not dry_run and user_config.roles is not None:
                 await apply_user_roles(
-                    db, user_ids[user_config.email], user_config.roles,
-                    role_ids, warnings,
+                    db, user_ids[user_config.email], user_config.roles, warnings,
                 )
 
             # Apply external identities (declarative: config is the full set)
@@ -271,23 +174,34 @@ async def apply_user_roles(
     db: AsyncSession,
     user_id: str,
     role_names: list[str],
-    role_ids: dict[str, str],
     warnings: list[str],
 ) -> None:
-    """Apply role memberships to a user"""
-    # Remove existing memberships for this user
-    stmt = delete(UserRole).where(UserRole.user_id == user_id)
-    await db.execute(stmt)
+    """Set a user's role memberships to the declared roles. Roles are found
+    by name in the database (they're applied before users). Memberships the
+    config no longer declares are ended the way the API ends them (inactive,
+    removed_at), not deleted: deleting every row of the user wiped membership
+    history, including memberships the API had ended."""
+    from datetime import UTC
 
-    # Add new memberships
+    declared: dict = {}
     for role_name in role_names:
-        if role_name not in role_ids:
+        role_id = (await db.execute(select(Role.id).where(Role.name == role_name))).scalar_one_or_none()
+        if role_id is None:
             warnings.append(f"Role '{role_name}' not found for user membership")
             continue
+        declared[role_id] = role_name
 
-        membership = UserRole(
-            user_id=user_id,
-            role_id=role_ids[role_name],
-            active=True,
-        )
-        db.add(membership)
+    memberships = (await db.execute(select(UserRole).where(UserRole.user_id == user_id))).scalars().all()
+    now = datetime.now(UTC)
+    for role_id in declared:
+        held = [m for m in memberships if m.role_id == role_id]
+        if any(m.active for m in held):
+            continue
+        if held:  # ended before: reactivate the most recent row
+            latest = max(held, key=lambda m: m.added_at or now)
+            latest.active, latest.removed_at, latest.removed_by = True, None, None
+        else:
+            db.add(UserRole(user_id=user_id, role_id=role_id, active=True))
+    for membership in memberships:
+        if membership.active and membership.role_id not in declared:
+            membership.active, membership.removed_at = False, now
