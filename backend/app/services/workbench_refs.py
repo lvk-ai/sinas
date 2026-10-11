@@ -53,12 +53,20 @@ class ReferenceError_(Exception):
     sentinel must never leak through to the tool as literal arguments."""
 
 
-def contains_reference(arguments_str: Any) -> bool:
-    """Cheap pre-check so the common case (no references) costs nothing."""
-    if isinstance(arguments_str, str):
-        return f'"{SENTINEL_KEY}"' in arguments_str
-    if isinstance(arguments_str, (dict, list)):
-        return f'"{SENTINEL_KEY}"' in json.dumps(arguments_str)
+def contains_reference(arguments: Any) -> bool:
+    """Cheap pre-check so the common case (no references) costs nothing.
+
+    A JSON string is parsed first: the key may be spelled with escapes
+    (`"\\u0024workbench"`) and must still count as a reference."""
+    if isinstance(arguments, str):
+        if f'"{SENTINEL_KEY}"' in arguments:
+            return True
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            return False
+    if isinstance(arguments, (dict, list)):
+        return f'"{SENTINEL_KEY}"' in json.dumps(arguments)
     return False
 
 
@@ -98,7 +106,12 @@ async def resolve_references(db, chat, user_id: str, arguments: Any) -> Any:
 
     async def _resolve_one(ref: dict[str, Any]) -> str:
         path = ref[SENTINEL_KEY]
-        cache_key = (path, ref.get("encoding") or "")
+        encoding = ref.get("encoding")
+        if encoding is not None and not isinstance(encoding, str):
+            raise ReferenceError_(
+                f"Invalid workbench reference {path!r}: 'encoding' must be a string"
+            )
+        cache_key = (path, encoding or "")
         if cache_key in resolved_cache:
             return resolved_cache[cache_key]
         err = _validate_path(path)
@@ -214,6 +227,15 @@ async def spill_result(
         if not await chat_has_workbench_enabled(db, chat):
             return None
         workbench = await get_or_create_workbench(db, chat)
+        # workbench_read pages by line: a JSON result saved as one line
+        # could only ever be read whole (and clipped again). Pretty-print
+        # it so an agent without code execution can page through it.
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            content = json.dumps(parsed, indent=2, ensure_ascii=False)
         path = _spill_filename(tool_name, tool_call_id, content)
         result = await _write_bytes(
             db,
