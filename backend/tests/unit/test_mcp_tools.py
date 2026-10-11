@@ -979,3 +979,32 @@ class TestReviewFollowUps:
         assert "headers" not in data and "auth" not in data
         assert "pw" not in data["url"] and "s3cret" not in json.dumps(out)
 
+
+    @pytest.mark.asyncio
+    async def test_two_bindings_for_one_server_are_unioned_at_call_time(self, db, fake_mcp, server, test_user):
+        from app.models.agent import Agent
+        from app.models.chat import Chat
+
+        ref = f"{server.namespace}/{server.name}"
+        agent = Agent(user_id=test_user.id, namespace=f"ns{_uid()}", name="dup",
+                      enabled_mcp_servers=[{"server": ref, "tools": ["add"]}, {"server": ref, "tools": ["echo"]}])
+        db.add(agent)
+        await db.flush()
+        chat = Chat(user_id=test_user.id, agent_id=agent.id, title="t")
+        db.add(chat)
+        await db.flush()
+        out = await McpToolConverter().execute_tool(
+            db, "mcp_x", {"text": "hi"}, str(test_user.id), _tool_def(server, "echo")["function"]["_metadata"], chat=chat,
+        )
+        assert out == {"text": "hi"}
+
+    @pytest.mark.asyncio
+    async def test_preview_reports_a_binding_to_a_missing_server(self, db, admin_user):
+        from app.services.config_apply.service import ConfigApplyService
+        from tests.unit.config_parity.test_mcp_servers import _config
+
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), managed_by="config", auto_commit=False)
+        result = await svc.apply_config(_config({
+            "agents": [{"namespace": f"ns{_uid()}", "name": "p", "systemPrompt": "x", "enabledMcpServers": ["tools/none-such"]}],
+        }), dry_run=True)
+        assert not result.success and "tools/none-such" in result.errors[0]
