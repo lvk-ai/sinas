@@ -462,6 +462,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     user_token = kwargs["user_token"]
     pending_approval_id = kwargs["pending_approval_id"]
     approved = kwargs["approved"]
+    rejected_tool_call_ids = list(kwargs.get("rejected_tool_call_ids") or [])
     channel_id = kwargs["channel_id"]
 
     from app.services.delegation import current_channel_id, current_delegation_depth
@@ -553,6 +554,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                             channel_id=channel_id, agent=base_fields.get("agent"),
                             defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
                             enqueued_at=kwargs.get("enqueued_at"),
+                            rejected_tool_call_ids=rejected_tool_call_ids,
                         ),
                         redis=redis, base_fields=base_fields,
                     ):
@@ -577,6 +579,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                         max_tokens=pending_approval.conversation_context.get("max_tokens"),
                         tools=pending_approval.conversation_context.get("tools", []),
                         status_templates=status_templates,
+                        rejected_tool_call_ids=rejected_tool_call_ids,
                     ):
                         if isinstance(chunk, dict):
                             if _is_suspension_chunk(chunk):
@@ -585,13 +588,15 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                 finally:
                     await chat_steering.release_chat_lock(chat_id, lock_token)
             else:
-                # Handle rejection - publish rejection info
-                await stream_relay.publish(channel_id, {
-                    "type": "tool_rejected",
-                    "tool_call_id": pending_approval.tool_call_id,
-                    "function_namespace": pending_approval.function_namespace,
-                    "function_name": pending_approval.function_name,
-                }, ttl=stream_ttl)
+                # Nothing in the round was allowed: report each rejection.
+                for tc in pending_approval.all_tool_calls or []:
+                    if tc.get("id") in rejected_tool_call_ids or tc.get("id") == pending_approval.tool_call_id:
+                        await stream_relay.publish(channel_id, {
+                            "type": "tool_rejected",
+                            "tool_call_id": tc.get("id"),
+                            "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
+                            "function_name": tc.get("function", {}).get("name"),
+                        }, ttl=stream_ttl)
 
         if _suspended:
             # The approved round suspended again (delegations or an ask_user

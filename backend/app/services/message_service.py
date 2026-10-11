@@ -960,8 +960,12 @@ class MessageService:
         status_templates: dict[str, str] = {},
         depth: int = 0,
         agent_label: Optional[str] = None,
+        rejected_tool_call_ids: Optional[list[str]] = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Execute tool calls, stream LLM follow-up response, and save final message."""
+        """Execute tool calls, stream LLM follow-up response, and save final message.
+
+        `rejected_tool_call_ids`: calls of this round the user refused at
+        the approval gate — answered with a rejection result, never run."""
         import sys
         print(f"🔧 _handle_tool_calls: {len(tool_calls)} calls: {[tc['function']['name'] for tc in tool_calls]}", flush=True, file=sys.stderr)
         if permissions is None:
@@ -1002,6 +1006,22 @@ class MessageService:
 
         # Separate tool calls into parallel and sequential groups
         valid_tool_calls = [tc for tc in tool_calls if tc.get("id")]
+
+        rejected_ids = set(rejected_tool_call_ids or [])
+        if rejected_ids:
+            # The user said no to these at the approval gate: the model gets
+            # a rejection result (so the transcript stays valid and it can
+            # react), and nothing of them executes.
+            rejected_content = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+            for tc in valid_tool_calls:
+                if tc["id"] in rejected_ids:
+                    self.db.add(
+                        Message(chat_id=chat_id, role="tool", content=rejected_content,
+                                tool_call_id=tc["id"], name=tc["function"]["name"])
+                    )
+                    yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": rejected_content}
+            await self.db.commit()
+            valid_tool_calls = [tc for tc in valid_tool_calls if tc["id"] not in rejected_ids]
 
         # Cooperative interrupt (issue #142): boundary check before executing
         # this round's tools. Synthetic tool results keep the transcript
