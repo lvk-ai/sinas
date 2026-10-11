@@ -238,9 +238,11 @@ async def build_conversation_history(
         if not (msg.role == "tool" and msg.tool_call_id and msg.tool_call_id not in all_tool_call_ids)
     ]
 
-    # Compact older tool results: keep last N inline, replace older with references.
-    # Safe here because build_conversation_history only runs for the initial LLM call —
-    # the follow-up after tool execution rebuilds from raw DB messages, bypassing this.
+    # Compact older tool results: keep last N inline, replace older with
+    # references the model can follow with retrieve_tool_result. Runs for the
+    # initial call and at every tool-round boundary (the follow-up rebuild
+    # goes through this builder too), so the newest results stay inline
+    # while a long turn's older ones shrink to pointers.
     max_inline = settings.tool_result_max_inline
     tool_result_indices = [
         idx for idx, msg in enumerate(chat_messages)
