@@ -100,6 +100,18 @@ export function AgentDetail() {
   // Raw text of an MCP tool-pattern input while it is being edited; split
   // into patterns on blur (splitting on every keystroke ate the separators).
   const [mcpPatternDrafts, setMcpPatternDrafts] = useState<Record<string, string>>({});
+  // A server may be bound more than once (REST and config allow it; the
+  // allowed tools are the union). The editor shows that union and writes
+  // it back as one binding, so editing never drops a sibling's patterns.
+  const mcpPatternsOf = (bindings: any[], server: string): string[] =>
+    Array.from(new Set(bindings.filter((x: any) => x.server === server).flatMap((x: any) => x.tools || [])));
+  const withMcpPatterns = (bindings: any[], server: string, tools: string[]): any[] => {
+    const first = bindings.findIndex((x: any) => x.server === server);
+    if (first < 0) return bindings;
+    return bindings
+      .map((x: any, i: number) => (i === first ? { ...x, tools } : x))
+      .filter((x: any, i: number) => i === first || x.server !== server);
+  };
   const [iconMode, setIconMode] = useState<'collection' | 'url'>('collection');
   const [iconCollectionNs, setIconCollectionNs] = useState('');
   const [iconCollectionName, setIconCollectionName] = useState('');
@@ -171,14 +183,11 @@ export function AgentDetail() {
     let submitted = formData;
     if (Object.keys(mcpPatternDrafts).length > 0) {
       const enabled: any[] = formData.enabled_mcp_servers || agent?.enabled_mcp_servers || [];
-      submitted = {
-        ...formData,
-        enabled_mcp_servers: enabled.map((x: any) =>
-          mcpPatternDrafts[x.server] !== undefined
-            ? { ...x, tools: mcpPatternDrafts[x.server].split(',').map((t: string) => t.trim()).filter(Boolean) }
-            : x
-        ),
-      };
+      let merged = enabled;
+      for (const [server, draft] of Object.entries(mcpPatternDrafts)) {
+        merged = withMcpPatterns(merged, server, draft.split(',').map((t: string) => t.trim()).filter(Boolean));
+      }
+      submitted = { ...formData, enabled_mcp_servers: merged };
     }
     updateMutation.mutate(submitted);
   };
@@ -1495,11 +1504,11 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                               <label className="text-xs text-gray-500">Tool patterns (comma-separated globs; empty = all)</label>
                               <input
                                 type="text"
-                                value={mcpPatternDrafts[ref] ?? (entry.tools || []).join(', ')}
+                                value={mcpPatternDrafts[ref] ?? mcpPatternsOf(enabled, ref).join(', ')}
                                 onChange={(e) => setMcpPatternDrafts({ ...mcpPatternDrafts, [ref]: e.target.value })}
                                 onBlur={(e) => {
                                   const tools = e.target.value.split(',').map((t: string) => t.trim()).filter(Boolean);
-                                  const updated = enabled.map((x: any) => (x.server === ref ? { ...x, tools } : x));
+                                  const updated = withMcpPatterns(enabled, ref, tools);
                                   setFormData({ ...formData, enabled_mcp_servers: updated });
                                   const { [ref]: _draft, ...rest } = mcpPatternDrafts;
                                   setMcpPatternDrafts(rest);

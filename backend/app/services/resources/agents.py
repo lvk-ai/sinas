@@ -239,6 +239,8 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         # reference never looks added.
         before = _normalized(current)
         for kind, label, model in _reference_kinds():
+            if kind == "mcp_servers":
+                continue  # _check_mcp_bindings above: existence, activity and permission
             added = _refs(spec, kind) - _refs(before, kind)
             wanted = []
             for ref in sorted(added):
@@ -291,6 +293,7 @@ def _reference_kinds():
     from app.models.connector import Connector
     from app.models.file import Collection
     from app.models.function import Function
+    from app.models.mcp_server import McpServer
     from app.models.pipeline import Pipeline
     from app.models.query import Query
     from app.models.skill import Skill
@@ -306,6 +309,7 @@ def _reference_kinds():
         ("connectors", "connector", Connector),
         ("pipelines", "pipeline", Pipeline),
         ("agents", "agent", Agent),
+        ("mcp_servers", "MCP server", McpServer),  # the applier's kind, as prune keys it
     )
 
 
@@ -325,6 +329,8 @@ def _refs(spec: Optional[AgentSpec], kind: str) -> set[str]:
         return {c.collection for c in spec.enabled_collections}
     if kind == "connectors":
         return {c.get("connector") for c in spec.enabled_connectors if isinstance(c, dict) and c.get("connector")}
+    if kind == "mcp_servers":
+        return {b.server for b in (spec.enabled_mcp_servers or [])}
     field = {"queries": "enabled_queries", "components": "enabled_components",
              "pipelines": "enabled_pipelines", "agents": "enabled_agents"}[kind]
     return {r for r in getattr(spec, field) if isinstance(r, str)}
