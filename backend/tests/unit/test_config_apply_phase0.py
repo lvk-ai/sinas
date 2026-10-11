@@ -53,28 +53,18 @@ def test_startup_autoapply_formatting_smoke():
 
 class TestSecretsApplierScoping:
     async def _apply(self, db: AsyncSession, owner_id, name, value):
-        from app.services.config_apply.resources import apply_secrets
+        from app.schemas.config import SinasConfig
+        from app.services.config_apply.service import ConfigApplyService
 
-        class _Cfg:
-            def __init__(self, name, value):
-                self.name = name
-                self.value = value
-                self.description = None
-
-        changes: list = []
-        await apply_secrets(
-            db=db,
-            secrets=[_Cfg(name, value)],
-            dry_run=False,
-            managed_by="config",
-            config_name="test",
-            owner_user_id=owner_id,
-            calculate_hash=lambda d: "hash-" + str(sorted(d.items())),
-            track_change=lambda *a: changes.append(a),
-            errors=[],
-            warnings=[],
-        )
-        return changes
+        config = SinasConfig.model_validate({
+            "apiVersion": "sinas.co/v1", "kind": "SinasConfig", "metadata": {"name": "test"},
+            "spec": {"secrets": [{"name": name, "value": value}]},
+        })
+        result = await ConfigApplyService(
+            db, "test", owner_user_id=owner_id, managed_by="config", auto_commit=False
+        ).apply_config(config)
+        assert result.success, result.errors
+        return result
 
     async def test_private_secret_of_another_user_is_not_overwritten(
         self, db: AsyncSession, test_user, admin_user
@@ -201,21 +191,18 @@ class TestApplyNotifications:
 
 class TestFunctionVersionChurn:
     async def _apply(self, db, owner_id, func_config):
-        from app.services.config_apply.resources import apply_functions
+        from app.schemas.config import SinasConfig
+        from app.services.config_apply.service import ConfigApplyService
 
-        return await apply_functions(
-            db=db,
-            functions=[func_config],
-            dry_run=False,
-            managed_by="config",
-            config_name="test",
-            owner_user_id=owner_id,
-            calculate_hash=lambda d: "hash-" + str(sorted(str(d))),
-            track_change=lambda *a: None,
-            errors=[],
-            warnings=[],
-            function_ids={},
-        )
+        config = SinasConfig.model_validate({
+            "apiVersion": "sinas.co/v1", "kind": "SinasConfig", "metadata": {"name": "test"},
+            "spec": {"functions": [func_config.model_dump(exclude_none=True)]},
+        })
+        result = await ConfigApplyService(
+            db, "test", owner_user_id=str(owner_id), managed_by="config", auto_commit=False
+        ).apply_config(config)
+        assert result.success, result.errors
+        return result
 
     async def _versions(self, db, name):
         from sqlalchemy import select

@@ -16,18 +16,10 @@ from app.schemas.config import (
     SinasConfig,
 )
 
-from app.services.config_apply.identity import apply_roles, apply_users
+from app.services.config_apply.identity import apply_users
 from app.services.config_apply.data_sources import (
-    apply_database_connections,
-    apply_llm_providers,
+    apply_connection_annotations,
 )
-from app.services.config_apply.resources import (
-    apply_dependencies,
-    apply_functions,
-    apply_pipelines,
-    apply_secrets,
-)
-from app.services.config_apply.agents import apply_agents
 from pydantic.alias_generators import to_camel
 
 from app.services.resources import ApplyContext, SideEffectBus
@@ -47,8 +39,12 @@ class ConfigApplyService:
         auto_commit: bool = True,
         skip_resource_types: Optional[set[str]] = None,
         prune_missing: bool = False,
+        supplied_secrets: Optional[set[str]] = None,
     ):
         self.db = db
+        # Shared secrets whose value a package preview has but doesn't save
+        # (secret variables): the dry run counts them as present.
+        self.supplied_secrets = supplied_secrets or set()
         self.config_name = config_name
         self.owner_user_id = owner_user_id
         self.managed_by = managed_by
@@ -74,13 +70,8 @@ class ConfigApplyService:
         self.warnings: list[str] = []
 
         # Resource lookup caches (name -> id)
-        self.role_ids: dict[str, str] = {}
         self.user_ids: dict[str, str] = {}
         self.datasource_ids: dict[str, str] = {}
-        self.function_ids: dict[str, str] = {}
-        self.agent_ids: dict[str, str] = {}
-        self.llm_provider_ids: dict[str, str] = {}
-        self.database_connection_ids: dict[str, str] = {}
         self.webhook_ids: dict[str, str] = {}
 
     def _calculate_hash(self, data: dict[str, Any]) -> str:
@@ -149,6 +140,55 @@ class ConfigApplyService:
             }
             for kind in ("functions", "agents", "pipelines")
         }
+        # What agents may refer to: declared in the same apply counts (it's
+        # applied all-or-nothing, and before the agents).
+        for kind in ("skills", "queries", "stores", "collections", "components", "connectors"):
+            self._pending_references[kind] = {
+                f"{item.namespace}/{item.name}": True for item in getattr(config.spec, kind)
+            }
+        # A function or agent the config leaves isActive unset on keeps its
+        # current state, so a disabled one stays disabled: a preview must see
+        # that, or it accepts a reference the real apply refuses. A
+        # declaration that does set isActive (the same one listed again)
+        # decides, as it does in the real apply.
+        from sqlalchemy import or_, select
+
+        from app.models.agent import Agent
+        from app.models.function import Function
+        from app.models.pipeline import Pipeline
+
+        for kind, model in (("functions", Function), ("agents", Agent), ("pipelines", Pipeline)):
+            items = getattr(config.spec, kind)
+            unset = [i for i in items if i.isActive is None]
+            if not unset:
+                continue
+            explicit = {f"{i.namespace}/{i.name}" for i in items if i.isActive is not None}
+            disabled = (await self.db.execute(
+                select(model.namespace, model.name).where(
+                    model.is_active.is_(False),
+                    or_(*((model.namespace == i.namespace) & (model.name == i.name) for i in unset)),
+                )
+            )).all()
+            for namespace, name in disabled:
+                if f"{namespace}/{name}" not in explicit:
+                    self._pending_references[kind][f"{namespace}/{name}"] = False
+        if "llmProviders" not in self.skip_resource_types:
+            self._pending_references["llmProviders"] = {
+                item.name: True for item in config.spec.llmProviders
+            }
+        self._pending_references["secrets"] = {name: True for name in self.supplied_secrets}
+        if not dry_run:
+            # Promotions to "the default" serialize on a lock taken before any
+            # row lock this apply takes (lock order: see lock_singleton).
+            from app.services.resources import ApplyContext
+            from app.services.resources.base import lock_singleton
+            from app.services.resources.registry import all_appliers
+
+            for applier in all_appliers():
+                if applier.singleton_lock and applier.kind not in self.skip_resource_types and any(
+                    getattr(item, "isDefault", None) for item in getattr(config.spec, applier.config_section)
+                ):
+                    await lock_singleton(ApplyContext(db=self.db, origin="config"), applier.singleton_lock)
         # Packages skip connections: one declared there is never created.
         if "databaseConnections" not in self.skip_resource_types:
             self._pending_references["databaseConnections"] = {
@@ -166,79 +206,39 @@ class ConfigApplyService:
                 errors=self.errors,
                 warnings=self.warnings,
             )
-            common_with_owner = dict(**common, owner_user_id=self.owner_user_id)
 
             # Apply resources in dependency order
+            from app.services.resources.registry import all_appliers
+
+            # Roles first: users (still applied by the legacy path) hold them.
+            role_applier = next(a for a in all_appliers() if a.kind == "roles")
             if "roles" not in self.skip_resource_types:
-                await apply_roles(
-                    **common,
-                    roles=config.spec.roles,
-                    role_ids=self.role_ids,
-                )
+                await self._apply_kind(role_applier, config.spec.roles, dry_run)
             if "users" not in self.skip_resource_types:
                 await apply_users(
                     **common,
                     users=config.spec.users,
-                    role_ids=self.role_ids,
                     user_ids=self.user_ids,
                 )
-            if "llmProviders" not in self.skip_resource_types:
-                await apply_llm_providers(
-                    **common,
-                    providers=config.spec.llmProviders,
-                    llm_provider_ids=self.llm_provider_ids,
-                )
-            if "databaseConnections" not in self.skip_resource_types:
-                await apply_database_connections(
-                    **common,
-                    connections=config.spec.databaseConnections,
-                    database_connection_ids=self.database_connection_ids,
-                )
 
-            if "secrets" not in self.skip_resource_types:
-                await apply_secrets(
-                    **common_with_owner,
-                    secrets=config.spec.secrets,
-                )
-
-            if "dependencies" not in self.skip_resource_types:
-                await apply_dependencies(
-                    **common_with_owner,
-                    dependencies=config.spec.dependencies,
-                )
-
-            if "functions" not in self.skip_resource_types:
-                await apply_functions(
-                    **common_with_owner,
-                    functions=config.spec.functions,
-                    function_ids=self.function_ids,
-                )
-            if "agents" not in self.skip_resource_types:
-                await apply_agents(
-                    **common_with_owner,
-                    agents=config.spec.agents,
-                    llm_provider_ids=self.llm_provider_ids,
-                    agent_ids=self.agent_ids,
-                )
-            # Pipelines apply after connectors/functions/queries/agents (their
-            # step references), and before the triggers that may target them.
-            if "pipelines" not in self.skip_resource_types:
-                await apply_pipelines(
-                    **common_with_owner,
-                    pipelines=config.spec.pipelines,
-                )
-            # Kinds with a per-resource applier: connectors, skills, queries,
-            # templates, collections, stores, manifests, components, webhooks,
-            # schedules, databaseTriggers — after
+            # Kinds with a per-resource applier: secrets, llmProviders, databaseConnections, dependencies, connectors, functions, agents, pipelines,
+            # skills, queries, templates, collections, stores, manifests,
+            # components, webhooks, schedules, databaseTriggers — after
             # everything they can point at. (Nothing checks a reference to a
-            # connector, skill or query yet; when agents and pipelines
-            # migrate, those move ahead of them.)
+            # connector, function, skill or query from agents or pipelines
+            # yet; when those migrate, these move ahead of them.)
             from app.services.resources.registry import all_appliers
 
             for applier in all_appliers():
-                if applier.kind not in self.skip_resource_types:
+                if applier.kind not in self.skip_resource_types and applier.kind != "roles":
                     await self._apply_kind(
                         applier, getattr(config.spec, applier.config_section), dry_run
+                    )
+                if applier.kind == "databaseConnections" and applier.kind not in self.skip_resource_types:
+                    # Table annotations: an additive layer on the connections
+                    # just applied (never removed by config).
+                    await apply_connection_annotations(
+                        self.db, config.spec.databaseConnections, dry_run, self._track_change, self.errors
                     )
 
             if self.prune_missing:
@@ -307,8 +307,12 @@ class ConfigApplyService:
         from app.services.resources.registry import all_appliers
 
         ctx = self._resource_context(dry_run)
-        for applier in all_appliers():
-            if applier.kind in self.skip_resource_types:
+        appliers = {a.kind: a for a in all_appliers()}
+
+        # What this source no longer declares.
+        candidates: list[tuple[Any, Any, str]] = []
+        for applier in appliers.values():
+            if applier.kind in self.skip_resource_types or not applier.deleted_with_package:
                 continue
             declared = {
                 applier.config_key(item)
@@ -324,17 +328,82 @@ class ConfigApplyService:
                 stmt = stmt.with_for_update().execution_options(populate_existing=True)
             for row in (await self.db.execute(stmt)).scalars().all():
                 key = applier.key_of_row(row)
-                if key in declared:
-                    continue
+                if key not in declared:
+                    candidates.append((applier, row, key))
+        if not candidates:
+            return
+
+        # Collections and stores holding what users put in them stay: a prune
+        # removes definitions, and those contents couldn't be restored from
+        # history. Deleting them stays a deliberate act. Decided first, since
+        # what they keep using must stay too.
+        removable = []
+        for applier, row, key in candidates:
+            contents = await _contents(self.db, applier.kind, row)
+            if contents:
+                self.warnings.append(
+                    f"Kept {applier.label.lower()} '{key}' although no longer declared: it holds "
+                    f"{contents}. Delete it in the console to remove it with its contents."
+                )
+            else:
+                removable.append((applier, row, key))
+
+        removing = {(applier.kind, key) for applier, _row, key in removable}
+        users = await self._users_of(removing, config, appliers, ctx)
+
+        for applier, row, key in removable:
+            label = applier.label.lower()
+            still_used = sorted(users.get((applier.kind, key), ()))
+            if still_used:
+                self.errors.append(
+                    f"Can't remove {label} '{key}': still used by {', '.join(still_used)}. "
+                    "Remove or change those too, or keep declaring it."
+                )
+                continue
+            try:
+                async with self.db.begin_nested():
+                    await applier.delete(row, ctx)
+            except Exception as e:
+                self.errors.append(f"Error removing {label} '{key}': {_describe_error(e)}")
+                continue
+            self._track_change("delete", applier.kind, key)
+
+    async def _users_of(self, removing: set, config: SinasConfig, appliers: dict, ctx) -> dict:
+        """For each (kind, key) about to be removed, the resources that still
+        point at it: rows that stay, and what this config declares (in a dry
+        run those don't exist yet)."""
+        from sqlalchemy import select
+
+        from app.services.resources.usage import REFERRING_KINDS, references_of
+
+        users: dict = {}
+        for kind in REFERRING_KINDS:
+            applier = appliers.get(kind)
+            if applier is None:
+                continue
+            # The state after this apply: what's stored, with what the config
+            # declares in its place (in a dry run it isn't written yet).
+            rows = {
+                applier.key_of_row(row): row
+                for row in (await self.db.execute(select(applier.model))).scalars().all()
+            }
+            after = {key: await applier.current_spec(ctx, row) for key, row in rows.items()}
+            for item in getattr(config.spec, applier.config_section, None) or []:
                 try:
-                    async with self.db.begin_nested():
-                        await applier.delete(row, ctx)
-                except Exception as e:
-                    self.errors.append(
-                        f"Error removing {applier.label.lower()} '{key}': {_describe_error(e)}"
-                    )
-                    continue
-                self._track_change("delete", applier.kind, key)
+                    spec = applier.spec_model.model_validate(item.model_dump(exclude_none=True))
+                except Exception:
+                    continue  # reported by the apply itself
+                key = applier.key_of(spec)
+                existing = rows.get(key)
+                if existing is not None and applier.ownership(existing, ctx) == "skip":
+                    continue  # not this apply's to write: what's stored stays
+                after[key] = spec
+            for key, spec in after.items():
+                if (kind, key) in removing:
+                    continue  # going too
+                for ref in references_of(kind, spec) & removing:
+                    users.setdefault(ref, set()).add(f"{applier.noun} '{key}'")
+        return users
 
     def _discard_pending(self) -> None:
         """Forget every queued notification: the transaction won't commit."""
@@ -392,3 +461,20 @@ def _describe_error(error: Exception) -> str:
             for err in error.errors(include_url=False)
         )
     return str(error)
+
+
+async def _contents(db, kind: str, row) -> str | None:
+    """What users stored in a collection or store, if anything."""
+    from sqlalchemy import func, select
+
+    if kind == "collections":
+        from app.models.file import File
+
+        count = (await db.execute(select(func.count()).select_from(File).where(File.collection_id == row.id))).scalar()
+        return f"{count} file{'s' if count != 1 else ''}" if count else None
+    if kind == "stores":
+        from app.models.state import State
+
+        count = (await db.execute(select(func.count()).select_from(State).where(State.store_id == row.id))).scalar()
+        return f"{count} saved state{'s' if count != 1 else ''}" if count else None
+    return None

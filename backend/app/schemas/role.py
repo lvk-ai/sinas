@@ -30,6 +30,8 @@ class RoleResponse(BaseModel):
     name: str
     description: Optional[str]
     email_domain: Optional[str]
+    # "system" for roles the platform owns (e.g. the built-in Deployers).
+    managed_by: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
