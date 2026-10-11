@@ -66,12 +66,33 @@ async def validate_config(
         strict=False,  # Don't error on missing env vars for validation
     )
 
-    # Convert ConfigValidation to ConfigValidateResponse
-    return ConfigValidateResponse(
-        valid=validation.is_valid,
-        errors=[SchemaValidationError(path=e.path, message=e.message) for e in validation.errors],
-        warnings=[SchemaValidationError(path="", message=w) for w in validation.warnings],
+    errors = [SchemaValidationError(path=e.path, message=e.message) for e in validation.errors]
+    warnings = [SchemaValidationError(path="", message=w) for w in validation.warnings]
+
+    # Reference checks live in the appliers (e.g. an agent's tools must
+    # exist): a dry run reports what the real apply would refuse. Skipped for
+    # packages with unresolved ${{ vars.* }} (their references aren't known
+    # until install; a package preview with variables covers them).
+    if validation.is_valid and config is not None and "${{" not in validate_request.config:
+        errors += await _dry_run_errors(db, config, user_id)
+
+    return ConfigValidateResponse(valid=not errors, errors=errors, warnings=warnings)
+
+
+async def _dry_run_errors(db: AsyncSession, config, user_id: str) -> list[SchemaValidationError]:
+    from app.services.package_service import PACKAGE_SKIP_TYPES
+
+    is_package = config.kind == "SinasPackage" and config.package is not None
+    service = ConfigApplyService(
+        db,
+        config.package.name if is_package else config.metadata.name,
+        owner_user_id=user_id,
+        managed_by=f"pkg:{config.package.name}" if is_package else "config",
+        auto_commit=False,
+        skip_resource_types=PACKAGE_SKIP_TYPES if is_package else None,
     )
+    result = await service.apply_config(config, dry_run=True)  # writes nothing
+    return [SchemaValidationError(path="", message=e) for e in result.errors]
 
 
 @router.post("/apply", response_model=ConfigApplyResponse)

@@ -118,3 +118,14 @@ class TestReviewFixes:
         await db.flush()
         r = await client.put(f"/api/v1/agents/{NS}/{name}", json={"description": "d"}, headers=auth_headers(admin_user))
         assert r.status_code == 200, r.text
+
+
+async def test_validate_reports_a_missing_tool(client, admin_user):
+    yaml_text = "\n".join([
+        "apiVersion: sinas.co/v1", "kind: SinasConfig", "metadata: {name: cfg}", "spec:",
+        "  agents:", f"    - {{namespace: {NS}, name: a{_uid()}, enabledFunctions: [{NS}/missing]}}",
+    ])
+    r = await client.post("/api/v1/config/validate", json={"config": yaml_text}, headers=auth_headers(admin_user))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["valid"] is False and "don't exist" in body["errors"][0]["message"]
