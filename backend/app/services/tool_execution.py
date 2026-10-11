@@ -795,8 +795,18 @@ async def execute_single_tool(
                     retrieve_limit = TOOL_RESULT_SIZE_OVERRIDES.get(
                         "retrieve_tool_result", settings.tool_result_context_max_size
                     )
+                    # Follow the pointer in the chat that produced the result
+                    # (a cross-chat lookup through the cache): the spill is in
+                    # that chat's workbench. Ownership is checked there.
+                    source_chat = chat
+                    source_chat_id = stored.get("chat_id")
+                    if source_chat_id and (chat is None or source_chat_id != str(chat.id)):
+                        try:
+                            source_chat = await db.get(Chat, uuid.UUID(source_chat_id))
+                        except (ValueError, TypeError):
+                            source_chat = None
                     full = await workbench_refs.load_spilled_result(
-                        db, chat, user_id, stored.get("result"), retrieve_limit
+                        db, source_chat, user_id, stored.get("result"), retrieve_limit
                     )
                     if full and "result" in full:
                         result = {

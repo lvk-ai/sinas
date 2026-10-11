@@ -1419,6 +1419,9 @@ class MessageService:
         template_vars = merge_user_template_context(
             template_vars, await load_user_context(self.db, user_id)
         )
+        # The rebuild below reads everything injected so far: those are
+        # answered by this turn, not by the end-of-turn drain.
+        await chat_steering.take_injections(chat_id)
         updated_messages = (
             await build_conversation_history(
                 db=self.db,
