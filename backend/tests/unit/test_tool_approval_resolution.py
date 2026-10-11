@@ -3,14 +3,23 @@ before its deadline — the expiry sweep resolves it the same way, so a late
 "approve" can never run a call the sweep already rejected."""
 
 import uuid
+
+import pytest_asyncio
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
+from app.core.database import async_engine
 from app.models.chat import Chat, Message
 from app.models.pending_approval import PendingToolApproval
 from app.services.queue_service import queue_service
 from tests.conftest import auth_headers
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_engine_per_test():
+    yield
+    await async_engine.dispose()
 
 
 async def _pending(db, user, expires_at, asked: int = 1):
