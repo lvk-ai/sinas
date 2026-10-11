@@ -26,6 +26,7 @@ from app.services.content_tokens import strip_base64_data, refresh_message_token
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
 from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
+from app.services import workbench_refs
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -585,8 +586,8 @@ class MessageService:
                 tools=prep["tools"],
                 agent_label=agent_label,
             ):
-                if isinstance(chunk, dict) and chunk.get("type") in SUSPENSION_EVENT_TYPES:
-                    suspended = True
+                if isinstance(chunk, dict) and chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    suspended = True  # parked or stopped: no follow-through
             if not suspended:
                 async for _ in self.answer_pending_injections(
                     chat_id=chat_id, user_id=user_id, user_token=user_token,
@@ -1204,6 +1205,7 @@ class MessageService:
             # before suspending; a failed prepare (unknown agent, permissions,
             # depth bound) records an immediate error result instead.
             prepared: list[dict[str, Any]] = []
+            _ref_chat_for_delegates = None
             for tc in delegate_calls:
                 args = safe_parse_arguments(tc["function"].get("arguments", ""))
                 yield {
@@ -1213,6 +1215,25 @@ class MessageService:
                     "arguments": tc["function"].get("arguments", "{}"),
                     "description": build_tool_status(tc["function"]["name"], args, status_templates),
                 }
+                # Suspended delegations bypass execute_single_tool, so
+                # {"$workbench": path} references resolve here — the child
+                # must receive the parent's file content, not the sentinel.
+                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                    if _ref_chat_for_delegates is None:
+                        _ref_chat_for_delegates = (
+                            await self.db.execute(select(Chat).where(Chat.id == chat_id))
+                        ).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(
+                            self.db, _ref_chat_for_delegates, user_id, args
+                        )
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
                 meta = _meta_by_name.get(tc["function"]["name"], {})
                 prep = await prepare_agent_delegation(
                     self.db, user_id, meta.get("agent_id"), args

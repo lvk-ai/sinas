@@ -342,3 +342,26 @@ async def test_non_streaming_send_uses_the_same_approval_decision(db, test_user,
     actions = await resolve_tool_approval_actions(db, calls, str(chat.id), tools)
     assert actions == {"c0": "ask", "c1": "auto", "c2": "auto"}
 
+
+
+@pytest.mark.asyncio
+async def test_requeue_marks_the_old_attempt(monkeypatch):
+    from app.queue import agent_jobs
+    from app.services.queue_service import JOB_STATUS_PREFIX
+    from app.services.stream_relay import stream_relay
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(stream_relay, "publish", noop)
+    written = {}
+
+    class R:
+        async def set(self, key, value, ex=None):
+            written[key] = json.loads(value)
+
+    async def enqueue(attempt):
+        return None
+
+    assert await agent_jobs._requeue_when_busy({"attempt": 0, "job_id": "old-job"}, "chan", enqueue, redis=R(), base_fields={"chat_id": "c"}) is True
+    assert written[f"{JOB_STATUS_PREFIX}old-job"] == {"chat_id": "c", "status": "requeued", "retry_attempt": 1}
