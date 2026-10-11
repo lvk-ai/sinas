@@ -27,7 +27,7 @@ from app.schemas import (
 )
 
 from app.services.resources import rest
-from app.services.resources.roles import RoleApplier, default_role_names
+from app.services.resources.roles import RoleApplier, is_default_role
 
 router = APIRouter(prefix="/roles", tags=["roles"])
 
@@ -181,7 +181,7 @@ async def update_role(
 
     ctx = rest.api_context(db, user_id)
     role = await rest.locked(_applier, ctx, role)
-    if role_data.name is not None and role_data.name != role.name and role.name in default_role_names():
+    if role_data.name is not None and role_data.name != role.name and is_default_role(role):
         raise HTTPException(
             status_code=400,
             detail=f"Role '{role.name}' is a default role: Sinas finds it by name, so it can't be renamed",
@@ -216,7 +216,7 @@ async def delete_role(
 
     set_permission_used(request, "sinas.roles.delete:all")
 
-    if role.name in default_role_names():
+    if is_default_role(role):
         raise HTTPException(
             status_code=400, detail=f"Role '{role.name}' is a default role and can't be deleted"
         )

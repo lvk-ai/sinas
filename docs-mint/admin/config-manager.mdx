@@ -89,7 +89,7 @@ npx -y @sinas/cli preview sinas/ --markdown plan.md
 npx -y @sinas/cli install sinas/ --yes          # add --prune to remove what files dropped
 ```
 
-- **API key** — Create one for CI (Access Control → API Keys) with only `sinas.config.validate:all`, `sinas.config.apply:all` and `sinas.packages.install:all`.
+- **API key** — Create a deploy key for CI: Access Control → API Keys → **Make a deploy key**, which links it to the built-in **Deployers** role (`sinas.config.validate:all`, `sinas.config.apply:all`, `sinas.packages.install:all`). Use one key per environment, set an expiry, and keep it in your CI's secrets only: applying config is admin-level, since a config can create roles and assign them.
 - **Files** — Folders are searched recursively; config files are applied before packages, in path order. Give each config file its own `metadata.name`.
 - **Package variables** — Per environment, from `SINAS_VAR_<NAME>` environment variables, a `--vars-file`, or `--var NAME=value`. A missing required variable fails the run.
 - **Plans** — `preview` prints what would change; `--markdown` writes it for a pull request comment, and in GitHub Actions it's added to the job summary. Every error exits 1.
