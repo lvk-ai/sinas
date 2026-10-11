@@ -519,6 +519,37 @@ async def test_finished_job_completes_the_suspended_round(committed_chat, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_large_waited_result_is_clipped_for_the_round(committed_chat, monkeypatch):
+    """The full output stays behind background_job_status; what completes
+    the parked round is bounded like any tool result."""
+    from app.services import code_execution
+
+    env = committed_chat
+    cid = str(env["chat"].id)
+    completed = []
+
+    async def fake_exec(code, user_id=None, chat_id=None, timeout=None):
+        return {"stdout": "x" * 50_000, "result": None}
+
+    async def fake_complete(pid, tool_call_id, content, *, user_token, resume_channel_id=None):
+        completed.append(json.loads(content))
+        return {"status": "completed", "resumed": True}
+
+    monkeypatch.setattr(code_execution, "execute", fake_exec)
+    monkeypatch.setattr(dc, "complete", fake_complete)
+    monkeypatch.setattr(settings, "background_job_result_max_chars", 2000)
+    await chat_wakeups.run_background_code_job(
+        job_id="job-big", chat_id=cid, user_id=str(env["user"].id), code="print('x'*50000)", description="d",
+        tool_call_id="call_big", pending_completion_id="pc-2", api_key_id=None,
+    )
+    (content,) = completed
+    assert content["truncated"] is True and content["job_id"] == "job-big"
+    assert len(json.dumps(content)) < 3000 and "background_job_status" in content["hint"]
+    full = await chat_wakeups.background_job_status(cid, "job-big")
+    assert len(full["result"]["stdout"]) == 50_000
+
+
+@pytest.mark.asyncio
 async def test_start_background_job_enqueues_on_the_function_queue(committed_chat, monkeypatch):
     from app.core import redis as redis_mod
 

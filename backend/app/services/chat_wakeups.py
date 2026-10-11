@@ -442,10 +442,6 @@ async def list_background_jobs(chat_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def _clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit] + f"\n[... clipped, {len(text) - limit} more chars; full result via background_job_status]"
-
-
 async def run_background_code_job(
     *, job_id: str, chat_id: str, user_id: str, code: str, description: str,
     tool_call_id: Optional[str], pending_completion_id: Optional[str], api_key_id: Optional[str],
@@ -469,6 +465,18 @@ async def run_background_code_job(
     async def report(status: str, result: dict[str, Any]) -> None:
         await set_status(status=status, finished_at=_now().isoformat(), result=result)
         content = json.dumps(result, default=str)
+        limit = settings.background_job_result_max_chars
+        if len(content) > limit:
+            # The full result stays behind background_job_status; what goes
+            # into the model request is bounded like any tool result.
+            content = json.dumps({
+                "job_id": job_id,
+                "status": status,
+                "truncated": True,
+                "result_preview": content[:limit],
+                "hint": f"Result clipped ({len(content) - limit} more chars); "
+                        f"the full result is available via background_job_status('{job_id}').",
+            })
         if pending_completion_id and tool_call_id:
             from app.services import deferred_completions
 
@@ -481,8 +489,7 @@ async def run_background_code_job(
         else:
             await deliver_to_chat(
                 chat_id,
-                f"[background job {job_id} {status}: {description}]\n"
-                f"{_clip(content, settings.background_job_result_max_chars)}",
+                f"[background job {job_id} {status}: {description}]\n{content}",
                 source="background_job", api_key_id=api_key_id,
             )
 
