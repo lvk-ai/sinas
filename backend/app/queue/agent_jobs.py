@@ -115,6 +115,55 @@ async def _terminate_execution_row(
             await batch_service.on_execution_terminated(db=db, batch_id=execution.batch_id)
 
 
+_BUSY_RETRY_SECONDS = 30
+_BUSY_MAX_ATTEMPTS = 20  # ~10 minutes of a chat staying busy
+
+
+async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue) -> bool:
+    """A continuation that could not take the chat lock is queued again
+    later rather than abandoned (its work exists nowhere else). Returns
+    True when requeued; past the attempt cap, reports and gives up."""
+    from app.services.stream_relay import stream_relay
+
+    attempt = int(kwargs.get("attempt", 0)) + 1
+    if attempt > _BUSY_MAX_ATTEMPTS:
+        await stream_relay.publish_error(
+            channel_id,
+            "Chat stayed busy with another running turn for too long; this continuation was dropped",
+        )
+        return False
+    try:
+        await enqueue(attempt)
+    except Exception as e:
+        logger.exception("Could not requeue busy continuation: %s", e)
+        await stream_relay.publish_error(channel_id, f"Chat is busy and the retry could not be queued: {e}")
+        return False
+    await stream_relay.publish(
+        channel_id,
+        {"type": "status", "status": "waiting", "message": f"Chat is busy; retrying in {_BUSY_RETRY_SECONDS}s (attempt {attempt})"},
+    )
+    return True
+
+
+async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db) -> bool:
+    """A continuation queued before an operator interrupt must not run on,
+    even though the running turn may have consumed the flag already."""
+    from app.models.chat import Message
+    from app.services import chat_steering
+    from app.services.stream_relay import stream_relay
+
+    requested_at = await chat_steering.interrupt_requested_at(chat_id)
+    enqueued_at = kwargs.get("enqueued_at")
+    if requested_at is None or enqueued_at is None or float(enqueued_at) > requested_at:
+        return False
+    await chat_steering.consume_interrupt(chat_id)
+    db.add(Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER))
+    await db.commit()
+    await stream_relay.publish(channel_id, {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER})
+    await stream_relay.publish_done(channel_id)
+    return True
+
+
 @_acting_as_job_key
 async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     """
@@ -386,6 +435,8 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
     Handles the approval flow continuation and publishes results to Redis Stream.
     """
+    from app.services.queue_service import queue_service
+
     from redis.asyncio import Redis
 
     from app.core.database import AsyncSessionLocal
@@ -484,9 +535,23 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
                 lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
                 if lock_token is None:
-                    await stream_relay.publish_error(
-                        channel_id, "Chat is busy with another running turn — try again"
-                    )
+                    # The approval is already resolved; giving up would strand
+                    # it. Come back when the running turn is done.
+                    if await _requeue_when_busy(
+                        kwargs, channel_id,
+                        lambda attempt: queue_service.enqueue_agent_resume(
+                            chat_id=chat_id, user_id=user_id, user_token=user_token,
+                            pending_approval_id=pending_approval_id, approved=approved,
+                            channel_id=channel_id, agent=base_fields.get("agent"),
+                            defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                            enqueued_at=kwargs.get("enqueued_at"),
+                        ),
+                    ):
+                        completed = True
+                    return
+                if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                    await chat_steering.release_chat_lock(chat_id, lock_token)
+                    completed = True
                     return
                 try:
                     # Execute the approved tool calls and stream the LLM response
@@ -583,6 +648,8 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     conversation from the DB, stream the next LLM turn, and keep going
     (further tool rounds included). Issue #90.
     """
+    from app.services.queue_service import queue_service
+
     from redis.asyncio import Redis
 
     from app.core.database import AsyncSessionLocal
@@ -642,11 +709,23 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     try:
         lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
         if lock_token is None:
-            await stream_relay.publish_error(
-                channel_id, "Chat is busy with another running turn — try again"
-            )
+            # The checkpoint is gone once this job was queued; this is the
+            # only continuation. Come back when the running turn is done.
+            if await _requeue_when_busy(
+                kwargs, channel_id,
+                lambda attempt: queue_service.enqueue_agent_delegate_resume(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    channel_id=channel_id, conversation_context=context,
+                    defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                    enqueued_at=kwargs.get("enqueued_at"),
+                ),
+            ):
+                completed = True
             return
         async with AsyncSessionLocal() as db:
+            if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                completed = True
+                return
             message_service = MessageService(db)
             async for chunk in message_service._stream_followup_after_tools(
                 chat_id=chat_id,

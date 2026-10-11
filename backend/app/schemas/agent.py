@@ -143,6 +143,14 @@ class AgentCreate(BaseModel):
         ),
     )
 
+    @field_validator("tool_approvals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
+
 
 class AgentUpdate(BaseModel):
     namespace: Optional[str] = Field(
@@ -205,6 +213,14 @@ class AgentUpdate(BaseModel):
     default_keep_alive: Optional[bool] = None
     system_tools: Optional[list[Union[str, SystemToolConfig]]] = None
     tool_approvals: Optional[dict[str, Any]] = None
+
+    @field_validator("tool_approvals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
 
 
 class AgentResponse(BaseModel):

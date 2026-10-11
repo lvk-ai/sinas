@@ -44,11 +44,14 @@ def resolve_action(
     if tool_name in session_grants:
         return AUTO
 
-    if tool_approvals:
-        for rule in tool_approvals.get("rules") or []:
+    if isinstance(tool_approvals, dict):
+        rules = tool_approvals.get("rules")
+        for rule in rules if isinstance(rules, list) else []:
+            if not isinstance(rule, dict):
+                continue
             pattern = rule.get("match")
             action = rule.get("action")
-            if not pattern or action not in (AUTO, ASK):
+            if not isinstance(pattern, str) or not pattern or action not in (AUTO, ASK):
                 continue
             if fnmatch(tool_name, pattern):
                 return action
@@ -56,8 +59,43 @@ def resolve_action(
     if intrinsic_ask:
         return ASK
 
-    default = (tool_approvals or {}).get("default", AUTO)
+    default = tool_approvals.get("default", AUTO) if isinstance(tool_approvals, dict) else AUTO
     return default if default in (AUTO, ASK) else AUTO
+
+
+def validate_tool_approvals(value: Any) -> Optional[dict[str, Any]]:
+    """Validate the config shape at save time so a bad rule can never be
+    stored and fail only when a chat uses it. Returns the normalized dict
+    (None stays None); raises ValueError with a precise message."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("tool_approvals must be an object with optional 'default' and 'rules'")
+    unknown = set(value) - {"default", "rules"}
+    if unknown:
+        raise ValueError(f"tool_approvals: unknown keys {sorted(unknown)}")
+    default = value.get("default", AUTO)
+    if default not in (AUTO, ASK):
+        raise ValueError(f"tool_approvals.default must be 'auto' or 'ask', got {default!r}")
+    rules = value.get("rules", [])
+    if rules is None:
+        rules = []
+    if not isinstance(rules, list):
+        raise ValueError("tool_approvals.rules must be a list of {match, action}")
+    normalized = []
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"tool_approvals.rules[{i}] must be an object with 'match' and 'action'")
+        extra = set(rule) - {"match", "action"}
+        if extra:
+            raise ValueError(f"tool_approvals.rules[{i}]: unknown keys {sorted(extra)}")
+        pattern, action = rule.get("match"), rule.get("action")
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(f"tool_approvals.rules[{i}].match must be a non-empty glob string")
+        if action not in (AUTO, ASK):
+            raise ValueError(f"tool_approvals.rules[{i}].action must be 'auto' or 'ask'")
+        normalized.append({"match": pattern, "action": action})
+    return {"default": default, "rules": normalized}
 
 
 async def get_session_grants(chat_id: str) -> set[str]:

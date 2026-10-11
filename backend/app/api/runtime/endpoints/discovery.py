@@ -142,9 +142,11 @@ async def list_collections(
         set_permission_used(request, "sinas.collections.read")
         return []
 
-    filters = None
+    # Workbenches (kind='workbench') are chat-internal, never a collection
+    # to discover — same fence as the collections API.
+    filters = Collection.kind == "collection"
     if ns_filter is not None:
-        filters = Collection.namespace.in_(ns_filter)
+        filters = and_(filters, Collection.namespace.in_(ns_filter))
 
     collections = await Collection.list_with_permissions(
         db=db,
