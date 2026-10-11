@@ -193,6 +193,40 @@ async def test_delivery_starts_a_turn_on_an_idle_chat(committed_chat, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_turn_owner_claims_the_reconnect_channel(committed_chat, monkeypatch):
+    """Two deliveries to an idle chat each recorded their own channel; the
+    job that takes the lock (owns the turn) is the one a reconnecting client
+    must find, whichever wrote `active_channel_id` last."""
+    from app.services.delegation import current_channel_id
+    from app.services.message_service import MessageService
+
+    env = committed_chat
+    cid = str(env["chat"].id)
+    _capture_enqueue(monkeypatch)
+    first = await chat_wakeups.deliver_to_chat(cid, "[wakeup a] one", source="wakeup")
+    second = await chat_wakeups.deliver_to_chat(cid, "[wakeup b] two", source="wakeup")
+    assert first["status"] == second["status"] == "started"
+    async with AsyncSessionLocal() as s:
+        assert (await s.get(Chat, env["chat"].id)).active_channel_id == second["channel_id"]
+
+    async def no_turn(self, **kwargs):
+        yield {"type": "done"}
+
+    monkeypatch.setattr(MessageService, "_send_message_stream_locked", no_turn)
+    token = current_channel_id.set(first["channel_id"])  # the first job runs the turn
+    try:
+        async with AsyncSessionLocal() as s:
+            async for _ in MessageService(s).send_message_stream(
+                chat_id=cid, user_id=str(env["user"].id), user_token="t", content="[wakeup a] one"
+            ):
+                pass
+    finally:
+        current_channel_id.reset(token)
+    async with AsyncSessionLocal() as s:
+        assert (await s.get(Chat, env["chat"].id)).active_channel_id == first["channel_id"]
+
+
+@pytest.mark.asyncio
 async def test_delivery_to_an_archived_chat_is_dropped(committed_chat, monkeypatch):
     env = committed_chat
     enqueued = _capture_enqueue(monkeypatch)

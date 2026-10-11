@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 
 import jsonschema
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -707,12 +707,32 @@ class MessageService:
             return
         try:
             await chat_steering.clear_interrupt(chat_id)
+            await self._claim_active_channel(chat_id)
             async for chunk in self._send_message_stream_locked(
                 chat_id=chat_id, user_id=user_id, user_token=user_token, content=content
             ):
                 yield chunk
         finally:
             await chat_steering.release_chat_lock(chat_id, lock_token)
+
+    async def _claim_active_channel(self, chat_id: str) -> None:
+        """The job that owns the turn owns the chat's reconnect channel.
+
+        Two queued messages for an idle chat each recorded their own channel
+        as `active_channel_id` when enqueued; only one of them runs the turn,
+        the other just injects and closes its channel. Whichever wrote last
+        would otherwise send a reconnecting client to a finished stream."""
+        from app.services.delegation import current_channel_id
+
+        channel_id = current_channel_id.get()
+        if not channel_id:
+            return
+        await self.db.execute(
+            update(Chat)
+            .where(Chat.id == uuid.UUID(chat_id), Chat.active_channel_id != channel_id)
+            .values(active_channel_id=channel_id)
+        )
+        await self.db.commit()
 
     async def _send_message_stream_locked(
         self,

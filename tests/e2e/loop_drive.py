@@ -102,6 +102,16 @@ def make_wakeups_plan():
     delivery ([background job ...], [wakeup ...], [watch ...]) answered with
     text."""
     def plan(messages):
+        # Arm first, whatever has already arrived: a fast background run can
+        # report back (injected into this very turn) before the timer is
+        # scheduled, and a delivery must never pre-empt the arming.
+        done = _answered(messages)
+        if "call_watch" not in done:
+            return "tool", ("call_watch", "create_watch", {"description": "CI result"})
+        if "call_bg" not in done:
+            return "tool", ("call_bg", "run_in_background", {"code": "print('hello from the background')\n41 + 1", "description": "count things"})
+        if "call_timer" not in done:
+            return "tool", ("call_timer", "schedule_wakeup", {"delay_seconds": 1, "note": "check whether anything arrived"})
         # Every delivery carries an id in its bracket prefix; acknowledge all
         # that no earlier reply mentioned (an injected delivery shares the
         # reply of the turn it landed in).
@@ -114,13 +124,6 @@ def make_wakeups_plan():
                     pending_ids.append(did)
         if pending_ids:
             return "text", "Noted deliveries: " + ", ".join(pending_ids)
-        done = _answered(messages)
-        if "call_watch" not in done:
-            return "tool", ("call_watch", "create_watch", {"description": "CI result"})
-        if "call_bg" not in done:
-            return "tool", ("call_bg", "run_in_background", {"code": "print('hello from the background')\n41 + 1", "description": "count things"})
-        if "call_timer" not in done:
-            return "tool", ("call_timer", "schedule_wakeup", {"delay_seconds": 1, "note": "check whether anything arrived"})
         return "text", "Armed a watch, a background run and a wakeup; ending my turn."
     return plan
 
