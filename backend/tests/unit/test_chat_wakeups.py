@@ -35,6 +35,17 @@ async def _dispose_engine_per_test():
     await async_engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _tmp_file_storage(tmp_path, monkeypatch):
+    """Workbench writes go to a temp dir, never the deployment's storage path."""
+    import app.services.file_storage as fs
+
+    monkeypatch.setenv("FILE_STORAGE_PATH", str(tmp_path / "files"))
+    fs._storage = None
+    yield
+    fs._storage = None
+
+
 @pytest_asyncio.fixture
 async def chat(db: AsyncSession, test_user: User) -> Chat:
     c = Chat(user_id=test_user.id, title="wakeups chat")
