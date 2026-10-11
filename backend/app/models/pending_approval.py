@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, created_at, uuid_pk
@@ -13,6 +13,12 @@ class PendingToolApproval(Base):
     """Track tool calls that require user approval before execution."""
 
     __tablename__ = "pending_tool_approvals"
+    # Tool-call ids are only unique per provider response; two chats may well
+    # see the same id. Uniqueness is per chat (the lookup key the approve
+    # endpoint uses), never global.
+    __table_args__ = (
+        UniqueConstraint("chat_id", "tool_call_id", name="uq_pending_tool_approvals_chat_tool_call"),
+    )
 
     id: Mapped[uuid_pk]
     chat_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chats.id"), nullable=False, index=True)
@@ -22,7 +28,7 @@ class PendingToolApproval(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
 
     # Tool call details
-    tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     function_namespace: Mapped[str] = mapped_column(String(255), nullable=False)
     function_name: Mapped[str] = mapped_column(String(255), nullable=False)
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)

@@ -1316,44 +1316,34 @@ class MessageService:
         result_chat = await self.db.execute(select(Chat).where(Chat.id == chat_id))
         chat = result_chat.scalar_one_or_none()
 
-        updated_messages = []
         agent = None
-
         if chat and chat.agent_id:
             result_agent = await self.db.execute(select(Agent).where(Agent.id == chat.agent_id))
             agent = result_agent.scalar_one_or_none()
-            if agent:
-                template_vars = None
-                if chat.chat_metadata and "agent_input" in chat.chat_metadata:
-                    template_vars = chat.chat_metadata["agent_input"]
-                system_content = await build_agent_system_content(
-                    self.db, agent, self.skill_converter, template_vars
-                )
-                if system_content:
-                    updated_messages.append({"role": "system", "content": system_content})
 
-        result = await self.db.execute(
-            select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at)
+        # Same builder as a fresh send (issue #225): the window, the rolling
+        # compaction summary and older-tool-result compaction apply at every
+        # round boundary, so a long autonomous turn can't outgrow the context
+        # the way a fresh send on the same chat never would.
+        template_vars = None
+        if chat and chat.chat_metadata and "agent_input" in chat.chat_metadata:
+            template_vars = chat.chat_metadata["agent_input"]
+        template_vars = merge_user_template_context(
+            template_vars, await load_user_context(self.db, user_id)
         )
-        for msg in result.scalars().all():
-            message_dict = {"role": msg.role}
-            if msg.content:
-                message_dict["content"] = msg.content
-            if msg.tool_calls:
-                validated_tc = validate_tool_calls(msg.tool_calls)
-                if validated_tc:
-                    message_dict["tool_calls"] = [
-                        {k: v for k, v in tc.items() if k != "description"}
-                        for tc in validated_tc
-                    ]
-                elif msg.tool_calls:
-                    print(f"\u26a0\ufe0f Skipping message {msg.id} with corrupted tool calls")
-                    continue
-            if msg.tool_call_id:
-                message_dict["tool_call_id"] = msg.tool_call_id
-            if msg.name:
-                message_dict["name"] = msg.name
-            updated_messages.append(message_dict)
+        updated_messages = (
+            await build_conversation_history(
+                db=self.db,
+                chat=chat,
+                skill_converter=self.skill_converter,
+                inject_context=False,
+                user_id=user_id,
+                template_variables=template_vars,
+                provider_type=None,
+            )
+            if chat
+            else []
+        )
 
         _agent_label = (
             f"{chat.agent_namespace}/{chat.agent_name}"

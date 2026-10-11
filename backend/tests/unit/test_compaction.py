@@ -5,6 +5,7 @@ prior summary folded into the next), the injection of the stored summary
 into the built history when windowing applies, and the schedule trigger
 when the summary lags the window.
 """
+import json
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -142,3 +143,86 @@ class TestHistoryInjection:
         assert not any(
             "should not appear" in (m.get("content") or "") for m in messages
         )
+
+
+class TestFollowupUsesWindowing:
+    """Issue #225: the tool-round boundary rebuild must apply the same
+    windowing and compaction as a fresh send, or a long autonomous turn
+    outgrows the context a fresh send on the same chat would never see."""
+
+    class _FakeProvider:
+        def __init__(self):
+            self.seen: list[list[dict]] = []
+
+        async def stream(self, messages, model, tools, temperature, max_tokens):
+            self.seen.append(messages)
+            yield {"content": "ok", "tool_calls": None, "finish_reason": "stop"}
+
+    async def _run_followup(self, db, chat, user, monkeypatch):
+        from app.services import message_service as ms
+
+        fake = self._FakeProvider()
+
+        async def fake_create_provider(*_a, **_k):
+            return fake
+
+        monkeypatch.setattr(ms, "create_provider", fake_create_provider)
+        service = ms.MessageService(db)
+        async for _ in service._stream_followup_after_tools(
+            chat_id=str(chat.id), user_id=str(user.id), user_token="",
+            provider=None, model=None, temperature=0.7, max_tokens=None, tools=[],
+        ):
+            pass
+        assert len(fake.seen) == 1
+        return fake.seen[0]
+
+    @pytest.mark.asyncio
+    async def test_followup_is_windowed(self, db, long_chat, test_user, monkeypatch):
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, long_chat, test_user, monkeypatch)
+        assert [m["content"] for m in sent] == [f"message {i}" for i in range(6, 10)]
+
+    @pytest.mark.asyncio
+    async def test_followup_injects_compaction_summary(self, db, long_chat, test_user, monkeypatch):
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", True)
+        monkeypatch.setattr(compaction, "maybe_schedule_compaction", lambda _cid: None)
+        long_chat.chat_metadata = {
+            "compaction": {"summary": "earlier: six messages", "covered_count": 6}
+        }
+        await db.flush()
+        sent = await self._run_followup(db, long_chat, test_user, monkeypatch)
+        assert "earlier: six messages" in sent[0]["content"]
+        assert [m["content"] for m in sent[1:]] == [f"message {i}" for i in range(6, 10)]
+
+    @pytest.mark.asyncio
+    async def test_followup_keeps_tool_pairs_and_compacts_old_results(
+        self, db, test_user, monkeypatch
+    ):
+        chat = Chat(user_id=test_user.id, title="tool-heavy turn")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        for i in range(6):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"c{i}",
+                           content=json.dumps({"big": "x" * 50, "i": i})))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 5)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        monkeypatch.setattr(settings, "tool_result_max_inline", 1)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        # Window boundary never splits a tool call from its result, and no
+        # orphaned tool result survives.
+        ids_called = {tc["id"] for m in sent if m.get("tool_calls") for tc in m["tool_calls"]}
+        ids_answered = {m["tool_call_id"] for m in sent if m["role"] == "tool"}
+        assert ids_called == ids_answered
+        # Only the newest result stays inline; older ones are pointers.
+        tool_msgs = [m for m in sent if m["role"] == "tool"]
+        assert tool_msgs[-1]["content"].startswith("{")
+        assert all("retrieve_tool_result" in m["content"] for m in tool_msgs[:-1])
