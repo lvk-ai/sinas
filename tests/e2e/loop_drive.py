@@ -317,8 +317,10 @@ class Driver:
                 sys.exit(f"FAIL stream {resp.status_code}: {resp.read()[:400]}")
             self.step(6, "turn 1 streamed:")
             self.consume(resp)
-        # Follow suspensions until the turn is over: answer questions, approve gates.
-        for _ in range(6):
+        # Follow suspensions until the turn is over: answer questions, approve
+        # gates. A real model may pause more often than the scripted one;
+        # whatever is still parked when this gives up fails verify().
+        for _ in range(12 if self.real else 6):
             st = self.state()
             if st["pending_inputs"]:
                 q = st["pending_inputs"][0]
@@ -343,7 +345,10 @@ class Driver:
         msgs = st["messages"]
         tools_seen = [m["name"] for m in msgs if m["role"] == "tool"]
         print("      transcript tools:", tools_seen)
-        final = next((m for m in reversed(msgs) if m["role"] == "assistant" and m["content"]), None)
+        # The turn is over only when the last assistant message is a plain
+        # reply: text, no tool calls, nothing parked behind it.
+        last_assistant = next((m for m in reversed(msgs) if m["role"] == "assistant"), None)
+        final = last_assistant if last_assistant and last_assistant.get("content") and not last_assistant.get("tool_calls") else None
         print("      final reply:", (final or {}).get("content", "")[:160])
         wb = sorted(f["name"] for f in self.ok(self.c.get(f"/chats/{self.chat_id}/workbench/files", headers=self.h)))
         ns, name = COLLECTION.split("/")
@@ -354,7 +359,9 @@ class Driver:
         print("      published:", published)
         failures = []
         if final is None:
-            failures.append("no final assistant reply")
+            failures.append("turn did not end with a plain assistant reply")
+        if st["pending_inputs"] or st["pending_approvals"]:
+            failures.append(f"turn ended with pending items: {len(st['pending_inputs'])} question(s), {len(st['pending_approvals'])} approval(s)")
         # Judge THIS run's promote, not whatever an earlier run left in the
         # collection: the promote tool result must be a success and the
         # published file must be at the version that result reports.
@@ -384,8 +391,6 @@ class Driver:
                 failures.append("out/summary.md missing from the workbench")
             if self.with_sandbox and "out/computed.txt" not in wb:
                 failures.append("execute_code output out/computed.txt did not persist to the workbench")
-            if not st["pending_inputs"] == [] or not st["pending_approvals"] == []:
-                failures.append("turn ended with pending items")
         if failures:
             print("E2E FAIL"); [print("   -", f) for f in failures]
             sys.exit(1)
