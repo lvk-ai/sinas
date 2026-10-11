@@ -333,25 +333,31 @@ class ConfigApplyService:
         if not candidates:
             return
 
-        removing = {(applier.kind, key) for applier, _row, key in candidates}
+        # Collections and stores holding what users put in them stay: a prune
+        # removes definitions, and those contents couldn't be restored from
+        # history. Deleting them stays a deliberate act. Decided first, since
+        # what they keep using must stay too.
+        removable = []
+        for applier, row, key in candidates:
+            contents = await _contents(self.db, applier.kind, row)
+            if contents:
+                self.warnings.append(
+                    f"Kept {applier.label.lower()} '{key}' although no longer declared: it holds "
+                    f"{contents}. Delete it in the console to remove it with its contents."
+                )
+            else:
+                removable.append((applier, row, key))
+
+        removing = {(applier.kind, key) for applier, _row, key in removable}
         users = await self._users_of(removing, config, appliers, ctx)
 
-        for applier, row, key in candidates:
+        for applier, row, key in removable:
             label = applier.label.lower()
             still_used = sorted(users.get((applier.kind, key), ()))
             if still_used:
                 self.errors.append(
                     f"Can't remove {label} '{key}': still used by {', '.join(still_used)}. "
                     "Remove or change those too, or keep declaring it."
-                )
-                continue
-            contents = await _contents(self.db, applier.kind, row)
-            if contents:
-                # A prune removes definitions; what users put in them can't be
-                # restored from history. Deleting that stays a deliberate act.
-                self.warnings.append(
-                    f"Kept {label} '{key}' although no longer declared: it holds {contents}. "
-                    "Delete it in the console to remove it with its contents."
                 )
                 continue
             try:
@@ -371,25 +377,27 @@ class ConfigApplyService:
         from app.services.resources.usage import REFERRING_KINDS, references_of
 
         users: dict = {}
-
-        def note(kind: str, key: str, spec) -> None:
-            if (kind, key) in removing:
-                return  # going too
-            for ref in references_of(kind, spec) & removing:
-                users.setdefault(ref, set()).add(f"{appliers[kind].noun} '{key}'")
-
         for kind in REFERRING_KINDS:
             applier = appliers.get(kind)
             if applier is None:
                 continue
-            for row in (await self.db.execute(select(applier.model))).scalars().all():
-                note(kind, applier.key_of_row(row), await applier.current_spec(ctx, row))
+            # The state after this apply: what's stored, with what the config
+            # declares in its place (in a dry run it isn't written yet).
+            after = {
+                applier.key_of_row(row): await applier.current_spec(ctx, row)
+                for row in (await self.db.execute(select(applier.model))).scalars().all()
+            }
             for item in getattr(config.spec, applier.config_section, None) or []:
                 try:
                     spec = applier.spec_model.model_validate(item.model_dump(exclude_none=True))
                 except Exception:
                     continue  # reported by the apply itself
-                note(kind, applier.key_of(spec), spec)
+                after[applier.key_of(spec)] = spec
+            for key, spec in after.items():
+                if (kind, key) in removing:
+                    continue  # going too
+                for ref in references_of(kind, spec) & removing:
+                    users.setdefault(ref, set()).add(f"{applier.noun} '{key}'")
         return users
 
     def _discard_pending(self) -> None:

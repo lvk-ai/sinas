@@ -6,7 +6,10 @@ from __future__ import annotations
 from typing import Any
 
 # Kinds whose resources point at others (as far as a removal can break them).
-REFERRING_KINDS = ("schedules", "webhooks", "databaseTriggers", "collections", "agents", "components")
+REFERRING_KINDS = (
+    "schedules", "webhooks", "databaseTriggers", "collections", "agents", "components", "pipelines",
+)
+_STEP_REFS = {"function": "functions", "agent": "agents", "query": "queries", "connector": "connectors"}
 
 _TARGET_KIND = {"function": "functions", "agent": "agents", "pipeline": "pipelines"}
 
@@ -32,6 +35,12 @@ def references_of(kind: str, spec: Any) -> set[tuple[str, str]]:
 
         for ref_kind, _label, _model in _reference_kinds():
             refs |= {(ref_kind, r) for r in _refs(spec, ref_kind)}
+    elif kind == "pipelines":
+        for step in spec.steps or []:
+            if isinstance(step, dict) and step.get("type") in _STEP_REFS and isinstance(step.get(step["type"]), str):
+                refs.add((_STEP_REFS[step["type"]], step[step["type"]]))
+        if isinstance(spec.per_user, dict) and isinstance(spec.per_user.get("connector"), str):
+            refs.add(("connectors", spec.per_user["connector"]))
     elif kind == "components":
         refs |= {("agents", r) for r in spec.enabled_agents}
         refs |= {("functions", r) for r in spec.enabled_functions}

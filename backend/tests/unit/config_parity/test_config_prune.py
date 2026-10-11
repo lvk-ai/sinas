@@ -101,3 +101,47 @@ async def test_a_collection_with_files_is_kept(client, db: AsyncSession, admin_u
     assert result["success"] and not result["summary"]["deleted"]
     assert any("holds 1 file" in w for w in result["warnings"])
     assert await Collection.get_by_name(db, NS, coll) is not None
+
+
+def _jobs(functions: list[str], schedule_target: str | None, extra: list[str] = ()) -> str:
+    lines = ["apiVersion: sinas.co/v1", "kind: SinasConfig", "metadata: {name: moves}", "spec:"]
+    lines.append("  functions:" + ("" if functions else " []"))
+    lines += [f"    - {{namespace: {NS}, name: {f}, code: 'def handler(i, c): return {{}}'}}" for f in functions]
+    if schedule_target:
+        lines += ["  schedules:", f"    - {{name: move-job, functionName: {NS}/{schedule_target}, cronExpression: '0 3 * * *'}}"]
+    lines += list(extra)
+    return "\n".join(lines) + "\n"
+
+
+async def test_moving_a_schedule_off_a_function_and_dropping_it_is_fine(client, db: AsyncSession, admin_user):
+    a, b = f"fa{uuid.uuid4().hex[:6]}", f"fb{uuid.uuid4().hex[:6]}"
+    assert (await _apply(client, admin_user, _jobs([a, b], a)))["success"]
+    for dry_run in (True, False):  # the preview judges the state after the apply
+        result = await _apply(client, admin_user, _jobs([b], b), prune=True, dryRun=dry_run)
+        assert result["success"], (dry_run, result["errors"])
+        assert result["summary"]["deleted"] == {"functions": 1}
+
+
+async def test_a_kept_collection_keeps_its_hook_function(client, db: AsyncSession, admin_user):
+    from app.models.file import Collection, File
+
+    fn, coll = f"hook{uuid.uuid4().hex[:6]}", f"c{uuid.uuid4().hex[:6]}"
+    with_coll = _jobs([fn], None, ["  collections:", f"    - {{namespace: {NS}, name: {coll}, postUploadFunction: {NS}/{fn}}}"])
+    assert (await _apply(client, admin_user, with_coll))["success"]
+    row = await Collection.get_by_name(db, NS, coll)
+    db.add(File(collection_id=row.id, name="a.txt", user_id=admin_user.id, content_type="text/plain"))
+    await db.flush()
+    # Drop both: the collection stays (it holds a file), so its function must too.
+    result = await _apply(client, admin_user, _jobs([], None, ["  collections: []"]), prune=True)
+    assert not result["success"]
+    assert any("still used by collection" in e and fn in e for e in result["errors"]), result["errors"]
+
+
+async def test_a_pipeline_step_keeps_its_function(client, db: AsyncSession, admin_user):
+    fn = f"step{uuid.uuid4().hex[:6]}"
+    step = f"        - {{name: run, type: function, function: {NS}/{fn}}}"
+    pipeline = ["  pipelines:", f"    - namespace: {NS}", "      name: nightly", "      steps:", step]
+    assert (await _apply(client, admin_user, _jobs([fn], None, pipeline)))["success"]
+    result = await _apply(client, admin_user, _jobs([], None, pipeline), prune=True, dryRun=True)
+    assert not result["success"]
+    assert any("still used by pipeline" in e for e in result["errors"]), result["errors"]
