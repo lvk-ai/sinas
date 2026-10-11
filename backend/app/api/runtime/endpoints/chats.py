@@ -1067,6 +1067,8 @@ async def get_chat(
         for item in await deferred_completions.list_pending_inputs(db, chat_id)
     ]
 
+    from app.services.workbench import chat_has_workbench_enabled
+
     return ChatWithMessages(
         id=chat.id,
         user_id=chat.user_id,
@@ -1079,6 +1081,7 @@ async def get_chat(
         expires_at=chat.expires_at,
         keep_alive=chat.keep_alive,
         active_channel_id=chat.active_channel_id,
+        workbench_enabled=await chat_has_workbench_enabled(db, chat),
         created_at=chat.created_at,
         updated_at=chat.updated_at,
         last_message_at=last_message_at,
