@@ -384,6 +384,47 @@ def build_tool_status(tool_name: str, arguments: dict, status_templates: dict[st
     return f"Running {ref.split('/')[-1].replace('_', ' ')}"
 
 
+async def resolve_tool_approval_actions(
+    db: AsyncSession,
+    tool_calls: list[dict[str, Any]],
+    chat_id: str,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, str]:
+    """{tool_call_id: "auto" | "ask"} for one round, by the same rule as
+    check_approval_requirements (agent rules and session grants over the
+    intrinsic requires_approval flags) — without creating approval rows.
+    The non-streaming send uses it: it cannot park on an approval, so it
+    refuses a call the rules would ask about and runs one they allow."""
+    from app.services import approval_rules
+
+    tool_approvals = None
+    chat = await db.get(Chat, chat_id)
+    if chat and chat.agent_id:
+        agent = await db.get(Agent, chat.agent_id)
+        tool_approvals = agent.tool_approvals if agent else None
+    session_grants = await approval_rules.get_session_grants(chat_id)
+    tool_meta_map = {
+        t["function"]["name"]: t["function"].get("_metadata", {})
+        for t in tools or []
+        if t.get("function", {}).get("name")
+    }
+    actions: dict[str, str] = {}
+    for tool_call in tool_calls:
+        tool_name = tool_call["function"]["name"]
+        meta = tool_meta_map.get(tool_name, {})
+        if meta.get("system_tool"):
+            intrinsic_ask = bool(meta.get("requires_approval"))
+        elif meta.get("namespace") and meta.get("name"):
+            function = await Function.get_by_name(db, meta["namespace"], meta["name"])
+            intrinsic_ask = bool(function and function.requires_approval)
+        else:
+            intrinsic_ask = False
+        actions[tool_call["id"]] = approval_rules.resolve_action(
+            tool_approvals, tool_name, intrinsic_ask, session_grants
+        )
+    return actions
+
+
 async def check_approval_requirements(
     db: AsyncSession,
     tool_calls: list[dict[str, Any]],

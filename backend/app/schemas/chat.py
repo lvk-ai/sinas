@@ -29,6 +29,10 @@ class ChatResponse(BaseModel):
     expires_at: Optional[datetime] = None
     keep_alive: Optional[bool] = None
     active_channel_id: Optional[str] = None
+    # Whether this chat's agent has the workbench tool: what a client needs
+    # to show the workbench panel, available with chat permission alone
+    # (reading the agent itself may be a permission the user lacks).
+    workbench_enabled: Optional[bool] = None
     created_at: datetime
     updated_at: datetime
     last_message_at: Optional[datetime] = None  # Timestamp of last message
