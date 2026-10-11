@@ -350,6 +350,18 @@ class TestAgentBinding:
         ).scalar_one()
         assert stored == [{"server": "tools/tracker", "tools": []}]
 
+    async def test_prune_keeps_a_server_an_agent_still_uses(self, db: AsyncSession, admin_user):
+        """A config that stops declaring a server but keeps an agent bound to
+        it must not lose the server (and the agent its tools) on prune."""
+        ns, name = f"ns{_uid()}", f"used-{_uid()}"
+        agent = {"namespace": ns, "name": "helper", "systemPrompt": "x", "enabledMcpServers": [f"tools/{name}"]}
+        _, result = await _apply(db, admin_user, {"mcpServers": [_yaml_server(name)], "agents": [agent]})
+        assert result.success, result.errors
+        _, result = await _apply(db, admin_user, {"agents": [agent]}, prune=True)
+        assert not result.success
+        assert f"tools/{name}" in result.errors[0] and f"'{ns}/helper'" in result.errors[0]
+        assert await _row(db, name) is not None
+
     async def test_agents_without_a_binding_are_unchanged(self, db: AsyncSession, admin_user):
         ns = f"ns{_uid()}"
         spec = {"agents": [{"namespace": ns, "name": "plain", "systemPrompt": "x"}]}

@@ -102,6 +102,7 @@ export function McpServerEditor() {
         navigate(`/mcp-servers/${data.namespace}/${data.name}`, { replace: true });
       } else {
         showSuccess('MCP server saved');
+        setToolsResult(null); // the listing was for the settings before this save
         queryClient.invalidateQueries({ queryKey: ['mcp-server', namespace, name] });
       }
     },
