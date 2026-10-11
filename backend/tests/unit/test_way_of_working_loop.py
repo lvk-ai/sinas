@@ -275,11 +275,13 @@ def _last_tool_result(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def read_spilled_result(messages, tools):
-    """Round 5: follow the pointer the truncated execute_code result carries."""
+    """Round 5: follow the pointer the truncated execute_code result carries.
+    The spill is pretty-printed JSON (pageable by line); the stdout string
+    is one of its lines, so a short page holds it."""
     result = _last_tool_result(messages)
     assert "_full_result" in result, result
     path = result["_full_result"]["workbench_file"]
-    return call("call_5", "workbench_read", {"filename": path, "limit": 1})
+    return call("call_5", "workbench_read", {"filename": path, "limit": 40})
 
 
 def fix_and_rerun(messages, tools):
