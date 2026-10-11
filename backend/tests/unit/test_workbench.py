@@ -1123,6 +1123,15 @@ class TestRoundFour:
             wb_open(str(tmp_path / "data.csv"), "x+b")
         assert lazy == {"data.csv"}
 
+        # Once the code removed the stub, exclusive creation succeeds and the
+        # replacement is a real change.
+        lazy.add("fresh.txt")
+        (tmp_path / "fresh.txt").write_bytes(b"")
+        (tmp_path / "fresh.txt").unlink()
+        with wb_open(str(tmp_path / "fresh.txt"), "x") as fh:
+            fh.write("made anew")
+        assert "fresh.txt" not in lazy
+
         # A failed truncating open keeps the flag too ...
         lazy.add("missing/dir.txt")
         with pytest.raises(FileNotFoundError):

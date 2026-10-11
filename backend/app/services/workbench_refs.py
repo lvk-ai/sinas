@@ -29,6 +29,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.models.file import File, FileVersion
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,6 @@ async def resolve_references(db, chat, user_id: str, arguments: Any) -> Any:
     """Replace every {"$workbench": path} object in `arguments` with the
     referenced file's content. Raises ReferenceError_ on any failure."""
     from app.services.workbench import _validate_path, get_or_create_workbench
-    from app.models.file import File, FileVersion
     from app.services.file_storage import get_storage
 
     if chat is None:
@@ -253,15 +253,26 @@ def spill_pointer_reserve(path: str) -> int:
     return len(json.dumps({"text": "", "_full_result": _spill_pointer(path)})) + 256
 
 
-def attach_spill_pointer(truncated_content: str, path: str) -> str:
-    """Point the truncated inline result at the spilled workbench file."""
+def attach_spill_pointer(truncated_content: str, path: str, max_size: Optional[int] = None) -> str:
+    """Point the truncated inline result at the spilled workbench file.
+
+    With `max_size`, the wrapped result is measured and clipped to fit:
+    plain text is JSON-escaped on wrapping (newlines, quotes, non-ASCII),
+    which can grow it past a reserve computed on the raw text."""
     pointer = _spill_pointer(path)
     try:
         parsed = json.loads(truncated_content)
     except (ValueError, TypeError):
         # Plain text too gets a structured pointer, so retrieve_tool_result
         # can follow it instead of serving the clipped text again.
-        return json.dumps({"text": truncated_content, "_full_result": pointer})
+        text = truncated_content
+        out = json.dumps({"text": text, "_full_result": pointer})
+        while max_size and len(out) > max_size and text:
+            # Shrink proportionally; escaping is at most a few bytes per char.
+            keep = int(len(text) * max_size / len(out)) - 1
+            text = text[: max(0, keep)]
+            out = json.dumps({"text": text, "_full_result": pointer})
+        return out
     if isinstance(parsed, dict):
         parsed["_full_result"] = pointer
         return json.dumps(parsed)
@@ -318,3 +329,69 @@ async def load_spilled_result(
     except (ValueError, TypeError):
         parsed = {"raw": content}
     return {"path": path, "result": parsed}
+
+
+async def copy_spilled_result(db, source_chat, target_chat, user_id: str, path: str) -> Optional[str]:
+    """Copy a spilled result from another chat's workbench into `target_chat`'s.
+
+    A cross-chat lookup that finds a full copy too large to return inline
+    can only point the caller at a file it can read: workbench_read and
+    code execution see the calling chat's workbench alone. Returns the
+    path of the copy (under tool_results/, naming the source chat), or
+    None when the copy isn't possible."""
+    from app.services.collection_tools import _infer_content_type
+    from app.services.file_storage import get_storage
+    from app.services.workbench import (
+        _write_bytes,
+        chat_has_workbench_enabled,
+        get_or_create_workbench,
+    )
+
+    try:
+        for c in (source_chat, target_chat):
+            if c is None or str(c.user_id) != str(user_id):
+                return None
+        if not await chat_has_workbench_enabled(db, target_chat):
+            return None
+        source_wb = await get_or_create_workbench(db, source_chat)
+        f = (
+            await db.execute(select(File).where(File.collection_id == source_wb.id, File.name == path))
+        ).scalar_one_or_none()
+        if f is None:
+            return None
+        version = (
+            await db.execute(
+                select(FileVersion).where(
+                    FileVersion.file_id == f.id, FileVersion.version_number == f.current_version
+                )
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            return None
+        content = await get_storage().read(version.storage_path)
+        target_wb = await get_or_create_workbench(db, target_chat)
+        base = path.rsplit("/", 1)[-1]
+        copy_path = f"tool_results/from_{str(source_chat.id)[:8]}_{base}"
+        existing = (
+            await db.execute(select(File).where(File.collection_id == target_wb.id, File.name == copy_path))
+        ).scalar_one_or_none()
+        result = await _write_bytes(
+            db,
+            get_storage(),
+            target_wb,
+            filename=copy_path,
+            content=content,
+            content_type=_infer_content_type(copy_path),
+            user_id=str(target_chat.user_id),
+            visibility="private",
+            file_metadata={"origin": "tool", "copied_from_chat": str(source_chat.id), "source_path": path},
+            existing=existing,
+        )
+        if "error" in result:
+            logger.warning(f"Could not copy spilled result '{path}': {result['error']}")
+            return None
+        await db.commit()
+        return copy_path
+    except Exception as e:
+        logger.warning(f"Could not copy spilled result '{path}': {e}")
+        return None
