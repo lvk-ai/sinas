@@ -126,5 +126,5 @@ python tests/e2e/loop_drive.py --url https://staging.example.com --key <admin ap
 python tests/e2e/loop_drive.py --url https://staging.example.com --key <admin api key> --real     # the deployment's own model; outcome checked, transcript printed
 ```
 
-The scripted model is an OpenAI-compatible server the script starts itself and registers as the default provider; the backend must be able to reach it (`--stub-host` / `--stub-endpoint`). Run it before cutting a release: with a real provider (`--real`) and, on a deployment with a sandbox executor, with `--sandbox`.
+The scripted model is an OpenAI-compatible server the script starts itself and selects only for `way-of-working/assistant`, without changing the deployment's default provider; the backend must be able to reach it (`--stub-host` / `--stub-endpoint`). Run it before cutting a release: with a real provider (`--real`) and, on a deployment with a sandbox executor, with `--sandbox`.
 
