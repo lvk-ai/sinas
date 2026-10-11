@@ -851,8 +851,17 @@ async def apply_sync_changes(
         except Exception:
             rejected.append({"path": path, "reason": "invalid base64 content"})
             continue
+        existing_row = None
         if base_hashes is not None:
-            current = await _current_hash(db, workbench, path)
+            # Lock the row first: the hash we compare and the version we bump
+            # must be the same one, or an upload committed in between is
+            # silently overwritten instead of saved aside.
+            existing_row = (
+                await db.execute(
+                    select(File).where(File.collection_id == workbench.id, File.name == path).with_for_update()
+                )
+            ).scalar_one_or_none()
+            current = await _version_hash(db, existing_row) if existing_row is not None else None
             started_from = base_hashes.get(path)
             if current is not None and current != started_from:
                 saved_as = f"{path}{CONFLICT_SUFFIX}"
@@ -887,12 +896,24 @@ async def apply_sync_changes(
             user_id=user_id,
             visibility="private",
             creation_metadata={"origin": "execution"},
+            existing=existing_row,
         )
         if "error" in result:
             rejected.append({"path": path, "reason": result["error"]})
         else:
             synced.append(path)
     return {"synced": synced, "rejected": rejected, "conflicts": conflicts}
+
+
+async def _version_hash(db: AsyncSession, f: File) -> Optional[str]:
+    """sha256 of `f`'s current version (the caller holds the row lock)."""
+    return (
+        await db.execute(
+            select(FileVersion.hash_sha256).where(
+                FileVersion.file_id == f.id, FileVersion.version_number == f.current_version
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def _current_hash(db: AsyncSession, workbench: Collection, path: str) -> Optional[str]:
