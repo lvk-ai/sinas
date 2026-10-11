@@ -1,5 +1,8 @@
 # Sinas GitOps & Enterprise Agentic Coding — Implementation Investigation
 
+> **Note (2026-10-11):** the `sinas-skills` repo referred to below has been renamed
+> `sinas-platform/cli` (same layout: `packages/cli` + `skills/`).
+
 Status: investigation (pre-implementation). Branch `worktree-gitops-agent-native`.
 Maps the design brief onto the current codebase and proposes the smallest
 change per intent. No code written yet.
