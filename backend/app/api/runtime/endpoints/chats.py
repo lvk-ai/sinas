@@ -820,18 +820,37 @@ async def approve_tool_call(
             except Exception as e:
                 logger.warning("Session grant for %s in chat %s not stored: %s", tool_name, chat_id, e)
 
+    # A round with several asked calls resumes once, after the last
+    # decision: every approval row stores the whole round, so resuming now
+    # would run the still-undecided calls unchecked.
+    from app.services import approval_rules
+
+    decision = await approval_rules.round_decision(db, pending_approval)
+    channel_id = str(uuid.uuid4())
+    if decision is None:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "approved" if request.approved else "rejected",
+                "tool_call_id": tool_call_id,
+                "channel_id": channel_id,
+                "resume": "waiting",
+                "message": "Decision recorded; the round resumes once every requested approval is answered.",
+            },
+        )
+
     # Extract token and enqueue resume job
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
-    channel_id = str(uuid.uuid4())
 
     await queue_service.enqueue_agent_resume(
         chat_id=chat_id,
         user_id=user_id,
         user_token=user_token,
         pending_approval_id=str(pending_approval.id),
-        approved=request.approved,
+        approved=bool(decision["approved_ids"]),
         channel_id=channel_id,
         agent=f"{chat.agent_namespace}/{chat.agent_name}",
+        rejected_tool_call_ids=decision["rejected_ids"],
     )
 
     return JSONResponse(
@@ -840,6 +859,7 @@ async def approve_tool_call(
             "status": "approved" if request.approved else "rejected",
             "tool_call_id": tool_call_id,
             "channel_id": channel_id,
+            "resume": "queued",
             "message": f"Resume job enqueued. Connect to /chats/{chat_id}/stream/{channel_id} for results.",
         },
     )

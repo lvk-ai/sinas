@@ -10,6 +10,8 @@ The invariants under test:
 """
 import uuid
 
+import json
+
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
@@ -233,6 +235,47 @@ class TestInterruptBoundary:
         assert {m.tool_call_id for m in tool_rows} == {"call_1", "call_2"}
         for m in tool_rows:
             assert "Interrupted" in m.content
+
+
+    @pytest.mark.asyncio
+    async def test_rejected_calls_are_answered_not_run(self, db, chat, test_user, monkeypatch):
+        """A round resumed after a multi-ask decision: the calls the user
+        refused get a rejection result and never execute."""
+        from app.services import message_service as ms
+
+        ran = []
+
+        async def fake_execute(tc, *args, **kwargs):
+            ran.append(tc["id"])
+            return (tc["id"], tc["function"]["name"], json.dumps({"ok": True}))
+
+        async def no_followup(self, *args, **kwargs):
+            return
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(ms, "execute_single_tool", fake_execute)
+        monkeypatch.setattr(MessageService, "_stream_followup_response", no_followup, raising=False)
+        service = MessageService(db)
+        tool_calls = [
+            {"id": "call_ok", "type": "function", "function": {"name": "some_tool", "arguments": "{}"}},
+            {"id": "call_no", "type": "function", "function": {"name": "other_tool", "arguments": "{}"}},
+        ]
+        events = []
+        try:
+            async for chunk in service._handle_tool_calls(
+                chat_id=str(chat.id), user_id=str(test_user.id), user_token="", messages=[],
+                tool_calls=tool_calls, provider=None, model=None, temperature=0.7, max_tokens=None,
+                tools=[], rejected_tool_call_ids=["call_no"],
+            ):
+                events.append(chunk)
+        except Exception:
+            pass  # the follow-up model call has no provider here; the round's results are what matters
+        assert ran == ["call_ok"]
+        rows = (await db.execute(select(Message).where(Message.chat_id == chat.id, Message.role == "tool"))).scalars().all()
+        by_id = {m.tool_call_id: m.content for m in rows}
+        assert "Rejected by user" in by_id["call_no"] and "ok" in by_id["call_ok"]
+        rejected_event = next(e for e in events if e.get("tool_call_id") == "call_no")
+        assert rejected_event["type"] == "tool_end" and "Rejected" in rejected_event["result"]
 
 
 class TestInterruptEndpoint:

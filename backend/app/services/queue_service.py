@@ -355,8 +355,13 @@ class QueueService:
         defer_seconds: Optional[int] = None,
         attempt: int = 0,
         enqueued_at: Optional[float] = None,
+        rejected_tool_call_ids: Optional[list[str]] = None,
     ) -> str:
         """Enqueue an agent resume job (after tool approval).
+
+        `rejected_tool_call_ids`: the round's asked calls the user said no
+        to; the resumed round answers them with a rejection instead of
+        running them.
 
         `defer_seconds`/`attempt`: a retry of a continuation that found the
         chat busy. `enqueued_at` is kept from the first enqueue so an
@@ -401,6 +406,7 @@ class QueueService:
             user_token=user_token,
             pending_approval_id=pending_approval_id,
             approved=approved,
+            rejected_tool_call_ids=list(rejected_tool_call_ids or []),
             channel_id=channel_id,
             trace_context=inject_trace_context(),
             # The API key the run acts through: its tools check the key's
