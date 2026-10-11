@@ -307,7 +307,11 @@ class ConfigApplyService:
         from app.services.resources.registry import all_appliers
 
         ctx = self._resource_context(dry_run)
-        for applier in all_appliers():
+        appliers = {a.kind: a for a in all_appliers()}
+
+        # What this source no longer declares.
+        candidates: list[tuple[Any, Any, str]] = []
+        for applier in appliers.values():
             if applier.kind in self.skip_resource_types or not applier.deleted_with_package:
                 continue
             declared = {
@@ -324,17 +328,82 @@ class ConfigApplyService:
                 stmt = stmt.with_for_update().execution_options(populate_existing=True)
             for row in (await self.db.execute(stmt)).scalars().all():
                 key = applier.key_of_row(row)
-                if key in declared:
-                    continue
+                if key not in declared:
+                    candidates.append((applier, row, key))
+        if not candidates:
+            return
+
+        # Collections and stores holding what users put in them stay: a prune
+        # removes definitions, and those contents couldn't be restored from
+        # history. Deleting them stays a deliberate act. Decided first, since
+        # what they keep using must stay too.
+        removable = []
+        for applier, row, key in candidates:
+            contents = await _contents(self.db, applier.kind, row)
+            if contents:
+                self.warnings.append(
+                    f"Kept {applier.label.lower()} '{key}' although no longer declared: it holds "
+                    f"{contents}. Delete it in the console to remove it with its contents."
+                )
+            else:
+                removable.append((applier, row, key))
+
+        removing = {(applier.kind, key) for applier, _row, key in removable}
+        users = await self._users_of(removing, config, appliers, ctx)
+
+        for applier, row, key in removable:
+            label = applier.label.lower()
+            still_used = sorted(users.get((applier.kind, key), ()))
+            if still_used:
+                self.errors.append(
+                    f"Can't remove {label} '{key}': still used by {', '.join(still_used)}. "
+                    "Remove or change those too, or keep declaring it."
+                )
+                continue
+            try:
+                async with self.db.begin_nested():
+                    await applier.delete(row, ctx)
+            except Exception as e:
+                self.errors.append(f"Error removing {label} '{key}': {_describe_error(e)}")
+                continue
+            self._track_change("delete", applier.kind, key)
+
+    async def _users_of(self, removing: set, config: SinasConfig, appliers: dict, ctx) -> dict:
+        """For each (kind, key) about to be removed, the resources that still
+        point at it: rows that stay, and what this config declares (in a dry
+        run those don't exist yet)."""
+        from sqlalchemy import select
+
+        from app.services.resources.usage import REFERRING_KINDS, references_of
+
+        users: dict = {}
+        for kind in REFERRING_KINDS:
+            applier = appliers.get(kind)
+            if applier is None:
+                continue
+            # The state after this apply: what's stored, with what the config
+            # declares in its place (in a dry run it isn't written yet).
+            rows = {
+                applier.key_of_row(row): row
+                for row in (await self.db.execute(select(applier.model))).scalars().all()
+            }
+            after = {key: await applier.current_spec(ctx, row) for key, row in rows.items()}
+            for item in getattr(config.spec, applier.config_section, None) or []:
                 try:
-                    async with self.db.begin_nested():
-                        await applier.delete(row, ctx)
-                except Exception as e:
-                    self.errors.append(
-                        f"Error removing {applier.label.lower()} '{key}': {_describe_error(e)}"
-                    )
-                    continue
-                self._track_change("delete", applier.kind, key)
+                    spec = applier.spec_model.model_validate(item.model_dump(exclude_none=True))
+                except Exception:
+                    continue  # reported by the apply itself
+                key = applier.key_of(spec)
+                existing = rows.get(key)
+                if existing is not None and applier.ownership(existing, ctx) == "skip":
+                    continue  # not this apply's to write: what's stored stays
+                after[key] = spec
+            for key, spec in after.items():
+                if (kind, key) in removing:
+                    continue  # going too
+                for ref in references_of(kind, spec) & removing:
+                    users.setdefault(ref, set()).add(f"{applier.noun} '{key}'")
+        return users
 
     def _discard_pending(self) -> None:
         """Forget every queued notification: the transaction won't commit."""
@@ -392,3 +461,20 @@ def _describe_error(error: Exception) -> str:
             for err in error.errors(include_url=False)
         )
     return str(error)
+
+
+async def _contents(db, kind: str, row) -> str | None:
+    """What users stored in a collection or store, if anything."""
+    from sqlalchemy import func, select
+
+    if kind == "collections":
+        from app.models.file import File
+
+        count = (await db.execute(select(func.count()).select_from(File).where(File.collection_id == row.id))).scalar()
+        return f"{count} file{'s' if count != 1 else ''}" if count else None
+    if kind == "stores":
+        from app.models.state import State
+
+        count = (await db.execute(select(func.count()).select_from(State).where(State.store_id == row.id))).scalar()
+        return f"{count} saved state{'s' if count != 1 else ''}" if count else None
+    return None
