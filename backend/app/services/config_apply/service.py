@@ -383,16 +383,21 @@ class ConfigApplyService:
                 continue
             # The state after this apply: what's stored, with what the config
             # declares in its place (in a dry run it isn't written yet).
-            after = {
-                applier.key_of_row(row): await applier.current_spec(ctx, row)
+            rows = {
+                applier.key_of_row(row): row
                 for row in (await self.db.execute(select(applier.model))).scalars().all()
             }
+            after = {key: await applier.current_spec(ctx, row) for key, row in rows.items()}
             for item in getattr(config.spec, applier.config_section, None) or []:
                 try:
                     spec = applier.spec_model.model_validate(item.model_dump(exclude_none=True))
                 except Exception:
                     continue  # reported by the apply itself
-                after[applier.key_of(spec)] = spec
+                key = applier.key_of(spec)
+                existing = rows.get(key)
+                if existing is not None and applier.ownership(existing, ctx) == "skip":
+                    continue  # not this apply's to write: what's stored stays
+                after[key] = spec
             for key, spec in after.items():
                 if (kind, key) in removing:
                     continue  # going too

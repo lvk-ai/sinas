@@ -145,3 +145,19 @@ async def test_a_pipeline_step_keeps_its_function(client, db: AsyncSession, admi
     result = await _apply(client, admin_user, _jobs([], None, pipeline), prune=True, dryRun=True)
     assert not result["success"]
     assert any("still used by pipeline" in e for e in result["errors"]), result["errors"]
+
+
+async def test_a_skipped_declaration_doesnt_hide_a_stored_reference(client, db: AsyncSession, admin_user):
+    """Config A owns function F; config B owns a schedule on F. A drops F and
+    declares B's schedule with another target: that declaration is skipped
+    (B owns it), so the schedule still uses F, and F stays."""
+    f, g = f"f{uuid.uuid4().hex[:6]}", f"g{uuid.uuid4().hex[:6]}"
+    fn = lambda n: f"    - {{namespace: {NS}, name: {n}, code: 'def handler(i, c): return {{}}'}}"  # noqa: E731
+    sched = lambda t: f"    - {{name: shared-job, functionName: {NS}/{t}, cronExpression: '0 3 * * *'}}"  # noqa: E731
+    head = lambda name: ["apiVersion: sinas.co/v1", "kind: SinasConfig", f"metadata: {{name: {name}}}", "spec:"]  # noqa: E731
+    assert (await _apply(client, admin_user, "\n".join(head("owner-a") + ["  functions:", fn(f), fn(g)]) + "\n"))["success"]
+    assert (await _apply(client, admin_user, "\n".join(head("owner-b") + ["  schedules:", sched(f)]) + "\n"))["success"]
+    doc = "\n".join(head("owner-a") + ["  functions:", fn(g), "  schedules:", sched(g)]) + "\n"
+    result = await _apply(client, admin_user, doc, prune=True)
+    assert not result["success"]
+    assert any("still used by schedule 'shared-job'" in e for e in result["errors"]), result["errors"]
