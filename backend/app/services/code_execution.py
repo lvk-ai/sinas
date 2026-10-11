@@ -121,6 +121,7 @@ async def execute(
     # changes back afterwards (see _finalize_workbench below).
     workbench_input: dict[str, Any] = {}
     workbench_skipped_in: list[dict[str, Any]] = []
+    workbench_base_hashes: Optional[dict[str, Optional[str]]] = None
     workbench_lazy: list[dict[str, Any]] = []
     workbench_chat_id: Optional[str] = None
     if chat_id:
@@ -141,6 +142,12 @@ async def execute(
                     workbench_chat_id = str(_chat.id)
                     workbench_skipped_in = manifest["skipped"]
                     workbench_lazy = manifest["lazy"]
+                    # The tree the run starts from: copy-out refuses to
+                    # overwrite a file that changed meanwhile (see
+                    # apply_sync_changes).
+                    workbench_base_hashes = {
+                        e["path"]: e["sha256"] for e in manifest["files"] + manifest["lazy"]
+                    }
                     workbench_input = {
                         "workbench_files": manifest["files"],
                         "workbench_lazy": [
@@ -192,12 +199,15 @@ async def execute(
                     ).scalar_one_or_none()
                     if _chat:
                         sync = await workbench_service.apply_sync_changes(
-                            _db, _chat, str(_chat.user_id), changes
+                            _db, _chat, str(_chat.user_id), changes,
+                            base_hashes=workbench_base_hashes,
                         )
                         await _db.commit()
                         info["synced"] = sync["synced"]
                         if sync["rejected"]:
                             info["rejected"] = sync["rejected"]
+                        if sync.get("conflicts"):
+                            info["conflicts"] = sync["conflicts"]
             except Exception as e:
                 logger.error(f"Workbench copy-out failed for chat {workbench_chat_id}: {e}")
                 info["error"] = f"Failed to persist workbench changes: {e}"

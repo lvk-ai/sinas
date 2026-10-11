@@ -803,15 +803,29 @@ async def fetch_file_bytes(
     }
 
 
+CONFLICT_SUFFIX = ".run-conflict"
+
+
 async def apply_sync_changes(
-    db: AsyncSession, chat: Chat, user_id: str, changes: list[dict[str, Any]]
+    db: AsyncSession,
+    chat: Chat,
+    user_id: str,
+    changes: list[dict[str, Any]],
+    base_hashes: Optional[dict[str, Optional[str]]] = None,
 ) -> dict[str, Any]:
     """Write files an execution created or modified back into the workbench.
 
     Each change is {path, content_b64}. Deletions are deliberately NOT
     synced: a crashed or chdir-ing execution must never wipe workbench
     files it simply didn't touch. Returns {"synced": [...], "rejected":
-    [{path, reason}]}.
+    [{path, reason}], "conflicts": [{path, saved_as, reason}]}.
+
+    `base_hashes` is the tree the run started from ({path: sha256}; a key
+    with None for a file that did not exist yet is not needed — absence
+    means absent). A file whose current content no longer matches what the
+    run started from — the agent, another run or a console upload changed
+    it meanwhile — is NOT overwritten: the run's copy is saved beside it as
+    `<path>.run-conflict` so no work is lost, and the conflict reported.
     """
     import base64
 
@@ -821,6 +835,7 @@ async def apply_sync_changes(
     storage = get_storage()
     synced: list[str] = []
     rejected: list[dict[str, str]] = []
+    conflicts: list[dict[str, str]] = []
     for change in changes or []:
         path = change.get("path", "")
         err = _validate_path(path)
@@ -832,6 +847,27 @@ async def apply_sync_changes(
         except Exception:
             rejected.append({"path": path, "reason": "invalid base64 content"})
             continue
+        if base_hashes is not None:
+            current = await _current_hash(db, workbench, path)
+            started_from = base_hashes.get(path)
+            if current is not None and current != started_from:
+                saved_as = f"{path}{CONFLICT_SUFFIX}"
+                aside = await _write_bytes(
+                    db, storage, workbench, filename=saved_as, content=content,
+                    content_type=_infer_content_type(path), user_id=user_id, visibility="private",
+                    file_metadata={"origin": "execution", "conflict_of": path},
+                )
+                conflicts.append({
+                    "path": path,
+                    "saved_as": saved_as if "error" not in aside else "",
+                    "reason": (
+                        f"'{path}' changed in the workbench while the run was in progress; "
+                        f"the run's copy was saved as '{saved_as}'" if "error" not in aside
+                        else f"'{path}' changed in the workbench while the run was in progress; "
+                             f"the run's copy could not be saved aside ({aside['error']})"
+                    ),
+                })
+                continue
         result = await _write_bytes(
             db,
             storage,
@@ -846,7 +882,24 @@ async def apply_sync_changes(
             rejected.append({"path": path, "reason": result["error"]})
         else:
             synced.append(path)
-    return {"synced": synced, "rejected": rejected}
+    return {"synced": synced, "rejected": rejected, "conflicts": conflicts}
+
+
+async def _current_hash(db: AsyncSession, workbench: Collection, path: str) -> Optional[str]:
+    """sha256 of the workbench file's current version, or None if absent."""
+    f = (
+        await db.execute(select(File).where(File.collection_id == workbench.id, File.name == path))
+    ).scalar_one_or_none()
+    if f is None:
+        return None
+    version = (
+        await db.execute(
+            select(FileVersion.hash_sha256).where(
+                FileVersion.file_id == f.id, FileVersion.version_number == f.current_version
+            )
+        )
+    ).scalar_one_or_none()
+    return version
 
 
 async def _write_bytes(

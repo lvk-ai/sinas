@@ -947,3 +947,44 @@ class TestWriteGuards:
 
 async def _coro(value):
     return value
+
+
+class TestCopyOutConflicts:
+    @pytest.mark.asyncio
+    async def test_file_changed_during_the_run_is_not_overwritten(self, db, chat, test_user):
+        import base64
+        from app.services.workbench import apply_sync_changes, build_sync_manifest
+
+        uid = str(test_user.id)
+        tools = WorkbenchTools()
+        await tools.execute_tool(db, chat, uid, "workbench_write", {"filename": "notes.md", "content": "v1"})
+        manifest = await build_sync_manifest(db, chat)
+        base = {e["path"]: e["sha256"] for e in manifest["files"] + manifest["lazy"]}
+        # The agent edits the file while the run is in progress.
+        await tools.execute_tool(db, chat, uid, "workbench_write", {"filename": "notes.md", "content": "v2 by agent"})
+
+        out = await apply_sync_changes(db, chat, uid, [
+            {"path": "notes.md", "content_b64": base64.b64encode(b"v2 by the run").decode()},
+            {"path": "new.txt", "content_b64": base64.b64encode(b"fresh").decode()},
+        ], base_hashes=base)
+        assert out["synced"] == ["new.txt"]
+        (conflict,) = out["conflicts"]
+        assert conflict["path"] == "notes.md" and conflict["saved_as"] == "notes.md.run-conflict"
+        kept = await tools.execute_tool(db, chat, uid, "workbench_read", {"filename": "notes.md"})
+        assert "v2 by agent" in kept["content"] and "by the run" not in kept["content"]
+        aside = await tools.execute_tool(db, chat, uid, "workbench_read", {"filename": "notes.md.run-conflict"})
+        assert "v2 by the run" in aside["content"]
+
+    @pytest.mark.asyncio
+    async def test_unchanged_file_is_written_back(self, db, chat, test_user):
+        import base64
+        from app.services.workbench import apply_sync_changes, build_sync_manifest
+
+        uid = str(test_user.id)
+        await WorkbenchTools().execute_tool(db, chat, uid, "workbench_write", {"filename": "a.txt", "content": "v1"})
+        manifest = await build_sync_manifest(db, chat)
+        base = {e["path"]: e["sha256"] for e in manifest["files"]}
+        out = await apply_sync_changes(db, chat, uid, [
+            {"path": "a.txt", "content_b64": base64.b64encode(b"v2").decode()},
+        ], base_hashes=base)
+        assert out["synced"] == ["a.txt"] and out["conflicts"] == []
