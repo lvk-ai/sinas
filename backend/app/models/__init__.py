@@ -46,6 +46,7 @@ from .user import (
     UserIdentity,
     UserRole,
 )
+from .chat_wakeup import ChatWakeup
 from .webhook import Webhook
 
 __all__ = [
@@ -53,6 +54,7 @@ __all__ = [
     "Function",
     "FunctionVersion",
     "Webhook",
+    "ChatWakeup",
     "ConfigRevision",
     "ScheduledJob",
     "Execution",

@@ -58,6 +58,7 @@ SUSPENSION_EVENT_TYPES = frozenset({ROUND_SUSPENDED, "delegation_pending"})
 
 SUB_AGENT = "sub_agent"
 HUMAN_INPUT = "human_input"
+BACKGROUND_JOB = "background_job"
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,24 @@ register_completer(
                     "with the information you have, state the assumption you "
                     "are making, or finish and let the user follow up."
                 ),
+                "timed_out": True,
+            }
+        ),
+    )
+)
+
+
+register_completer(
+    Completer(
+        kind=BACKGROUND_JOB,
+        tool_message_name=lambda entry: "run_in_background",
+        timeout_content=lambda tc_id, entry: json.dumps(
+            {
+                "error": (
+                    "The background run did not finish before the deadline. "
+                    "Check background_job_status for a late result, or run it again."
+                ),
+                "job_id": entry.get("job_id"),
                 "timed_out": True,
             }
         ),

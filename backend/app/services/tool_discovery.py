@@ -376,6 +376,12 @@ async def get_available_tools(
     if has_system_tool(system_tools, "askUser"):
         from app.services.ask_user_tools import get_ask_user_tool_definition
         tools.append(get_ask_user_tool_definition())
+    if has_system_tool(system_tools, "background"):
+        from app.services.chat_wakeups import get_background_tool_definitions
+        tools.extend(get_background_tool_definitions(
+            code_execution_available=has_system_tool(system_tools, "codeExecution")
+            and settings.code_execution_enabled
+        ))
 
     # Check for paused executions belonging to this chat
     result = await db.execute(

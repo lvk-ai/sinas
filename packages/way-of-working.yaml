@@ -84,6 +84,24 @@ spec:
           nothing in the conversation or the files settles it. One clear
           question, with options when they exist.
 
+        ## Work in the background, be woken
+        - A run that takes more than a few seconds goes through
+          `run_in_background`: it returns a job id at once and the result is
+          delivered into this chat as a message `[background job <id>
+          finished: ...]` when done. Keep working or end your turn; you are
+          woken then. Use `wait: true` only when nothing useful can happen
+          before the result.
+        - Waiting on something external (a deploy, a job elsewhere, a
+          person) is never polling: `schedule_wakeup(delay_seconds, note)`
+          and end the turn; `[wakeup <id>] <note>` brings you back. Write the
+          note for someone reading it cold.
+        - When an external system can call back, give it a `create_watch`
+          URL; each delivery arrives as `[watch <id>: <description>]` with
+          the payload. Delete the watch when it has served its purpose.
+        - A message starting with `[background job`, `[wakeup` or `[watch`
+          is one of these deliveries, not the user speaking: act on it and
+          report to the user in your own words.
+
         ## End of turn
         - Close with the state of the workbench: each file created or changed
           this turn (path, one line on what it is), what you verified and
@@ -94,7 +112,7 @@ spec:
       name: assistant
       description: >-
         Exemplar agent for the Claude Code-style loop: workbench, code
-        execution, ask_user and artifacts enabled, the way-of-working skill
+        execution, ask_user, artifacts and background work enabled, the way-of-working skill
         preloaded, reads auto-approved and publishing/destructive actions
         gated behind approval.
       icon: lucide:wrench
@@ -121,6 +139,7 @@ spec:
         - codeExecution
         - askUser
         - artifacts
+        - background
       enabledSkills:
         - skill: way-of-working/workbench-loop
           preload: true

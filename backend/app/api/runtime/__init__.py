@@ -1,7 +1,7 @@
 """Runtime API - Data Plane for execution, authentication, and runtime state."""
 from fastapi import APIRouter
 
-from app.api.runtime.endpoints import batches, manifests, authentication, chats, components, discovery, executions, files, functions, info, oidc, pipelines, queries, stores, templates, webhooks, workbench
+from app.api.runtime.endpoints import batches, manifests, authentication, chats, components, discovery, executions, files, functions, info, oidc, pipelines, queries, stores, templates, watch, webhooks, workbench
 
 runtime_router = APIRouter()
 
@@ -20,6 +20,7 @@ runtime_router.include_router(chats.router, tags=["runtime-chats"])
 
 # Workbench - a chat's private working tree (uploads, browsing)
 runtime_router.include_router(workbench.router, tags=["runtime-workbench"])
+runtime_router.include_router(watch.router, tags=["runtime-watch"])
 
 # Functions - function execution (sync and async)
 runtime_router.include_router(functions.router, tags=["runtime-functions"])

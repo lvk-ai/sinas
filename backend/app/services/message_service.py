@@ -1,6 +1,7 @@
 """Message service for chat processing with tool calling."""
 import asyncio
 import json
+import uuid
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -53,6 +54,16 @@ from app.core.telemetry import get_tracer, otel_attr
 
 logger = logging.getLogger(__name__)
 _tracer = get_tracer()
+
+
+def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
+    """A deferred_completer tool defers unconditionally unless its metadata
+    names an argument (`deferred_if_arg`) that must be truthy for it."""
+    arg = meta.get("deferred_if_arg")
+    if not arg:
+        return True
+    args = safe_parse_arguments(tool_call.get("function", {}).get("arguments", ""))
+    return bool(isinstance(args, dict) and args.get(arg))
 
 
 class MessageService:
@@ -962,6 +973,7 @@ class MessageService:
 
         delegate_calls: list[dict[str, Any]] = []
         ask_user_calls: list[dict[str, Any]] = []
+        background_calls: list[dict[str, Any]] = []
         _meta_by_name: dict[str, dict[str, Any]] = {}
         if current_channel_id.get() is not None:
             _meta_by_name = (
@@ -977,6 +989,8 @@ class MessageService:
                     delegate_calls.append(tc)
                 elif meta.get("deferred_completer") == "human_input":
                     ask_user_calls.append(tc)
+                elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
+                    background_calls.append(tc)
                 else:
                     executable_calls.append(tc)
             valid_tool_calls = executable_calls
@@ -1105,7 +1119,7 @@ class MessageService:
         # Suspend the round on the deferred calls: checkpoint them as pending
         # completions and end this generator instead of blocking a worker
         # slot; the resume job continues once the last completion lands.
-        if delegate_calls or ask_user_calls:
+        if delegate_calls or ask_user_calls or background_calls:
             from app.services import deferred_completions
             from app.services.delegation import (
                 current_delegation_depth,
@@ -1194,6 +1208,47 @@ class MessageService:
                     "expires_at": deadline,
                 })
 
+            # Background runs the model waits on (run_in_background wait=true):
+            # the job is queued only after the checkpoint exists, like
+            # delegation children. A malformed call fails immediately.
+            background_jobs: list[tuple[str, str, str, str]] = []  # (tool_call_id, job_id, code, description)
+            for tc in background_calls:
+                args = safe_parse_arguments(tc["function"].get("arguments", ""))
+                if not isinstance(args, dict):
+                    args = {}
+                code = args.get("code")
+                description = str(args.get("description") or "background run")
+                yield {
+                    "type": "tool_start",
+                    "tool_call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"].get("arguments", "{}"),
+                    "description": build_tool_status(tc["function"]["name"], args, status_templates),
+                }
+                if not code or not isinstance(code, str) or not code.strip() or not settings.code_execution_enabled:
+                    error_content = json.dumps({"error": (
+                        "Code execution is disabled on this deployment." if not settings.code_execution_enabled
+                        else "run_in_background requires non-empty 'code'"
+                    )})
+                    tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                    self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                    await self.db.commit()
+                    yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                    continue
+                job_id = str(uuid.uuid4())
+                entry = {
+                    "completer": deferred_completions.BACKGROUND_JOB,
+                    "job_id": job_id,
+                    "description": description,
+                }
+                deadline = deferred_completions.deadline_from_now(
+                    settings.code_execution_timeout + settings.background_job_grace_seconds
+                )
+                if deadline:
+                    entry["expires_at"] = deadline
+                entries[tc["id"]] = entry
+                background_jobs.append((tc["id"], job_id, code, description))
+
             if entries:
                 row = await deferred_completions.suspend_round(
                     self.db,
@@ -1232,6 +1287,21 @@ class MessageService:
                         user_token=user_token,
                         delegation_depth=current_delegation_depth.get(),
                     )
+                if background_jobs:
+                    from app.services import chat_wakeups
+
+                    for tool_call_id, job_id, code, description in background_jobs:
+                        started = await chat_wakeups.start_background_job(
+                            chat_id, user_id, code, description,
+                            tool_call_id=tool_call_id, pending_completion_id=str(row.id),
+                        )
+                        yield {
+                            "type": "background_job_started",
+                            "tool_call_id": tool_call_id,
+                            "job_id": started.get("job_id", job_id),
+                            "description": description,
+                            "pending_completion_id": str(row.id),
+                        }
                 for event in ask_events:
                     yield {**event, "pending_completion_id": str(row.id)}
                 if prepared:

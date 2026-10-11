@@ -361,6 +361,22 @@ class Settings(BaseSettings):
     tool_approval_timeout_seconds: int = 0
     agent_delegate_suspend_timeout_seconds: int = 0
 
+    # Background work and wakeups (`background` system tool; ADR
+    # 2026-10-11-background-jobs-and-wakeups). A background code run that
+    # the agent waits on gets this grace on top of code_execution_timeout
+    # before the round resumes with a timeout error; results delivered into
+    # the chat are clipped to background_job_result_max_chars (the full
+    # result stays readable via background_job_status for 24h). Timers may
+    # be set at most wakeup_max_delay_seconds ahead; watches live
+    # watch_default_ttl_seconds unless asked otherwise (capped at
+    # watch_max_ttl_seconds) and accept payloads up to watch_max_payload_bytes.
+    background_job_grace_seconds: int = 120
+    background_job_result_max_chars: int = 16000
+    wakeup_max_delay_seconds: int = 7 * 86400
+    watch_default_ttl_seconds: int = 86400
+    watch_max_ttl_seconds: int = 30 * 86400
+    watch_max_payload_bytes: int = 65536
+
     # MCP servers (see ADR 2026-10-09-mcp-client). A server's tool list is
     # cached in-process so a chat turn doesn't re-handshake with every
     # enabled server; a failed listing is cached for a shorter time so a dead
