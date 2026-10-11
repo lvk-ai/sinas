@@ -40,7 +40,9 @@ async def create_mcp_server(
     """Create an MCP server."""
     user_id, permissions = current_user_data
 
-    permission = "sinas.mcp_servers.create:own"
+    # Namespaced like the default grant (sinas.mcp_servers/*/*.create:own):
+    # a bare "sinas.mcp_servers.create" would not match a path-scoped grant.
+    permission = f"sinas.mcp_servers/{data.namespace}/{data.name}.create:own"
     if not check_permission(permissions, permission):
         set_permission_used(request, permission, has_perm=False)
         raise HTTPException(status_code=403, detail="Not authorized to create MCP servers")

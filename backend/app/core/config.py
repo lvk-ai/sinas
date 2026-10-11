@@ -368,6 +368,11 @@ class Settings(BaseSettings):
     # 0 disables that cache.
     mcp_tool_list_ttl_seconds: int = 60
     mcp_tool_list_failure_ttl_seconds: int = 15
+    # Bounds on one tools/list discovery: pages followed and wall time, so
+    # a server that pages forever (or repeats a cursor) is dropped from the
+    # chat's tool list instead of holding the turn.
+    mcp_list_tools_max_pages: int = 50
+    mcp_list_tools_total_timeout_seconds: int = 60
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data

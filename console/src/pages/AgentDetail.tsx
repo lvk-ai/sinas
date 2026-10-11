@@ -1420,6 +1420,34 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   (named <code className="text-xs bg-surface-1 px-1 rounded">mcp_&lt;namespace&gt;__&lt;server&gt;__&lt;tool&gt;</code>),
                   so approval rules can gate them by name. Optionally narrow to tool name patterns.
                 </p>
+                {(() => {
+                  // Bindings whose server is no longer listed (deleted, inactive, or
+                  // unreadable) still have to be shown, or they can never be removed and
+                  // every save is refused for them.
+                  const enabledNow: any[] = formData.enabled_mcp_servers || agent.enabled_mcp_servers || [];
+                  const listedRefs = new Set((mcpServers || []).filter((s: any) => s.is_active).map((s: any) => `${s.namespace}/${s.name}`));
+                  const orphaned = enabledNow.filter((e: any) => !listedRefs.has(e.server));
+                  if (orphaned.length === 0) return null;
+                  return (
+                    <div className="space-y-2 mb-3">
+                      {orphaned.map((entry: any) => (
+                        <div key={entry.server} className="border border-amber-700/40 bg-amber-900/10 rounded-lg p-3 flex items-center justify-between">
+                          <div>
+                            <span className="text-sm font-medium text-gray-100 font-mono">{entry.server}</span>
+                            <p className="text-xs text-amber-400 mt-0.5">Server unavailable (deleted, inactive, or no access). Remove it to save this agent.</p>
+                          </div>
+                          <button
+                            type="button"
+                            className="btn btn-secondary text-xs"
+                            onClick={() => setFormData({ ...formData, enabled_mcp_servers: enabledNow.filter((x: any) => x.server !== entry.server) })}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
                 {mcpServers && mcpServers.length > 0 ? (
                   <div className="space-y-3">
                     {mcpServers.filter((s: any) => s.is_active).map((server: any) => {
