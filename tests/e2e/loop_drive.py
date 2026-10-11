@@ -244,10 +244,29 @@ class Driver:
         self.step(2, f"collection {COLLECTION} ready")
         inst = self.ok(self.c.post("/api/v1/packages/install", headers=self.h, json={"source": PACKAGE.read_text()}))
         self.step(3, f"package installed: {inst['package']['name']} {inst['package']['version']}")
+        # The scripted run drives a COPY of the package's agent bound to the
+        # stub; the package agent itself is never touched, so a later --real
+        # run (and real users) keep its provider and the package keeps
+        # managing it.
+        agent_ref = "way-of-working/assistant"
         if stub_provider_id:
-            self.ok(self.c.put("/api/v1/agents/way-of-working/assistant", headers=self.h, json={"llm_provider_id": stub_provider_id, "model": "stub"}))
-            self.step(3, "test agent bound to the stub provider")
-        chat = self.ok(self.c.post("/agents/way-of-working/assistant/chats", headers=self.h, json={"title": "e2e loop drive", "keep_alive": True}))
+            source = self.ok(self.c.get("/api/v1/agents/way-of-working/assistant", headers=self.h))
+            copy = {k: source.get(k) for k in (
+                "description", "temperature", "max_tokens", "system_prompt", "input_schema", "output_schema",
+                "initial_messages", "enabled_functions", "enabled_agents", "enabled_skills", "function_parameters",
+                "status_templates", "enabled_queries", "query_parameters", "enabled_stores", "enabled_collections",
+                "enabled_components", "enabled_connectors", "enabled_pipelines", "hooks", "icon", "system_tools",
+                "tool_approvals", "default_job_timeout", "default_keep_alive",
+            ) if source.get(k) is not None}
+            copy.update({"namespace": "e2e", "name": "assistant", "llm_provider_id": stub_provider_id, "model": "stub"})
+            r = self.c.put("/api/v1/agents/e2e/assistant", headers=self.h, json={k: v for k, v in copy.items() if k not in ("namespace", "name")})
+            if r.status_code == 404:
+                self.ok(self.c.post("/api/v1/agents", headers=self.h, json=copy))
+            else:
+                self.ok(r)
+            agent_ref = "e2e/assistant"
+            self.step(3, f"stub-bound copy of the package agent ready as {agent_ref}")
+        chat = self.ok(self.c.post(f"/agents/{agent_ref}/chats", headers=self.h, json={"title": "e2e loop drive", "keep_alive": True}))
         self.chat_id = chat["id"]
         self.step(4, f"chat {self.chat_id} (keep_alive)")
         self.ok(self.c.post(f"/chats/{self.chat_id}/workbench/files", headers=self.h, json={"name": "input/orders.csv", "content_base64": base64.b64encode(INPUT_CSV.encode()).decode()}))
