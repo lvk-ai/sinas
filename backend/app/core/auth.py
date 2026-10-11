@@ -20,6 +20,7 @@ from app.core.database import get_db
 from app.core.email import send_otp_email_async
 from app.core.token_signing import decode_access_token, get_signing_context
 from app.core.permissions import (
+    DEFAULT_ROLE_DESCRIPTIONS,
     DEFAULT_ROLE_PERMISSIONS,
     check_permission,
     validate_permission_subset,
@@ -1050,7 +1051,7 @@ def set_permission_used(request: Request, permission: str, has_perm: bool = True
 
 async def initialize_default_roles(db: AsyncSession):
     """
-    Initialize default roles (GuestUsers, Users, Admins) with permissions.
+    Initialize default roles (GuestUsers, Users, Deployers, Admins) with permissions.
 
     Should be called during application startup or setup.
     """
@@ -1061,7 +1062,10 @@ async def initialize_default_roles(db: AsyncSession):
 
         if not role:
             # Create role
-            role = Role(name=role_name, description=f"Default {role_name} role")
+            role = Role(
+                name=role_name,
+                description=DEFAULT_ROLE_DESCRIPTIONS.get(role_name, f"Default {role_name} role"),
+            )
             db.add(role)
             await db.commit()
             await db.refresh(role)

@@ -32,6 +32,8 @@ export function APIKeys() {
     retry: false,
     enabled: showCreateModal,
   });
+  // The built-in role for CI/CD deploy keys (see DEFAULT_ROLE_PERMISSIONS).
+  const deployersRole = roles?.find((role) => role.name === 'Deployers');
 
   const filteredApiKeys = apiKeys?.filter(key => showInactive || key.is_active);
 
@@ -276,6 +278,34 @@ export function APIKeys() {
             </div>
 
             <form onSubmit={handleCreate} className="p-6 space-y-6">
+              {deployersRole && !formData.role_ids?.includes(deployersRole.id) && (
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-line-soft bg-surface-0 px-4 py-3">
+                  <p className="text-sm text-gray-300">
+                    For CI/CD (deploying config and packages with the Sinas CLI)?
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setFormData({
+                        ...formData,
+                        name: formData.name || 'ci-deploy',
+                        role_ids: [...(formData.role_ids ?? []), deployersRole.id],
+                      })
+                    }
+                    className="btn-secondary text-sm whitespace-nowrap"
+                  >
+                    Make a deploy key
+                  </button>
+                </div>
+              )}
+              {deployersRole && formData.role_ids?.includes(deployersRole.id) && (
+                <div className="rounded-lg border border-yellow-700/40 bg-yellow-900/20 px-4 py-3 text-sm text-yellow-300">
+                  A deploy key can apply config, which is admin-level: a config can create roles
+                  and assign them. Keep it in your CI's secrets only, use one key per environment,
+                  set an expiry, and rotate it.
+                </div>
+              )}
+
               <div>
                 <label htmlFor="name" className="block text-sm font-medium text-gray-300 mb-2">
                   Key Name *

@@ -257,6 +257,10 @@ def validate_permission_subset(
 
 
 # Default role permissions
+DEFAULT_ROLE_DESCRIPTIONS = {
+    "Deployers": "For CI/CD API keys: validate, preview and apply config, install packages",
+}
+
 DEFAULT_ROLE_PERMISSIONS = {
     "GuestUsers": {
         "sinas.users.read:own": True,
@@ -348,6 +352,16 @@ DEFAULT_ROLE_PERMISSIONS = {
         "sinas.templates/*/*.send:own": True,  # Send with specific templates
         # Request Logs (non-namespaced)
         "sinas.logs.read:own": True,
+    },
+    # For CI/CD API keys that validate, preview and apply config and install
+    # packages (e.g. the Sinas CLI in a pipeline). No members by default: link
+    # it to an API key. Applying config is admin-level power (a config can
+    # create roles and assign them), so treat a deploy key like an admin
+    # credential.
+    "Deployers": {
+        "sinas.config.validate:all": True,
+        "sinas.config.apply:all": True,
+        "sinas.packages.install:all": True,
     },
     "Admins": {
         "sinas.*:all": True,  # Full access to everything including:
