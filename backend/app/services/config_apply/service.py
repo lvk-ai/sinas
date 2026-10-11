@@ -140,6 +140,12 @@ class ConfigApplyService:
             }
             for kind in ("functions", "agents", "pipelines")
         }
+        # What agents may refer to: declared in the same apply counts (it's
+        # applied all-or-nothing, and before the agents).
+        for kind in ("skills", "queries", "stores", "collections", "components", "connectors"):
+            self._pending_references[kind] = {
+                f"{item.namespace}/{item.name}": True for item in getattr(config.spec, kind)
+            }
         # A function or agent the config leaves isActive unset on keeps its
         # current state, so a disabled one stays disabled: a preview must see
         # that, or it accepts a reference the real apply refuses. A
@@ -200,7 +206,6 @@ class ConfigApplyService:
                 errors=self.errors,
                 warnings=self.warnings,
             )
-            common_with_owner = dict(**common, owner_user_id=self.owner_user_id)
 
             # Apply resources in dependency order
             from app.services.resources.registry import all_appliers

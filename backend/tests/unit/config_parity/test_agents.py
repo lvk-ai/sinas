@@ -41,6 +41,25 @@ async def provider(db: AsyncSession) -> LLMProvider:
     return row
 
 
+@pytest.fixture(autouse=True)
+async def tools(db: AsyncSession, admin_user):
+    """What the sample agents use: an agent's tools must exist first."""
+    from app.models.function import Function
+    from app.models.store import Store
+
+    for model, values in (
+        (Function, dict(namespace="tools", name="search", code="def handler(i, c): return {}",
+                        input_schema={}, output_schema={})),
+        (Store, dict(namespace="crm", name="notes")),
+    ):
+        exists = (await db.execute(
+            select(model).where(model.namespace == values["namespace"], model.name == values["name"])
+        )).scalar_one_or_none()
+        if exists is None:
+            db.add(model(user_id=admin_user.id, **values))
+    await db.flush()
+
+
 def _yaml(name: str, **extra) -> dict:
     return {
         "namespace": NS, "name": name, "description": "Helps", "systemPrompt": "Be brief.",

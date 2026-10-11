@@ -30,8 +30,8 @@ def _applier_classes() -> list[type[ResourceApplier]]:
     return [
         RoleApplier, SecretApplier, LLMProviderApplier, DatabaseConnectionApplier, DependencyApplier,
         ConnectorApplier, FunctionApplier, SkillApplier, QueryApplier, TemplateApplier, CollectionApplier,
-        StoreApplier, ManifestApplier, AgentApplier, PipelineApplier,
-        ComponentApplier, WebhookApplier, ScheduleApplier,
+        StoreApplier, ManifestApplier, PipelineApplier, ComponentApplier, AgentApplier,
+        WebhookApplier, ScheduleApplier,
         DatabaseTriggerApplier,
     ]
 
