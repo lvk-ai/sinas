@@ -97,3 +97,24 @@ class TestConfigApply:
             {"namespace": NS, "name": f"a{_uid()}", "enabledFunctions": [f"{NS}/missing"]},
         ])
         assert not result.success and "don't exist" in result.errors[0]
+
+
+class TestReviewFixes:
+    async def test_config_can_edit_an_agent_with_an_older_dangling_reference(self, db: AsyncSession, admin_user):
+        name = f"a{_uid()}"
+        await _function(db, admin_user, "gone")
+        spec = {"namespace": NS, "name": name, "enabledFunctions": [f"{NS}/gone"]}
+        assert (await _apply(db, admin_user, agents=[spec])).success
+        gone = (await db.execute(
+            Function.__table__.select().where(Function.namespace == NS, Function.name == "gone")
+        )).first()
+        await db.execute(Function.__table__.delete().where(Function.id == gone.id))
+        result = await _apply(db, admin_user, agents=[{**spec, "description": "still editable"}])
+        assert result.success, result.errors
+
+    async def test_a_bare_stored_name_isnt_an_addition(self, client, db: AsyncSession, admin_user):
+        name = f"a{_uid()}"
+        db.add(Agent(namespace=NS, name=name, user_id=admin_user.id, enabled_functions=["lookup"]))
+        await db.flush()
+        r = await client.put(f"/api/v1/agents/{NS}/{name}", json={"description": "d"}, headers=auth_headers(admin_user))
+        assert r.status_code == 200, r.text

@@ -194,8 +194,12 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         if spec.llm_provider_name and (current is None or current.llm_provider_name != spec.llm_provider_name):
             await self.check_references(spec, ctx)
         missing: list[str] = []
+        # The stored state in the spec's own spelling (e.g. a bare "lookup"
+        # stored long ago reads as "default/lookup"), so an unchanged
+        # reference never looks added.
+        before = _normalized(current)
         for kind, label, model in _reference_kinds():
-            added = _refs(spec, kind) - (_refs(current, kind) if current is not None else set())
+            added = _refs(spec, kind) - _refs(before, kind)
             wanted = []
             for ref in sorted(added):
                 if "*" in ref or (kind == "agents" and (ref == spec.key or _is_uuid(ref))):
@@ -280,6 +284,15 @@ def _refs(spec: Optional[AgentSpec], kind: str) -> set[str]:
     field = {"queries": "enabled_queries", "components": "enabled_components",
              "pipelines": "enabled_pipelines", "agents": "enabled_agents"}[kind]
     return {r for r in getattr(spec, field) if isinstance(r, str)}
+
+
+def _normalized(spec: Optional[AgentSpec]) -> Optional[AgentSpec]:
+    if spec is None:
+        return None
+    try:
+        return AgentSpec.model_validate(spec.model_dump())
+    except Exception:  # stored data the spec no longer accepts: compare as is
+        return spec
 
 
 def _is_uuid(value: str) -> bool:
