@@ -89,14 +89,31 @@ def _tool_result(messages, call_id):
     return ""
 
 
+_DELIVERY_RE = re.compile(r"^\[(?:watch|wakeup|background job) ([0-9a-f-]{8,})")
+
+
+def _delivery_id(content: str):
+    found = _DELIVERY_RE.match(content)
+    return found.group(1) if found else None
+
+
 def make_wakeups_plan():
     """Turn 1 arms all three wakeup paths and ends; every later turn is a
     delivery ([background job ...], [wakeup ...], [watch ...]) answered with
     text."""
     def plan(messages):
-        last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
-        if str(last_user.get("content") or "").startswith("["):
-            return "text", "Noted the delivery: " + str(last_user.get("content"))[:40]
+        # Every delivery carries an id in its bracket prefix; acknowledge all
+        # that no earlier reply mentioned (an injected delivery shares the
+        # reply of the turn it landed in).
+        pending_ids = []
+        acked = " ".join(str(m.get("content") or "") for m in messages if m.get("role") == "assistant")
+        for m in messages:
+            if m.get("role") == "user":
+                did = _delivery_id(str(m.get("content") or ""))
+                if did and did not in acked and did not in pending_ids:
+                    pending_ids.append(did)
+        if pending_ids:
+            return "text", "Noted deliveries: " + ", ".join(pending_ids)
         done = _answered(messages)
         if "call_watch" not in done:
             return "tool", ("call_watch", "create_watch", {"description": "CI result"})
@@ -344,17 +361,13 @@ class WakeupsDriver(Driver):
             msgs = self.state()["messages"]
             users = [m["content"] for m in msgs if m["role"] == "user" and (m["content"] or "").startswith("[")]
             prefixes = {u.split(" ", 1)[0] for u in users}
-            replies = [m for m in msgs if m["role"] == "assistant" and (m["content"] or "").startswith("Noted the delivery")]
-            if {"[watch", "[background", "[wakeup"} <= prefixes and len(replies) >= 1 and not self.state()["active_channel_id"] is None and len(replies) >= len(users) - 0:
-                break
-            if {"[watch", "[background", "[wakeup"} <= prefixes and len(replies) >= 1:
-                # injected deliveries share one reply; give the running turn a moment to finish
-                time.sleep(3)
-                msgs = self.state()["messages"]
+            acked = " ".join((m["content"] or "") for m in msgs if m["role"] == "assistant")
+            ids = [_delivery_id(u) for u in users]
+            if {"[watch", "[background", "[wakeup"} <= prefixes and all(i and i in acked for i in ids):
                 break
             time.sleep(3)
         self.deliveries = [m["content"] for m in msgs if m["role"] == "user" and (m["content"] or "").startswith("[")]
-        self.replies = [m["content"] for m in msgs if m["role"] == "assistant" and (m["content"] or "").startswith("Noted the delivery")]
+        self.replies = [m["content"] for m in msgs if m["role"] == "assistant" and (m["content"] or "").startswith("Noted deliveries")]
 
     def verify(self):
         print("      deliveries:")
@@ -366,8 +379,11 @@ class WakeupsDriver(Driver):
         for p in ("[watch", "[background", "[wakeup"):
             if p not in prefixes:
                 failures.append(f"no {p} delivery arrived")
-        if not self.replies:
-            failures.append("the agent never replied to a delivery")
+        acked = " ".join(self.replies)
+        for d in self.deliveries:
+            did = _delivery_id(d)
+            if not did or did not in acked:
+                failures.append(f"delivery not acknowledged by any reply: {d[:60]}")
         if any("conclusion" not in d for d in self.deliveries if d.startswith("[watch")):
             failures.append("watch payload missing from the delivery")
         if failures:

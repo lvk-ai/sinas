@@ -66,7 +66,10 @@ async def committed_chat():
     async with AsyncSessionLocal() as s:
         cid, uid, rid = env["chat"].id, env["user"].id, role.id
         await s.execute(delete(ChatWakeup).where(ChatWakeup.chat_id == cid))
+        from app.models.pending_approval import PendingToolApproval
+
         await s.execute(delete(PendingCompletion).where(PendingCompletion.chat_id == cid))
+        await s.execute(delete(PendingToolApproval).where(PendingToolApproval.chat_id == cid))
         await s.execute(delete(Message).where(Message.chat_id == cid))
         await s.execute(delete(Chat).where(Chat.id == cid))
         await s.execute(delete(UserRole).where(UserRole.user_id == uid))
@@ -310,9 +313,9 @@ async def _run_round(db, chat, user, tool_calls, monkeypatch, channel="chan-bg")
     monkeypatch.setattr(settings, "code_execution_enabled", True)
     started = []
 
-    async def fake_start(chat_id, user_id, code, description, *, tool_call_id=None, pending_completion_id=None):
-        started.append({"chat_id": chat_id, "code": code, "tool_call_id": tool_call_id, "pending_completion_id": pending_completion_id})
-        return {"job_id": "job-1", "status": "queued", "description": description}
+    async def fake_start(chat_id, user_id, code, description, *, tool_call_id=None, pending_completion_id=None, job_id=None):
+        started.append({"chat_id": chat_id, "code": code, "tool_call_id": tool_call_id, "pending_completion_id": pending_completion_id, "job_id": job_id})
+        return {"job_id": job_id or "job-1", "status": "queued", "description": description}
 
     monkeypatch.setattr(chat_wakeups, "start_background_job", fake_start)
 
@@ -362,9 +365,11 @@ async def test_wait_true_suspends_the_round_on_a_background_job(db, chat, test_u
     row = (await db.execute(select(PendingCompletion).where(PendingCompletion.chat_id == chat.id))).scalar_one()
     assert dc.entry_kind(row.pending["call_bg"]) == dc.BACKGROUND_JOB
     assert row.pending["call_bg"]["expires_at"]  # deadline armed
-    # The job was queued only after the checkpoint existed, against it.
+    # The job was queued only after the checkpoint existed, against it, under
+    # the id the checkpoint records (a timeout message points at a real job).
     (s,) = started
     assert s["pending_completion_id"] == str(row.id) and s["tool_call_id"] == "call_bg"
+    assert s["job_id"] == row.pending["call_bg"]["job_id"]
 
 
 @pytest.mark.asyncio
@@ -474,3 +479,81 @@ async def test_start_background_job_enqueues_on_the_function_queue(committed_cha
     assert kw["job_id"] == out["job_id"] and kw["pending_completion_id"] is None
     listed = await chat_wakeups.list_background_jobs(cid)
     assert [j["job_id"] for j in listed] == [out["job_id"]]
+
+
+@pytest.mark.asyncio
+async def test_wait_true_resolves_workbench_references_in_code(db, test_user, monkeypatch):
+    """A saved script runs the same whether the model waits on it or not."""
+    from app.models.agent import Agent
+    from app.services.workbench import WorkbenchTools
+
+    agent = Agent(namespace="test", name=f"wb-{uuid.uuid4().hex[:6]}", user_id=test_user.id, system_tools=["workbench", "codeExecution", "background"])
+    db.add(agent)
+    await db.flush()
+    chat = Chat(user_id=test_user.id, agent_id=agent.id, title="refs")
+    db.add(chat)
+    await db.flush()
+    await db.refresh(chat)
+    await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "script.py", "content": "print('from file')"})
+    call = {"id": "call_ref", "type": "function", "function": {"name": "run_in_background",
+            "arguments": json.dumps({"code": {"$workbench": "script.py"}, "description": "d", "wait": True})}}
+    chunks, started = await _run_round(db, chat, test_user, [call], monkeypatch)
+    assert dc.ROUND_SUSPENDED in {c.get("type") for c in chunks}
+    assert started[0]["code"] == "print('from file')"
+
+    missing = {"id": "call_gone", "type": "function", "function": {"name": "run_in_background",
+               "arguments": json.dumps({"code": {"$workbench": "nope.py"}, "description": "d", "wait": True})}}
+    chunks, started = await _run_round(db, chat, test_user, [missing], monkeypatch)
+    ends = {c["tool_call_id"]: c for c in chunks if c.get("type") == "tool_end"}
+    assert "error" in json.loads(ends["call_gone"]["result"]) and started == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_injects_while_an_approval_is_open(committed_chat, monkeypatch):
+    from app.models.pending_approval import PendingToolApproval
+
+    env = committed_chat
+    cid = str(env["chat"].id)
+    enqueued = _capture_enqueue(monkeypatch)
+    async with AsyncSessionLocal() as s:
+        anchor = Message(chat_id=env["chat"].id, role="assistant", content=None,
+                         tool_calls=[{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}])
+        s.add(anchor)
+        await s.flush()
+        s.add(PendingToolApproval(
+            chat_id=env["chat"].id, message_id=anchor.id, user_id=env["user"].id, tool_call_id="c1",
+            function_namespace="ns", function_name="t", arguments={}, all_tool_calls=[], conversation_context={},
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        ))
+        await s.commit()
+    out = await chat_wakeups.deliver_to_chat(cid, "[wakeup z] while approval open", source="wakeup")
+    assert out["status"] == "injected" and enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_still_reports_back(committed_chat, monkeypatch):
+    import asyncio
+
+    from app.services import code_execution
+
+    env = committed_chat
+    cid = str(env["chat"].id)
+    delivered = []
+
+    async def fake_exec(code, user_id=None, chat_id=None, timeout=None):
+        raise asyncio.CancelledError()
+
+    async def fake_deliver(chat_id, content, *, source, api_key_id=None):
+        delivered.append(content)
+        return {"status": "started"}
+
+    monkeypatch.setattr(code_execution, "execute", fake_exec)
+    monkeypatch.setattr(chat_wakeups, "deliver_to_chat", fake_deliver)
+    with pytest.raises(asyncio.CancelledError):
+        await chat_wakeups.run_background_code_job(
+            job_id="job-c", chat_id=cid, user_id=str(env["user"].id), code="x", description="d",
+            tool_call_id=None, pending_completion_id=None, api_key_id=None,
+        )
+    assert delivered and delivered[0].startswith("[background job job-c failed: d]")
+    assert (await chat_wakeups.background_job_status(cid, "job-c"))["status"] == "failed"
+

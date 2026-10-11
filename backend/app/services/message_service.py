@@ -26,6 +26,7 @@ from app.utils.schema import validate_with_coercion
 from app.services.content_tokens import strip_base64_data, refresh_message_tokens  # noqa: F401 — re-exported
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
+from app.services import workbench_refs
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -1212,12 +1213,11 @@ class MessageService:
             # the job is queued only after the checkpoint exists, like
             # delegation children. A malformed call fails immediately.
             background_jobs: list[tuple[str, str, str, str]] = []  # (tool_call_id, job_id, code, description)
+            _ref_chat = None
             for tc in background_calls:
                 args = safe_parse_arguments(tc["function"].get("arguments", ""))
                 if not isinstance(args, dict):
                     args = {}
-                code = args.get("code")
-                description = str(args.get("description") or "background run")
                 yield {
                     "type": "tool_start",
                     "tool_call_id": tc["id"],
@@ -1225,6 +1225,23 @@ class MessageService:
                     "arguments": tc["function"].get("arguments", "{}"),
                     "description": build_tool_status(tc["function"]["name"], args, status_templates),
                 }
+                # {"$workbench": path} references resolve here exactly as the
+                # inline path (execute_single_tool) resolves them, so a saved
+                # script runs the same whether or not the model waits on it.
+                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                    if _ref_chat is None:
+                        _ref_chat = (await self.db.execute(select(Chat).where(Chat.id == chat_id))).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(self.db, _ref_chat, user_id, args)
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
+                code = args.get("code")
+                description = str(args.get("description") or "background run")
                 if not code or not isinstance(code, str) or not code.strip() or not settings.code_execution_enabled:
                     error_content = json.dumps({"error": (
                         "Code execution is disabled on this deployment." if not settings.code_execution_enabled
@@ -1294,6 +1311,7 @@ class MessageService:
                         started = await chat_wakeups.start_background_job(
                             chat_id, user_id, code, description,
                             tool_call_id=tool_call_id, pending_completion_id=str(row.id),
+                            job_id=job_id,
                         )
                         yield {
                             "type": "background_job_started",

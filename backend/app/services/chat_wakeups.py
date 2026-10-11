@@ -20,6 +20,7 @@ fresh stream channel, acting through the API key the chat's turn acted
 through. Every delivery is a user-role message with a bracketed prefix the
 way-of-working skill teaches the agent to recognise.
 """
+import asyncio
 import json
 import logging
 import secrets
@@ -27,7 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.core.config import settings
 from app.models.chat import Chat
@@ -98,6 +99,10 @@ async def deliver_to_chat(
         if user is None or not user.is_active:
             return {"status": "dropped", "reason": "owner_inactive"}
 
+        # Parked rounds: a pending completion (ask_user, delegation, a
+        # background run being waited on) or an unanswered tool approval.
+        # Both released the lock, both have open tool calls a new turn would
+        # "repair" with synthetic errors — so inject, never start a turn.
         suspended = (
             await db.execute(
                 select(PendingCompletion.id)
@@ -105,6 +110,21 @@ async def deliver_to_chat(
                 .limit(1)
             )
         ).scalar_one_or_none() is not None
+        if not suspended:
+            from app.models.pending_approval import PendingToolApproval
+
+            now = _now()
+            suspended = (
+                await db.execute(
+                    select(PendingToolApproval.id)
+                    .where(
+                        PendingToolApproval.chat_id == chat.id,
+                        PendingToolApproval.approved.is_(None),
+                        or_(PendingToolApproval.expires_at.is_(None), PendingToolApproval.expires_at > now),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none() is not None
 
         if suspended or await chat_steering.is_chat_locked(chat_id):
             injected = await MessageService(db).inject_user_message(chat_id, str(chat.user_id), content)
@@ -254,6 +274,26 @@ async def delete_watch(db, chat: Chat, watch_id: str) -> dict[str, Any]:
     return {"watch_id": watch_id, "deleted": True}
 
 
+async def watch_status(token: str) -> Optional[tuple[int, dict[str, Any]]]:
+    """(status, body) when `token` cannot take a delivery (404 unknown, 410
+    expired or deleted), else None. Cheap: one indexed lookup, no writes."""
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(ChatWakeup.cancelled, ChatWakeup.expires_at)
+                .where(ChatWakeup.token == token, ChatWakeup.kind == WATCH)
+            )
+        ).first()
+    if row is None:
+        return 404, {"detail": "Unknown watch"}
+    cancelled, expires_at = row
+    if cancelled or (expires_at and expires_at <= _now()):
+        return 410, {"detail": "Watch expired or deleted"}
+    return None
+
+
 async def handle_watch_delivery(token: str, payload: Any) -> tuple[int, dict[str, Any]]:
     """POST /watch/{token}: deliver `payload` into the watch's chat.
 
@@ -327,6 +367,7 @@ async def list_wakeups(db, chat: Chat) -> dict[str, Any]:
 async def start_background_job(
     chat_id: str, user_id: str, code: str, description: str,
     *, tool_call_id: Optional[str] = None, pending_completion_id: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Queue a sandbox run. Without `pending_completion_id` the result is
     delivered into the chat when done; with it, the result completes that
@@ -340,7 +381,9 @@ async def start_background_job(
     if not code or not code.strip():
         return {"error": "run_in_background requires non-empty 'code'"}
 
-    job_id = str(uuid.uuid4())
+    # The caller may fix the id (a waited-on run records it in the
+    # checkpoint so a timeout message can point at a real status record).
+    job_id = job_id or str(uuid.uuid4())
     redis = await get_redis()
     await redis.set(
         f"{BG_JOB_PREFIX}{job_id}",
@@ -419,17 +462,9 @@ async def run_background_code_job(
         await redis.set(f"{BG_JOB_PREFIX}{job_id}", json.dumps(data, default=str), ex=BG_JOB_TTL)
 
     await set_status(status="running", started_at=_now().isoformat())
-    key_token = bind_api_key(api_key_id)
-    try:
-        try:
-            result = await code_execution.execute(code, user_id=user_id, chat_id=chat_id)
-            status = "failed" if result.get("error") else "finished"
-        except Exception as e:  # the run itself blew up: still report back
-            logger.exception("Background job %s crashed", job_id)
-            result = {"error": str(e)}
-            status = "failed"
-        await set_status(status=status, finished_at=_now().isoformat(), result=result)
 
+    async def report(status: str, result: dict[str, Any]) -> None:
+        await set_status(status=status, finished_at=_now().isoformat(), result=result)
         content = json.dumps(result, default=str)
         if pending_completion_id and tool_call_id:
             from app.services import deferred_completions
@@ -447,6 +482,23 @@ async def run_background_code_job(
                 f"{_clip(content, settings.background_job_result_max_chars)}",
                 source="background_job", api_key_id=api_key_id,
             )
+
+    key_token = bind_api_key(api_key_id)
+    try:
+        try:
+            result = await code_execution.execute(code, user_id=user_id, chat_id=chat_id)
+            status = "failed" if result.get("error") else "finished"
+        except asyncio.CancelledError:
+            # Worker timeout or shutdown: a job must never leave a round
+            # parked or a chat waiting for a message that is not coming.
+            logger.warning("Background job %s cancelled", job_id)
+            await asyncio.shield(report("failed", {"error": "Background run was cancelled (worker timeout or shutdown)"}))
+            raise
+        except Exception as e:  # the run itself blew up: still report back
+            logger.exception("Background job %s crashed", job_id)
+            result = {"error": str(e)}
+            status = "failed"
+        await report(status, result)
     finally:
         reset_api_key(key_token)
 
