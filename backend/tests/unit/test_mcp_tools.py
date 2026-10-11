@@ -1051,3 +1051,25 @@ class TestReviewFollowUps:
             "agents": [{"namespace": f"ns{_uid()}", "name": "p", "systemPrompt": "x", "enabledMcpServers": ["tools/none-such"]}],
         }), dry_run=True)
         assert not result.success and "tools/none-such" in result.errors[0]
+
+
+class TestRequestLogRedaction:
+    def test_mcp_server_writes_are_stored_without_credentials(self):
+        from app.middleware.request_logger import redact_body
+
+        body = {
+            "namespace": "tools", "name": "tracker",
+            "url": "https://user:hunter2@mcp.example.com/mcp?key=abc#frag",
+            "headers": {"Authorization": "Bearer xyz", "X-Api-Key": "k"},
+            "auth": {"type": "bearer", "secret": "TRACKER_TOKEN"},
+            "nested": [{"token": "t", "headers": {"A": "b"}}],
+        }
+        out = redact_body(body)
+        shown = json.dumps(out)
+        for secret in ("hunter2", "key=abc", "Bearer xyz", '"k"', "TRACKER_TOKEN", '"t"', '"b"'):
+            assert secret not in shown, secret
+        assert out["url"] == "https://***@mcp.example.com/mcp?***"
+        assert out["headers"] == {"Authorization": "***REDACTED***", "X-Api-Key": "***REDACTED***"}
+        assert out["namespace"] == "tools" and out["auth"]["type"] == "bearer"
+        assert redact_body({"url": "relative/path"})["url"] == "relative/path"
+        assert redact_body([1, "x", None]) == [1, "x", None]
