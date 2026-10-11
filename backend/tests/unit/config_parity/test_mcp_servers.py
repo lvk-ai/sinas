@@ -400,3 +400,30 @@ class TestAgentBinding:
             "enabled_mcp_servers": [{"server": "tools/nope"}],
         }, headers=headers)
         assert response.status_code == 404, response.text
+
+
+class TestListingGrants:
+    async def test_an_explicit_grant_lists_another_owners_server(self, client, db: AsyncSession, admin_user):
+        """A user with read:own plus a name-scoped grant on someone else's
+        server must see it in the listing, not only on a direct read."""
+        from app.models.user import Role, RolePermission, User, UserRole
+
+        name = f"shared-{_uid()}"
+        assert (await client.post("/api/v1/mcp-servers", json=_rest_server(name), headers=auth_headers(admin_user))).status_code == 201
+        viewer = User(email=f"viewer-{_uid()}@example.com")
+        db.add(viewer)
+        await db.flush()
+        role = Role(name=f"viewer-{_uid()}", description="t")
+        db.add(role)
+        await db.flush()
+        for key in ("sinas.mcp_servers/*/*.read:own", f"sinas.mcp_servers/tools/{name}.read:all"):
+            db.add(RolePermission(role_id=role.id, permission_key=key, permission_value=True))
+        db.add(UserRole(role_id=role.id, user_id=viewer.id, active=True))
+        await db.commit()
+        listed = (await client.get("/api/v1/mcp-servers", headers=auth_headers(viewer))).json()
+        assert [s["name"] for s in listed if s["name"] == name] == [name]
+        # Still nothing they were not granted.
+        other = f"private-{_uid()}"
+        await client.post("/api/v1/mcp-servers", json=_rest_server(other), headers=auth_headers(admin_user))
+        listed = (await client.get("/api/v1/mcp-servers", headers=auth_headers(viewer))).json()
+        assert other not in [s["name"] for s in listed]

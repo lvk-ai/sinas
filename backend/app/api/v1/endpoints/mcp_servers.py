@@ -7,6 +7,7 @@ every channel. The live tools/list is a runtime operation and stays here.
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
@@ -66,12 +67,14 @@ async def list_mcp_servers(
     """List MCP servers."""
     user_id, permissions = current_user_data
 
-    servers = await McpServer.list_with_permissions(
-        db=db, user_id=user_id, permissions=permissions, action="read"
-    )
-    # The listing query is namespace-wide for a name-scoped grant; each row
-    # still has to pass the per-server check before its url and headers
-    # (credential-bearing) are returned.
+    # The table is small (servers are config-level resources), and the
+    # per-server check is the one that knows every grant shape — ownership,
+    # namespace-wide and name-scoped. The generic listing query takes the
+    # ownership-only branch for a user with `read:own`, which hid servers
+    # the user was explicitly granted; so list everything and let the
+    # per-server check decide what is returned (url and headers are
+    # credential-bearing).
+    servers = (await db.execute(select(McpServer).order_by(McpServer.namespace, McpServer.name))).scalars().all()
     servers = [s for s in servers if s.can_user_access(str(user_id), permissions, "read")]
     set_permission_used(request, "sinas.mcp_servers.read")
     return [McpServerResponse.model_validate(s) for s in servers]
