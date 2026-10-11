@@ -535,6 +535,7 @@ async def expire_due(now: Optional[datetime] = None) -> int:
                     channel_id=str(uuid.uuid4()),
                     agent=f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_name else None,
                     rejected_tool_call_ids=decision["rejected_ids"],
+                    job_id=approval_rules.round_job_id(approval),
                 )
                 queued_rounds.add(round_id)
             except Exception:

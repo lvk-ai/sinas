@@ -356,12 +356,15 @@ class QueueService:
         attempt: int = 0,
         enqueued_at: Optional[float] = None,
         rejected_tool_call_ids: Optional[list[str]] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """Enqueue an agent resume job (after tool approval).
 
         `rejected_tool_call_ids`: the round's asked calls the user said no
         to; the resumed round answers them with a rejection instead of
-        running them.
+        running them. `job_id`: a fixed id makes the enqueue idempotent —
+        a round resumed by the approve endpoint and by the expiry sweep
+        runs once (arq won't queue a second job under an id it has).
 
         `defer_seconds`/`attempt`: a retry of a continuation that found the
         chat busy. `enqueued_at` is kept from the first enqueue so an
@@ -370,7 +373,8 @@ class QueueService:
         pool = await get_arq_pool()
         redis = await get_redis()
 
-        job_id = str(uuid.uuid4())
+        fixed_id = job_id is not None
+        job_id = job_id or str(uuid.uuid4())
 
         status_data: dict[str, Any] = {
             "status": "queued",
@@ -387,6 +391,7 @@ class QueueService:
             f"{JOB_STATUS_PREFIX}{job_id}",
             json.dumps(status_data),
             ex=JOB_TTL,
+            nx=fixed_id,
         )
 
         enqueue_kwargs: dict[str, Any] = {
