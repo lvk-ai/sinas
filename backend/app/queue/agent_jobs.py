@@ -119,7 +119,7 @@ _BUSY_RETRY_SECONDS = 30
 _BUSY_MAX_ATTEMPTS = 20  # ~10 minutes of a chat staying busy
 
 
-async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue) -> bool:
+async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue, redis=None, base_fields=None) -> bool:
     """A continuation that could not take the chat lock is queued again
     later rather than abandoned (its work exists nowhere else). Returns
     True when requeued; past the attempt cap, reports and gives up."""
@@ -142,6 +142,14 @@ async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue) -> bool:
         channel_id,
         {"type": "status", "status": "waiting", "message": f"Chat is busy; retrying in {_BUSY_RETRY_SECONDS}s (attempt {attempt})"},
     )
+    # This attempt is over; the retry runs under a new job id, so record
+    # that here or this record reads "running" until it expires.
+    if redis is not None and kwargs.get("job_id"):
+        await redis.set(
+            f"{JOB_STATUS_PREFIX}{kwargs['job_id']}",
+            json.dumps({**(base_fields or {}), "status": "requeued", "retry_attempt": attempt}),
+            ex=JOB_TTL,
+        )
     return True
 
 
@@ -546,14 +554,16 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                             defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
                             enqueued_at=kwargs.get("enqueued_at"),
                         ),
+                        redis=redis, base_fields=base_fields,
                     ):
                         completed = True
                     return
-                if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
-                    await chat_steering.release_chat_lock(chat_id, lock_token)
-                    completed = True
-                    return
                 try:
+                    # Inside the release-protected block: a failure in the
+                    # stop check must not leave the chat locked.
+                    if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                        completed = True
+                        return
                     # Execute the approved tool calls and stream the LLM response
                     async for chunk in message_service._handle_tool_calls(
                         chat_id=chat_id,
@@ -719,8 +729,25 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                     defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
                     enqueued_at=kwargs.get("enqueued_at"),
                 ),
+                redis=redis, base_fields=base_fields,
             ):
                 completed = True
+                return
+            # Dropped for good: a batch or delegated child must still close
+            # its Execution and tell its parent, or the parent waits forever.
+            if execution_id:
+                await _terminate_execution_row(
+                    execution_id, ExecutionStatus.FAILED, error="Chat stayed busy; continuation dropped",
+                )
+            if parent_pending_delegation_id and parent_tool_call_id:
+                from app.services.delegation import on_child_complete
+
+                await on_child_complete(
+                    parent_pending_delegation_id, parent_tool_call_id,
+                    json.dumps({"error": "Chat stayed busy; continuation dropped", "chat_id": chat_id}),
+                    user_token=user_token,
+                )
+            completed = True
             return
         async with AsyncSessionLocal() as db:
             if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):

@@ -1006,3 +1006,46 @@ class TestChatResponseFlag:
             assert resp.status_code == 200, resp.text
             assert resp.json()["workbench_enabled"] is expected
 
+
+
+class TestRoundFour:
+    @pytest.mark.asyncio
+    async def test_storage_failure_leaves_no_dangling_version(self, db, chat, test_user, monkeypatch):
+        from app.services import file_storage
+        from app.services.workbench import _write_bytes
+
+        wb = await get_or_create_workbench(db, chat)
+        storage = file_storage.get_storage()
+        uid = str(test_user.id)
+        ok = await _write_bytes(db, storage, wb, filename="a.txt", content=b"v1", content_type="text/plain", user_id=uid, visibility="private")
+        assert ok["version"] == 1
+
+        async def boom(path, content):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(storage, "save", boom)
+        res = await _write_bytes(db, storage, wb, filename="a.txt", content=b"v2", content_type="text/plain", user_id=uid, visibility="private")
+        assert "Storage write failed" in res["error"]
+        f = (await db.execute(select(File).where(File.collection_id == wb.id, File.name == "a.txt"))).scalar_one()
+        await db.refresh(f)
+        assert f.current_version == 1  # the bump was rolled back with the failed write
+
+    @pytest.mark.asyncio
+    async def test_expired_chat_takes_its_workbench_along(self, db, chat, test_user, monkeypatch):
+        from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
+        from app.services.file_storage import get_storage
+
+        uid = str(test_user.id)
+        await WorkbenchTools().execute_tool(db, chat, uid, "workbench_write", {"filename": "gone.txt", "content": "bye"})
+        wb = await get_or_create_workbench(db, chat)
+        paths = await delete_workbenches_for_chats(db, [chat.id])
+        assert len(paths) == 1 and paths[0].startswith(f"_chat/{chat.id}/")
+        assert (await db.execute(select(Collection).where(Collection.id == wb.id))).scalar_one_or_none() is None
+        assert (await db.execute(select(File).where(File.collection_id == wb.id))).scalars().all() == []
+        assert await get_storage().read(paths[0]) == b"bye"  # bytes removed after the commit, by the caller
+
+    def test_truncating_modes_never_fetch_a_lazy_file(self):
+        from app.services.code_execution import _build_wrapper
+
+        wrapper = _build_wrapper("pass", workbench=True)
+        assert 'if "w" in _m or "x" in _m:' in wrapper

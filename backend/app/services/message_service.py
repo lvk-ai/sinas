@@ -586,8 +586,8 @@ class MessageService:
                 tools=prep["tools"],
                 agent_label=agent_label,
             ):
-                if isinstance(chunk, dict) and chunk.get("type") in SUSPENSION_EVENT_TYPES:
-                    suspended = True
+                if isinstance(chunk, dict) and chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    suspended = True  # parked or stopped: no follow-through
             if not suspended:
                 async for _ in self.answer_pending_injections(
                     chat_id=chat_id, user_id=user_id, user_token=user_token,
