@@ -373,6 +373,14 @@ class ResourceApplier(Generic[TSpec]):
     async def check_references(self, spec: TSpec, ctx: ApplyContext) -> None:
         """Raise ReferenceNotFound if the spec points at something missing."""
 
+    async def check_new_references(
+        self, spec: TSpec, ctx: ApplyContext, current: Optional[TSpec]
+    ) -> None:
+        """Called on create (current None) and when a reference field changed.
+        Kinds that only check what a change adds (leaving older references
+        alone) override this; the default checks every reference."""
+        await self.check_references(spec, ctx)
+
     def effects(self, action: str, row: Any) -> list[Any]:
         return []
 
@@ -439,7 +447,7 @@ class ResourceApplier(Generic[TSpec]):
             # Checked in dry runs too: a preview must refuse what the real
             # apply would refuse (e.g. an inactive target), or a package
             # preview says "fine" for an install that then fails.
-            await self.check_references(spec, ctx)
+            await self.check_new_references(spec, ctx, None)
             if ctx.dry_run:
                 return ApplyResult("create", changes=changes)
             row = self.new_row(spec, ctx)
@@ -490,7 +498,7 @@ class ResourceApplier(Generic[TSpec]):
             return ApplyResult("unchanged", obj=row)
 
         if any(field in changes for field in self.reference_fields):
-            await self.check_references(spec, ctx)
+            await self.check_new_references(spec, ctx, current)
 
         if ctx.dry_run:
             return ApplyResult("update", obj=row, changes=changes)

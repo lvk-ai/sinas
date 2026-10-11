@@ -16,7 +16,7 @@ from sqlalchemy import select, update
 from app.models.agent import Agent
 from app.models.llm_provider import LLMProvider
 from app.schemas.spec.agent import AgentSpec
-from app.services.resources.base import ApplyContext, ReferenceNotFound, ResourceApplier
+from app.services.resources.base import ApplierError, ApplyContext, ReferenceNotFound, ResourceApplier
 
 _FIELDS = (
     "description", "model", "max_tokens", "system_prompt", "icon", "default_job_timeout",
@@ -36,7 +36,11 @@ class AgentApplier(ResourceApplier[AgentSpec]):
     config_section = "agents"
     spec_model = AgentSpec
     model = Agent
-    reference_fields = ("llm_provider_name",)
+    reference_fields = (
+        "llm_provider_name", "enabled_functions", "enabled_skills", "enabled_queries",
+        "enabled_stores", "enabled_collections", "enabled_components", "enabled_connectors",
+        "enabled_pipelines", "enabled_agents", "hooks",
+    )
     # Operator state: a deleted (switched-off) agent stays off, and the
     # default chosen in the console stays the default, unless config says so.
     singleton_lock = "default-agent"
@@ -178,6 +182,43 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         if spec.llm_provider_name and not ctx.declared("llmProviders", spec.llm_provider_name):
             await self._provider_id(ctx, spec.llm_provider_name)
 
+    async def check_new_references(
+        self, spec: AgentSpec, ctx: ApplyContext, current: Optional[AgentSpec]
+    ) -> None:
+        """Everything an agent can use must exist before it's added to the
+        agent: create the agent, create its tools, then add them. Only what
+        this write adds is checked, so an agent holding an older reference to
+        something since removed can still be edited. Wildcards ("ns/*") and
+        legacy agent ids aren't references to one thing and pass; so does
+        anything the same config declares (it's applied all-or-nothing)."""
+        if spec.llm_provider_name and (current is None or current.llm_provider_name != spec.llm_provider_name):
+            await self.check_references(spec, ctx)
+        missing: list[str] = []
+        # The stored state in the spec's own spelling (e.g. a bare "lookup"
+        # stored long ago reads as "default/lookup"), so an unchanged
+        # reference never looks added.
+        before = _normalized(current)
+        for kind, label, model in _reference_kinds():
+            added = _refs(spec, kind) - _refs(before, kind)
+            wanted = []
+            for ref in sorted(added):
+                if "*" in ref or (kind == "agents" and (ref == spec.key or _is_uuid(ref))):
+                    continue
+                if "/" not in ref:
+                    missing.append(f"{label} '{ref}' (name it as namespace/name)")
+                elif ref in ctx.pending_references.get(kind, {}):
+                    continue  # declared by the same config
+                else:
+                    wanted.append(ref)
+            if wanted:
+                found = await _existing(ctx, model, wanted)
+                missing += [f"{label} '{ref}'" for ref in wanted if ref not in found]
+        if missing:
+            raise MissingAgentReferences(
+                f"Agent '{spec.key}' refers to things that don't exist (create them first, "
+                f"then add them to the agent): {', '.join(missing)}"
+            )
+
     async def delete(self, row: Agent, ctx: ApplyContext) -> None:
         """Hard delete (package uninstall, or an upgrade that drops it). Chats
         outlive it: a conversation is the user's, so only their link to the
@@ -195,3 +236,84 @@ async def provider_name(db, provider_id) -> Optional[str]:
     return (
         await db.execute(select(LLMProvider.name).where(LLMProvider.id == provider_id))
     ).scalar_one_or_none()
+
+
+class MissingAgentReferences(ApplierError):
+    status_code = 400
+
+
+def _reference_kinds():
+    from app.models.component import Component
+    from app.models.connector import Connector
+    from app.models.file import Collection
+    from app.models.function import Function
+    from app.models.pipeline import Pipeline
+    from app.models.query import Query
+    from app.models.skill import Skill
+    from app.models.store import Store
+
+    return (
+        ("functions", "function", Function),
+        ("skills", "skill", Skill),
+        ("queries", "query", Query),
+        ("stores", "store", Store),
+        ("collections", "collection", Collection),
+        ("components", "component", Component),
+        ("connectors", "connector", Connector),
+        ("pipelines", "pipeline", Pipeline),
+        ("agents", "agent", Agent),
+    )
+
+
+def _refs(spec: Optional[AgentSpec], kind: str) -> set[str]:
+    if spec is None:
+        return set()
+    if kind == "functions":
+        refs = list(spec.enabled_functions)
+        for entries in (spec.hooks or {}).values():
+            refs += [e.get("function") for e in entries or [] if isinstance(e, dict) and e.get("function")]
+        return set(refs)
+    if kind == "skills":
+        return {s.skill for s in spec.enabled_skills}
+    if kind == "stores":
+        return {s.store for s in spec.enabled_stores}
+    if kind == "collections":
+        return {c.collection for c in spec.enabled_collections}
+    if kind == "connectors":
+        return {c.get("connector") for c in spec.enabled_connectors if isinstance(c, dict) and c.get("connector")}
+    field = {"queries": "enabled_queries", "components": "enabled_components",
+             "pipelines": "enabled_pipelines", "agents": "enabled_agents"}[kind]
+    return {r for r in getattr(spec, field) if isinstance(r, str)}
+
+
+def _normalized(spec: Optional[AgentSpec]) -> Optional[AgentSpec]:
+    if spec is None:
+        return None
+    try:
+        return AgentSpec.model_validate(spec.model_dump())
+    except Exception:  # stored data the spec no longer accepts: compare as is
+        return spec
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+async def _existing(ctx: ApplyContext, model, refs: list[str]) -> set[str]:
+    """Which of these "namespace/name" refs exist (in any state: a disabled
+    tool is still the agent's to use once it's back on)."""
+    from sqlalchemy import and_, or_
+
+    pairs = [ref.split("/", 1) for ref in refs]
+    rows = (
+        await ctx.db.execute(
+            select(model.namespace, model.name).where(
+                or_(*(and_(model.namespace == ns, model.name == name) for ns, name in pairs))
+            )
+        )
+    ).all()
+    return {f"{ns}/{name}" for ns, name in rows}
