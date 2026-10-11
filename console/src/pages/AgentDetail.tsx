@@ -166,7 +166,21 @@ export function AgentDetail() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    updateMutation.mutate(formData);
+    // Enter can submit before an MCP pattern field blurs: fold any typed
+    // drafts into the submitted bindings so nothing the user typed is lost.
+    let submitted = formData;
+    if (Object.keys(mcpPatternDrafts).length > 0) {
+      const enabled: any[] = formData.enabled_mcp_servers || agent?.enabled_mcp_servers || [];
+      submitted = {
+        ...formData,
+        enabled_mcp_servers: enabled.map((x: any) =>
+          mcpPatternDrafts[x.server] !== undefined
+            ? { ...x, tools: mcpPatternDrafts[x.server].split(',').map((t: string) => t.trim()).filter(Boolean) }
+            : x
+        ),
+      };
+    }
+    updateMutation.mutate(submitted);
   };
 
   const handleDelete = () => {

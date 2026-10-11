@@ -297,4 +297,15 @@ async def _get(db: AsyncSession, arguments: dict[str, Any]) -> dict[str, Any]:
             val = str(val)
         data[col_name] = val
 
+    if resource_type == "mcpServers":
+        # Introspection is read-only metadata: never the credentials. The
+        # header values and any credential in the URL are a per-server
+        # secret the chat's user may not hold.
+        from app.services.mcp_client import safe_url
+
+        data.pop("headers", None)
+        data.pop("auth", None)
+        if isinstance(data.get("url"), str):
+            data["url"] = safe_url(data["url"])
+
     return {"type": resource_type, "namespace": namespace, "name": name, "data": data}
