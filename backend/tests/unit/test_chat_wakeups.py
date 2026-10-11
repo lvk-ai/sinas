@@ -177,6 +177,25 @@ async def test_delivery_injects_into_a_suspended_chat(committed_chat, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_delivery_injects_while_a_completed_checkpoint_waits_to_be_queued(committed_chat, monkeypatch):
+    """complete() records remaining == 0 before the saved turn is queued;
+    a wakeup in that gap must not start a second turn beside it."""
+    env = committed_chat
+    cid = str(env["chat"].id)
+    enqueued = _capture_enqueue(monkeypatch)
+    async with AsyncSessionLocal() as s:
+        row = await dc.suspend_round(
+            s, chat_id=cid, user_id=str(env["user"].id), channel_id="c",
+            entries={"call_q": {"completer": dc.HUMAN_INPUT, "question": "?"}},
+            conversation_context={},
+        )
+        row.remaining = 0
+        await s.commit()
+    out = await chat_wakeups.deliver_to_chat(cid, "[watch w] payload", source="watch")
+    assert out["status"] == "injected" and enqueued == []
+
+
+@pytest.mark.asyncio
 async def test_delivery_starts_a_turn_on_an_idle_chat(committed_chat, monkeypatch):
     env = committed_chat
     cid = str(env["chat"].id)

@@ -103,10 +103,13 @@ async def deliver_to_chat(
         # background run being waited on) or an unanswered tool approval.
         # Both released the lock, both have open tool calls a new turn would
         # "repair" with synthetic errors — so inject, never start a turn.
+        # A checkpoint whose last completion landed (remaining == 0) still
+        # parks the chat: its row stays until the saved turn is queued, and
+        # a turn started in that gap would run beside the saved one.
         suspended = (
             await db.execute(
                 select(PendingCompletion.id)
-                .where(PendingCompletion.chat_id == chat.id, PendingCompletion.remaining > 0)
+                .where(PendingCompletion.chat_id == chat.id)
                 .limit(1)
             )
         ).scalar_one_or_none() is not None
