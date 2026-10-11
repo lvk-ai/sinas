@@ -246,6 +246,41 @@ class TestResultSpill:
         assert len(out.encode("utf-8")) <= cap
         assert workbench_refs.spill_pointer(json.loads(out)) == path
 
+    def test_wrapped_text_never_exceeds_the_cap(self):
+        """Escaping (newlines, quotes, non-ASCII) grows wrapped text past a
+        reserve computed on the raw text; the wrapper measures and clips."""
+        from app.services.tool_execution import truncate_tool_result
+
+        cap = 3000
+        path = "tool_results/big.txt"
+        text = ('"quoted"\n\u00e9\t' * 1000)
+        budget = cap - workbench_refs.spill_pointer_reserve(path)
+        out = workbench_refs.attach_spill_pointer(truncate_tool_result(text, budget), path, max_size=cap)
+        assert len(out) <= cap
+        parsed = json.loads(out)
+        assert parsed["text"] and workbench_refs.spill_pointer(parsed) == path
+
+    @pytest.mark.asyncio
+    async def test_oversized_cross_chat_result_is_copied_into_the_callers_workbench(self, db, wb_chat, test_user):
+        from app.models import Agent
+
+        other_agent = Agent(namespace="test", name="other", user_id=test_user.id, system_tools=["workbench"])
+        db.add(other_agent)
+        await db.flush()
+        other = Chat(user_id=test_user.id, agent_id=other_agent.id, title="other chat")
+        db.add(other)
+        await db.flush()
+
+        path = await workbench_refs.spill_result(db, wb_chat, str(test_user.id), "big_query", "call_big", "x" * 5000)
+        assert path
+        copy = await workbench_refs.copy_spilled_result(db, wb_chat, other, str(test_user.id), path)
+        assert copy and copy.startswith("tool_results/from_")
+        got = await WorkbenchTools().execute_tool(db, other, str(test_user.id), "workbench_read", {"filename": copy})
+        assert "xxxx" in got.get("content", "")
+        # Not for someone else's chat.
+        stranger = Chat(user_id=uuid.uuid4(), title="stranger")
+        assert await workbench_refs.copy_spilled_result(db, wb_chat, stranger, str(test_user.id), path) is None
+
     @pytest.mark.asyncio
     async def test_store_clip_keeps_the_pointer(self, monkeypatch):
         from app.services import tool_result_store
@@ -377,3 +412,42 @@ class TestRetrieveServesSpilledCopy:
         out = await self._retrieve(db, wb_chat, test_user, "call_gone", monkeypatch)
         assert out["result"]["rows"] == [1]
         assert out["source"] == "messages"
+
+
+class TestDeferredAskUserReferences:
+    @pytest.mark.asyncio
+    async def test_saved_question_and_options_resolve(self, db, test_user):
+        """ask_user is deferred like a delegation and bypasses
+        execute_single_tool: its references must resolve all the same."""
+        from app.models import Agent
+        from app.services import deferred_completions as dc
+        from app.services.ask_user_tools import get_ask_user_tool_definition
+        from app.services.delegation import current_channel_id
+        from app.services.message_service import MessageService
+
+        agent = Agent(namespace="test", name="asker", user_id=test_user.id, system_tools=["workbench", "askUser"])
+        db.add(agent)
+        await db.flush()
+        chat = Chat(user_id=test_user.id, agent_id=agent.id, title="ask refs")
+        db.add(chat)
+        await db.flush()
+        await _write(db, chat, test_user, "question.txt", "Which region do you want?")
+        await _write(db, chat, test_user, "options.json", json.dumps(["eu", "us"]))
+        call = {"id": "call_qref", "type": "function", "function": {"name": "ask_user", "arguments": json.dumps({
+            "question": {"$workbench": "question.txt"}, "options": {"$workbench": "options.json"},
+        })}}
+        token = current_channel_id.set("chan-refs")
+        chunks = []
+        try:
+            async for chunk in MessageService(db)._handle_tool_calls(
+                chat_id=str(chat.id), user_id=str(test_user.id), user_token="tok", messages=[],
+                tool_calls=[call], provider="openai", model="gpt-test", temperature=0.7, max_tokens=None,
+                tools=[get_ask_user_tool_definition()], permissions={},
+            ):
+                chunks.append(chunk)
+        finally:
+            current_channel_id.reset(token)
+        asked = next(c for c in chunks if c.get("type") == "input_required")
+        assert asked["question"] == "Which region do you want?"
+        assert asked["options"] == ["eu", "us"]
+        assert any(c.get("type") == dc.ROUND_SUSPENDED for c in chunks)
