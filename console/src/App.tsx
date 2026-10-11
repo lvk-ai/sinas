@@ -173,6 +173,7 @@ function App() {
               <Route path="connectors" element={<Connectors />} />
               <Route path="connectors/:namespace/:name" element={<ConnectorEditor />} />
               <Route path="mcp-servers" element={<McpServers />} />
+              <Route path="mcp-servers/new" element={<McpServerEditor />} />
               <Route path="mcp-servers/:namespace/:name" element={<McpServerEditor />} />
               <Route path="pipelines" element={<Pipelines />} />
               <Route path="pipelines/:namespace/:name" element={<PipelineEditor />} />

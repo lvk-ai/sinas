@@ -131,12 +131,14 @@ class McpToolConverter:
         """Tool definitions for every enabled server that answers. A server
         that is missing, inactive or unreachable contributes no tools and a
         log line — never a failed chat turn."""
-        tools: list[dict[str, Any]] = []
         permissions: Optional[dict[str, bool]] = None
         # Names must be unique across ALL servers, not per server: the
         # dispatcher looks a call up by name, and 'a__b/c' and 'a/b__c' both
-        # encode a tool 'echo' as mcp_a__b__c__echo.
-        seen: set[str] = set()
+        # encode a tool 'echo' as mcp_a__b__c__echo. Candidates are gathered
+        # first so a collision renames EVERY party to it, independent of
+        # discovery order: an approval rule on a tool's name must keep
+        # matching the same remote operation whatever the listing order.
+        candidates: list[tuple[McpServer, ListedTool]] = []
         # A server bound more than once is one server with the union of its
         # bindings' patterns: each remote tool is offered once (an approval
         # rule matching its name then covers every call to it), and the
@@ -170,17 +172,31 @@ class McpToolConverter:
                     continue
                 if not any(binding_allows(patterns, tool.name) for patterns in bindings):
                     continue
-                definition = self._to_tool(server, tool, seen)
-                tools.append(definition)
-        return tools
+                candidates.append((server, tool))
+        counts: dict[str, int] = {}
+        for server, tool in candidates:
+            base = self._base_name(server, tool)
+            counts[base] = counts.get(base, 0) + 1
+        seen: set[str] = set()
+        return [
+            self._to_tool(server, tool, seen, collided=counts[self._base_name(server, tool)] > 1)
+            for server, tool in candidates
+        ]
 
-    def _to_tool(self, server: McpServer, tool: ListedTool, seen: set[str]) -> dict[str, Any]:
-        base = f"{MCP_TOOL_PREFIX}{server.namespace}__{server.name}__{_sanitize(tool.name)}"
+    @staticmethod
+    def _base_name(server: McpServer, tool: ListedTool) -> str:
+        return f"{MCP_TOOL_PREFIX}{server.namespace}__{server.name}__{_sanitize(tool.name)}"
+
+    def _to_tool(
+        self, server: McpServer, tool: ListedTool, seen: set[str], *, collided: bool = False
+    ) -> dict[str, Any]:
+        base = self._base_name(server, tool)
         tool_name = base
-        if tool_name in seen:
+        if collided or tool_name in seen:
             # Same encoded name from another server (or two MCP names that
             # sanitize alike): disambiguate with a digest of the server ref
-            # and the raw tool name so the suffix is stable across turns.
+            # and the raw tool name so the suffix is stable across turns —
+            # and, with `collided`, applied to every party whatever the order.
             digest = hashlib.sha1(f"{server.namespace}/{server.name}:{tool.name}".encode()).hexdigest()[:6]
             tool_name = f"{base}_{digest}"
             n = 1

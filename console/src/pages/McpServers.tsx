@@ -44,7 +44,7 @@ export function McpServers() {
           <h1 className="text-3xl font-bold text-gray-100">MCP Servers</h1>
           <p className="text-gray-400 mt-1">Remote Model Context Protocol servers whose tools agents can call</p>
         </div>
-        <Link to="/mcp-servers/new/new" className="btn btn-primary flex items-center">
+        <Link to="/mcp-servers/new" className="btn btn-primary flex items-center">
           <Plus className="w-5 h-5 mr-2" />
           New MCP Server
         </Link>
@@ -57,7 +57,7 @@ export function McpServers() {
           <Network className="w-12 h-12 text-gray-600 mx-auto mb-4" />
           <h3 className="text-lg font-medium text-gray-300">No MCP servers yet</h3>
           <p className="text-gray-500 mt-1">Register a Streamable HTTP (or SSE) MCP endpoint to expose its tools to agents</p>
-          <Link to="/mcp-servers/new/new" className="btn btn-primary mt-4 inline-flex items-center">
+          <Link to="/mcp-servers/new" className="btn btn-primary mt-4 inline-flex items-center">
             <Plus className="w-4 h-4 mr-2" />
             Add MCP Server
           </Link>
