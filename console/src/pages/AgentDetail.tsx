@@ -103,8 +103,12 @@ export function AgentDetail() {
   // A server may be bound more than once (REST and config allow it; the
   // allowed tools are the union). The editor shows that union and writes
   // it back as one binding, so editing never drops a sibling's patterns.
-  const mcpPatternsOf = (bindings: any[], server: string): string[] =>
-    Array.from(new Set(bindings.filter((x: any) => x.server === server).flatMap((x: any) => x.tools || [])));
+  const mcpPatternsOf = (bindings: any[], server: string): string[] => {
+    const mine = bindings.filter((x: any) => x.server === server);
+    // An empty list means "every tool": one such binding makes the union everything.
+    if (mine.some((x: any) => !(x.tools || []).length)) return [];
+    return Array.from(new Set(mine.flatMap((x: any) => x.tools || [])));
+  };
   const withMcpPatterns = (bindings: any[], server: string, tools: string[]): any[] => {
     const first = bindings.findIndex((x: any) => x.server === server);
     if (first < 0) return bindings;
