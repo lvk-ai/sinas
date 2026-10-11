@@ -315,3 +315,30 @@ def test_tool_approvals_travel_through_the_agent_spec():
     assert AgentApplier().spec_from_row(row, None).tool_approvals == {"default": "ask", "rules": []}
     row2 = Agent(namespace="n", name="b")
     assert AgentApplier().spec_from_row(row2, None).tool_approvals is None
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_send_uses_the_same_approval_decision(db, test_user, monkeypatch):
+    """A tool an `ask` rule covers is refused on the non-streaming path (it
+    cannot park on an approval); one an `auto` rule allows runs even if its
+    function is flagged requires_approval."""
+    from app.models.agent import Agent
+    from app.services.tool_execution import resolve_tool_approval_actions
+
+    agent = Agent(namespace="test", name=f"rules-{uuid.uuid4().hex[:6]}", user_id=test_user.id,
+                  tool_approvals={"rules": [{"match": "write_*", "action": "ask"}, {"match": "flagged_*", "action": "auto"}]})
+    db.add(agent)
+    await db.flush()
+    chat = Chat(user_id=test_user.id, agent_id=agent.id, title="t")
+    db.add(chat)
+    await db.flush()
+    tools = [
+        {"type": "function", "function": {"name": "write_file", "_metadata": {"system_tool": True}}},
+        {"type": "function", "function": {"name": "flagged_tool", "_metadata": {"system_tool": True, "requires_approval": True}}},
+        {"type": "function", "function": {"name": "read_file", "_metadata": {"system_tool": True}}},
+    ]
+    calls = [{"id": f"c{i}", "type": "function", "function": {"name": n, "arguments": "{}"}}
+             for i, n in enumerate(["write_file", "flagged_tool", "read_file"])]
+    actions = await resolve_tool_approval_actions(db, calls, str(chat.id), tools)
+    assert actions == {"c0": "ask", "c1": "auto", "c2": "auto"}
+

@@ -45,6 +45,7 @@ from app.services.tool_discovery import (
 from app.services.tool_execution import (
     build_tool_status,
     check_approval_requirements,
+    resolve_tool_approval_actions,
     execute_single_tool,
     is_sequential_tool,
     safe_parse_arguments,
@@ -567,26 +568,20 @@ class MessageService:
         )
 
         if response.get("tool_calls"):
-            # Build tool name → metadata lookup
-            _tool_meta = {t["function"]["name"]: t["function"].get("_metadata", {}) for t in prep["tools"]} if prep.get("tools") else {}
+            # The same decision the streaming path makes (agent rules and
+            # session grants over the intrinsic flags): a call the rules
+            # would ask about cannot be parked here, so it is refused; one
+            # they allow runs, even if its function is flagged.
+            actions = await resolve_tool_approval_actions(
+                self.db, response["tool_calls"], chat_id, prep.get("tools")
+            )
             for tool_call in response["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                meta = _tool_meta.get(tool_name, {})
-                if meta.get("system_tool") and meta.get("requires_approval"):
+                if actions.get(tool_call["id"]) == "ask":
                     _llm_span.end()
                     raise ValueError(
-                        f"System tool {tool_name} requires user approval. "
+                        f"Tool {tool_call['function']['name']} requires user approval. "
                         "Please use streaming mode to handle approval flow."
                     )
-                namespace, name = meta.get("namespace"), meta.get("name")
-                if namespace and name:
-                    function = await Function.get_by_name(self.db, namespace, name)
-                    if function and function.requires_approval:
-                        _llm_span.end()
-                        raise ValueError(
-                            f"Function {namespace}/{name} requires user approval. "
-                            "Please use streaming mode to handle approval flow."
-                        )
 
             suspended = False
             async for chunk in self._handle_tool_calls(
@@ -1507,6 +1502,9 @@ class MessageService:
         template_vars = merge_user_template_context(
             template_vars, await load_user_context(self.db, user_id)
         )
+        # The rebuild below reads everything injected so far: those are
+        # answered by this turn, not by the end-of-turn drain.
+        await chat_steering.take_injections(chat_id)
         updated_messages = (
             await build_conversation_history(
                 db=self.db,

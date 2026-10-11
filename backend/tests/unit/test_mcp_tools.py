@@ -966,3 +966,16 @@ class TestReviewFollowUps:
         assert "k0" not in mcp_client._tool_cache and f"k{mcp_client._TOOL_CACHE_MAX_ENTRIES + 4}" in mcp_client._tool_cache
         mcp_client.clear_tool_cache()
 
+    @pytest.mark.asyncio
+    async def test_config_introspection_never_returns_credentials(self, db, test_user):
+        from app.services.config_tools import _get
+
+        row = _server(test_user, headers={"Authorization": "Bearer s3cret"}, url="https://user:pw@mcp.test/mcp",
+                      auth={"type": "bearer", "secret": "tok"})
+        db.add(row)
+        await db.flush()
+        out = await _get(db, {"type": "mcpServers", "namespace": row.namespace, "name": row.name})
+        data = out["data"]
+        assert "headers" not in data and "auth" not in data
+        assert "pw" not in data["url"] and "s3cret" not in json.dumps(out)
+

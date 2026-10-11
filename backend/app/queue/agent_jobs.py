@@ -724,6 +724,21 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
             return
         async with AsyncSessionLocal() as db:
             if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                # A delegated or batch child that stops must still close its
+                # Execution and tell its parent, or the parent waits forever.
+                if execution_id:
+                    await _terminate_execution_row(
+                        execution_id, ExecutionStatus.CANCELLED, error="Interrupted by operator",
+                    )
+                if parent_pending_delegation_id and parent_tool_call_id:
+                    from app.services.delegation import on_child_complete
+
+                    await on_child_complete(
+                        parent_pending_delegation_id,
+                        parent_tool_call_id,
+                        json.dumps({"error": "Interrupted by operator", "chat_id": chat_id}),
+                        user_token=user_token,
+                    )
                 completed = True
                 return
             message_service = MessageService(db)

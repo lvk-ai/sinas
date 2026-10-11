@@ -69,6 +69,10 @@ async def list_mcp_servers(
     servers = await McpServer.list_with_permissions(
         db=db, user_id=user_id, permissions=permissions, action="read"
     )
+    # The listing query is namespace-wide for a name-scoped grant; each row
+    # still has to pass the per-server check before its url and headers
+    # (credential-bearing) are returned.
+    servers = [s for s in servers if s.can_user_access(str(user_id), permissions, "read")]
     set_permission_used(request, "sinas.mcp_servers.read")
     return [McpServerResponse.model_validate(s) for s in servers]
 
@@ -111,9 +115,20 @@ async def update_mcp_server(
     )
     set_permission_used(request, f"sinas.mcp_servers/{namespace}/{name}.update")
 
+    patch = {key: value for key, value in data.model_dump().items() if value is not None}
+    # A rename is also a write under the NEW name: the caller must be allowed
+    # to update there too, or a name-scoped grant could move a server into
+    # a namespace it may not touch.
+    target_ns = patch.get("namespace", namespace)
+    target_name = patch.get("name", name)
+    if (target_ns, target_name) != (namespace, name):
+        target_perm = f"sinas.mcp_servers/{target_ns}/{target_name}.update:own"
+        if not check_permission(permissions, target_perm):
+            set_permission_used(request, target_perm, has_perm=False)
+            raise HTTPException(status_code=403, detail=f"Not authorized to move this MCP server to '{target_ns}/{target_name}'")
+
     ctx = rest.api_context(db, user_id)
     server = await rest.locked(_applier, ctx, server)
-    patch = {key: value for key, value in data.model_dump().items() if value is not None}
     await rest.write(_applier, ctx, rest.patch_spec(_applier, server, patch), existing=server)
     await rest.commit(db, ctx)
     await db.refresh(server)

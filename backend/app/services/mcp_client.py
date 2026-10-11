@@ -17,6 +17,7 @@ tools" without being hammered on every message.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import hashlib
@@ -254,12 +255,21 @@ async def _fetch_tools(
                         f"MCP server '{server.namespace}/{server.name}' returned more than "
                         f"{settings.mcp_list_tools_max_pages} pages of tools; listing abandoned"
                     )
-                if time.monotonic() > deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise McpClientError(
                         f"MCP server '{server.namespace}/{server.name}' took longer than "
                         f"{settings.mcp_list_tools_total_timeout_seconds}s to list its tools; listing abandoned"
                     )
-                page = await client.list_tools(cursor=cursor)
+                try:
+                    # The total budget bounds the in-flight request too, not
+                    # just the decision to send the next one.
+                    page = await asyncio.wait_for(client.list_tools(cursor=cursor), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise McpClientError(
+                        f"MCP server '{server.namespace}/{server.name}' took longer than "
+                        f"{settings.mcp_list_tools_total_timeout_seconds}s to list its tools; listing abandoned"
+                    )
                 for tool in page.tools:
                     annotations = tool.annotations.model_dump(exclude_none=True) if tool.annotations else None
                     tools.append(ListedTool(

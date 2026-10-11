@@ -1031,3 +1031,21 @@ class TestCopyOutConflicts:
             {"path": "a.txt", "content_b64": base64.b64encode(b"v2").decode()},
         ], base_hashes=base)
         assert out["synced"] == ["a.txt"] and out["conflicts"] == []
+
+
+class TestChatResponseFlag:
+    @pytest.mark.asyncio
+    async def test_chat_detail_reports_workbench_enabled(self, db, client, test_user):
+        from app.models import Agent
+
+        for tools, expected in (([], False), (["workbench"], True)):
+            agent = Agent(namespace="test", name=f"flag-{uuid.uuid4().hex[:6]}", user_id=test_user.id, system_tools=tools)
+            db.add(agent)
+            await db.flush()
+            c = Chat(user_id=test_user.id, agent_id=agent.id, agent_namespace=agent.namespace, agent_name=agent.name, title="t")
+            db.add(c)
+            await db.flush()
+            resp = await client.get(f"/chats/{c.id}", headers=auth_headers(test_user))
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["workbench_enabled"] is expected
+

@@ -45,9 +45,13 @@ export function ChatDetail() {
   const agentRef = `${chat.agent_namespace}/${chat.agent_name}`;
   // The panel only makes sense for an agent that has the workbench: without
   // it, uploads land where no tool or sandbox run will ever see them.
-  const agentHasWorkbench = (agent?.system_tools ?? []).some((t) =>
-    typeof t === 'string' ? t === 'workbench' : t?.name === 'workbench'
-  );
+  // The chat response says so with chat permission alone; the agent record
+  // (which the user may not be allowed to read) is only a fallback.
+  const agentHasWorkbench =
+    chat.workbench_enabled ??
+    (agent?.system_tools ?? []).some((t) =>
+      typeof t === 'string' ? t === 'workbench' : t?.name === 'workbench'
+    );
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">

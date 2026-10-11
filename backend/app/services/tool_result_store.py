@@ -127,6 +127,7 @@ async def get_tool_result(
                 "status_code": None,
                 "duration_ms": None,
                 "source": "messages",
+                "chat_id": str(msg.chat_id),
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             }
 
@@ -153,6 +154,9 @@ async def get_tool_result(
             "status_code": record.status_code,
             "duration_ms": record.duration_ms,
             "source": record.source,
+            # The chat the result was produced in: a spilled copy lives in
+            # THAT chat's workbench, not the caller's.
+            "chat_id": str(record.chat_id) if record.chat_id else None,
             "created_at": record.created_at.isoformat(),
         }
 
