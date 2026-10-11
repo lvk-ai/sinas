@@ -1192,11 +1192,15 @@ async def execute_single_tool(
                 spill_path = await workbench_refs.spill_result(
                     db, chat, user_id, tool_name, tool_call["id"], result_content
                 )
-                result_content = truncate_tool_result(result_content, max_result_size)
                 if spill_path:
+                    # Leave room for the pointer: the persisted copy is capped
+                    # at the same size, and a clipped copy loses the pointer.
+                    budget = max(1024, max_result_size - workbench_refs.spill_pointer_reserve(spill_path))
                     result_content = workbench_refs.attach_spill_pointer(
-                        result_content, spill_path
+                        truncate_tool_result(result_content, budget), spill_path
                     )
+                else:
+                    result_content = truncate_tool_result(result_content, max_result_size)
 
     except Exception as e:
         print(f"❌ Tool execution failed: {tool_name}: {e}", flush=True)

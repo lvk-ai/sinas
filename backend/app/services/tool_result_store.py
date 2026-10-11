@@ -41,11 +41,17 @@ async def save_tool_result(
 
         # Truncate large results
         if result_size > MAX_RESULT_SIZE:
-            result_json = {
+            clipped = {
                 "_truncated": True,
                 "_original_size": result_size,
                 "_preview": result_str[:1000] + "...",
             }
+            # A spilled result's pointer is how the full copy is found later
+            # (retrieve_tool_result, other chats): it survives the clip.
+            pointer = result_json.get("_full_result") if isinstance(result_json, dict) else None
+            if isinstance(pointer, dict):
+                clipped["_full_result"] = pointer
+            result_json = clipped
 
         retention_days = settings.tool_result_retention_days
         expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)

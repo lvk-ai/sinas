@@ -19,7 +19,11 @@ async def delete_workbenches_for_chats(db, chat_ids) -> list[str]:
     names = [str(cid) for cid in chat_ids]
     workbench_ids = (
         await db.execute(
-            select(Collection.id).where(Collection.namespace == "_chat", Collection.name.in_(names))
+            select(Collection.id).where(
+                Collection.kind == "workbench",
+                Collection.namespace == "_chat",
+                Collection.name.in_(names),
+            )
         )
     ).scalars().all()
     if not workbench_ids:
