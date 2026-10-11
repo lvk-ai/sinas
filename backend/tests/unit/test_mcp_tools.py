@@ -242,6 +242,24 @@ class TestDiscovery:
         assert "namespace" not in add["_metadata"] and "name" not in add["_metadata"]
 
     @pytest.mark.asyncio
+    async def test_overlapping_bindings_offer_each_tool_once(self, db, fake_mcp, test_user):
+        """Two bindings of one server are one grant with the union of their
+        patterns: a tool both allow is offered once, under its plain name,
+        so an approval rule on that name covers every call to it."""
+        server = _server(test_user)
+        db.add(server)
+        await db.flush()
+        await db.refresh(server)
+        ref = f"{server.namespace}/{server.name}"
+        tools = await McpToolConverter().get_available_tools(
+            db, [{"server": ref, "tools": ["add"]}, {"server": ref, "tools": ["a*", "echo"]}], str(test_user.id)
+        )
+        assert sorted(t["function"]["_metadata"]["mcp_tool"] for t in tools) == ["add", "echo"]
+        assert sorted(t["function"]["name"] for t in tools) == sorted(
+            f"mcp_{server.namespace}__{server.name}__{n}" for n in ("add", "echo")
+        )  # one entry each, plain names, no digest suffix
+
+    @pytest.mark.asyncio
     async def test_server_filters_and_agent_filter(self, db, fake_mcp, test_user):
         server = _server(test_user, tool_allow=["e*", "add", "pic*"], tool_deny=["echo"])
         db.add(server)

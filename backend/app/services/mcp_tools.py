@@ -137,8 +137,15 @@ class McpToolConverter:
         # dispatcher looks a call up by name, and 'a__b/c' and 'a/b__c' both
         # encode a tool 'echo' as mcp_a__b__c__echo.
         seen: set[str] = set()
+        # A server bound more than once is one server with the union of its
+        # bindings' patterns: each remote tool is offered once (an approval
+        # rule matching its name then covers every call to it), and the
+        # names never depend on how many bindings there are.
+        combined: dict[str, list[list[str]]] = {}
         for entry in enabled_mcp_servers or []:
             ref, patterns = _normalize_entry(entry)
+            combined.setdefault(ref, []).append(patterns)
+        for ref, bindings in combined.items():
             parts = ref.split("/", 1)
             if len(parts) != 2:
                 logger.warning(f"Invalid MCP server reference: {ref!r}")
@@ -159,7 +166,9 @@ class McpToolConverter:
                 logger.warning(f"MCP tools unavailable for '{ref}': {e}", exc_info=True)
                 continue
             for tool in listed:
-                if not server_allows(server, tool.name) or not binding_allows(patterns, tool.name):
+                if not server_allows(server, tool.name):
+                    continue
+                if not any(binding_allows(patterns, tool.name) for patterns in bindings):
                     continue
                 definition = self._to_tool(server, tool, seen)
                 tools.append(definition)
