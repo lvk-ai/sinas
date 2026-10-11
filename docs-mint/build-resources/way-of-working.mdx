@@ -73,7 +73,7 @@ toolApprovals:
       action: ask
 ```
 
-Resolution for one call: a per-chat "always allow" grant the user gave earlier wins; then the first matching rule; then the tool's own `requiresApproval` flag; then `default`. A rule with `action: auto` deliberately overrides a function's `requiresApproval` (the "auto-allow reads" case), since both settings belong to the agent's author. An asked call surfaces as an `approval_required` stream event; `POST /chats/{id}/approve-tool/{tool_call_id}` with `approved` and optional `always_allow` resumes the round.
+Resolution for one call: a per-chat "always allow" grant the user gave earlier wins; then the first matching rule; then the tool's own `requiresApproval` flag; then `default`. A rule with `action: auto` deliberately overrides a function's `requiresApproval` (the "auto-allow reads" case), since both settings belong to the agent's author. An asked call surfaces as an `approval_required` stream event; answer each with `POST /chats/{id}/approve-tool/{tool_call_id}` (`approved`, optional `always_allow`). A round with several asked calls resumes once, after the last decision (the response's `resume` is `waiting` until then, `queued` on the decision that resumes it): approved calls run, rejected ones get a rejection result the model can react to. An ask left to expire counts as rejected.
 
 ## What the loop looks like
 
