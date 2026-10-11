@@ -98,3 +98,16 @@ Every step of that sequence is pinned by `backend/tests/unit/test_way_of_working
 ## Tuning the skill
 
 The skill is an ordinary [skill](/build-resources/skills): edit it in the console or ship your own under a different name. Editing a package-managed skill detaches it from the package (it survives uninstall and no longer follows upgrades). It is injected into every turn, so additions should earn their tokens: a rule that changes what the agent does, not an explanation of why.
+
+## Staging check
+
+`tests/e2e/loop_drive.py` drives the whole loop against a running deployment over HTTP: it installs this package, uploads a CSV to a keep-alive chat's workbench and follows one turn through list, read, write, the `ask_user` suspension, the `workbench_promote` approval gate and the final reply, then checks the workbench, the target collection and the collections listing.
+
+```bash
+python tests/e2e/loop_drive.py --url https://staging.example.com --key <admin api key>            # scripted model, every step asserted
+python tests/e2e/loop_drive.py --url https://staging.example.com --key <admin api key> --sandbox  # adds an execute_code step (needs a sandbox executor)
+python tests/e2e/loop_drive.py --url https://staging.example.com --key <admin api key> --real     # the deployment's own model; outcome checked, transcript printed
+```
+
+The scripted model is an OpenAI-compatible server the script starts itself and registers as the default provider; the backend must be able to reach it (`--stub-host` / `--stub-endpoint`). Run it before cutting a release: with a real provider (`--real`) and, on a deployment with a sandbox executor, with `--sandbox`.
+
