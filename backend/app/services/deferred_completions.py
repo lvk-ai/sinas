@@ -429,9 +429,14 @@ async def expire_due(now: Optional[datetime] = None) -> int:
     Runs from the worker cron sweep. Safe to run concurrently: `complete()`
     locks per row, and an entry that lands in between is skipped.
     """
+    import uuid
+
     from app.core.database import AsyncSessionLocal
+    from app.models.chat import Chat
     from app.models.pending_approval import PendingToolApproval
     from app.models.pending_completion import PendingCompletion
+    from app.services import approval_rules
+    from app.services.queue_service import queue_service
 
     now = now or datetime.now(timezone.utc)
     resolved = 0
@@ -494,7 +499,8 @@ async def expire_due(now: Optional[datetime] = None) -> int:
             )
             .with_for_update(skip_locked=True)
         )
-        for approval in result.scalars().all():
+        expired = result.scalars().all()
+        for approval in expired:
             approval.approved = False
             resolved += 1
             logger.info(
@@ -503,5 +509,35 @@ async def expire_due(now: Optional[datetime] = None) -> int:
                 approval.tool_call_id,
             )
         await db.commit()
+
+        # A round whose last open ask just expired, with other calls the
+        # user had approved, is waiting on nobody now: resume it (the
+        # approved calls run, the expired ones are answered as rejected).
+        # Fully rejected rounds stay as they are — the repair on the next
+        # turn covers them, as before.
+        seen_rounds: set = set()
+        for approval in expired:
+            if approval.message_id in seen_rounds:
+                continue
+            seen_rounds.add(approval.message_id)
+            decision = await approval_rules.round_decision(db, approval)
+            if not decision or not decision["approved_ids"]:
+                continue
+            chat = await db.get(Chat, approval.chat_id)
+            if chat is None:
+                continue
+            try:
+                await queue_service.enqueue_agent_resume(
+                    chat_id=str(chat.id),
+                    user_id=str(approval.user_id),
+                    user_token="",
+                    pending_approval_id=str(approval.id),
+                    approved=True,
+                    channel_id=str(uuid.uuid4()),
+                    agent=f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_name else None,
+                    rejected_tool_call_ids=decision["rejected_ids"],
+                )
+            except Exception:
+                logger.exception("Could not resume the round of expired approval %s", approval.id)
 
     return resolved
