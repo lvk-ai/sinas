@@ -16,7 +16,8 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat import Chat
-from app.models.file import Collection, File
+from sqlalchemy import select
+from app.models.file import Collection, File, FileVersion
 from app.models.user import RolePermission, User
 from app.services.collection_tools import CollectionToolConverter
 from app.services.workbench import (
@@ -789,3 +790,160 @@ class TestDeltaAndAffinity:
         # Affinity stamps the chat on whatever container was handed out.
         got = await pool.acquire(timeout=1, chat_id="chat-7")
         assert got is c and c.last_chat_id == "chat-7"
+
+
+class TestWriteGuards:
+    """Byte writes honour what uploads honour: the filter's approved bytes
+    and metadata, the target's metadata schema, its storage quota, its
+    post-upload hook, and a tree where a path is a file or a directory,
+    never both."""
+
+    @pytest.mark.asyncio
+    async def test_file_and_directory_paths_cannot_coexist(self, db, chat, test_user):
+        tools = WorkbenchTools()
+        ok = await tools.execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "a/b.txt", "content": "x"})
+        assert "error" not in ok, ok
+        clash = await tools.execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "a", "content": "x"})
+        assert "directory" in clash["error"]
+        clash = await tools.execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "a/b.txt/c.txt", "content": "x"})
+        assert "is a file" in clash["error"]
+        # same guard on the byte path (uploads, checkout)
+        wb = await get_or_create_workbench(db, chat)
+        from app.services.file_storage import get_storage
+        from app.services.workbench import _write_bytes
+        res = await _write_bytes(db, get_storage(), wb, filename="a", content=b"x", content_type="text/plain", user_id=str(test_user.id), visibility="private")
+        assert "directory" in res["error"]
+
+    def test_hidden_directories_are_rejected_but_hidden_files_allowed(self):
+        from app.services.workbench import _validate_path
+        assert _validate_path(".config/settings.json")
+        assert _validate_path("src/.cache/x")
+        assert _validate_path(".gitignore") is None
+        assert _validate_path("src/.env") is None
+
+    @pytest.mark.asyncio
+    async def test_filter_result_is_what_gets_written(self, db, chat, test_user, monkeypatch):
+        import base64
+        from app.services import workbench as wb_mod
+        from app.services.queue_service import queue_service
+
+        async def fake_filter(**kwargs):
+            assert kwargs["input_data"]["filename"] == "renamed.txt"  # the destination name
+            assert kwargs["input_data"]["user_metadata"] == {"topic": "q"}
+            return {"approved": True, "modified_content": base64.b64encode(b"CLEANED").decode(), "metadata": {"scanned": True}}
+
+        monkeypatch.setattr(queue_service, "enqueue_and_wait", fake_filter)
+        from app.models.function import Function
+        monkeypatch.setattr(Function, "get_by_name", classmethod(lambda cls, db, ns, name: _coro(object())))
+        await _grant(db, test_user, "sinas.collections/*/*.upload:own")
+
+        outcome = await wb_mod.run_content_filter(
+            db, "f/filter", namespace="ns", collection_name="c", filename="renamed.txt",
+            content=b"dirty", content_type="text/plain", user_id=str(test_user.id), user_metadata={"topic": "q"},
+        )
+        assert outcome == {"content": b"CLEANED", "metadata": {"scanned": True}}
+
+        # promote uses it: filtered bytes + merged metadata land in the target
+        target = Collection(namespace="ns", name="c", user_id=test_user.id, content_filter_function="f/filter")
+        db.add(target)
+        await db.flush()
+        await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "in.txt", "content": "dirty"})
+        out = await WorkbenchTools().execute_tool(
+            db, chat, str(test_user.id), "workbench_promote",
+            {"filename": "in.txt", "collection": "ns/c", "target_filename": "renamed.txt", "metadata": {"topic": "q"}},
+        )
+        assert "error" not in out, out
+        f = (await db.execute(select(File).where(File.collection_id == target.id))).scalar_one()
+        assert f.name == "renamed.txt" and f.file_metadata == {"topic": "q", "scanned": True}
+        from app.services.file_storage import get_storage
+        v = (await db.execute(select(FileVersion).where(FileVersion.file_id == f.id))).scalar_one()
+        assert await get_storage().read(v.storage_path) == b"CLEANED"
+
+    @pytest.mark.asyncio
+    async def test_promote_validates_target_metadata_schema(self, db, chat, test_user):
+        await _grant(db, test_user, "sinas.collections/*/*.upload:own")
+        target = Collection(
+            namespace="ns", name="strict", user_id=test_user.id,
+            metadata_schema={"type": "object", "required": ["owner"], "properties": {"owner": {"type": "string"}}},
+        )
+        db.add(target)
+        await db.flush()
+        await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "r.md", "content": "x"})
+        out = await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_promote", {"filename": "r.md", "collection": "ns/strict"})
+        assert out["error"] == "Invalid metadata" and "owner" in out["message"]
+        out = await WorkbenchTools().execute_tool(
+            db, chat, str(test_user.id), "workbench_promote", {"filename": "r.md", "collection": "ns/strict", "metadata": {"owner": "me"}}
+        )
+        assert "error" not in out, out
+
+    @pytest.mark.asyncio
+    async def test_promote_runs_the_post_upload_function(self, db, chat, test_user, monkeypatch):
+        from app.models.function import Function
+        from app.services.queue_service import queue_service
+
+        queued = []
+
+        async def fake_enqueue(**kwargs):
+            queued.append(kwargs)
+            return "job"
+
+        monkeypatch.setattr(queue_service, "enqueue_function", fake_enqueue)
+        monkeypatch.setattr(Function, "get_by_name", classmethod(lambda cls, db, ns, name: _coro(object())))
+        await _grant(db, test_user, "sinas.collections/*/*.upload:own")
+        target = Collection(namespace="ns", name="indexed", user_id=test_user.id, post_upload_function="f/index")
+        db.add(target)
+        await db.flush()
+        await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "doc.md", "content": "x"})
+        out = await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_promote", {"filename": "doc.md", "collection": "ns/indexed"})
+        assert "error" not in out, out
+        (call,) = queued
+        assert call["function_name"] == "index" and call["trigger_id"] == "post_upload:ns/indexed"
+        assert call["input_data"]["filename"] == "doc.md" and call["input_data"]["version"] == 1
+        assert call["input_data"]["file_id"] and call["input_data"]["file_path"]
+
+    @pytest.mark.asyncio
+    async def test_storage_quota_applies_to_promote(self, db, chat, test_user):
+        await _grant(db, test_user, "sinas.collections/*/*.upload:own")
+        target = Collection(namespace="ns", name="tiny", user_id=test_user.id, max_total_size_gb=1)
+        db.add(target)
+        await db.flush()
+        # Pretend the collection already holds ~1GB (a version row; no bytes needed)
+        existing = File(collection_id=target.id, name="big.bin", user_id=test_user.id, content_type="application/octet-stream", current_version=1, visibility="private")
+        db.add(existing)
+        await db.flush()
+        db.add(FileVersion(file_id=existing.id, version_number=1, storage_path="x", size_bytes=1024 ** 3 - 10, hash_sha256="h", uploaded_by=test_user.id))
+        await db.flush()
+        await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_write", {"filename": "more.txt", "content": "x" * 100})
+        out = await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_promote", {"filename": "more.txt", "collection": "ns/tiny"})
+        assert "quota" in out["error"]
+
+    @pytest.mark.asyncio
+    async def test_checkout_skips_names_that_would_escape_or_collide(self, db, chat, test_user):
+        await _grant(db, test_user, "sinas.collections/*/*.download:own")
+        src = Collection(namespace="ns", name="src", user_id=test_user.id)
+        db.add(src)
+        await db.flush()
+        for name in ("../outside.txt", "fine.txt"):
+            f = File(collection_id=src.id, name=name, user_id=test_user.id, content_type="text/plain", current_version=1, visibility="private")
+            db.add(f)
+            await db.flush()
+            from app.services.file_storage import get_storage
+            path = f"ns/src/{f.id}/v1"
+            await get_storage().save(path, b"x")
+            db.add(FileVersion(file_id=f.id, version_number=1, storage_path=path, size_bytes=1, hash_sha256="h", uploaded_by=test_user.id))
+        await db.flush()
+        out = await WorkbenchTools().execute_tool(db, chat, str(test_user.id), "workbench_checkout", {"collection": "ns/src", "pattern": "*"})
+        assert [c["filename"] for c in out["checked_out"]] == ["fine.txt"]
+        assert any("outside" in e for e in out["errors"])
+
+    @pytest.mark.asyncio
+    async def test_runtime_discovery_hides_workbenches(self, db, chat, client, test_user):
+        await get_or_create_workbench(db, chat)
+        await db.flush()
+        resp = await client.get("/collections", headers=auth_headers(test_user))
+        assert resp.status_code == 200
+        assert all(c["namespace"] != "_chat" for c in resp.json())
+
+
+async def _coro(value):
+    return value

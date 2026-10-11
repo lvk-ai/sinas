@@ -658,6 +658,10 @@ def _build_wrapper(user_code: str, workbench: bool = False) -> str:
         _max_total = int(_wb_limits.get("max_total_bytes") or 32 * 1024 * 1024)
         _total = 0
         for _dirpath, _dirnames, _filenames in _os.walk(_wb_root):
+            # Hidden directories are tool caches (.venv, .cache, ...), never
+            # workbench content: workbench paths reject hidden directory
+            # segments (_validate_path), so nothing under one can be a file
+            # the chat owns. Hidden files at any level are kept.
             _dirnames[:] = [_d for _d in _dirnames if not _d.startswith(".")]
             for _fn in _filenames:
                 _full = _os.path.join(_dirpath, _fn)

@@ -205,8 +205,9 @@ async def upload_workbench_file(
 
     content_type = file_data.content_type or _infer_content_type(file_data.name)
 
+    upload_metadata = dict(file_data.file_metadata)
     if settings.workbench_content_filter_function:
-        filter_err = await run_content_filter(
+        outcome = await run_content_filter(
             db,
             settings.workbench_content_filter_function,
             namespace="_chat",
@@ -215,12 +216,16 @@ async def upload_workbench_file(
             content=content,
             content_type=content_type,
             user_id=str(user_id),
+            user_metadata=upload_metadata,
         )
-        if filter_err:
+        if "error" in outcome:
             raise HTTPException(
                 status_code=422,
-                detail=filter_err.get("message") or filter_err.get("error", "Rejected by content filter"),
+                detail=outcome.get("message") or outcome.get("error", "Rejected by content filter"),
             )
+        # What the filter approved is what gets stored.
+        content = outcome["content"]
+        upload_metadata.update(outcome["metadata"])
 
     workbench = await get_or_create_workbench(db, chat)
     result = await _write_bytes(
@@ -232,7 +237,7 @@ async def upload_workbench_file(
         content_type=content_type,
         user_id=str(user_id),
         visibility="private",
-        file_metadata={**file_data.file_metadata, "origin": "upload"},
+        file_metadata={**upload_metadata, "origin": "upload"},
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
