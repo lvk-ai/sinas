@@ -126,6 +126,7 @@ export interface Chat {
   created_at: string;
   updated_at: string;
   last_message_at: string | null;
+  workbench_enabled?: boolean | null;
 }
 
 export interface WorkbenchFile {
