@@ -1273,7 +1273,7 @@ class MessageService:
                 # Suspended delegations bypass execute_single_tool, so
                 # {"$workbench": path} references resolve here — the child
                 # must receive the parent's file content, not the sentinel.
-                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                if workbench_refs.contains_reference(args):
                     if _ref_chat_for_delegates is None:
                         _ref_chat_for_delegates = (
                             await self.db.execute(select(Chat).where(Chat.id == chat_id))
@@ -1325,7 +1325,7 @@ class MessageService:
                 }
                 # Deferred like delegations, so {"$workbench": path} references
                 # (a saved question, saved options) resolve here too.
-                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                if workbench_refs.contains_reference(args):
                     if _ref_chat_for_delegates is None:
                         _ref_chat_for_delegates = (
                             await self.db.execute(select(Chat).where(Chat.id == chat_id))

@@ -451,3 +451,42 @@ class TestDeferredAskUserReferences:
         assert asked["question"] == "Which region do you want?"
         assert asked["options"] == ["eu", "us"]
         assert any(c.get("type") == dc.ROUND_SUSPENDED for c in chunks)
+
+
+class TestReferenceEdgeCases:
+    def test_escaped_sentinel_counts_as_a_reference(self):
+        raw = '{"question": {"\\u0024workbench": "question.txt"}}'
+        assert workbench_refs.contains_reference(raw)
+        assert workbench_refs.contains_reference(json.loads(raw))
+        assert not workbench_refs.contains_reference('{"question": "plain"}')
+
+    @pytest.mark.asyncio
+    async def test_bad_encoding_is_a_reference_error_not_a_crash(self, db, chat, test_user):
+        await _write(db, chat, test_user, "q.txt", "hello")
+        with pytest.raises(workbench_refs.ReferenceError_, match="encoding"):
+            await workbench_refs.resolve_references(
+                db, chat, str(test_user.id), {"q": {"$workbench": "q.txt", "encoding": ["text"]}}
+            )
+
+    @pytest.mark.asyncio
+    async def test_spilled_json_is_saved_pageable(self, db, test_user):
+        """workbench_read pages by line: a JSON spill must not be one line."""
+        from app.models import Agent
+
+        agent = Agent(namespace="test", name="pager", user_id=test_user.id, system_tools=["workbench"])
+        db.add(agent)
+        await db.flush()
+        chat = Chat(user_id=test_user.id, agent_id=agent.id, title="pager chat")
+        db.add(chat)
+        await db.flush()
+        rows = [{"id": i, "name": f"row {i}"} for i in range(200)]
+        path = await workbench_refs.spill_result(db, chat, str(test_user.id), "q", "call_page", json.dumps(rows))
+        assert path
+        uid = str(test_user.id)
+        first = await WorkbenchTools().execute_tool(db, chat, uid, "workbench_read", {"filename": path, "offset": 1, "limit": 5})
+        assert first.get("content") and len(first["content"].strip().split("\n")) == 5
+        later = await WorkbenchTools().execute_tool(db, chat, uid, "workbench_read", {"filename": path, "offset": 300, "limit": 5})
+        assert later.get("content") and '"name"' in later["content"]
+        # And it still reads back as the same JSON.
+        full = await workbench_refs.load_spilled_result(db, chat, uid, {"_full_result": {"workbench_file": path}}, 10**7)
+        assert full["result"] == rows
