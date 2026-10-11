@@ -334,7 +334,9 @@ class Driver:
                 a = st["pending_approvals"][0]
                 ap = self.ok(self.c.post(f"/chats/{self.chat_id}/approve-tool/{a['tool_call_id']}", headers=self.h, json={"approved": True}))
                 self.step(8, f"approved {a['function_name']} -> channel={ap.get('channel_id')}")
-                if ap.get("channel_id"):
+                # A round with several asked calls resumes only on the last
+                # decision: until then nothing publishes on the channel.
+                if ap.get("resume", "queued") == "queued" and ap.get("channel_id"):
                     with self.c.stream("GET", f"/chats/{self.chat_id}/stream/{ap['channel_id']}", headers=self.h) as resp:
                         self.consume(resp)
                 continue
@@ -366,7 +368,14 @@ class Driver:
         # collection: the promote tool result must be a success and the
         # published file must be at the version that result reports.
         promote_results = [m for m in msgs if m["role"] == "tool" and m["name"] == "workbench_promote"]
-        failed_tools = [m["name"] for m in msgs if m["role"] == "tool" and "error" in (self._json(m["content"]) or {})]
+        def _failed(content):
+            # A tool's own error, or a code run that finished with one
+            # (execute_code reports it under result.error / result.status).
+            parsed = self._json(content) or {}
+            inner = parsed.get("result") if isinstance(parsed.get("result"), dict) else {}
+            return "error" in parsed or "error" in inner or inner.get("status") == "failed"
+
+        failed_tools = [m["name"] for m in msgs if m["role"] == "tool" and _failed(m["content"])]
         if failed_tools:
             failures.append(f"tool calls failed this run: {failed_tools}")
         if not promote_results:
