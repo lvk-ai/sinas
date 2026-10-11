@@ -627,6 +627,18 @@ async def execute_background_tool(db, chat: Chat, user_id: str, tool_name: str, 
     if chat is None:
         return {"error": "Background tools need a chat"}
     if tool_name == RUN_IN_BACKGROUND:
+        if arguments.get("wait"):
+            # Reaching the inline executor with wait=true means the round
+            # could not suspend (no job channel: an inline stream or a
+            # synchronous send). Say so rather than returning a handle the
+            # model did not ask for.
+            return {
+                "error": (
+                    "wait=true needs a queued turn (a chat created with keep_alive: true); "
+                    "this turn runs inline. Call again with wait=false and you will be "
+                    "sent the result, or poll background_job_status."
+                )
+            }
         return await start_background_job(
             str(chat.id), user_id, arguments.get("code", ""), arguments.get("description") or "background run",
         )

@@ -568,3 +568,9 @@ async def test_cancelled_job_still_reports_back(committed_chat, monkeypatch):
     assert delivered and delivered[0].startswith("[background job job-c failed: d]")
     assert (await chat_wakeups.background_job_status(cid, "job-c"))["status"] == "failed"
 
+
+
+@pytest.mark.asyncio
+async def test_inline_wait_is_refused_with_guidance(db, chat, test_user):
+    out = await chat_wakeups.execute_background_tool(db, chat, str(test_user.id), "run_in_background", {"code": "1", "description": "d", "wait": True})
+    assert "keep_alive" in out["error"]
