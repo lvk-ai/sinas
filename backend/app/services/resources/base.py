@@ -53,6 +53,33 @@ class CdcTriggerChanged:
         return json.dumps({"action": self.action, "trigger_id": self.trigger_id})
 
 
+@dataclass(frozen=True)
+class StoredFilesRemoved:
+    """Remove files from storage once the rows that pointed at them are gone
+    for good: after the commit, so a rolled-back delete never loses a file.
+    Best-effort per file (one that's already missing is fine)."""
+
+    paths: tuple[str, ...]
+
+    async def run(self) -> None:
+        from app.services.file_storage import get_storage
+
+        import asyncio
+
+        storage = get_storage()
+        for path in self.paths:
+            try:
+                await storage.delete(path)
+            except Exception as e:  # pragma: no cover - logged, never raised
+                logger.warning(f"Could not remove stored file {path}: {e}")
+            # Local storage deletes synchronously: let other requests run
+            # between files, or a large collection stalls the worker.
+            await asyncio.sleep(0)
+
+
+PUBLISH_TIMEOUT_SECONDS = 5
+
+
 class SideEffectBus:
     """Effects recorded during a write, published only after it commits.
 
@@ -76,20 +103,40 @@ class SideEffectBus:
     def discard(self) -> None:
         self._effects.clear()
 
+    async def _publish(self, messages: list[Any]) -> None:
+        """Each publish is bounded on its own: a healthy batch of any size
+        goes out, while a Redis that stops answering is given up on (and the
+        cleanup after it still runs)."""
+        import asyncio
+
+        sent = 0
+        try:
+            from app.core.redis import get_redis
+
+            redis = await asyncio.wait_for(get_redis(), timeout=PUBLISH_TIMEOUT_SECONDS)
+            for effect in messages:
+                await asyncio.wait_for(
+                    redis.publish(effect.channel, effect.message()), timeout=PUBLISH_TIMEOUT_SECONDS
+                )
+                sent += 1
+        except Exception as e:  # pragma: no cover - logged, never raised
+            logger.warning(f"Failed to publish side effects {messages[sent:]}: {e!r}")
+
     async def flush(self) -> None:
         """Publish and clear. Best-effort: the write already committed, so a
         failed notification must not turn into a failed request."""
         effects, self._effects = self._effects, []
-        if not effects:
-            return
-        try:
-            from app.core.redis import get_redis
-
-            redis = await get_redis()
-            for effect in effects:
-                await redis.publish(effect.channel, effect.message())
-        except Exception as e:  # pragma: no cover - logged, never raised
-            logger.warning(f"Failed to publish side effects {effects}: {e}")
+        tasks = [e for e in effects if hasattr(e, "run")]
+        messages = [e for e in effects if not hasattr(e, "run")]
+        # Notifications first: workers (scheduler, CDC) shouldn't wait for
+        # slower cleanup work.
+        if messages:
+            await self._publish(messages)
+        for task in tasks:  # work to do after the commit (e.g. storage cleanup)
+            try:
+                await task.run()
+            except Exception as e:  # pragma: no cover - logged, never raised
+                logger.warning(f"Post-commit effect {task!r} failed: {e}")
 
 
 # --------------------------------------------------------------- context + results
@@ -213,6 +260,29 @@ def ownership_decision(
     return "skip"
 
 
+# --------------------------------------------------------------- shared invariants
+
+
+async def lock_singleton(ctx: "ApplyContext", name: str) -> None:
+    """Serialize changes to a one-row-at-most invariant (the default agent,
+    the default provider) until the transaction ends. Row locks can't: with
+    no current default there is no row to lock, so two promotions could both
+    see none and both commit.
+
+    Lock order: every entry point that may promote takes this lock FIRST,
+    before any row lock (config apply at its start, REST before locking the
+    row, restore before finding it). Taken later, a request holding a row
+    lock and waiting here deadlocks with one holding this and wanting that
+    row. Re-entrant: the applier takes it again when it unsets the others."""
+    import zlib
+
+    from sqlalchemy import text
+
+    await ctx.db.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"), {"key": zlib.crc32(f"sinas:{name}".encode())}
+    )
+
+
 # --------------------------------------------------------------- applier
 
 
@@ -236,6 +306,13 @@ class ResourceApplier(Generic[TSpec]):
     # Operator state a config sets only when it says so: left out of the
     # YAML, an existing resource keeps its value (see apply's `keep`).
     keep_unless_declared: ClassVar[tuple[str, ...]] = ()
+    # Kinds with an `is_default` that at most one row may have: the name of
+    # the lock that serializes promotions (see lock_singleton).
+    singleton_lock: ClassVar[Optional[str]] = None
+    # Whether a package uninstall, or an upgrade that no longer ships one,
+    # deletes rows of this kind. Off for kinds whose rows hold what an
+    # operator entered (secrets): they outlive the package.
+    deleted_with_package: ClassVar[bool] = True
 
     # ---- hooks -------------------------------------------------------------
 
@@ -282,8 +359,27 @@ class ResourceApplier(Generic[TSpec]):
         stay that id, whatever its name resolves to by now."""
         self.write_fields(row, spec)
 
+    def pinned_fields(self, row: Any) -> tuple[str, ...]:
+        """Fields of this row no write may change, on any channel (restores
+        included): they keep their current value. For rows whose parts the
+        platform owns."""
+        return ()
+
+    def ownership(self, row: Any, ctx: ApplyContext) -> OwnershipDecision:
+        """Who may write an existing row (design §4.4). Override only with a
+        reason the shared state machine doesn't cover."""
+        return ownership_decision(row.managed_by, ctx, getattr(row, "config_name", None))
+
     async def check_references(self, spec: TSpec, ctx: ApplyContext) -> None:
         """Raise ReferenceNotFound if the spec points at something missing."""
+
+    async def check_new_references(
+        self, spec: TSpec, ctx: ApplyContext, current: Optional[TSpec]
+    ) -> None:
+        """Called on create (current None) and when a reference field changed.
+        Kinds that only check what a change adds (leaving older references
+        alone) override this; the default checks every reference."""
+        await self.check_references(spec, ctx)
 
     def effects(self, action: str, row: Any) -> list[Any]:
         return []
@@ -339,6 +435,10 @@ class ResourceApplier(Generic[TSpec]):
         keep = set(keep)
         if current is not None and keep:
             spec = spec.model_copy(update={field: getattr(current, field) for field in keep})
+        if current is not None:
+            pinned = self.pinned_fields(row)
+            if pinned:
+                spec = spec.model_copy(update={field: getattr(current, field) for field in pinned})
         new_canonical = self.history_spec(spec)
 
         # ---- create ----------------------------------------------------------
@@ -347,7 +447,7 @@ class ResourceApplier(Generic[TSpec]):
             # Checked in dry runs too: a preview must refuse what the real
             # apply would refuse (e.g. an inactive target), or a package
             # preview says "fine" for an install that then fails.
-            await self.check_references(spec, ctx)
+            await self.check_new_references(spec, ctx, None)
             if ctx.dry_run:
                 return ApplyResult("create", changes=changes)
             row = self.new_row(spec, ctx)
@@ -365,7 +465,7 @@ class ResourceApplier(Generic[TSpec]):
             return ApplyResult("create", obj=row, changes=changes, revision=revision)
 
         # ---- update ----------------------------------------------------------
-        decision = ownership_decision(row.managed_by, ctx, getattr(row, "config_name", None))
+        decision = self.ownership(row, ctx)
         if decision == "skip":
             if row.managed_by is None:
                 warning = (
@@ -398,7 +498,7 @@ class ResourceApplier(Generic[TSpec]):
             return ApplyResult("unchanged", obj=row)
 
         if any(field in changes for field in self.reference_fields):
-            await self.check_references(spec, ctx)
+            await self.check_new_references(spec, ctx, current)
 
         if ctx.dry_run:
             return ApplyResult("update", obj=row, changes=changes)

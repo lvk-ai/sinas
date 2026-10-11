@@ -6,24 +6,22 @@ import re
 from typing import Any, Optional
 
 import yaml
-from sqlalchemy import delete, select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
-from app.models.chat import Chat
 from app.models.connector import Connector
 from app.models.manifest import Manifest
 from app.models.component import Component
 from app.models.database_trigger import DatabaseTrigger
 from app.models.file import Collection
-from app.models.function import Function, FunctionVersion
+from app.models.function import Function
 from app.models.package import Package
 from app.models.query import Query
 from app.models.schedule import ScheduledJob
 from app.models.skill import Skill
 from app.models.store import Store
 from app.models.template import Template
-from app.models.user import APIKeyRole, Role, RolePermission, UserRole
 from app.models.webhook import Webhook
 from app.schemas.config import ConfigApplyResponse, OwnershipSkip, SinasConfig
 from app.services.config_apply import ConfigApplyService
@@ -400,6 +398,11 @@ class PackageService:
             skip_resource_types=PACKAGE_SKIP_TYPES,
             # An upgrade removes what the new version no longer ships.
             prune_missing=True,
+            # The real install saves these before applying; the preview doesn't.
+            supplied_secrets={
+                v["name"] for v in variable_declarations
+                if v.get("type") == "secret" and (variables or {}).get(v["name"]) is not None
+            },
         )
 
         result = await apply_service.apply_config(config, dry_run=True)
@@ -446,29 +449,6 @@ class PackageService:
 
         deleted_counts = {}
 
-        # Delete managed resources across all model types
-        model_names = {
-            Agent: "agents",
-            Function: "functions",
-        }
-
-        # Children whose FK has no ON DELETE rule must be cleared first. The
-        # loop below issues Core bulk deletes, which bypass the ORM's
-        # delete-orphan cascades entirely, so a package whose functions had
-        # ever been versioned (or whose agents had ever been chatted with)
-        # failed the whole uninstall on a ForeignKeyViolationError (#63).
-        # Every other child of these tables already cascades at the DB level.
-        function_ids = select(Function.id).where(Function.managed_by == managed_by).scalar_subquery()
-        await self.db.execute(
-            delete(FunctionVersion).where(FunctionVersion.function_id.in_(function_ids))
-        )
-        # Chats outlive the package: a conversation is the user's, not the
-        # package's, so only the link to the vanishing agent is cleared.
-        agent_ids = select(Agent.id).where(Agent.managed_by == managed_by).scalar_subquery()
-        await self.db.execute(
-            update(Chat).where(Chat.agent_id.in_(agent_ids)).values(agent_id=None)
-        )
-
         # Kinds with an applier go through it rather than a bulk delete: each
         # deletion is recorded in the change history (so it can be restored),
         # and running workers are told — a bulk delete left the scheduler
@@ -484,6 +464,8 @@ class PackageService:
             config_name=package_name,
         )
         for applier in all_appliers():
+            if not applier.deleted_with_package:
+                continue
             # Locked, and the ownership filter re-checked on the locked row: a
             # concurrent manual edit detaches a row (managed_by = NULL), and
             # must not be deleted after its save succeeded.
@@ -500,21 +482,9 @@ class PackageService:
             if rows:
                 deleted_counts[applier.kind] = len(rows)
 
-        for model, type_name in model_names.items():
-            stmt = delete(model).where(model.managed_by == managed_by)
-            result = await self.db.execute(stmt)
-            if result.rowcount > 0:
-                deleted_counts[type_name] = result.rowcount
-
-        # Package-managed roles: children first (their FKs have no ON DELETE),
-        # then the roles. User assignments vanish with the role — deliberate:
-        # an uninstalled package's authority should not linger anywhere.
-        role_ids = select(Role.id).where(Role.managed_by == managed_by).scalar_subquery()
-        for child in (RolePermission, UserRole, APIKeyRole):
-            await self.db.execute(delete(child).where(child.role_id.in_(role_ids)))
-        result = await self.db.execute(delete(Role).where(Role.managed_by == managed_by))
-        if result.rowcount > 0:
-            deleted_counts["roles"] = result.rowcount
+        # Package-managed roles went with the appliers above, user and API-key
+        # assignments with them — deliberate: an uninstalled package's
+        # authority should not linger anywhere.
 
         # Delete package record
         await self.db.delete(package)
@@ -827,26 +797,26 @@ class PackageService:
                     # a name-only lookup could silently overwrite another
                     # user's PRIVATE secret of the same name (same bug class
                     # the config-apply secrets path fixed).
-                    from app.core.encryption import encryption_service
-                    from app.models.secret import Secret
-                    existing = await self.db.execute(
-                        select(Secret).where(
-                            Secret.name == name, Secret.visibility == "shared"
-                        )
+                    # Through the applier, as the installing user's own entry
+                    # (recorded, value redacted). It stays theirs: the
+                    # package may fill it in but never deletes it.
+                    from app.services.resources import ApplyContext
+                    from app.services.resources.secrets import SecretApplier
+
+                    applier = SecretApplier()
+                    ctx = ApplyContext(
+                        db=self.db, origin="api",
+                        actor_user_id=str(user_id), owner_user_id=str(user_id),
                     )
-                    secret = existing.scalar_one_or_none()
-                    if secret:
-                        secret.encrypted_value = encryption_service.encrypt(str(value))
+                    secret = await applier.find(ctx, name)
+                    if secret is None:
+                        spec = applier.spec_model.model_validate({
+                            "name": name, "value": str(value),
+                            "description": decl.get("description"),
+                        })
                     else:
-                        secret = Secret(
-                            name=name,
-                            encrypted_value=encryption_service.encrypt(str(value)),
-                            description=decl.get("description"),
-                            user_id=user_id,
-                            visibility="shared",
-                        )
-                        self.db.add(secret)
-                    await self.db.flush()
+                        spec = applier.spec_from_row(secret).model_copy(update={"value": str(value)})
+                    await applier.apply(spec, ctx, existing=secret)
                 # The substitution value is the secret reference syntax
                 resolved[name] = f"{{{{{name}}}}}"
                 stored_values[name] = "***"

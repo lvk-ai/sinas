@@ -3,7 +3,7 @@ Pydantic schemas for declarative configuration
 """
 from typing import Any, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, validator
+from pydantic import BaseModel, Field, field_validator, model_validator, validator
 
 
 class ConfigMetadata(BaseModel):
@@ -50,14 +50,31 @@ class UserConfig(BaseModel):
 
     email: str
     isActive: bool = True
-    roles: list[str] = Field(default_factory=list)
+    # Left out: the user's memberships are not managed by this config. A
+    # list (even empty) is the full set of roles the user holds.
+    roles: Optional[list[str]] = None
     permissions: list[UserPermissionConfig] = Field(default_factory=list)
     customFields: Optional[dict[str, Any]] = None
     identities: list[UserIdentityConfig] = Field(default_factory=list)
 
+    @field_validator("email")
+    @classmethod
+    def _normalized(cls, value: str) -> str:
+        # As the API and login store and look them up: "Ann@X.com " used to
+        # miss the existing ann@x.com and create a second user.
+        from app.core.auth import normalize_email
+
+        return normalize_email(value)
+
 
 class LLMProviderConfig(BaseModel):
     """LLM provider configuration"""
+
+    @field_validator("apiKey")
+    @classmethod
+    def _blank_key_is_unset(cls, value: Optional[str]) -> Optional[str]:
+        # An empty apiKey keeps the stored key, as it always did.
+        return value or None
 
     name: str
     type: str  # openai, azure, ollama, anthropic, etc.
@@ -65,12 +82,14 @@ class LLMProviderConfig(BaseModel):
     endpoint: Optional[str] = None
     models: list[str] = Field(default_factory=list)
     defaultModel: Optional[str] = None
-    isDefault: bool = False
+    # Unset: a new provider is not the default and is active; an existing one
+    # keeps what it has (made default, or deleted, in the console).
+    isDefault: Optional[bool] = None
     # Passthrough for provider-specific config (merged into the DB `config`
     # column, not overwritten). For Azure: api_version, azure_deployment,
     # max_tokens_param, drop_params, extra_params.
     config: dict[str, Any] = Field(default_factory=dict)
-    isActive: bool = True
+    isActive: Optional[bool] = None
 
 
 class DatabaseAnnotationConfig(BaseModel):
@@ -95,7 +114,17 @@ class DatabaseConnectionConfig(BaseModel):
     password: Optional[str] = None  # Stored encrypted; no env interpolation
     sslMode: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
+    # Unset: a new connection is active and writable; an existing one keeps
+    # what it has (switched off, or made read-only, in the console).
+    readOnly: Optional[bool] = None
+    isActive: Optional[bool] = None
     annotations: list[DatabaseAnnotationConfig] = Field(default_factory=list)
+
+    @field_validator("password")
+    @classmethod
+    def _blank_password_is_unset(cls, value: Optional[str]) -> Optional[str]:
+        # An empty password keeps the stored one, as it always did.
+        return value or None
 
 
 class QueryConfig(BaseModel):
@@ -126,8 +155,10 @@ class FunctionConfig(BaseModel):
     outputSchema: Optional[dict[str, Any]] = None
     icon: Optional[str] = None
     timeout: Optional[int] = None
+    # Unset: a new function gets the default, an existing one keeps its value.
     sharedPool: Optional[bool] = None
     requiresApproval: Optional[bool] = None
+    isActive: Optional[bool] = None
 
 
 class SkillConfig(BaseModel):
@@ -221,7 +252,11 @@ class AgentConfig(BaseModel):
     initialMessages: Optional[list[dict[str, str]]] = None
     hooks: Optional[dict[str, Any]] = None  # {"onUserMessage": [...], "onAssistantMessage": [...]}
     icon: Optional[str] = None
-    isDefault: bool = False
+    # Unset: a new agent is not the default and is active; an existing one
+    # keeps what it has (the console may have made it the default, or it
+    # may have been deleted, which switches it off).
+    isDefault: Optional[bool] = None
+    isActive: Optional[bool] = None
     defaultJobTimeout: Optional[int] = None
     defaultKeepAlive: bool = False
     systemTools: list[Any] = Field(
@@ -527,7 +562,9 @@ class PipelineConfig(BaseModel):
     disableAfterFailures: Optional[int] = None
     output: Optional[Any] = None
     outputExpr: Optional[str] = Field(default=None, alias="output.$")
-    isActive: bool = True
+    # Unset: a new pipeline is active, an existing one keeps its state (it
+    # may have been switched off, or auto-disabled after failures).
+    isActive: Optional[bool] = None
 
     def output_mapping(self) -> Optional[dict[str, Any]]:
         """Build the stored output-mapping dict from the YAML-level fields."""
@@ -543,6 +580,18 @@ class DependencyConfig(BaseModel):
 
     packageName: str
     version: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "DependencyConfig":
+        # "package==1.2.3" in one field declares the version too, and a blank
+        # version is no version (the pinned one is kept) — decided here, so
+        # config apply sees what is actually declared.
+        if "==" in self.packageName:
+            name, pinned = self.packageName.split("==", 1)
+            self.packageName = name
+            self.version = self.version or pinned
+        self.version = self.version or None
+        return self
 
 
 class VariableConfig(BaseModel):
@@ -688,6 +737,11 @@ class ConfigApplyRequest(BaseModel):
     config: str  # YAML content
     dryRun: bool = False
     force: bool = False
+    # Also remove what this config (same metadata.name) applied earlier but no
+    # longer declares. Opt-in: a config file may be partial. Never removes
+    # secrets, LLM providers, database connections or dependencies, nor
+    # anything edited by hand since (an edit detaches it from the config).
+    prune: bool = False
 
 
 class ConfigValidateRequest(BaseModel):
