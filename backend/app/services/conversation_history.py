@@ -204,12 +204,22 @@ async def build_conversation_history(
                 break  # Stop once we hit non-tool messages
 
         if referenced_tc_ids:
-            # Scan messages before the window for assistant messages with matching tool_calls
-            for msg in reversed(all_messages[:window_start_idx]):
+            # Scan messages before the window for assistant messages with
+            # matching tool_calls. Bring the whole exchange back: the call
+            # AND the results of its batch that also fell before the window
+            # — otherwise those completed calls get synthetic "interrupted"
+            # results from the repair below and the model may redo them.
+            before = all_messages[:window_start_idx]
+            for idx in range(len(before) - 1, -1, -1):
+                msg = before[idx]
                 if msg.tool_calls:
                     msg_tc_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
                     if msg_tc_ids & referenced_tc_ids:
-                        prepend.insert(0, msg)
+                        batch_results = [
+                            m for m in before[idx + 1:]
+                            if m.role == "tool" and m.tool_call_id in msg_tc_ids
+                        ]
+                        prepend[0:0] = [msg] + batch_results
                         referenced_tc_ids -= msg_tc_ids
                 if not referenced_tc_ids:
                     break
