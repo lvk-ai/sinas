@@ -33,7 +33,8 @@ export function McpServerEditor() {
   const { namespace, name } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const isNew = namespace === 'new' && name === 'new';
+  // The create route has no params; a saved server named new/new is a server like any other.
+  const isNew = namespace === undefined && name === undefined;
   const { showSuccess } = useToast();
 
   const [formData, setFormData] = useState({

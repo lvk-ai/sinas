@@ -242,6 +242,31 @@ class TestDiscovery:
         assert "namespace" not in add["_metadata"] and "name" not in add["_metadata"]
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_colliding_names_are_suffixed_whatever_the_order(self, db, fake_mcp, test_user):
+        """`delete.issue` and `delete_issue` encode alike: both get their
+        digest suffix, in either listing order, so an approval rule keeps
+        naming the same remote operation."""
+        from app.services.mcp_client import ListedTool
+
+        conv = McpToolConverter()
+        server = _server(test_user)
+        a = ListedTool(name="delete.issue", description="", input_schema={})
+        b = ListedTool(name="delete_issue", description="", input_schema={})
+
+        def names(order):
+            counts = {}
+            for t in order:
+                counts[conv._base_name(server, t)] = counts.get(conv._base_name(server, t), 0) + 1
+            seen = set()
+            return {t.name: conv._to_tool(server, t, seen, collided=counts[conv._base_name(server, t)] > 1)["function"]["name"] for t in order}
+
+        first, second = names([a, b]), names([b, a])
+        assert first == second
+        assert first["delete.issue"] != first["delete_issue"]
+        assert all(n.count("_") > 0 and not n.endswith("__delete_issue") for n in first.values())
+
+    @pytest.mark.asyncio
     async def test_overlapping_bindings_offer_each_tool_once(self, db, fake_mcp, test_user):
         """Two bindings of one server are one grant with the union of their
         patterns: a tool both allow is offered once, under its plain name,
