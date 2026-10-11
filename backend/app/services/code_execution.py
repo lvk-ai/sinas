@@ -647,23 +647,21 @@ def _build_wrapper(user_code: str, workbench: bool = False) -> str:
         if _rel is not None and _rel in _wb_lazy_unfetched:
             _mode = args[0] if args else kwargs.get("mode", "r")
             _m = str(_mode)
-            if "w" in _m:
-                # A truncating mode replaces the file: the old bytes are never
-                # needed, so no fetch — which also lets a file above the fetch
-                # limit be replaced. The stub stops being lazy only once the
-                # open succeeded: a failed open leaves an empty stub that
-                # copy-out must keep ignoring, or it would save empty bytes
-                # over the real file.
+            if "w" in _m or "x" in _m:
+                # A replacing mode never needs the old bytes, so no fetch —
+                # which also lets a file above the fetch limit be replaced.
+                # Exclusive creation fails while the stub is there (as on
+                # any file system) and succeeds once the code removed it.
+                # Either way the path stops being lazy only when the open
+                # succeeded: a failed open leaves an empty stub (or nothing)
+                # that copy-out must keep ignoring, or it would save empty
+                # bytes over the real file.
                 _fh = _wb_real_open(file, *args, **kwargs)
                 _wb_lazy_unfetched.discard(_rel)
                 return _fh
-            if "x" not in _m:
-                # Reading or appending needs the real bytes first — and a
-                # failed fetch must raise, never fall through to the stub.
-                workbench_fetch(_fp)
-            # Exclusive creation ("x") of a file that exists in the workbench
-            # fails like it would on any file system (the stub is there); the
-            # path stays lazy so the stub is still skipped at copy-out.
+            # Reading or appending needs the real bytes first — and a failed
+            # fetch must raise, never fall through to the stub.
+            workbench_fetch(_fp)
         return _wb_real_open(file, *args, **kwargs)
 
     _builtins.open = _wb_open

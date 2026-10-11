@@ -448,6 +448,7 @@ async def check_approval_requirements(
         One {tool_call_id, function_namespace, function_name, arguments}
         entry per call that needs approval (empty list: run everything).
     """
+    from app.core.auth import current_api_key_id as _current_api_key_id
     from app.services import approval_rules
 
     asked: list[dict[str, Any]] = []
@@ -542,6 +543,10 @@ async def check_approval_requirements(
                 "max_tokens": max_tokens,
                 "messages": messages,
                 "tools": tools,
+                # The key the round ran under: a resume the expiry sweep
+                # queues acts through it, never through the owner's wider
+                # access (the endpoint's resume acts through the approver's).
+                "api_key_id": _current_api_key_id(),
             },
         )
         db.add(pending_approval)
