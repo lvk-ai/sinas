@@ -257,6 +257,12 @@ def validate_permission_subset(
 
 
 # Default role permissions
+# Default roles added after the first three. Created owned by the platform
+# (managed_by "system"): an instance may already have its own role by that
+# name, and seeding permissions into it would grant them to its members.
+SYSTEM_ROLES = {"Deployers"}
+SYSTEM = "system"
+
 DEFAULT_ROLE_DESCRIPTIONS = {
     "Deployers": "For CI/CD API keys: validate, preview and apply config, install packages",
 }

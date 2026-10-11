@@ -357,6 +357,8 @@ export interface Role {
   id: string;
   name: string;
   description: string | null;
+  // "system" for roles the platform owns (e.g. the built-in Deployers).
+  managed_by?: string | null;
   created_at: string;
 }
 

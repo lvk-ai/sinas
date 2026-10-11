@@ -34,6 +34,17 @@ def default_role_names() -> set[str]:
     return set(DEFAULT_ROLE_PERMISSIONS)
 
 
+def is_default_role(row: Role) -> bool:
+    """A role the platform owns: the original three by name, later ones
+    (e.g. Deployers) only as created by the platform — an instance's own role
+    that happens to share such a name is an ordinary role."""
+    from app.core.permissions import SYSTEM, SYSTEM_ROLES
+
+    if row.name in SYSTEM_ROLES:
+        return row.managed_by == SYSTEM
+    return row.name in default_role_names()
+
+
 class ProtectedRole(ApplierError):
     status_code = 403
 
@@ -123,17 +134,17 @@ class RoleApplier(ResourceApplier[RoleSpec]):
         # them with a clear message).
         if row.name == ADMINS:
             return ("name", "permissions")
-        if row.name in default_role_names():
+        if is_default_role(row):
             return ("name",)
         return ()
 
     def ownership(self, row: Role, ctx: ApplyContext) -> OwnershipDecision:
-        if row.name in default_role_names() and row.managed_by is None:
+        if is_default_role(row) and row.managed_by in (None, "system"):
             return "write" if ctx.origin == "api" else "skip"
         return ownership_decision(row.managed_by, ctx, row.config_name)
 
     async def delete(self, row: Role, ctx: ApplyContext) -> None:
-        if row.name in default_role_names():
+        if is_default_role(row):
             raise ProtectedRole(f"Role '{row.name}' is a default role and can't be deleted")
         # Its permissions and memberships go with it (ORM cascade; API-key
         # bindings by the database's).

@@ -33,7 +33,8 @@ export function APIKeys() {
     enabled: showCreateModal,
   });
   // The built-in role for CI/CD deploy keys (see DEFAULT_ROLE_PERMISSIONS).
-  const deployersRole = roles?.find((role) => role.name === 'Deployers');
+  // Only the platform's own (an instance may have a role of its own by that name).
+  const deployersRole = roles?.find((role) => role.name === 'Deployers' && role.managed_by === 'system');
 
   const filteredApiKeys = apiKeys?.filter(key => showInactive || key.is_active);
 

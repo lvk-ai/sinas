@@ -1,5 +1,6 @@
 """Authentication and authorization system with OTP, JWT, and API keys."""
 import hashlib
+import logging
 import random
 import secrets
 import string
@@ -22,6 +23,8 @@ from app.core.token_signing import decode_access_token, get_signing_context
 from app.core.permissions import (
     DEFAULT_ROLE_DESCRIPTIONS,
     DEFAULT_ROLE_PERMISSIONS,
+    SYSTEM,
+    SYSTEM_ROLES,
     check_permission,
     validate_permission_subset,
 )
@@ -1059,12 +1062,23 @@ async def initialize_default_roles(db: AsyncSession):
         # Check if role exists
         result = await db.execute(select(Role).where(Role.name == role_name))
         role = result.scalar_one_or_none()
+        system_role = role_name in SYSTEM_ROLES
+
+        if role is not None and system_role and role.managed_by != SYSTEM:
+            # An instance's own role by this name: never seed permissions into
+            # it (its members would gain them). The built-in one isn't added.
+            logging.getLogger(__name__).warning(
+                "A role named %r already exists and isn't the built-in one; leaving it as is "
+                "(rename it to get the built-in %s role)", role_name, role_name,
+            )
+            continue
 
         if not role:
             # Create role
             role = Role(
                 name=role_name,
                 description=DEFAULT_ROLE_DESCRIPTIONS.get(role_name, f"Default {role_name} role"),
+                managed_by=SYSTEM if system_role else None,
             )
             db.add(role)
             await db.commit()
