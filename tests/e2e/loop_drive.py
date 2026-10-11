@@ -89,6 +89,25 @@ def _tool_result(messages, call_id):
     return ""
 
 
+def make_wakeups_plan():
+    """Turn 1 arms all three wakeup paths and ends; every later turn is a
+    delivery ([background job ...], [wakeup ...], [watch ...]) answered with
+    text."""
+    def plan(messages):
+        last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
+        if str(last_user.get("content") or "").startswith("["):
+            return "text", "Noted the delivery: " + str(last_user.get("content"))[:40]
+        done = _answered(messages)
+        if "call_watch" not in done:
+            return "tool", ("call_watch", "create_watch", {"description": "CI result"})
+        if "call_bg" not in done:
+            return "tool", ("call_bg", "run_in_background", {"code": "print('hello from the background')\n41 + 1", "description": "count things"})
+        if "call_timer" not in done:
+            return "tool", ("call_timer", "schedule_wakeup", {"delay_seconds": 1, "note": "check whether anything arrived"})
+        return "text", "Armed a watch, a background run and a wakeup; ending my turn."
+    return plan
+
+
 def make_plan(with_sandbox: bool):
     def plan(messages):
         done = _answered(messages)
@@ -165,8 +184,8 @@ class _Stub(BaseHTTPRequestHandler):
         self.wfile.write(out)
 
 
-def start_stub(host: str, port: int, with_sandbox: bool) -> HTTPServer:
-    _Stub.plan = staticmethod(make_plan(with_sandbox))
+def start_stub(host: str, port: int, with_sandbox: bool, wakeups: bool = False) -> HTTPServer:
+    _Stub.plan = staticmethod(make_wakeups_plan() if wakeups else make_plan(with_sandbox))
     server = HTTPServer((host, port), _Stub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -296,12 +315,74 @@ class Driver:
         print("E2E PASS")
 
 
+class WakeupsDriver(Driver):
+    """--wakeups: the agent arms a watch, a background run and a timer, ends
+    its turn, and each delivery wakes it (a new turn, or an injection if one
+    is already running). Checks all three deliveries and replies landed."""
+
+    def turn(self):
+        with self.c.stream("POST", f"/chats/{self.chat_id}/messages/stream", headers=self.h, json={"content": f"Arm the wakeups. (run {self.chat_id})"}) as resp:
+            if resp.status_code != 200:
+                sys.exit(f"FAIL stream {resp.status_code}: {resp.read()[:400]}")
+            self.step(6, "turn 1 streamed:")
+            self.consume(resp)
+        msgs = self.state()["messages"]
+        watch = next((json.loads(m["content"]) for m in msgs if m["role"] == "tool" and m["name"] == "create_watch"), None)
+        if not watch or "url" not in watch:
+            sys.exit(f"FAIL create_watch gave no url: {watch}")
+        self.step(7, f"watch url {watch['url']}")
+        # The URL is built from the deployment's public base; post to the same
+        # path on the base we are talking to.
+        url = "/watch/" + watch["url"].rsplit("/", 1)[1]
+        r = self.c.post(url, json={"conclusion": "success", "run": 42})
+        self.step(8, f"POST watch -> {r.status_code} {r.text[:80]}")
+        if r.status_code != 202:
+            sys.exit("FAIL watch delivery rejected")
+        # Wait for the three deliveries and the agent's replies to them.
+        deadline = time.time() + 150
+        while time.time() < deadline:
+            msgs = self.state()["messages"]
+            users = [m["content"] for m in msgs if m["role"] == "user" and (m["content"] or "").startswith("[")]
+            prefixes = {u.split(" ", 1)[0] for u in users}
+            replies = [m for m in msgs if m["role"] == "assistant" and (m["content"] or "").startswith("Noted the delivery")]
+            if {"[watch", "[background", "[wakeup"} <= prefixes and len(replies) >= 1 and not self.state()["active_channel_id"] is None and len(replies) >= len(users) - 0:
+                break
+            if {"[watch", "[background", "[wakeup"} <= prefixes and len(replies) >= 1:
+                # injected deliveries share one reply; give the running turn a moment to finish
+                time.sleep(3)
+                msgs = self.state()["messages"]
+                break
+            time.sleep(3)
+        self.deliveries = [m["content"] for m in msgs if m["role"] == "user" and (m["content"] or "").startswith("[")]
+        self.replies = [m["content"] for m in msgs if m["role"] == "assistant" and (m["content"] or "").startswith("Noted the delivery")]
+
+    def verify(self):
+        print("      deliveries:")
+        for d in self.deliveries:
+            print("        ", d.replace("\n", " | ")[:120])
+        print("      replies:", len(self.replies))
+        failures = []
+        prefixes = {d.split(" ", 1)[0] for d in self.deliveries}
+        for p in ("[watch", "[background", "[wakeup"):
+            if p not in prefixes:
+                failures.append(f"no {p} delivery arrived")
+        if not self.replies:
+            failures.append("the agent never replied to a delivery")
+        if any("conclusion" not in d for d in self.deliveries if d.startswith("[watch")):
+            failures.append("watch payload missing from the delivery")
+        if failures:
+            print("E2E FAIL"); [print("   -", f) for f in failures]
+            sys.exit(1)
+        print("E2E PASS")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--key", required=True, help="admin API key (sinas.*:all)")
     ap.add_argument("--real", action="store_true", help="drive with the deployment's default provider instead of the stub")
     ap.add_argument("--sandbox", action="store_true", help="add an execute_code step (needs a sandbox executor)")
+    ap.add_argument("--wakeups", action="store_true", help="instead of the loop, arm a watch, a background run and a timer and check each wakes the agent")
     ap.add_argument("--stub-host", default="127.0.0.1", help="interface the stub listens on; must be reachable from the backend")
     ap.add_argument("--stub-port", type=int, default=8999)
     ap.add_argument("--stub-endpoint", help="URL the backend should use for the stub, if not http://<stub-host>:<port>/v1")
@@ -309,9 +390,11 @@ def main():
 
     stub_endpoint = None
     if not a.real:
-        start_stub(a.stub_host, a.stub_port, a.sandbox)
+        start_stub(a.stub_host, a.stub_port, a.sandbox, wakeups=a.wakeups)
         stub_endpoint = a.stub_endpoint or f"http://{a.stub_host}:{a.stub_port}/v1"
-    d = Driver(a.url, a.key, a.real, a.sandbox)
+    if a.wakeups and a.real:
+        sys.exit("--wakeups needs the scripted model")
+    d = (WakeupsDriver if a.wakeups else Driver)(a.url, a.key, a.real, a.sandbox)
     d.setup(stub_endpoint)
     d.turn()
     d.verify()
