@@ -1281,7 +1281,6 @@ class MessageService:
                 args = safe_parse_arguments(tc["function"].get("arguments", ""))
                 if not isinstance(args, dict):
                     args = {}  # valid JSON but not an object (null, []): no question
-                question = args.get("question")
                 yield {
                     "type": "tool_start",
                     "tool_call_id": tc["id"],
@@ -1289,6 +1288,25 @@ class MessageService:
                     "arguments": tc["function"].get("arguments", "{}"),
                     "description": build_tool_status(tc["function"]["name"], args, status_templates),
                 }
+                # Deferred like delegations, so {"$workbench": path} references
+                # (a saved question, saved options) resolve here too.
+                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                    if _ref_chat_for_delegates is None:
+                        _ref_chat_for_delegates = (
+                            await self.db.execute(select(Chat).where(Chat.id == chat_id))
+                        ).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(
+                            self.db, _ref_chat_for_delegates, user_id, args
+                        )
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
+                question = args.get("question")
                 if not question or not isinstance(question, str):
                     error_content = json.dumps({"error": "ask_user requires a non-empty 'question' string"})
                     tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
@@ -1297,6 +1315,12 @@ class MessageService:
                     yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
                     continue
                 options = args.get("options")
+                if isinstance(options, str):
+                    # A saved options file resolves to its text: a JSON list.
+                    try:
+                        options = json.loads(options)
+                    except (ValueError, TypeError):
+                        options = None
                 if not (isinstance(options, list) and all(isinstance(o, str) for o in options)):
                     options = None
                 entry: dict[str, Any] = {

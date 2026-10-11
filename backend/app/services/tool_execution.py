@@ -857,16 +857,33 @@ async def execute_single_tool(
                             "workbench_file": full["path"],
                         }
                     elif full:
-                        result = {
-                            **stored,
-                            "workbench_file": full["path"],
-                            "note": (
-                                f"The full result is larger than this tool can "
-                                f"return inline; read '{full['path']}' with "
-                                "workbench_read (offset/limit) or process it "
-                                "with code execution."
-                            ),
-                        }
+                        readable_path = full["path"]
+                        if source_chat is not chat and chat is not None:
+                            # The caller can only read its own workbench: give
+                            # it a copy there, or the pointer is useless.
+                            readable_path = await workbench_refs.copy_spilled_result(
+                                db, source_chat, chat, user_id, full["path"]
+                            )
+                        if readable_path:
+                            result = {
+                                **stored,
+                                "workbench_file": readable_path,
+                                "note": (
+                                    f"The full result is larger than this tool can "
+                                    f"return inline; read '{readable_path}' with "
+                                    "workbench_read (offset/limit) or process it "
+                                    "with code execution."
+                                ),
+                            }
+                        else:
+                            result = {
+                                **stored,
+                                "note": (
+                                    "The full result lives in another chat's workbench "
+                                    "and is too large to return inline or copy here; "
+                                    "only its clipped copy is available."
+                                ),
+                            }
                 else:
                     # Help the agent self-correct instead of giving up. Most
                     # "not found" hits are hallucinated ids — surface the
@@ -1174,7 +1191,7 @@ async def execute_single_tool(
                     # at the same size, and a clipped copy loses the pointer.
                     budget = max(1024, max_result_size - workbench_refs.spill_pointer_reserve(spill_path))
                     result_content = workbench_refs.attach_spill_pointer(
-                        truncate_tool_result(result_content, budget), spill_path
+                        truncate_tool_result(result_content, budget), spill_path, max_size=max_result_size
                     )
                 else:
                     result_content = truncate_tool_result(result_content, max_result_size)
