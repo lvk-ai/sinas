@@ -56,6 +56,39 @@ async def build_agent_system_content(
     return system_content
 
 
+def _move_messages_out_of_tool_exchanges(messages: list) -> list:
+    """Reorder so that nothing but tool results sits between an assistant
+    message's tool_calls and the results answering them. Messages that
+    were interleaved (injected user text, interrupt markers) are emitted
+    right after the exchange completes, or before the next assistant
+    message if some results never came (the repair step then fills those
+    in directly behind the call)."""
+    out: list = []
+    held: list = []
+    expected: set[str] = set()
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            out.extend(held)
+            held = []
+            expected = {tc.get("id") for tc in msg.tool_calls if isinstance(tc, dict) and tc.get("id")}
+            out.append(msg)
+            continue
+        if msg.role == "tool":
+            out.append(msg)
+            if msg.tool_call_id in expected:
+                expected.discard(msg.tool_call_id)
+                if not expected:
+                    out.extend(held)
+                    held = []
+            continue
+        if expected:
+            held.append(msg)
+        else:
+            out.append(msg)
+    out.extend(held)
+    return out
+
+
 async def build_conversation_history(
     db: AsyncSession,
     chat: Chat,
@@ -192,10 +225,15 @@ async def build_conversation_history(
     else:
         chat_messages = all_messages
 
+    # A message injected while a tool round ran was persisted between the
+    # assistant's tool_calls and their results (loop controls). Providers
+    # require the results to follow the calls directly, so move such
+    # messages to after the exchange they interrupted.
+    chat_messages = _move_messages_out_of_tool_exchanges(list(chat_messages))
+
     # Repair orphaned tool calls: if an assistant message has tool_calls
     # but some don't have matching tool result messages, inject synthetic
     # error results so the LLM provider doesn't reject the history.
-    chat_messages = list(chat_messages)
     existing_tool_result_ids = {
         msg.tool_call_id for msg in chat_messages
         if msg.role == "tool" and msg.tool_call_id

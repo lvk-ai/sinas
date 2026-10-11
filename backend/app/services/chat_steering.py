@@ -23,6 +23,7 @@ Mechanics:
   lock to decide send-vs-inject.
 """
 import logging
+import time
 import uuid
 from contextvars import ContextVar
 from typing import Optional
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 _LOCK_PREFIX = "chat:loop-lock:"
 _INTERRUPT_PREFIX = "chat:interrupt:"
+_INTERRUPT_AT_PREFIX = "chat:interrupt-at:"
+_INJECTED_PREFIX = "chat:injected:"
 
 # The token of the lock the current task holds, so the loop can heartbeat
 # it at round boundaries without threading the token through every call.
@@ -133,6 +136,21 @@ async def request_interrupt(chat_id: str, requested_by: str = "") -> None:
 
     redis = await get_redis()
     await redis.set(f"{_INTERRUPT_PREFIX}{chat_id}", requested_by or "1", ex=INTERRUPT_TTL)
+    # When it was asked for: a continuation queued BEFORE this moment must
+    # not run on, even if the running turn consumed the flag first.
+    await redis.set(f"{_INTERRUPT_AT_PREFIX}{chat_id}", str(time.time()), ex=INTERRUPT_TTL)
+
+
+async def interrupt_requested_at(chat_id: str) -> Optional[float]:
+    """Unix time of the most recent interrupt request still in force, if any."""
+    from app.core.redis import get_redis
+
+    redis = await get_redis()
+    raw = await redis.get(f"{_INTERRUPT_AT_PREFIX}{chat_id}")
+    try:
+        return float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
 
 
 async def consume_interrupt(chat_id: str) -> bool:
@@ -148,7 +166,30 @@ async def clear_interrupt(chat_id: str) -> None:
     from app.core.redis import get_redis
 
     redis = await get_redis()
-    await redis.delete(f"{_INTERRUPT_PREFIX}{chat_id}")
+    await redis.delete(f"{_INTERRUPT_PREFIX}{chat_id}", f"{_INTERRUPT_AT_PREFIX}{chat_id}")
+
+
+async def note_injection(chat_id: str) -> None:
+    """A message was injected into a running loop. Counted so the loop can
+    tell, when its turn ends, whether anything arrived that no round
+    boundary answered (a turn that ends in plain text has no boundary)."""
+    from app.core.redis import get_redis
+
+    redis = await get_redis()
+    await redis.incr(f"{_INJECTED_PREFIX}{chat_id}")
+    await redis.expire(f"{_INJECTED_PREFIX}{chat_id}", INTERRUPT_TTL * 6)
+
+
+async def take_injections(chat_id: str) -> int:
+    """Number of injections since the last take; resets the count."""
+    from app.core.redis import get_redis
+
+    redis = await get_redis()
+    raw = await redis.getdel(f"{_INJECTED_PREFIX}{chat_id}")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 INTERRUPT_MARKER = "Interrupted by operator."
