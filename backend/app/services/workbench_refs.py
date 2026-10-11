@@ -236,13 +236,26 @@ async def spill_result(
         return None
 
 
-def attach_spill_pointer(truncated_content: str, path: str) -> str:
-    """Point the truncated inline result at the spilled workbench file."""
+def _spill_pointer(path: str) -> dict[str, str]:
     note = (
         f"Full result saved to workbench file '{path}' — read it with "
         "workbench_read (supports offset/limit) or process it with code execution."
     )
-    pointer = {"workbench_file": path, "hint": note}
+    return {"workbench_file": path, "hint": note}
+
+
+def spill_pointer_reserve(path: str) -> int:
+    """Bytes to leave free when truncating a result that will carry a spill
+    pointer: the pointer itself plus the wrapper and JSON escaping
+    attach_spill_pointer may add. The inline copy and the persisted copy
+    share one size cap, so a pointer attached on top of a full-size
+    truncation would push the persisted copy over it and get clipped away."""
+    return len(json.dumps({"text": "", "_full_result": _spill_pointer(path)})) + 256
+
+
+def attach_spill_pointer(truncated_content: str, path: str) -> str:
+    """Point the truncated inline result at the spilled workbench file."""
+    pointer = _spill_pointer(path)
     try:
         parsed = json.loads(truncated_content)
     except (ValueError, TypeError):
