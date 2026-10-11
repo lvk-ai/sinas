@@ -753,7 +753,7 @@ nothing here conflicts with its decisions:
 - **Structured validator errors (#8c)**: the uncommitted `config_parser.py`
   WIP continues independently; spec-model pydantic errors give it per-field
   paths for free once resources migrate.
-- **CLI/skills stay in `sinas-skills`** — untouched; they talk to the same
+- **CLI/skills stay in `sinas-skills`** (since renamed `sinas-platform/cli`) — untouched; they talk to the same
   endpoints.
 
 ## 7. Phased issue breakdown (ready to file)
