@@ -646,13 +646,16 @@ def _build_wrapper(user_code: str, workbench: bool = False) -> str:
                 _rel = None
         if _rel is not None and _rel in _wb_lazy_unfetched:
             _mode = args[0] if args else kwargs.get("mode", "r")
-            # A plain overwrite ("w"/"x") doesn't need the old bytes; any
-            # other mode must fetch first — and a failed fetch must raise,
-            # never fall through to the empty stub.
-            if any(_c in str(_mode) for _c in ("r", "a", "+")):
-                workbench_fetch(_fp)
-            else:
+            # A truncating mode ("w", "x", with or without "+") replaces the
+            # file: the old bytes are never needed, so no fetch — which also
+            # lets a file above the fetch limit be replaced. Any reading or
+            # appending mode must fetch first — and a failed fetch must
+            # raise, never fall through to the empty stub.
+            _m = str(_mode)
+            if "w" in _m or "x" in _m:
                 _wb_lazy_unfetched.discard(_rel)
+            else:
+                workbench_fetch(_fp)
         return _wb_real_open(file, *args, **kwargs)
 
     _builtins.open = _wb_open
