@@ -162,3 +162,8 @@ async def round_decision(db, approval) -> Optional[dict[str, Any]]:
                 return None
         (approved_ids if decided else rejected_ids).append(row.tool_call_id)
     return {"approved_ids": approved_ids, "rejected_ids": rejected_ids}
+
+
+def round_job_id(approval) -> str:
+    """The one job id a round's resume runs under, whoever queues it."""
+    return f"approval-round-{approval.message_id}"
