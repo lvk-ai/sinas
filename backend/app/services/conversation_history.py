@@ -162,11 +162,37 @@ async def build_conversation_history(
 
         chat_messages = all_messages[-settings.max_history_messages:]
 
+        # Pin the current turn's opening user message (and the latest user
+        # message, if different). On a fresh send the newest message is the
+        # user's and the window always holds it; at a tool-round boundary
+        # the turn's opener is the OLDEST of the turn's messages and the
+        # first to fall out — after which a long autonomous turn no longer
+        # knows what it was asked to do. The turn starts after the previous
+        # final assistant reply (content, no tool calls).
+        window_start_idx = len(all_messages) - settings.max_history_messages
+        turn_start = 0
+        for i in range(len(all_messages) - 1, -1, -1):
+            m = all_messages[i]
+            if m.role == "assistant" and m.content and not m.tool_calls:
+                turn_start = i + 1
+                break
+        pinned = []
+        opener = next(
+            (m for m in all_messages[turn_start:window_start_idx] if m.role == "user"), None
+        )
+        if opener is not None:
+            pinned.append(opener)
+        if chat_messages and not any(m.role == "user" for m in chat_messages):
+            latest_user = next(
+                (m for m in reversed(all_messages[:window_start_idx]) if m.role == "user"), None
+            )
+            if latest_user is not None and latest_user is not opener:
+                pinned.append(latest_user)
+
         # Ensure tool call/result pairs aren't split by the window boundary.
         # Walk backwards from the start of the window to include any orphaned
         # assistant messages that contain tool_calls referenced by tool results
         # at the start of the window, and vice versa.
-        window_start_idx = len(all_messages) - settings.max_history_messages
         prepend = []
 
         # Collect tool_call_ids referenced by tool messages at the start of the window
@@ -188,7 +214,7 @@ async def build_conversation_history(
                 if not referenced_tc_ids:
                     break
 
-        chat_messages = prepend + list(chat_messages)
+        chat_messages = pinned + prepend + list(chat_messages)
     else:
         chat_messages = all_messages
 

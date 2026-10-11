@@ -226,3 +226,34 @@ class TestFollowupUsesWindowing:
         tool_msgs = [m for m in sent if m["role"] == "tool"]
         assert tool_msgs[-1]["content"].startswith("{")
         assert all("retrieve_tool_result" in m["content"] for m in tool_msgs[:-1])
+
+    @pytest.mark.asyncio
+    async def test_followup_pins_the_turn_opener(self, db, test_user, monkeypatch):
+        """A long turn's opening user message is the oldest of its messages
+        and would be the first to fall out of the window; it is pinned so the
+        model always sees what it was asked."""
+        chat = Chat(user_id=test_user.id, title="long turn")
+        db.add(chat)
+        await db.flush()
+        # previous turn, finished
+        db.add(Message(chat_id=chat.id, role="user", content="old ask"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="old reply"))
+        await db.flush()
+        # current turn: opener + many tool rounds
+        db.add(Message(chat_id=chat.id, role="user", content="THE TASK"))
+        await db.flush()
+        for i in range(5):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"r{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"r{i}", content="{}"))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        users = [m["content"] for m in sent if m["role"] == "user"]
+        assert users == ["THE TASK"]  # pinned; the previous turn's ask stays out
+        assert sent[0]["role"] == "user"  # ahead of the windowed tail
+        assert [m["tool_call_id"] for m in sent if m["role"] == "tool"] == ["r3", "r4"]
