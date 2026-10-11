@@ -61,6 +61,34 @@ def _validate_path(filename: str) -> Optional[str]:
     parts = filename.replace("\\", "/").split("/")
     if any(p in ("", ".", "..") for p in parts):
         return "filename must not contain empty, '.' or '..' path segments"
+    # Hidden directories are not part of the workbench: the sandbox copy-out
+    # walk skips them (so edits under one would be lost), and tooling caches
+    # live there. Hidden *files* ('.gitignore') are fine.
+    if any(p.startswith(".") for p in parts[:-1]):
+        return "filename must not contain hidden directories (path segments starting with '.')"
+    return None
+
+
+async def _path_conflict(db: AsyncSession, collection_id, filename: str) -> Optional[str]:
+    """A file may not also be a directory: 'a' and 'a/b.txt' cannot coexist,
+    or the sandbox cannot materialize the tree. Returns an error string."""
+    parts = filename.split("/")
+    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts))]
+    if prefixes:
+        clash = (
+            await db.execute(
+                select(File.name).where(File.collection_id == collection_id, File.name.in_(prefixes)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if clash:
+            return f"'{clash}' is a file; '{filename}' cannot be created beneath it"
+    below = (
+        await db.execute(
+            select(File.name).where(File.collection_id == collection_id, File.name.like(filename.replace("%", "\\%").replace("_", "\\_") + "/%")).limit(1)
+        )
+    ).scalar_one_or_none()
+    if below:
+        return f"'{filename}' is a directory (contains '{below}'); it cannot also be a file"
     return None
 
 
@@ -196,6 +224,10 @@ def get_workbench_tool_definitions() -> list[dict[str, Any]]:
             {
                 "filename": filename_prop,
                 "collection": {"type": "string", "description": "Target collection as 'namespace/name'"},
+                "metadata": {
+                    "type": "object",
+                    "description": "File metadata for the target collection (validated against its metadata schema, if any)",
+                },
                 "target_filename": {
                     "type": "string",
                     "description": "Filename in the target collection (defaults to the workbench filename)",
@@ -239,7 +271,9 @@ class WorkbenchTools:
         if tool_name == "workbench_read":
             return await self._conv._get_file(db, workbench, _INTERNAL_NAMESPACE, user_id, arguments)
         if tool_name == "workbench_write":
-            err = _validate_path(arguments.get("filename", ""))
+            err = _validate_path(arguments.get("filename", "")) or await _path_conflict(
+                db, workbench.id, arguments.get("filename", "")
+            )
             if err:
                 return {"error": err}
             return await self._conv._write_file(
@@ -306,6 +340,12 @@ class WorkbenchTools:
         checked_out: list[dict[str, Any]] = []
         errors: list[str] = []
         for f in files:
+            bad = _validate_path(f.name) or await _path_conflict(db, workbench.id, f.name)
+            if bad:
+                # Collection names are freer than workbench paths; a name
+                # that would escape or collide in the working tree is skipped.
+                errors.append(f"{f.name}: {bad}")
+                continue
             version = await self._current_version(db, f)
             if version is None:
                 errors.append(f"{f.name}: no stored version")
@@ -388,22 +428,35 @@ class WorkbenchTools:
         except Exception as e:
             return {"error": f"Failed to read '{filename}': {e}"}
 
+        provenance = (wb_file.file_metadata or {}).get(PROVENANCE_KEY)
+        target_filename = arguments.get("target_filename") or filename
+
+        # Metadata for the target: what the caller supplies, validated against
+        # the collection's schema exactly as an upload is, then whatever the
+        # content filter adds. Collections that require fields must not be
+        # able to receive files through promote that uploads would reject.
+        metadata = arguments.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return {"error": "metadata must be an object"}
         if target.content_filter_function:
-            filter_err = await run_content_filter(
+            outcome = await run_content_filter(
                 db,
                 target.content_filter_function,
                 namespace=namespace,
                 collection_name=name,
-                filename=filename,
+                filename=target_filename,
                 content=content,
                 content_type=wb_file.content_type,
                 user_id=user_id,
+                user_metadata=metadata,
             )
-            if filter_err:
-                return filter_err
-
-        provenance = (wb_file.file_metadata or {}).get(PROVENANCE_KEY)
-        target_filename = arguments.get("target_filename") or filename
+            if "error" in outcome:
+                return outcome
+            content = outcome["content"]
+            metadata = {**metadata, **outcome["metadata"]}
+        schema_err = _validate_metadata(target, metadata)
+        if schema_err:
+            return schema_err
 
         # Checked-out file going back to where it came from → update the source.
         if provenance and provenance.get("collection") == coll_ref and not arguments.get("target_filename"):
@@ -430,6 +483,7 @@ class WorkbenchTools:
                     content_type=wb_file.content_type,
                     user_id=user_id,
                     visibility=source_file.visibility,
+                    file_metadata={**(source_file.file_metadata or {}), **metadata} if metadata else None,
                     existing=source_file,
                 )
                 if "error" in result:
@@ -440,6 +494,7 @@ class WorkbenchTools:
                 new_meta[PROVENANCE_KEY] = {**provenance, "version": result["version"]}
                 wb_file.file_metadata = new_meta
                 await db.commit()  # tool sessions are discarded uncommitted
+                await _trigger_post_upload(db, target, result, user_id, source_file.file_metadata or {})
                 return {**result, "collection": coll_ref, "updated_source": True}
             # Source file vanished — fall through to create-new.
 
@@ -460,10 +515,12 @@ class WorkbenchTools:
             content_type=wb_file.content_type,
             user_id=user_id,
             visibility=visibility,
+            file_metadata=metadata or None,
         )
         if "error" in result:
             return result
         await db.commit()  # tool sessions are discarded uncommitted
+        await _trigger_post_upload(db, target, result, user_id, metadata)
         return {**result, "collection": coll_ref, "updated_source": False}
 
     # ── helpers ─────────────────────────────────────────────────────
@@ -507,13 +564,17 @@ async def run_content_filter(
     content: bytes,
     content_type: str,
     user_id: str,
-) -> Optional[dict[str, Any]]:
-    """Run a content filter function against candidate bytes; None = approved.
+    user_metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Run a content filter function against candidate bytes.
 
     Same contract as the collection upload endpoint: the filter receives the
     candidate file and must return {"approved": true} for the write to
-    proceed. Used by workbench_promote (the target collection's filter) and
-    by workbench uploads (the deployment-wide workbench filter setting).
+    proceed; it may replace the bytes (`modified_content`, base64) and add
+    `metadata`. Returns {"content": bytes, "metadata": dict} on approval —
+    the caller must write THOSE, not the candidate — or {"error": ...}.
+    Used by workbench_promote (the target collection's filter) and by
+    workbench uploads (the deployment-wide workbench filter setting).
     """
     import base64
 
@@ -541,7 +602,7 @@ async def run_content_filter(
                 "filename": filename,
                 "content_type": content_type,
                 "size_bytes": len(content),
-                "user_metadata": {},
+                "user_metadata": user_metadata or {},
                 "user_id": user_id,
             },
             execution_id=str(uuid_lib.uuid4()),
@@ -559,7 +620,69 @@ async def run_content_filter(
             "error": "Rejected by content filter",
             "message": reason or f"'{namespace}/{collection_name}' declined this file.",
         }
+    approved = content
+    if filter_result.get("modified_content"):
+        try:
+            approved = base64.b64decode(filter_result["modified_content"])
+        except Exception as e:
+            return {"error": f"Invalid modified_content from content filter: {e}"}
+    extra = filter_result.get("metadata")
+    return {"content": approved, "metadata": extra if isinstance(extra, dict) else {}}
+
+
+def _validate_metadata(collection: Collection, metadata: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Validate file metadata against the collection's metadata_schema, as
+    the upload endpoint does."""
+    if not collection.metadata_schema:
+        return None
+    import jsonschema
+
+    try:
+        jsonschema.validate(instance=metadata, schema=collection.metadata_schema)
+    except jsonschema.ValidationError as e:
+        return {
+            "error": "Invalid metadata",
+            "message": f"'{collection.namespace}/{collection.name}' requires metadata matching its schema: {e.message}",
+        }
     return None
+
+
+async def _trigger_post_upload(
+    db: AsyncSession, collection: Collection, written: dict[str, Any], user_id: str, metadata: dict[str, Any]
+) -> None:
+    """Queue the collection's post_upload_function for a file promote just
+    wrote, with the same input an upload gives it. Best effort: a failure
+    to queue never fails the promote, as with uploads."""
+    if not collection.post_upload_function or "/" not in collection.post_upload_function:
+        return
+    from app.models.execution import TriggerType
+    from app.models.function import Function
+    from app.services.queue_service import queue_service
+
+    post_namespace, post_name = collection.post_upload_function.split("/", 1)
+    try:
+        if not await Function.get_by_name(db, post_namespace, post_name):
+            return
+        await queue_service.enqueue_function(
+            function_namespace=post_namespace,
+            function_name=post_name,
+            input_data={
+                "file_id": written.get("file_id"),
+                "namespace": collection.namespace,
+                "collection": collection.name,
+                "filename": written.get("filename"),
+                "version": written.get("version"),
+                "file_path": written.get("storage_path"),
+                "user_id": user_id,
+                "metadata": metadata,
+            },
+            execution_id=str(uuid_lib.uuid4()),
+            trigger_type=TriggerType.MANUAL.value,
+            trigger_id=f"post_upload:{collection.namespace}/{collection.name}",
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.warning("post_upload_function for %s/%s not queued: %s", collection.namespace, collection.name, e)
 
 
 # ---------------------------------------------------------------------------
@@ -684,15 +807,29 @@ async def fetch_file_bytes(
     }
 
 
+CONFLICT_SUFFIX = ".run-conflict"
+
+
 async def apply_sync_changes(
-    db: AsyncSession, chat: Chat, user_id: str, changes: list[dict[str, Any]]
+    db: AsyncSession,
+    chat: Chat,
+    user_id: str,
+    changes: list[dict[str, Any]],
+    base_hashes: Optional[dict[str, Optional[str]]] = None,
 ) -> dict[str, Any]:
     """Write files an execution created or modified back into the workbench.
 
     Each change is {path, content_b64}. Deletions are deliberately NOT
     synced: a crashed or chdir-ing execution must never wipe workbench
     files it simply didn't touch. Returns {"synced": [...], "rejected":
-    [{path, reason}]}.
+    [{path, reason}], "conflicts": [{path, saved_as, reason}]}.
+
+    `base_hashes` is the tree the run started from ({path: sha256}; a key
+    with None for a file that did not exist yet is not needed — absence
+    means absent). A file whose current content no longer matches what the
+    run started from — the agent, another run or a console upload changed
+    it meanwhile — is NOT overwritten: the run's copy is saved beside it as
+    `<path>.run-conflict` so no work is lost, and the conflict reported.
     """
     import base64
 
@@ -702,6 +839,7 @@ async def apply_sync_changes(
     storage = get_storage()
     synced: list[str] = []
     rejected: list[dict[str, str]] = []
+    conflicts: list[dict[str, str]] = []
     for change in changes or []:
         path = change.get("path", "")
         err = _validate_path(path)
@@ -713,6 +851,27 @@ async def apply_sync_changes(
         except Exception:
             rejected.append({"path": path, "reason": "invalid base64 content"})
             continue
+        if base_hashes is not None:
+            current = await _current_hash(db, workbench, path)
+            started_from = base_hashes.get(path)
+            if current is not None and current != started_from:
+                saved_as = f"{path}{CONFLICT_SUFFIX}"
+                aside = await _write_bytes(
+                    db, storage, workbench, filename=saved_as, content=content,
+                    content_type=_infer_content_type(path), user_id=user_id, visibility="private",
+                    file_metadata={"origin": "execution", "conflict_of": path},
+                )
+                conflicts.append({
+                    "path": path,
+                    "saved_as": saved_as if "error" not in aside else "",
+                    "reason": (
+                        f"'{path}' changed in the workbench while the run was in progress; "
+                        f"the run's copy was saved as '{saved_as}'" if "error" not in aside
+                        else f"'{path}' changed in the workbench while the run was in progress; "
+                             f"the run's copy could not be saved aside ({aside['error']})"
+                    ),
+                })
+                continue
         # Provenance, like uploads ("upload") and spilled results ("tool"):
         # a file born in an execution is stamped so; a file that already
         # existed keeps its metadata — in particular a checked-out file that
@@ -733,7 +892,24 @@ async def apply_sync_changes(
             rejected.append({"path": path, "reason": result["error"]})
         else:
             synced.append(path)
-    return {"synced": synced, "rejected": rejected}
+    return {"synced": synced, "rejected": rejected, "conflicts": conflicts}
+
+
+async def _current_hash(db: AsyncSession, workbench: Collection, path: str) -> Optional[str]:
+    """sha256 of the workbench file's current version, or None if absent."""
+    f = (
+        await db.execute(select(File).where(File.collection_id == workbench.id, File.name == path))
+    ).scalar_one_or_none()
+    if f is None:
+        return None
+    version = (
+        await db.execute(
+            select(FileVersion.hash_sha256).where(
+                FileVersion.file_id == f.id, FileVersion.version_number == f.current_version
+            )
+        )
+    ).scalar_one_or_none()
+    return version
 
 
 async def _write_bytes(
@@ -764,6 +940,30 @@ async def _write_bytes(
     size_mb = len(content) / (1024 * 1024)
     if size_mb > collection.max_file_size_mb:
         return {"error": f"File too large ({size_mb:.2f}MB > {collection.max_file_size_mb}MB limit)"}
+    if existing is None:
+        conflict = await _path_conflict(db, collection.id, filename)
+        if conflict:
+            return {"error": conflict}
+    # The collection's storage quota applies to every write, as it does to
+    # uploads; every version counts.
+    if collection.max_total_size_gb:
+        from sqlalchemy import func
+
+        used = (
+            await db.execute(
+                select(func.coalesce(func.sum(FileVersion.size_bytes), 0))
+                .join(File, File.id == FileVersion.file_id)
+                .where(File.collection_id == collection.id)
+            )
+        ).scalar() or 0
+        max_total = collection.max_total_size_gb * 1024 * 1024 * 1024
+        if used + len(content) > max_total:
+            return {
+                "error": (
+                    f"Collection storage quota exceeded ({used / (1024 ** 3):.2f}GB used of "
+                    f"{collection.max_total_size_gb}GB; this file needs {size_mb:.2f}MB more)"
+                )
+            }
 
     file_hash = storage.calculate_hash(content)
 
@@ -832,4 +1032,6 @@ async def _write_bytes(
         "version": file_record.current_version,
         "size_bytes": len(content),
         "created": created,
+        "file_id": str(file_record.id),
+        "storage_path": storage_path,
     }

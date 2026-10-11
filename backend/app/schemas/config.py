@@ -257,6 +257,14 @@ class AgentConfig(BaseModel):
         ),
     )
 
+    @field_validator("toolApprovals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
+
 
 class WebhookDedupConfig(BaseModel):
     """Webhook deduplication configuration"""

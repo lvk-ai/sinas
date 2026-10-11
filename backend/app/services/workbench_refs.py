@@ -246,10 +246,13 @@ def attach_spill_pointer(truncated_content: str, path: str) -> str:
         parsed = json.loads(truncated_content)
     except (ValueError, TypeError):
         return truncated_content + f"\n[{note}]"
+    pointer = {"workbench_file": path, "hint": note}
     if isinstance(parsed, dict):
-        parsed["_full_result"] = {"workbench_file": path, "hint": note}
+        parsed["_full_result"] = pointer
         return json.dumps(parsed)
-    return truncated_content + f"\n[{note}]"
+    # A JSON array (or scalar) stays valid JSON: wrap it so the pointer
+    # travels with it and retrieve_tool_result can still follow it.
+    return json.dumps({"result": parsed, "_full_result": pointer})
 
 
 def spill_pointer(stored_result: Any) -> Optional[str]:
