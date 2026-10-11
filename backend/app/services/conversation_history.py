@@ -232,8 +232,11 @@ async def build_conversation_history(
         for msg in chat_messages:
             if msg.role == "tool" and msg.tool_call_id:
                 referenced_tc_ids.add(msg.tool_call_id)
-            elif msg.role != "tool":
-                break  # Stop once we hit non-tool messages
+            elif msg.role == "assistant":
+                break  # a new exchange starts here
+            # A user/system message injected mid-batch (loop controls) sits
+            # between the batch's results: scan past it, or the results
+            # behind it look unmatched and the call is never restored.
 
         if referenced_tc_ids:
             # Scan messages before the window for assistant messages with
