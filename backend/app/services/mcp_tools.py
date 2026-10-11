@@ -9,13 +9,15 @@ that metadata. Filtering happens twice: the server's own allow/deny lists
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
 import re
 from typing import Any, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import get_user_permissions
+from app.core.auth import get_effective_permissions
 from app.models.mcp_server import McpServer
 from app.services import mcp_client
 from app.services.mcp_client import MCP_TOOL_PREFIX, ListedTool, McpClientError
@@ -64,17 +66,43 @@ async def accessible_server(
     resource's own permission model (sinas.mcp_servers/<ns>/<name>.read, :own
     for the owner, :all for everyone else) — the same check the REST API
     applies — so binding a server to an agent never grants the chat's user a
-    server, or its credentials, they could not read themselves."""
+    server, or its credentials, they could not read themselves. The
+    permissions are the EFFECTIVE ones: a run acting through an API key is
+    held to the key's grants, not the owner's."""
     server = await McpServer.get_by_name(db, namespace, name)
     if not server or not server.is_active:
         return None, f"MCP server '{namespace}/{name}' not found or inactive"
     if not user_id:
         return None, f"MCP server '{namespace}/{name}': no user to authorize"
     if permissions is None:
-        permissions = await get_user_permissions(db, user_id)
+        permissions = await get_effective_permissions(db, user_id)
     if not server.can_user_access(str(user_id), permissions, "read"):
         return None, f"MCP server '{namespace}/{name}': not authorized"
     return server, None
+
+
+async def _current_binding_problem(
+    db: AsyncSession, chat: Any, namespace: str, name: str, mcp_tool: str
+) -> Optional[str]:
+    """Why the chat's agent may not call `mcp_tool` on `namespace/name` as
+    of now, or None. No chat (a pipeline or direct call) means no agent
+    binding to check — those paths carry their own access checks."""
+    if chat is None or not getattr(chat, "agent_id", None):
+        return None
+    from app.models.agent import Agent
+
+    agent = (await db.execute(select(Agent).where(Agent.id == chat.agent_id))).scalar_one_or_none()
+    if agent is None:
+        return None
+    ref = f"{namespace}/{name}"
+    for entry in agent.enabled_mcp_servers or []:
+        entry_ref, patterns = _normalize_entry(entry)
+        if entry_ref != ref:
+            continue
+        if binding_allows(patterns, mcp_tool):
+            return None
+        return f"Tool '{mcp_tool}' on MCP server '{ref}' is outside this agent's tool patterns"
+    return f"MCP server '{ref}' is no longer enabled for this agent"
 
 
 def _normalize_entry(entry: Any) -> tuple[str, list[str]]:
@@ -99,6 +127,10 @@ class McpToolConverter:
         log line — never a failed chat turn."""
         tools: list[dict[str, Any]] = []
         permissions: Optional[dict[str, bool]] = None
+        # Names must be unique across ALL servers, not per server: the
+        # dispatcher looks a call up by name, and 'a__b/c' and 'a/b__c' both
+        # encode a tool 'echo' as mcp_a__b__c__echo.
+        seen: set[str] = set()
         for entry in enabled_mcp_servers or []:
             ref, patterns = _normalize_entry(entry)
             parts = ref.split("/", 1)
@@ -107,7 +139,7 @@ class McpToolConverter:
                 continue
             namespace, name = parts
             if permissions is None and user_id:
-                permissions = await get_user_permissions(db, user_id)
+                permissions = await get_effective_permissions(db, user_id)
             server, problem = await accessible_server(db, namespace, name, user_id, permissions)
             if server is None:
                 logger.warning(f"MCP tools unavailable: {problem}")
@@ -120,7 +152,6 @@ class McpToolConverter:
             except Exception as e:  # pragma: no cover - belt and braces
                 logger.warning(f"MCP tools unavailable for '{ref}': {e}", exc_info=True)
                 continue
-            seen: set[str] = set()
             for tool in listed:
                 if not server_allows(server, tool.name) or not binding_allows(patterns, tool.name):
                     continue
@@ -130,10 +161,17 @@ class McpToolConverter:
 
     def _to_tool(self, server: McpServer, tool: ListedTool, seen: set[str]) -> dict[str, Any]:
         base = f"{MCP_TOOL_PREFIX}{server.namespace}__{server.name}__{_sanitize(tool.name)}"
-        tool_name, n = base, 1
-        while tool_name in seen:  # two MCP names sanitizing to the same one
-            n += 1
-            tool_name = f"{base}_{n}"
+        tool_name = base
+        if tool_name in seen:
+            # Same encoded name from another server (or two MCP names that
+            # sanitize alike): disambiguate with a digest of the server ref
+            # and the raw tool name so the suffix is stable across turns.
+            digest = hashlib.sha1(f"{server.namespace}/{server.name}:{tool.name}".encode()).hexdigest()[:6]
+            tool_name = f"{base}_{digest}"
+            n = 1
+            while tool_name in seen:
+                n += 1
+                tool_name = f"{base}_{digest}_{n}"
         seen.add(tool_name)
         description = tool.description or tool.title or tool.name
         parameters = tool.input_schema or {"type": "object", "properties": {}}
@@ -183,6 +221,12 @@ class McpToolConverter:
             return {"error": problem}
         if not server_allows(server, mcp_tool):
             return {"error": f"Tool '{mcp_tool}' is not allowed on MCP server '{namespace}/{name}'"}
+        # The agent's CURRENT binding decides, not the tool list a resumed
+        # round was saved with: a server unbound, or a pattern narrowed,
+        # while a call waited for approval must not run anyway.
+        binding_problem = await _current_binding_problem(db, chat, namespace, name, mcp_tool)
+        if binding_problem:
+            return {"error": binding_problem}
 
         store_blob = await self._blob_store(db, chat, user_id, tool_name) if chat is not None else None
         try:

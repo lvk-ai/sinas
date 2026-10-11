@@ -33,7 +33,8 @@ from app.models.mcp_server import McpServer
 from app.models.pending_approval import PendingToolApproval
 from app.models.secret import Secret
 from app.models.user import Role, RolePermission, User, UserRole
-from app.services.mcp_client import blob_prefix_for, safe_url
+from app.core.config import settings
+from app.services.mcp_client import ListedTool, blob_prefix_for, safe_url
 from app.services import mcp_client
 from app.services.mcp_tools import McpToolConverter, parse_mcp_tool_name
 from app.services.tool_execution import (
@@ -357,7 +358,8 @@ class TestExecution:
         self, db, fake_mcp, server, test_user
     ):
         agent = Agent(
-            user_id=test_user.id, namespace=f"ns{_uid()}", name="wb", system_tools=["workbench"]
+            user_id=test_user.id, namespace=f"ns{_uid()}", name="wb", system_tools=["workbench"],
+            enabled_mcp_servers=_binding(server),
         )
         db.add(agent)
         await db.flush()
@@ -387,7 +389,8 @@ class TestExecution:
         file: the workbench advances the version, so the earlier pointer
         would silently serve the later blob."""
         agent = Agent(
-            user_id=test_user.id, namespace=f"ns{_uid()}", name="wb", system_tools=["workbench"]
+            user_id=test_user.id, namespace=f"ns{_uid()}", name="wb", system_tools=["workbench"],
+            enabled_mcp_servers=_binding(server),
         )
         db.add(agent)
         await db.flush()
@@ -713,15 +716,15 @@ async def committed_env(fake_mcp):
         await s.flush()
         s.add(RolePermission(role_id=role.id, permission_key="sinas.*:all", permission_value=True))
         s.add(UserRole(role_id=role.id, user_id=user.id, active=True))
+        server = _server(user)
         agent = Agent(
             user_id=user.id, namespace=f"ns{_uid()}", name="mcp-agent",
-            system_tools=["workbench"],
+            system_tools=["workbench"], enabled_mcp_servers=_binding(server),
             tool_approvals={"rules": [{"match": "mcp_*", "action": "ask"}]},
         )
         s.add(agent)
         await s.flush()
         chat = Chat(user_id=user.id, agent_id=agent.id, title="mcp chat")
-        server = _server(user)
         s.add_all([chat, server])
         await s.commit()
         for row in (user, chat, agent, server):
@@ -873,3 +876,93 @@ class TestToolsEndpoint:
         )
         assert response.status_code == 502
         assert "down.test" in response.json()["detail"]
+
+
+# ------------------------------------------------------------ review follow-ups
+
+
+class TestReviewFollowUps:
+    def test_same_encoded_name_from_two_servers_stays_unique(self, test_user):
+        """'a__b/c' and 'a/b__c' both encode 'echo' as mcp_a__b__c__echo; the
+        dispatcher looks tools up by name, so names are unique across the
+        whole list, not per server."""
+        s1 = _server(test_user, namespace="a__b", name="c")
+        s2 = _server(test_user, namespace="a", name="b__c")
+        seen: set[str] = set()
+        conv = McpToolConverter()
+        t1 = conv._to_tool(s1, ListedTool(name="echo", description="", input_schema={}), seen)
+        t2 = conv._to_tool(s2, ListedTool(name="echo", description="", input_schema={}), seen)
+        assert t1["function"]["name"] != t2["function"]["name"]
+        assert t2["function"]["_metadata"]["server_name"] == "b__c"
+        # stable across calls
+        t2b = conv._to_tool(s2, ListedTool(name="echo", description="", input_schema={}), {t1["function"]["name"]})
+        assert t2b["function"]["name"] == t2["function"]["name"]
+
+    @pytest.mark.asyncio
+    async def test_current_agent_binding_gates_execution(self, db, fake_mcp, server, test_user):
+        from app.models.agent import Agent
+        from app.models.chat import Chat
+
+        async def run(binding):
+            agent = Agent(user_id=test_user.id, namespace=f"ns{_uid()}", name="g", enabled_mcp_servers=binding)
+            db.add(agent)
+            await db.flush()
+            chat = Chat(user_id=test_user.id, agent_id=agent.id, title="t")
+            db.add(chat)
+            await db.flush()
+            return await McpToolConverter().execute_tool(
+                db, "mcp_x", {"text": "hi"}, str(test_user.id),
+                _tool_def(server, "echo")["function"]["_metadata"], chat=chat,
+            )
+
+        assert "no longer enabled" in (await run([]))["error"]
+        assert "outside this agent's tool patterns" in (await run(_binding(server, ["add"])))["error"]
+        assert (await run(_binding(server)))["text"] == "hi"
+
+    @pytest.mark.asyncio
+    async def test_tool_listing_refuses_endless_or_repeating_pages(self, db, server, test_user, monkeypatch):
+        import contextlib
+        from types import SimpleNamespace
+
+        class RepeatingClient:
+            async def list_tools(self, cursor=None):
+                return SimpleNamespace(tools=[], next_cursor="again")
+
+        @contextlib.asynccontextmanager
+        async def fake_connect(*a, **k):
+            yield RepeatingClient()
+
+        monkeypatch.setattr(mcp_client, "connect", fake_connect)
+        with pytest.raises(mcp_client.McpClientError, match="repeated"):
+            await mcp_client.list_tools(db, server, str(test_user.id), use_cache=False)
+
+        class EndlessClient:
+            n = 0
+
+            async def list_tools(self, cursor=None):
+                self.n += 1
+                return SimpleNamespace(tools=[], next_cursor=f"p{self.n}")
+
+        @contextlib.asynccontextmanager
+        async def fake_connect2(*a, **k):
+            yield EndlessClient()
+
+        monkeypatch.setattr(mcp_client, "connect", fake_connect2)
+        monkeypatch.setattr(settings, "mcp_list_tools_max_pages", 3)
+        with pytest.raises(mcp_client.McpClientError, match="more than 3 pages"):
+            await mcp_client.list_tools(db, server, str(test_user.id), use_cache=False)
+
+    def test_tool_cache_drops_expired_entries_and_is_capped(self):
+        import time as _t
+
+        mcp_client.clear_tool_cache()
+        now = _t.monotonic()
+        mcp_client._tool_cache["old"] = (now - 1, [])
+        for i in range(mcp_client._TOOL_CACHE_MAX_ENTRIES + 5):
+            mcp_client._tool_cache[f"k{i}"] = (now + 100 + i, [])
+        mcp_client._prune_tool_cache(now)
+        assert "old" not in mcp_client._tool_cache
+        assert len(mcp_client._tool_cache) == mcp_client._TOOL_CACHE_MAX_ENTRIES
+        assert "k0" not in mcp_client._tool_cache and f"k{mcp_client._TOOL_CACHE_MAX_ENTRIES + 4}" in mcp_client._tool_cache
+        mcp_client.clear_tool_cache()
+

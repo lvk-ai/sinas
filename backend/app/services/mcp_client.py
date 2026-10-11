@@ -201,6 +201,21 @@ def _describe(server: McpServer, error: BaseException) -> str:
 _tool_cache: dict[str, tuple[float, list[ListedTool] | McpClientError]] = {}
 
 
+# Entries past their TTL are dropped on every lookup, and the cache is
+# capped (oldest expiry first) so per-user, per-credential keys cannot
+# accumulate in a long-lived worker.
+_TOOL_CACHE_MAX_ENTRIES = 512
+
+
+def _prune_tool_cache(now: float) -> None:
+    expired = [k for k, (until, _) in _tool_cache.items() if until <= now]
+    for k in expired:
+        _tool_cache.pop(k, None)
+    if len(_tool_cache) > _TOOL_CACHE_MAX_ENTRIES:
+        for k, _ in sorted(_tool_cache.items(), key=lambda kv: kv[1][0])[: len(_tool_cache) - _TOOL_CACHE_MAX_ENTRIES]:
+            _tool_cache.pop(k, None)
+
+
 def _cache_key(server: McpServer, user_id: Optional[str], headers: dict[str, str]) -> str:
     """Per server version, per caller, per credential. updated_at changes on
     every edit (a changed URL or auth invalidates); the caller and a digest of
@@ -226,8 +241,24 @@ async def _fetch_tools(
         db, server, user_id, read_timeout=float(server.connect_timeout_seconds), headers=headers
     ) as client:
         cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        pages = 0
+        deadline = time.monotonic() + settings.mcp_list_tools_total_timeout_seconds
         try:
             while True:
+                # A server that keeps paging (repeating a cursor, or never
+                # ending) must not hold a chat turn or grow memory forever.
+                pages += 1
+                if pages > settings.mcp_list_tools_max_pages:
+                    raise McpClientError(
+                        f"MCP server '{server.namespace}/{server.name}' returned more than "
+                        f"{settings.mcp_list_tools_max_pages} pages of tools; listing abandoned"
+                    )
+                if time.monotonic() > deadline:
+                    raise McpClientError(
+                        f"MCP server '{server.namespace}/{server.name}' took longer than "
+                        f"{settings.mcp_list_tools_total_timeout_seconds}s to list its tools; listing abandoned"
+                    )
                 page = await client.list_tools(cursor=cursor)
                 for tool in page.tools:
                     annotations = tool.annotations.model_dump(exclude_none=True) if tool.annotations else None
@@ -241,6 +272,13 @@ async def _fetch_tools(
                 cursor = page.next_cursor
                 if not cursor:
                     break
+                if cursor in seen_cursors:
+                    raise McpClientError(
+                        f"MCP server '{server.namespace}/{server.name}' repeated a tools page cursor; listing abandoned"
+                    )
+                seen_cursors.add(cursor)
+        except McpClientError:
+            raise
         except Exception as e:
             raise McpClientError(_describe(server, e)) from e
     return tools
@@ -257,6 +295,7 @@ async def list_tools(
     headers = await resolve_headers(db, server, user_id)
     key = _cache_key(server, user_id, headers)
     now = time.monotonic()
+    _prune_tool_cache(now)
     if use_cache:
         cached = _tool_cache.get(key)
         if cached and cached[0] > now:
