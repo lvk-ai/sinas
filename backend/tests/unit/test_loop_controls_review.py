@@ -294,3 +294,24 @@ def test_resolver_survives_whatever_is_stored():
     assert r({"rules": [{"match": 42, "action": "ask"}, {"match": "write_*", "action": "ask"}]}, "write_x", False, set()) == "ask"
     assert r({"rules": {"match": "x"}}, "x", True, set()) == "ask"
     assert r("garbage", "x", False, set()) == "auto"
+
+
+def test_tool_approvals_travel_through_the_agent_spec():
+    """Config apply and the REST API both go through AgentSpec now: the
+    rules are validated there and survive the row round trip."""
+    from pydantic import ValidationError
+
+    from app.models.agent import Agent
+    from app.schemas.spec.agent import AgentSpec
+    from app.services.resources.agents import AgentApplier
+
+    spec = AgentSpec(namespace="n", name="a", toolApprovals={"rules": [{"match": "write_*", "action": "ask"}]})
+    assert spec.tool_approvals == {"default": "auto", "rules": [{"match": "write_*", "action": "ask"}]}
+    assert spec.to_config()["toolApprovals"]["rules"][0]["match"] == "write_*"
+    with pytest.raises(ValidationError):
+        AgentSpec(namespace="n", name="a", toolApprovals={"rules": ["write_*"]})
+
+    row = Agent(namespace="n", name="a", tool_approvals={"default": "ask", "rules": []})
+    assert AgentApplier().spec_from_row(row, None).tool_approvals == {"default": "ask", "rules": []}
+    row2 = Agent(namespace="n", name="b")
+    assert AgentApplier().spec_from_row(row2, None).tool_approvals is None

@@ -66,12 +66,33 @@ async def validate_config(
         strict=False,  # Don't error on missing env vars for validation
     )
 
-    # Convert ConfigValidation to ConfigValidateResponse
-    return ConfigValidateResponse(
-        valid=validation.is_valid,
-        errors=[SchemaValidationError(path=e.path, message=e.message) for e in validation.errors],
-        warnings=[SchemaValidationError(path="", message=w) for w in validation.warnings],
+    errors = [SchemaValidationError(path=e.path, message=e.message) for e in validation.errors]
+    warnings = [SchemaValidationError(path="", message=w) for w in validation.warnings]
+
+    # Reference checks live in the appliers (e.g. an agent's tools must
+    # exist): a dry run reports what the real apply would refuse. Skipped for
+    # packages with unresolved ${{ vars.* }} (their references aren't known
+    # until install; a package preview with variables covers them).
+    if validation.is_valid and config is not None and "${{" not in validate_request.config:
+        errors += await _dry_run_errors(db, config, user_id)
+
+    return ConfigValidateResponse(valid=not errors, errors=errors, warnings=warnings)
+
+
+async def _dry_run_errors(db: AsyncSession, config, user_id: str) -> list[SchemaValidationError]:
+    from app.services.package_service import PACKAGE_SKIP_TYPES
+
+    is_package = config.kind == "SinasPackage" and config.package is not None
+    service = ConfigApplyService(
+        db,
+        config.package.name if is_package else config.metadata.name,
+        owner_user_id=user_id,
+        managed_by=f"pkg:{config.package.name}" if is_package else "config",
+        auto_commit=False,
+        skip_resource_types=PACKAGE_SKIP_TYPES if is_package else None,
     )
+    result = await service.apply_config(config, dry_run=True)  # writes nothing
+    return [SchemaValidationError(path="", message=e) for e in result.errors]
 
 
 @router.post("/apply", response_model=ConfigApplyResponse)
@@ -122,7 +143,9 @@ async def apply_config(
             )
 
         # Apply configuration
-        apply_service = ConfigApplyService(db, config.metadata.name, owner_user_id=user_id)
+        apply_service = ConfigApplyService(
+            db, config.metadata.name, owner_user_id=user_id, prune_missing=apply_request.prune
+        )
         result = await apply_service.apply_config(config, dry_run=apply_request.dryRun)
 
         # Add validation warnings to result
@@ -340,6 +363,11 @@ async def restore_config_revision(
         reference_scope_user_id=None,
         restored_from_id=revision.id,
     )
+    if applier.singleton_lock and spec.is_default:
+        # Before the row lock below (lock order: see lock_singleton).
+        from app.services.resources.base import lock_singleton
+
+        await lock_singleton(ctx, applier.singleton_lock)
     current = (
         await applier.find_by_id(ctx, revision.resource_id) if revision.resource_id else None
     )

@@ -560,6 +560,164 @@ invalidation effect).
   (`passive_deletes`), not loaded one by one. Collection blobs in storage
   are still not removed on delete — separate issue.
 
+### Slice 7: functions (decisions)
+
+- **One write path:** REST, config, packages and restore share
+  FunctionApplier: history, restore, prune on upgrade, recorded uninstall.
+- **Versions** snapshot code and schemas: v1 on create, the next one only
+  when code or a schema actually changes — on every channel (REST used to add
+  one whenever code was sent). Versions are deleted with the function and
+  are not part of history; a restore starts again at v1.
+- **`is_active` is operator state** ("disabled"), kept unless declared, as
+  are `sharedPool` and `requiresApproval` (config already left those as they
+  were when unset). Config used to treat a disabled function as reclaimable
+  and switch it back on. Export includes disabled ones.
+- **REST-only gates stay REST-only:** code execution being off, the
+  shared-pool permission, and the syntax/schema checks. Config and packages
+  may still declare functions (decided: they just can't run).
+- The dead `function_ids` cache (keyed by bare name) is gone.
+
+### Slice 8: secrets (decisions)
+
+- **Shared secrets only.** They're what config declares, what package secret
+  variables fill in, and what connectors/pipelines resolve. Private secrets
+  are a user's own credentials, not configuration: written directly, not in
+  history.
+- **History never holds a value.** `SecretSpec.canonical()` puts a keyed
+  stand-in (`history.redact`) in place of the value, so history, diffs and
+  the stored checksum never carry it; the real value is kept encrypted beside
+  the revision for restores (`secret_values` / `with_secrets`).
+- **Value and description are kept unless declared**; a new secret still
+  needs a value (also refused in a dry run).
+- **Packages may fill in, never delete.** New applier knobs: `ownership()`
+  (secrets let a package adopt an existing row — its secret variables write
+  it just before the package applies, as before) and `deleted_with_package`
+  (off for secrets: uninstall and upgrades never deleted them, and still
+  don't). Package secret variables now write through the applier as the
+  installing user's own entry.
+- Export lists shared secrets only (private names used to be exported, and
+  re-applying them failed for lack of a value).
+
+### Slice 9: agents (decisions)
+
+- **Delete stays a soft delete** (decided): the API switches an agent off,
+  recorded in history; an update with `is_active: true` restores it;
+  recreating its name is a 400 that says so. Config and packages keep that
+  state unless they declare `isActive` (config used to bring deleted agents
+  back). Package uninstall and upgrade prune delete the row; chats are kept,
+  unlinked (they keep the agent's namespace/name).
+- **`isDefault` is operator state too**, kept unless declared; making one
+  the default unsets the others, on every channel.
+- **The LLM provider is held by id, declared by name** (as queries do with
+  connections): REST translates at the boundary, an unknown provider is a
+  404/clear apply error (was a 500 / unchecked in previews), and a write
+  re-resolves the name only when the spec names another provider.
+- **Config's normalizations are spec validators**, so REST gets them too:
+  bare function/skill/collection names mean `default/`, a bare store name
+  means read-write, and camelCase hooks are stored as the snake_case the
+  runtime reads (they were silently ignored).
+- REST: temperature 0 stays 0 (was 0.7); a rename clash is a 400 (was 500).
+- The unused `agent_ids` cache and the legacy normalizers are gone.
+- Not changed: references to functions, skills etc. are still only checked
+  by the config parser, not on REST writes.
+
+### Slice 10: pipelines (decisions)
+
+- One applier for REST, config, packages and restore. The definition rules
+  (`validate_pipeline_definition`) are the spec's whole-spec rule, so every
+  channel refuses the same things; a REST PUT with an invalid merged
+  definition stays a 400.
+- **`isActive` is kept unless declared:** a pipeline switched off by hand,
+  or auto-disabled after failures, stays off when config is re-applied
+  (config switched every one back on). Switching one back on clears the
+  failure state; the cursor stays. Export includes inactive ones.
+- Config's top-level `output` / `output.$` map to `output_mapping` in the
+  spec and back on export.
+- **Packages now remove their pipelines** on uninstall and prune them on
+  upgrade; pipelines were never part of package uninstall before.
+- References in steps are still not checked at write time (run time fails
+  clearly), as before.
+- The legacy normalizers module is gone: nothing uses it any more.
+
+### Slice 11: LLM providers (decisions)
+
+- Final batch scope (agreed): providers, database connections, dependencies
+  and roles move to appliers, one PR each; users stay on their own path
+  (identity, not config) with small fixes. Packages keep the dependencies
+  they add.
+- One applier for config and REST. Owner-less (admin-managed); `rest.locked`
+  compares the key alone for such kinds.
+- The API key is redacted like a secret's value (`canonical()`), restorable
+  via `secret_values`, and kept when left out. `isActive` and `isDefault`
+  are kept unless declared (config switched deleted providers back on and
+  unset a console default); making one the default records the previous
+  default's change too.
+- Config's top-level `models` lives in `config.models`, as in the database;
+  `config` is now the declared state (it was merged with keys set
+  elsewhere — those are console edits, which detach the provider).
+- Export no longer drops `defaultModel`, `isDefault` and extra `config`,
+  includes switched-off providers, and the key only with include_secrets.
+- REST delete stays a soft delete (agents point at the provider by id).
+
+### Slice 12: database connections (decisions)
+
+- One applier for config and REST; owner-less like providers. The password
+  is redacted in history (restorable via `secret_values`), kept when left
+  out or blank. `isActive` and `readOnly` can now be declared, and are
+  kept unless declared. REST delete stays a soft delete (queries and
+  triggers point at the connection by id); the pool is invalidated after
+  REST writes as before (other processes notice via the pool's config hash).
+- **The built-in connection** (`managed_by: system`) stays the platform's:
+  config and packages skip it, and an API edit of the fields the endpoint
+  lets change doesn't detach it (`ownership()` override).
+- **Annotations stay outside the spec**: an additive layer applied right
+  after the connections, as before.
+- Connections are exported now (they weren't), with their annotations; the
+  password only with include_secrets (an unreadable one fails that export);
+  the built-in connection is left out.
+
+### Slice 13: dependencies (decisions)
+
+- Migration `d3p4e5n6d7s8` adds the ownership columns (existing rows stay
+  unmanaged). One applier for config, packages and REST; history included.
+- **Packages keep what they add** (agreed): `deleted_with_package = False`,
+  so uninstall and upgrades never remove a dependency.
+- **A package can't approve what the deployment refuses**
+  (ALLOW_PACKAGE_INSTALLATION / ALLOWED_PACKAGES), as the API can't; checked
+  on create, in previews too. The operator's own config stays exempt, as
+  it always was.
+- A version left out keeps the pinned one; `name==version` in one field
+  still splits.
+- `config_apply/resources.py` is gone: every kind it held has an applier.
+
+### Slice 14: roles (decisions)
+
+- **Definition only**: name, description, email domain and the permission
+  map. Memberships and API-key bindings stay outside ("define, never
+  bind"); a restore brings the definition back, not who held it.
+- Roles apply first in config apply (before the legacy users path), and
+  users now find roles by name in the database (a config user can hold a
+  role declared elsewhere, e.g. Admins).
+- Permissions are upserted in place; `permissions: []` now clears them
+  (it never did). History holds the permission map.
+- **Default roles** (Admins, Users, GuestUsers) stay the platform's: config
+  and packages skip them as before (`ownership()`), the API edits them
+  without detaching; nobody renames or deletes one (`pinned_fields`, delete
+  guard; the API answers 400), and Admins' permissions stay locked.
+- Packages: uninstall goes through the applier (memberships and API-key
+  bindings go with the role, as before); an upgrade now prunes a role the
+  new version dropped. Governance (`package_role_violations`) unchanged.
+- Users stay on their own path (identity, not config); small fixes follow.
+
+### Users (decided: stay on their own path)
+
+Users are identity, not config: most come from login flows, carry password
+hashes, tokens and API keys, and history would hold personal data. They
+keep the legacy config path, with fixes: emails are normalized as the API
+and login do; dropped memberships are ended (inactive, removed_at) instead
+of deleting every membership row of the user; export lists current
+memberships only and no lastLoginAt.
+
 ### Parity test strategy
 
 New `backend/tests/unit/config_parity/` harness (there are currently **zero**
@@ -595,7 +753,7 @@ nothing here conflicts with its decisions:
 - **Structured validator errors (#8c)**: the uncommitted `config_parser.py`
   WIP continues independently; spec-model pydantic errors give it per-field
   paths for free once resources migrate.
-- **CLI/skills stay in `sinas-skills`** — untouched; they talk to the same
+- **CLI/skills stay in `sinas-skills`** (since renamed `sinas-platform/cli`) — untouched; they talk to the same
   endpoints.
 
 ## 7. Phased issue breakdown (ready to file)
