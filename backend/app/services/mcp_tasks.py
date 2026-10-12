@@ -358,7 +358,8 @@ def _queue_delivery(row: McpTask, content: str) -> None:
     """Add a message to the task's outbox, in the same commit as the state
     change it reports. `_flush_deliveries` sends it; until it has, the task
     stays due, so the sweep retries."""
-    row.pending_deliveries = list(row.pending_deliveries or []) + [content]
+    entry = {"id": uuid.uuid4().hex, "content": content}
+    row.pending_deliveries = list(row.pending_deliveries or []) + [entry]
     if row.next_poll_at is None:  # finished: due again until delivered
         row.next_poll_at = _now()
 
@@ -367,59 +368,100 @@ _DELIVERY_RETRY = timedelta(seconds=30)
 
 
 async def _flush_deliveries(task_id: uuid.UUID) -> None:
-    """Send the task's outbox into the chat, in order. A message leaves the
-    outbox only once the chat accepted it (or dropped it: an archived chat,
-    an inactive owner); a failure leaves it there and retries later.
+    """Send the task's outbox into the chat, in order.
 
-    No lock is held while the chat is written to: delivery writes the chat
-    in sessions of its own, and holding this row's lock across that could
-    deadlock with anything that locks the chat first (deleting it cascades
-    to this row). Instead the message is claimed (the row is made not due
-    for the length of a lease, so no sweep picks it up meanwhile), delivered,
-    then removed under the lock. A crash in between can send a message
-    twice, never lose one."""
+    Each message leaves the outbox in the same transaction that writes it
+    into the chat (`deliver_to_chat`'s guard): it is delivered exactly when
+    it is removed. Two flushes racing can't both send it (the second finds it
+    gone), and a cancel that empties the outbox first means it is never
+    sent. No lock is held across the delivery: the guard locks the chat row
+    and then this row, in the order that deleting a chat takes them.
+
+    A message the chat refuses for good (an archived chat, an inactive
+    owner, a hook that blocks it) is dropped from the outbox; one that fails
+    stays there for the next sweep."""
     from app.core.database import AsyncSessionLocal
     from app.services.chat_wakeups import deliver_to_chat
 
     while True:
         async with AsyncSessionLocal() as db:
-            row = await db.get(McpTask, task_id, with_for_update=True, populate_existing=True)
+            row = await db.get(McpTask, task_id)
             if row is None:
                 return
             pending = list(row.pending_deliveries or [])
             if not pending:
                 if row.finished_at is not None and row.next_poll_at is not None:
                     row.next_poll_at = None  # nothing left to poll or deliver
-                await db.commit()
+                    await db.commit()
                 return
-            resume_at = row.next_poll_at
-            row.next_poll_at = _now() + _LEASE  # claimed
-            await db.commit()
-            message, chat_id, api_key_id = pending[0], str(row.chat_id), row.api_key_id
+            entry, chat_id, api_key_id = pending[0], row.chat_id, row.api_key_id
+
+        async def take_off(session) -> bool:
+            """In the delivery's transaction: the message is still owed, and
+            now it isn't."""
+            await session.execute(
+                select(Chat.id).where(Chat.id == chat_id).with_for_update(key_share=True)
+            )
+            task = (
+                await session.execute(
+                    select(McpTask).where(McpTask.id == task_id).with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            current = list(task.pending_deliveries or []) if task is not None else []
+            if not current or current[0].get("id") != entry["id"]:
+                return False
+            task.pending_deliveries = current[1:]
+            if task.finished_at is not None and not task.pending_deliveries:
+                task.next_poll_at = None
+            return True
 
         try:
-            await deliver_to_chat(chat_id, message, source="mcp_task", api_key_id=api_key_id)
-            delivered = True
+            outcome = await deliver_to_chat(
+                str(chat_id), entry["content"], source="mcp_task", api_key_id=api_key_id, guard=take_off
+            )
         except Exception:
             logger.exception("Delivering MCP task %s into chat %s failed; retrying", task_id, chat_id)
-            delivered = False
+            await _after_failed_delivery(task_id, entry)
+            return
 
-        async with AsyncSessionLocal() as db:
-            row = await db.get(McpTask, task_id, with_for_update=True, populate_existing=True)
-            if row is None:
-                return
-            if not delivered:
-                row.next_poll_at = _now() + _DELIVERY_RETRY
-                await db.commit()
-                return
-            current = list(row.pending_deliveries or [])
-            if current and current[0] == message:
-                row.pending_deliveries = current[1:]
-            if row.finished_at is None:
-                row.next_poll_at = resume_at or _now()  # back to its poll schedule
-            else:
-                row.next_poll_at = _now() if row.pending_deliveries else None
-            await db.commit()
+        if outcome.get("status") == "dropped" and outcome.get("reason") != "withdrawn":
+            # Refused for good before reaching the guard: don't retry it.
+            await _remove_entry(task_id, entry["id"])
+
+
+async def _remove_entry(task_id: uuid.UUID, entry_id: str) -> None:
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        row = await db.get(McpTask, task_id, with_for_update=True)
+        if row is None:
+            return
+        row.pending_deliveries = [e for e in (row.pending_deliveries or []) if e.get("id") != entry_id]
+        if row.finished_at is not None and not row.pending_deliveries:
+            row.next_poll_at = None
+        await db.commit()
+
+
+async def _after_failed_delivery(task_id: uuid.UUID, entry: dict[str, Any]) -> None:
+    """A delivery raised. If it failed before committing, the message is
+    still in the outbox; if it failed after (the new turn could not be
+    queued), it was taken off but never arrived: put it back at the front.
+    Either way, try again later."""
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        row = await db.get(McpTask, task_id, with_for_update=True)
+        if row is None:
+            return
+        pending = list(row.pending_deliveries or [])
+        cancelled_by_agent = row.status == "cancelled" and row.result == {"error": "Cancelled by the agent"}
+        if all(e.get("id") != entry["id"] for e in pending) and not cancelled_by_agent:
+            row.pending_deliveries = [entry] + pending
+        retry = _now() + _DELIVERY_RETRY
+        if row.finished_at is not None or row.next_poll_at is None or row.next_poll_at > retry:
+            row.next_poll_at = retry
+        await db.commit()
 
 
 def snapshot(row: McpTask) -> dict[str, Any]:

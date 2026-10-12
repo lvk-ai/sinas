@@ -70,7 +70,7 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 async def deliver_to_chat(
-    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None
+    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None, guard=None
 ) -> dict[str, Any]:
     """Put `content` in front of the agent of `chat_id`.
 
@@ -80,6 +80,13 @@ async def deliver_to_chat(
     loop drains it at its next round boundary. Otherwise starts a new turn
     through the queue, on a fresh channel recorded as the chat's
     `active_channel_id` so a client can reconnect.
+
+    `guard(db)`, when given, runs in the transaction that writes the
+    delivery (the injected message, or the new turn's channel) and commits
+    with it; returning False withdraws the delivery ("dropped", reason
+    "withdrawn"). A sender with an outbox uses it to take the message off in
+    the same transaction as delivering it: it is then delivered exactly when
+    it leaves the outbox, with no lock held across the delivery.
 
     Returns {"status": "injected" | "started" | "dropped", ...}.
     """
@@ -130,14 +137,26 @@ async def deliver_to_chat(
             ).scalar_one_or_none() is not None
 
         if suspended or await chat_steering.is_chat_locked(chat_id):
-            injected = await MessageService(db).inject_user_message(chat_id, str(chat.user_id), content)
+            withdrawn = False
+
+            async def checked(session) -> bool:
+                nonlocal withdrawn
+                withdrawn = not await guard(session)
+                return not withdrawn
+
+            injected = await MessageService(db).inject_user_message(
+                chat_id, str(chat.user_id), content, guard=checked if guard is not None else None
+            )
             if injected is None:
-                return {"status": "dropped", "reason": "blocked_by_hook"}
+                return {"status": "dropped", "reason": "withdrawn" if withdrawn else "blocked_by_hook"}
             logger.info("Wakeup (%s) injected into running/suspended chat %s", source, chat_id)
             return {"status": "injected", "message_id": str(injected.id)}
 
         token = create_access_token(user_id=str(user.id), email=user.email)
         channel_id = str(uuid.uuid4())
+        if guard is not None and not await guard(db):
+            await db.rollback()
+            return {"status": "dropped", "reason": "withdrawn"}
         chat.active_channel_id = channel_id
         await db.commit()
         agent_label = (
