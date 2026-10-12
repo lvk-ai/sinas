@@ -88,8 +88,7 @@ async def build_conversation_history(
     # Add system prompt from agent if exists
     system_content = ""
     if chat.agent_id:
-        result = await db.execute(select(Agent).where(Agent.id == chat.agent_id))
-        agent = result.scalar_one_or_none()
+        agent = await db.get(Agent, chat.agent_id)
         if agent:
             system_content = await build_agent_system_content(
                 db, agent, skill_converter, template_variables
@@ -100,8 +99,7 @@ async def build_conversation_history(
     if inject_context and user_id and chat.agent_id:
         # Determine which stores to use for context injection
         final_stores = None
-        result = await db.execute(select(Agent).where(Agent.id == chat.agent_id))
-        agent = result.scalar_one_or_none()
+        agent = await db.get(Agent, chat.agent_id)
         if agent:
             final_stores = agent.enabled_stores or []
 
