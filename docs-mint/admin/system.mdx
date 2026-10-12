@@ -251,6 +251,7 @@ ALLOWED_PACKAGES=requests,pandas,numpy,redis,boto3
 | `QUEUE_AGENT_CONCURRENCY` | 5 | Concurrent jobs per agent worker |
 | `QUEUE_MAX_RETRIES` | 3 | Retry attempts before DLQ |
 | `QUEUE_RETRY_DELAY` | 10 | Seconds between retries |
+| `QUEUE_POLL_DELAY` | 0.05 | Seconds between an idle worker's checks for new jobs |
 
 **Packages:**
 

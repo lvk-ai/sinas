@@ -285,6 +285,11 @@ class Settings(BaseSettings):
     # fails loudly instead of spinning forever. 0 = wait forever.
     queue_saturation_timeout_seconds: int = 21600  # 6 hours
     queue_retry_delay: int = 10
+    # How often an idle worker checks its queue for new jobs (seconds). arq's
+    # default, 0.5, added up to half a second before a queued job started: an
+    # agent message on a keep-alive chat, and every function a tool call
+    # runs. A check is one cheap Redis command.
+    queue_poll_delay: float = 0.05
 
     # Pipeline runs (see ADR 2026-07-28-pipelines-triggers-and-linear-steps).
     # Runs are await-heavy orchestration → high concurrency is cheap.
