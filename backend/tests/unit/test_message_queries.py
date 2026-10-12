@@ -6,12 +6,13 @@ milliseconds away, that was a noticeable part of the wait before the model
 was even called. Now each is loaded once, whatever the number of tools.
 """
 import re
+import uuid
 
-from sqlalchemy import event
+from sqlalchemy import event, select
 
 from app.core import database as core_db
 from app.core.encryption import EncryptionService
-from app.models import LLMProvider
+from app.models import LLMProvider, Message
 from app.providers.openai_provider import OpenAIProvider
 from app.services.message_service import MessageService
 from tests.conftest import auth_headers
@@ -62,12 +63,20 @@ async def _statements_for_one_message(client, db, admin_user, monkeypatch, n_too
     engines = [db.bind.sync_engine, core_db.async_engine.sync_engine]
     for engine in engines:
         event.listen(engine, "before_cursor_execute", record)
+    events = []
     try:
-        async for _ in svc.send_message_stream(chat_id=chat, user_id=str(admin_user.id), user_token="", content="hi"):
-            pass
+        async for chunk in svc.send_message_stream(chat_id=chat, user_id=str(admin_user.id), user_token="", content="hi"):
+            events.append(chunk)
     finally:
         for engine in engines:
             event.remove(engine, "before_cursor_execute", record)
+
+    # The message went through: no error, and the reply was saved.
+    assert not [e for e in events if e.get("type") == "error"], events
+    replies = (await db.execute(
+        select(Message.content).where(Message.chat_id == uuid.UUID(chat), Message.role == "assistant")
+    )).scalars().all()
+    assert replies == ["ok"], replies
     return statements
 
 
