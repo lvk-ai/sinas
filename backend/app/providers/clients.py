@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Per loop. More than a deployment has providers; past it, the least
-# recently used client is dropped (not closed: a call may still be using it).
+# recently used client is dropped, and closed once any call still using it
+# has had time to finish (longer than the SDKs' 10-minute request timeout).
 MAX_CLIENTS = 64
+CLOSE_EVICTED_AFTER_S = 15 * 60
 
 _clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, OrderedDict[Hashable, Any]]" = (
     weakref.WeakKeyDictionary()
@@ -53,7 +55,8 @@ def shared_client(key: Hashable, make: Callable[[], T]) -> T:
     if client is None or _is_closed(client):
         client = clients[key] = make()
         while len(clients) > MAX_CLIENTS:
-            clients.popitem(last=False)
+            _, evicted = clients.popitem(last=False)
+            loop.call_later(CLOSE_EVICTED_AFTER_S, lambda c=evicted: loop.create_task(_close(c)))
     else:
         clients.move_to_end(key)
     return client
@@ -75,10 +78,14 @@ async def close_shared_clients() -> None:
         return
     clients = _clients.pop(loop, None) or {}
     for client in clients.values():
-        close = getattr(client, "close", None) or getattr(client, "aclose", None)
-        try:
-            result = close() if close else None
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:
-            logger.debug(f"Closing an LLM client failed: {e}")
+        await _close(client)
+
+
+async def _close(client: Any) -> None:
+    close = getattr(client, "close", None) or getattr(client, "aclose", None)
+    try:
+        result = close() if close else None
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception as e:
+        logger.debug(f"Closing an LLM client failed: {e}")

@@ -63,3 +63,15 @@ async def test_a_closed_client_is_replaced_and_shutdown_closes_them():
     await close_shared_clients()
     assert second.is_closed()
     assert shared_client(("x",), object) is not None
+
+
+async def test_an_evicted_client_is_closed_later(monkeypatch):
+    from app.providers import clients
+
+    monkeypatch.setattr(clients, "MAX_CLIENTS", 1)
+    monkeypatch.setattr(clients, "CLOSE_EVICTED_AFTER_S", 0.01)
+    first = OpenAIProvider(api_key="k1").client
+    OpenAIProvider(api_key="k2")  # evicts the first
+    assert not first.is_closed()  # a call may still be using it
+    await asyncio.sleep(0.05)
+    assert first.is_closed()
