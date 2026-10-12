@@ -6,11 +6,15 @@ an agent's tool call runs.
 """
 from arq.worker import create_worker
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.queue.worker import AgentWorkerSettings, PipelineWorkerSettings, SubAgentWorkerSettings, WorkerSettings
 
 
-def test_every_worker_polls_its_queue_often():
+def test_the_default_is_short():
+    assert Settings.model_fields["queue_poll_delay"].default == 0.05
+
+
+def test_every_worker_uses_the_setting():
     for cls in (WorkerSettings, AgentWorkerSettings, SubAgentWorkerSettings, PipelineWorkerSettings):
         worker = create_worker(cls, handle_signals=False)
-        assert worker.poll_delay_s == settings.queue_poll_delay <= 0.1, cls.__name__
+        assert worker.poll_delay_s == settings.queue_poll_delay, cls.__name__
