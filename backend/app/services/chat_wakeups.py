@@ -365,7 +365,13 @@ async def list_wakeups(db, chat: Chat) -> dict[str, Any]:
         for r in rows if r.kind == WATCH and not (r.expires_at and r.expires_at <= now)
     ]
     jobs = await list_background_jobs(str(chat.id))
-    return {"timers": timers, "watches": watches, "background_jobs": jobs}
+    from app.services.mcp_tasks import list_tasks
+
+    out = {"timers": timers, "watches": watches, "background_jobs": jobs}
+    mcp_tasks = await list_tasks(db, chat)
+    if mcp_tasks:
+        out["mcp_tasks"] = mcp_tasks
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +635,7 @@ def get_background_tool_definitions(code_execution_available: bool) -> list[dict
             "type": "function",
             "function": {
                 "name": LIST_WAKEUPS,
-                "description": "List this chat's pending wakeup timers, active watch URLs and recent background jobs.",
+                "description": "List this chat's pending wakeup timers, active watch URLs, recent background jobs and running MCP tasks.",
                 "parameters": {"type": "object", "properties": {}},
                 "_metadata": meta,
             },

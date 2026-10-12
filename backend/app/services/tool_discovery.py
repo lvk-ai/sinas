@@ -294,6 +294,10 @@ async def get_available_tools(
             db=db, enabled_mcp_servers=enabled_mcp_servers, user_id=user_id
         )
         tools.extend(mcp_tools)
+        # A server may answer with a task (MCP Tasks); these follow it up.
+        from app.services.mcp_tasks import get_tool_definitions as mcp_task_tools
+
+        tools.extend(mcp_task_tools())
 
     # Get pipeline tools (only if list has items - opt-in)
     enabled_pipelines = getattr(agent, "enabled_pipelines", None) or []
