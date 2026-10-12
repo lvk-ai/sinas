@@ -195,8 +195,8 @@ async def get_available_tools(
         return tools
 
     # Get agent configuration
-    result = await db.execute(select(Agent).where(Agent.id == chat.agent_id))
-    agent = result.scalar_one_or_none()
+    # From the session when the caller already loaded it: no query.
+    agent = await db.get(Agent, chat.agent_id)
     if not agent:
         return tools
 

@@ -11,10 +11,15 @@ enabled_collections, enabled_skills, etc.
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# Exact refs follow each model's `get_by_name`: these only match active rows;
+# the others (Skill, Query, Pipeline, ...) match a row either way. Models
+# without `get_by_name` match active rows when they have `is_active`.
+_EXACT_REFS_ACTIVE_ONLY = frozenset({"Function", "Agent", "Component", "LLMProvider"})
 
 
 def matches_ref_pattern(ref: str, patterns: list) -> bool:
@@ -70,23 +75,38 @@ async def resolve_resource_refs(
 
     has_is_active = hasattr(model_class, "is_active")
 
-    for entry in refs:
-        # Extract the reference string from either a plain string or dict
+    def ref_of(entry) -> str:
+        """The reference string of a plain string or a dict/config entry."""
         if isinstance(entry, str):
-            ref = entry
-        elif isinstance(entry, dict):
-            ref = entry.get(ref_field, "")
-        elif hasattr(entry, ref_field):
-            ref = getattr(entry, ref_field)
-        elif hasattr(entry, "skill"):
-            ref = entry.skill  # EnabledSkillConfig
-        elif hasattr(entry, "store"):
-            ref = entry.store  # EnabledStoreConfig
-        elif hasattr(entry, "collection"):
-            ref = entry.collection  # EnabledCollectionConfig
-        else:
-            continue
+            return entry
+        if isinstance(entry, dict):
+            return entry.get(ref_field, "")
+        for field in (ref_field, "skill", "store", "collection"):
+            if hasattr(entry, field):
+                return getattr(entry, field)
+        return ""
 
+    refs = [ref_of(entry) for entry in refs]
+
+    # Every exact ref in one query, not one query each.
+    pairs = {
+        tuple(ref.split("/", 1)) for ref in refs if ref and "/" in ref and not ref.endswith("/*")
+    }
+    exact: dict[tuple[str, str], Any] = {}
+    if pairs:
+        if hasattr(model_class, "get_by_name"):
+            active_only = model_class.__name__ in _EXACT_REFS_ACTIVE_ONLY
+        else:
+            active_only = has_is_active
+        query = select(model_class).where(
+            tuple_(model_class.namespace, model_class.name).in_(list(pairs))
+        )
+        if active_only:
+            query = query.where(model_class.is_active == True)
+        for r in (await db.execute(query)).scalars().all():
+            exact[(r.namespace, r.name)] = r
+
+    for ref in refs:
         if not ref or "/" not in ref:
             continue
 
@@ -116,16 +136,7 @@ async def resolve_resource_refs(
         else:
             # Exact match
             ns, name = ref.split("/", 1)
-            if hasattr(model_class, "get_by_name"):
-                r = await model_class.get_by_name(db, ns, name)
-            else:
-                query = select(model_class).where(
-                    model_class.namespace == ns, model_class.name == name
-                )
-                if has_is_active:
-                    query = query.where(model_class.is_active == True)
-                result = await db.execute(query)
-                r = result.scalar_one_or_none()
+            r = exact.get((ns, name))
 
             if r and r.id not in seen_ids:
                 seen_ids.add(r.id)

@@ -99,6 +99,7 @@ async def create_provider(
     db: Optional[AsyncSession] = None,
     usage_context: Optional[dict[str, Any]] = None,
     overrides: Optional[dict[str, Any]] = None,
+    config: Optional[Any] = None,
 ) -> BaseLLMProvider:
     """
     Create an LLM provider instance from database configuration.
@@ -110,6 +111,8 @@ async def create_provider(
         usage_context: Attribution for token-usage records (user_id, chat_id,
             message_id, agent, source). Calls are recorded even without it,
             just unattributed.
+        config: The provider's row, when the caller already loaded it (the
+            one `provider_name`, or the default, would find). Saves a query.
 
     Returns:
         BaseLLMProvider instance, wrapped in UsageTrackingProvider so every
@@ -124,7 +127,11 @@ async def create_provider(
         raise ValueError("Database session required to load LLM provider configuration")
 
     # Find provider in database
-    if provider_name:
+    if config is not None and config.is_active and (
+        config.name == provider_name if provider_name else config.is_default
+    ):
+        result = None
+    elif provider_name:
         # Find by name
         result = await db.execute(
             select(LLMProvider).where(
@@ -139,7 +146,7 @@ async def create_provider(
             )
         )
 
-    provider_config = result.scalar_one_or_none()
+    provider_config = config if result is None else result.scalar_one_or_none()
     if not provider_config:
         raise ValueError(f"No active LLM provider found for: {provider_name or 'default'}")
 

@@ -27,8 +27,8 @@ _SQL_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 async def load_user_context(db: AsyncSession, user_id: str) -> dict[str, Any]:
     """Load the user context dict: {"id", "email", "custom_fields"}."""
-    result = await db.execute(select(User).where(User.id == uuid.UUID(str(user_id))))
-    user = result.scalar_one_or_none()
+    # From the session after the first load in a request: no query.
+    user = await db.get(User, uuid.UUID(str(user_id)))
     if not user:
         return {"id": str(user_id), "email": None, "custom_fields": {}}
     return {
