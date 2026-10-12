@@ -137,7 +137,7 @@ async def get_request_log_stats(
     where_clause = " AND ".join(conditions) if conditions else "1=1"
 
     # Query ClickHouse for stats
-    if not clickhouse_logger._ensure_client():
+    if not clickhouse_logger.available:
         raise HTTPException(status_code=503, detail="ClickHouse not available")
 
     try:
@@ -151,8 +151,7 @@ async def get_request_log_stats(
             FROM request_logs
             WHERE {where_clause}
         """
-        stats_result = clickhouse_logger.client.query(stats_query, parameters=parameters)
-        stats_row = stats_result.result_rows[0]
+        stats_row = (await clickhouse_logger.query(stats_query, parameters))[0]
 
         # Top paths
         top_paths_query = f"""
@@ -163,7 +162,7 @@ async def get_request_log_stats(
             ORDER BY cnt DESC
             LIMIT 10
         """
-        top_paths_result = clickhouse_logger.client.query(top_paths_query, parameters=parameters)
+        top_paths = await clickhouse_logger.query(top_paths_query, parameters)
 
         # Top permissions
         top_perms_query = f"""
@@ -174,18 +173,20 @@ async def get_request_log_stats(
             ORDER BY cnt DESC
             LIMIT 10
         """
-        top_perms_result = clickhouse_logger.client.query(top_perms_query, parameters=parameters)
+        top_perms = await clickhouse_logger.query(top_perms_query, parameters)
 
         return RequestLogStatsResponse(
             total_requests=stats_row[0],
             unique_users=stats_row[1],
             avg_response_time_ms=float(stats_row[2]) if stats_row[2] else 0.0,
             error_rate=float(stats_row[3]) if stats_row[3] else 0.0,
-            top_paths=[{"path": row[0], "count": row[1]} for row in top_paths_result.result_rows],
+            top_paths=[{"path": row[0], "count": row[1]} for row in top_paths],
             top_permissions=[
-                {"permission": row[0], "count": row[1]} for row in top_perms_result.result_rows
+                {"permission": row[0], "count": row[1]} for row in top_perms
             ],
         )
 
+    except ConnectionError:
+        raise HTTPException(status_code=503, detail="ClickHouse not available")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch statistics: {str(e)}")

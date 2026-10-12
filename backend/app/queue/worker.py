@@ -470,6 +470,11 @@ async def shutdown(ctx: dict) -> None:
             pass
         await redis.aclose()
 
+    # Execution log rows still buffered for ClickHouse
+    from app.services.clickhouse_logger import clickhouse_logger
+
+    await clickhouse_logger.aclose()
+
     logger.info("Worker stopped")
 
 

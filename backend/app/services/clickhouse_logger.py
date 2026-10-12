@@ -1,6 +1,19 @@
-"""ClickHouse logger service for comprehensive request logging."""
+"""ClickHouse logger service for comprehensive request logging.
+
+Nothing here runs ClickHouse I/O on the event loop. The client is
+synchronous, and every request used to insert its log row inline, blocking
+every other request and stream in the process while it ran. With ClickHouse
+unreachable, each request also tried to reconnect, for up to the connect
+timeout. Now log calls only buffer the row. A background task inserts the
+buffer in batches from a thread, and a failed connection waits a while
+before the next attempt. Logging stays best effort: rows are dropped when
+ClickHouse is down or the buffer is full.
+"""
+import asyncio
 import json
 import logging
+import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -12,25 +25,78 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+FLUSH_INTERVAL_S = 1.0
+MAX_BUFFERED_ROWS = 10_000  # per table
+RETRY_AFTER_S = 30.0  # after a failed connection or insert
+CONNECT_TIMEOUT_S = 3
+
+REQUEST_COLUMNS = [
+    "request_id",
+    "timestamp",
+    "user_id",
+    "user_email",
+    "permission_used",
+    "has_permission",
+    "method",
+    "path",
+    "query_params",
+    "request_body",
+    "user_agent",
+    "referer",
+    "ip_address",
+    "status_code",
+    "response_time_ms",
+    "response_size_bytes",
+    "resource_type",
+    "resource_id",
+    "group_id",
+    "error_message",
+    "error_type",
+    "metadata",
+]
+
+EXECUTION_COLUMNS = [
+    "log_id",
+    "timestamp",
+    "execution_id",
+    "event",
+    "function_name",
+    "step_id",
+    "input_data",
+    "output_data",
+    "error",
+    "duration_ms",
+    "status",
+]
+
+_COLUMNS = {"request_logs": REQUEST_COLUMNS, "execution_logs": EXECUTION_COLUMNS}
+
 
 class ClickHouseLogger:
     """Centralized ClickHouse logging service."""
 
     def __init__(self):
         self.client: Optional[Client] = None
-        self._initialize_client()
+        self._disabled = False
+        self._retry_at = 0.0
+        self._connect_lock = threading.Lock()
+        self._buffers: dict[str, list[list[Any]]] = {table: [] for table in _COLUMNS}
+        self._dropped = 0
+        self._flusher: Optional[asyncio.Task] = None
+        if not settings.clickhouse_host:
+            self._initialize_client()  # logs that it's off
 
     def _initialize_client(self):
         """Initialize ClickHouse client connection.
 
         An empty CLICKHOUSE_HOST means ClickHouse is deliberately disabled
         (e.g. the compact deployment profile): skip connecting entirely so
-        the per-request `_ensure_client` retry doesn't attempt a connection
-        and log an error on every request. Logging methods no-op and log
-        queries return empty, as with any unavailable ClickHouse.
+        `_ensure_client` never attempts a connection or logs an error.
+        Logging methods no-op and log queries return empty, as with any
+        unavailable ClickHouse.
         """
         if not settings.clickhouse_host:
-            if not getattr(self, "_disabled", False):
+            if not self._disabled:
                 logger.info("ClickHouse disabled (CLICKHOUSE_HOST empty) — request/execution logging off")
             self._disabled = True
             self.client = None
@@ -42,19 +108,96 @@ class ClickHouseLogger:
                 username=settings.clickhouse_user,
                 password=settings.clickhouse_password,
                 database=settings.clickhouse_database,
+                connect_timeout=CONNECT_TIMEOUT_S,
+                # No session: the client is shared by threads, and one
+                # session refuses concurrent queries.
+                autogenerate_session_id=False,
             )
         except Exception as e:
             logger.error(f"Failed to initialize ClickHouse client: {e}")
             self.client = None
 
     def _ensure_client(self) -> bool:
-        """Ensure client is connected, retry if needed."""
-        if getattr(self, "_disabled", False):
+        """Connect if needed. Blocking: call it from a thread.
+
+        After a failure, it doesn't try again for RETRY_AFTER_S.
+        """
+        if self._disabled:
             return False
         if self.client:
             return True
-        self._initialize_client()
+        with self._connect_lock:
+            if self.client:
+                return True
+            if time.monotonic() < self._retry_at:
+                return False
+            self._initialize_client()
+            if self.client is None and not self._disabled:
+                self._retry_at = time.monotonic() + RETRY_AFTER_S
         return self.client is not None
+
+    def _lost(self, error: Exception, what: str) -> None:
+        """A call failed: log it, and reconnect later instead of at once."""
+        logger.warning(f"ClickHouse {what} failed: {error}")
+        self.client = None
+        self._retry_at = time.monotonic() + RETRY_AFTER_S
+
+    # --- writes: buffered, inserted in batches off the event loop ---
+
+    def _enqueue(self, table: str, row: list[Any]) -> None:
+        if self._disabled:
+            return
+        buffer = self._buffers[table]
+        if len(buffer) >= MAX_BUFFERED_ROWS:
+            self._dropped += 1
+            if self._dropped % 1000 == 1:
+                logger.warning(f"ClickHouse log buffer full: {self._dropped} rows dropped so far")
+            return
+        buffer.append(row)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # flushed by the next call that has a loop, or on close
+        if self._flusher is None or self._flusher.done() or self._flusher.get_loop() is not loop:
+            self._flusher = loop.create_task(self._flush_soon())
+
+    async def _flush_soon(self) -> None:
+        """Flush every FLUSH_INTERVAL_S while there are rows; stop when idle."""
+        while any(self._buffers.values()):
+            await asyncio.sleep(FLUSH_INTERVAL_S)
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Insert everything buffered so far, from a thread."""
+        for table, rows in list(self._buffers.items()):
+            if rows:
+                self._buffers[table] = []
+                await asyncio.to_thread(self._insert, table, rows)
+
+    def _insert(self, table: str, rows: list[list[Any]]) -> None:
+        if not self._ensure_client():
+            return
+        try:
+            self.client.insert(table, rows, column_names=_COLUMNS[table])
+        except Exception as e:
+            self._lost(e, f"insert of {len(rows)} {table} rows")
+
+    # --- reads: run in a thread ---
+
+    def _query_rows(self, query: str, parameters: Optional[dict[str, Any]] = None) -> list:
+        if not self._ensure_client():
+            raise ConnectionError("ClickHouse not available")
+        return self.client.query(query, parameters=parameters or {}).result_rows
+
+    @property
+    def available(self) -> bool:
+        """Whether ClickHouse is configured and not known to be down."""
+        return not self._disabled and (self.client is not None or time.monotonic() >= self._retry_at)
+
+    async def query(self, query: str, parameters: Optional[dict[str, Any]] = None) -> list:
+        """Rows of a query, run in a thread. Raises ConnectionError when
+        ClickHouse is unavailable."""
+        return await asyncio.to_thread(self._query_rows, query, parameters)
 
     async def log_request(
         self,
@@ -106,72 +249,37 @@ class ClickHouseLogger:
             error_type: Error type/class
             metadata: Additional metadata as dict
         """
-        if not self._ensure_client():
-            return  # Skip logging if ClickHouse not available
-
         try:
-            # Serialize complex fields to JSON
-            query_params_str = json.dumps(query_params) if query_params else ""
-            request_body_str = json.dumps(request_body) if request_body else ""
-            metadata_str = json.dumps(metadata) if metadata else ""
-
-            # Insert log entry
-            self.client.insert(
+            self._enqueue(
                 "request_logs",
                 [
-                    [
-                        request_id,
-                        datetime.utcnow(),
-                        user_id or "",
-                        user_email or "",
-                        permission_used or "",
-                        has_permission,
-                        method,
-                        path,
-                        query_params_str,
-                        request_body_str,
-                        user_agent or "",
-                        referer or "",
-                        ip_address or "",
-                        status_code,
-                        response_time_ms,
-                        response_size_bytes,
-                        resource_type or "",
-                        resource_id or "",
-                        group_id or "",
-                        error_message or "",
-                        error_type or "",
-                        metadata_str,
-                    ]
-                ],
-                column_names=[
-                    "request_id",
-                    "timestamp",
-                    "user_id",
-                    "user_email",
-                    "permission_used",
-                    "has_permission",
-                    "method",
-                    "path",
-                    "query_params",
-                    "request_body",
-                    "user_agent",
-                    "referer",
-                    "ip_address",
-                    "status_code",
-                    "response_time_ms",
-                    "response_size_bytes",
-                    "resource_type",
-                    "resource_id",
-                    "group_id",
-                    "error_message",
-                    "error_type",
-                    "metadata",
+                    request_id,
+                    datetime.utcnow(),
+                    user_id or "",
+                    user_email or "",
+                    permission_used or "",
+                    has_permission,
+                    method,
+                    path,
+                    json.dumps(query_params) if query_params else "",
+                    json.dumps(request_body) if request_body else "",
+                    user_agent or "",
+                    referer or "",
+                    ip_address or "",
+                    status_code,
+                    response_time_ms,
+                    response_size_bytes,
+                    resource_type or "",
+                    resource_id or "",
+                    group_id or "",
+                    error_message or "",
+                    error_type or "",
+                    json.dumps(metadata) if metadata else "",
                 ],
             )
         except Exception as e:
-            # Silently fail - logging should never crash the app
-            logger.warning(f"Failed to log request to ClickHouse: {e}")
+            # Logging must never fail a request
+            logger.warning(f"Failed to log request: {e}")
 
     async def query_logs(
         self,
@@ -200,7 +308,7 @@ class ClickHouseLogger:
         Returns:
             List of log entries
         """
-        if not self._ensure_client():
+        if self._disabled:
             return []
 
         try:
@@ -238,53 +346,47 @@ class ClickHouseLogger:
                 OFFSET {offset}
             """
 
-            result = self.client.query(query, parameters=parameters)
-            return result.result_rows
+            return await self.query(query, parameters)
         except Exception as e:
             logger.error(f"Failed to query logs from ClickHouse: {e}")
             return []
+
+    def _execution_event(
+        self,
+        execution_id: str,
+        event: str,
+        function_name: str = "",
+        step_id: str = "",
+        input_data: Optional[dict[str, Any]] = None,
+        output_data: Optional[dict[str, Any]] = None,
+        error: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        status: str = "",
+    ) -> None:
+        try:
+            row = [
+                str(uuid.uuid4()),
+                datetime.utcnow(),
+                execution_id,
+                event,
+                function_name,
+                step_id,
+                json.dumps(input_data, default=str) if input_data else "",
+                json.dumps(output_data, default=str) if output_data else "",
+                error or "",
+                duration_ms or 0,
+                status,
+            ]
+        except Exception as e:
+            logger.warning(f"Failed to log {event}: {e}")
+            return
+        self._enqueue("execution_logs", row)
 
     async def log_execution_start(
         self, execution_id: str, function_name: str, input_data: dict[str, Any]
     ):
         """Log execution start event."""
-        if not self._ensure_client():
-            return
-
-        try:
-            self.client.insert(
-                "execution_logs",
-                [
-                    [
-                        str(uuid.uuid4()),
-                        datetime.utcnow(),
-                        execution_id,
-                        "execution_started",
-                        function_name,
-                        "",  # step_id
-                        json.dumps(input_data) if input_data else "",
-                        "",  # output_data
-                        "",  # error
-                        0,  # duration_ms
-                        "",  # status
-                    ]
-                ],
-                column_names=[
-                    "log_id",
-                    "timestamp",
-                    "execution_id",
-                    "event",
-                    "function_name",
-                    "step_id",
-                    "input_data",
-                    "output_data",
-                    "error",
-                    "duration_ms",
-                    "status",
-                ],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log execution start: {e}")
+        self._execution_event(execution_id, "execution_started", function_name, input_data=input_data)
 
     async def log_execution_end(
         self,
@@ -295,85 +397,16 @@ class ClickHouseLogger:
         duration_ms: Optional[int] = None,
     ):
         """Log execution end event."""
-        if not self._ensure_client():
-            return
-
-        try:
-            self.client.insert(
-                "execution_logs",
-                [
-                    [
-                        str(uuid.uuid4()),
-                        datetime.utcnow(),
-                        execution_id,
-                        "execution_completed",
-                        "",  # function_name
-                        "",  # step_id
-                        "",  # input_data
-                        json.dumps(output_data) if output_data else "",
-                        error or "",
-                        duration_ms or 0,
-                        status,
-                    ]
-                ],
-                column_names=[
-                    "log_id",
-                    "timestamp",
-                    "execution_id",
-                    "event",
-                    "function_name",
-                    "step_id",
-                    "input_data",
-                    "output_data",
-                    "error",
-                    "duration_ms",
-                    "status",
-                ],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log execution end: {e}")
+        self._execution_event(
+            execution_id, "execution_completed",
+            output_data=output_data, error=error, duration_ms=duration_ms, status=status,
+        )
 
     async def log_function_call(
         self, execution_id: str, function_name: str, step_id: str, input_data: dict[str, Any]
     ):
         """Log function call within an execution."""
-        if not self._ensure_client():
-            return
-
-        try:
-            self.client.insert(
-                "execution_logs",
-                [
-                    [
-                        str(uuid.uuid4()),
-                        datetime.utcnow(),
-                        execution_id,
-                        "function_called",
-                        function_name,
-                        step_id,
-                        json.dumps(input_data) if input_data else "",
-                        "",  # output_data
-                        "",  # error
-                        0,  # duration_ms
-                        "",  # status
-                    ]
-                ],
-                column_names=[
-                    "log_id",
-                    "timestamp",
-                    "execution_id",
-                    "event",
-                    "function_name",
-                    "step_id",
-                    "input_data",
-                    "output_data",
-                    "error",
-                    "duration_ms",
-                    "status",
-                ],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log function call: {e}")
+        self._execution_event(execution_id, "function_called", function_name, step_id, input_data=input_data)
 
     async def log_function_result(
         self,
@@ -385,47 +418,14 @@ class ClickHouseLogger:
         duration_ms: Optional[int] = None,
     ):
         """Log function result within an execution."""
-        if not self._ensure_client():
-            return
-
-        try:
-            self.client.insert(
-                "execution_logs",
-                [
-                    [
-                        str(uuid.uuid4()),
-                        datetime.utcnow(),
-                        execution_id,
-                        "function_completed",
-                        function_name,
-                        step_id,
-                        "",  # input_data
-                        json.dumps(output_data) if output_data else "",
-                        error or "",
-                        duration_ms or 0,
-                        "",  # status
-                    ]
-                ],
-                column_names=[
-                    "log_id",
-                    "timestamp",
-                    "execution_id",
-                    "event",
-                    "function_name",
-                    "step_id",
-                    "input_data",
-                    "output_data",
-                    "error",
-                    "duration_ms",
-                    "status",
-                ],
-            )
-        except Exception as e:
-            logger.warning(f"Failed to log function result: {e}")
+        self._execution_event(
+            execution_id, "function_completed", function_name, step_id,
+            output_data=output_data, error=error, duration_ms=duration_ms,
+        )
 
     async def get_execution_logs(self, execution_id: str, limit: int = 1000) -> list:
         """Get logs for a specific execution."""
-        if not self._ensure_client():
+        if self._disabled:
             return []
 
         try:
@@ -436,8 +436,7 @@ class ClickHouseLogger:
                 ORDER BY timestamp ASC
                 LIMIT {limit}
             """
-            result = self.client.query(query, parameters={"execution_id": execution_id})
-            return result.result_rows
+            return await self.query(query, {"execution_id": execution_id})
         except Exception as e:
             logger.error(f"Failed to get execution logs: {e}")
             return []
@@ -494,10 +493,21 @@ class ClickHouseLogger:
         except Exception as e:
             logger.error(f"ClickHouse storage migration: failed to apply: {e}")
 
+    async def aclose(self):
+        """Insert what's still buffered, then close the connection."""
+        if self._flusher is not None and not self._flusher.done():
+            self._flusher.cancel()
+        try:
+            await self.flush()
+        except Exception as e:
+            logger.warning(f"ClickHouse final flush failed: {e}")
+        self.close()
+
     def close(self):
         """Close ClickHouse connection."""
         if self.client:
             self.client.close()
+            self.client = None
 
 
 # Global logger instance
