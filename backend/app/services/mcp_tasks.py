@@ -359,7 +359,8 @@ def _queue_delivery(row: McpTask, content: str) -> None:
     change it reports. `_flush_deliveries` sends it; until it has, the task
     stays due, so the sweep retries."""
     row.pending_deliveries = list(row.pending_deliveries or []) + [content]
-    row.next_poll_at = _now()
+    if row.next_poll_at is None:  # finished: due again until delivered
+        row.next_poll_at = _now()
 
 
 _DELIVERY_RETRY = timedelta(seconds=30)
@@ -368,35 +369,56 @@ _DELIVERY_RETRY = timedelta(seconds=30)
 async def _flush_deliveries(task_id: uuid.UUID) -> None:
     """Send the task's outbox into the chat, in order. A message leaves the
     outbox only once the chat accepted it (or dropped it: an archived chat,
-    an inactive owner); a failure leaves it there and retries later. The row
-    is locked while a message is handed over, so two flushes never send the
-    same one; a crash between handing it over and committing can send a
-    message twice, never lose one."""
+    an inactive owner); a failure leaves it there and retries later.
+
+    No lock is held while the chat is written to: delivery writes the chat
+    in sessions of its own, and holding this row's lock across that could
+    deadlock with anything that locks the chat first (deleting it cascades
+    to this row). Instead the message is claimed (the row is made not due
+    for the length of a lease, so no sweep picks it up meanwhile), delivered,
+    then removed under the lock. A crash in between can send a message
+    twice, never lose one."""
     from app.core.database import AsyncSessionLocal
     from app.services.chat_wakeups import deliver_to_chat
 
-    async with AsyncSessionLocal() as db:
-        while True:
+    while True:
+        async with AsyncSessionLocal() as db:
             row = await db.get(McpTask, task_id, with_for_update=True, populate_existing=True)
             if row is None:
-                await db.commit()
                 return
             pending = list(row.pending_deliveries or [])
             if not pending:
-                if row.finished_at is not None:
+                if row.finished_at is not None and row.next_poll_at is not None:
                     row.next_poll_at = None  # nothing left to poll or deliver
                 await db.commit()
                 return
-            try:
-                await deliver_to_chat(str(row.chat_id), pending[0], source="mcp_task", api_key_id=row.api_key_id)
-            except Exception:
-                logger.exception("Delivering MCP task %s into chat %s failed; retrying", row.id, row.chat_id)
-                retry = _now() + _DELIVERY_RETRY
-                if row.next_poll_at is None or row.next_poll_at > retry or row.finished_at is not None:
-                    row.next_poll_at = retry
+            resume_at = row.next_poll_at
+            row.next_poll_at = _now() + _LEASE  # claimed
+            await db.commit()
+            message, chat_id, api_key_id = pending[0], str(row.chat_id), row.api_key_id
+
+        try:
+            await deliver_to_chat(chat_id, message, source="mcp_task", api_key_id=api_key_id)
+            delivered = True
+        except Exception:
+            logger.exception("Delivering MCP task %s into chat %s failed; retrying", task_id, chat_id)
+            delivered = False
+
+        async with AsyncSessionLocal() as db:
+            row = await db.get(McpTask, task_id, with_for_update=True, populate_existing=True)
+            if row is None:
+                return
+            if not delivered:
+                row.next_poll_at = _now() + _DELIVERY_RETRY
                 await db.commit()
                 return
-            row.pending_deliveries = pending[1:]
+            current = list(row.pending_deliveries or [])
+            if current and current[0] == message:
+                row.pending_deliveries = current[1:]
+            if row.finished_at is None:
+                row.next_poll_at = resume_at or _now()  # back to its poll schedule
+            else:
+                row.next_poll_at = _now() if row.pending_deliveries else None
             await db.commit()
 
 
