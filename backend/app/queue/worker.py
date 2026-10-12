@@ -470,6 +470,11 @@ async def shutdown(ctx: dict) -> None:
             pass
         await redis.aclose()
 
+    # Execution log rows still buffered for ClickHouse
+    from app.services.clickhouse_logger import clickhouse_logger
+
+    await clickhouse_logger.aclose()
+
     # LLM clients this worker opened (agent jobs)
     from app.providers.clients import close_shared_clients
 

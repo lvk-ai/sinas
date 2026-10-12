@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -100,7 +101,7 @@ async def lifespan(app: FastAPI):
 
     # Apply ClickHouse storage/TTL migration
     try:
-        clickhouse_logger.apply_storage_migration()
+        await asyncio.to_thread(clickhouse_logger.apply_storage_migration)
     except Exception as e:
         print(f"⚠️  ClickHouse storage migration skipped: {e}")
 
@@ -127,7 +128,7 @@ async def lifespan(app: FastAPI):
     from app.providers.clients import close_shared_clients
 
     await close_shared_clients()
-    clickhouse_logger.close()
+    await clickhouse_logger.aclose()
     await close_redis()
 
 
