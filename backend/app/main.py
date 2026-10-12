@@ -123,6 +123,10 @@ async def lifespan(app: FastAPI):
     from app.services.database_pool import DatabasePoolManager
 
     await DatabasePoolManager.get_instance().close_all()
+
+    from app.providers.clients import close_shared_clients
+
+    await close_shared_clients()
     clickhouse_logger.close()
     await close_redis()
 

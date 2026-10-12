@@ -6,6 +6,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from .base import BaseLLMProvider
+from .clients import secret_id, shared_client
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -15,7 +16,10 @@ class OpenAIProvider(BaseLLMProvider):
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         super().__init__(api_key, base_url)
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.client = shared_client(
+            ("openai", secret_id(api_key), base_url),
+            lambda: AsyncOpenAI(api_key=api_key, base_url=base_url),
+        )
 
     def _prepare_params(
         self,
