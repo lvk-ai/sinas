@@ -325,6 +325,57 @@ class TestKeptTasks:
         row = await _poll_until(handle["task_id"], lambda r: r.finished_at is not None)
         assert row.status == "failed" and "Lost contact" in row.result["error"]
 
+    async def test_a_failed_inline_poll_keeps_the_task_instead_of_losing_it(self, env):
+        env["fake"].tasks.fail_gets = 1
+        handle = await _call(env, "slow", {"text": "kept"}, wait=5)
+        assert handle["status"] == "working" and "task_id" in handle
+        row = await _poll_until(handle["task_id"], lambda r: r.finished_at is not None)
+        assert row.result == {"text": "done: kept"}
+
+    async def test_a_slow_answer_does_not_stretch_the_inline_wait(self, env):
+        env["fake"].tasks.get_delay = 3
+        started = asyncio.get_running_loop().time()
+        handle = await _call(env, "slow", {"text": "z"}, wait=1)
+        assert asyncio.get_running_loop().time() - started < 2.5
+        assert handle["status"] == "working"
+
+    async def test_a_delivery_that_fails_is_kept_and_retried(self, env, monkeypatch):
+        calls = {"n": 0}
+        real = chat_wakeups.deliver_to_chat
+
+        async def flaky(chat_id, content, *, source, api_key_id=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("redis is down")
+            return await real(chat_id, content, source=source, api_key_id=api_key_id)
+
+        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", flaky)
+        handle = await _call(env, "slow", {"text": "r"})
+        row = await _poll_until(handle["task_id"], lambda r: r.finished_at is not None)
+        # Finished, but the result has not reached the chat yet: still owed.
+        assert env["delivered"] == [] and len(row.pending_deliveries) == 1 and row.next_poll_at is not None
+        await mcp_tasks.poll_due_tasks(now=_in(minutes=5))
+        row = await _row(handle["task_id"])
+        assert len(env["delivered"]) == 1 and "done: r" in env["delivered"][0][1]
+        assert row.pending_deliveries == [] and row.next_poll_at is None
+
+    async def test_a_poll_that_returns_after_a_cancel_changes_nothing(self, env, monkeypatch):
+        handle = await _call(env, "ask")
+        real_get = mcp_client.get_task
+
+        async def get_then_cancelled(db, server, user_id, task_id):
+            state = await real_get(db, server, user_id, task_id)  # input_required
+            async with AsyncSessionLocal() as s:  # the agent cancels meanwhile
+                chat = await s.get(Chat, env["chat"].id)
+                await mcp_tasks.execute_tool(s, chat, str(env["user"].id), mcp_tasks.MCP_TASK_CANCEL,
+                                             {"task_id": handle["task_id"]})
+            return state
+
+        monkeypatch.setattr(mcp_client, "get_task", get_then_cancelled)
+        await mcp_tasks.poll_due_tasks(now=_in(minutes=5))
+        row = await _row(handle["task_id"])
+        assert row.status == "cancelled" and env["delivered"] == []
+
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}
         assert names == {"mcp_task_status", "mcp_task_respond", "mcp_task_cancel"}

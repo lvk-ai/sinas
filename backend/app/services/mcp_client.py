@@ -192,14 +192,25 @@ class _TasksExtension(ClientExtension):
             if task.status == "input_required":
                 raise TaskPending(task)
             interval = poll_interval_seconds(task, floor=0.2, ceiling=5.0, default=1.0)
-            if time.monotonic() + interval > deadline:
+            if time.monotonic() + interval >= deadline:
                 raise TaskPending(task)
             await asyncio.sleep(interval)
-            task = await _send_get(ctx.session, task.task_id)
+            try:
+                # Each look is bounded by what is left of the wait, so a slow
+                # answer can't hold the turn past it.
+                task = await _send_get(ctx.session, task.task_id, timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as e:
+                # The task exists on the server whatever this look did: hand
+                # it on (with what we last knew) to be polled again, rather
+                # than lose the handle.
+                logger.info(f"MCP task {task.task_id}: inline poll failed ({e}); handing it on")
+                raise TaskPending(task) from e
 
 
-async def _send_get(session: Any, task_id: str) -> TaskState:
-    return await session.send_request(_GetTask(params=_TaskParams(task_id=task_id)), TaskState)
+async def _send_get(session: Any, task_id: str, timeout: Optional[float] = None) -> TaskState:
+    return await session.send_request(
+        _GetTask(params=_TaskParams(task_id=task_id)), TaskState, request_read_timeout_seconds=timeout
+    )
 
 
 @dataclass(frozen=True)

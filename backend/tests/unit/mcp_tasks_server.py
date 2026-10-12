@@ -58,6 +58,8 @@ class TasksExtension(Extension):
         self.declared: list[bool] = []  # per tools/call: did the client declare Tasks?
         self.cancelled: list[str] = []
         self.updates: list[dict[str, Any]] = []
+        self.fail_gets = 0  # the next N tasks/get answer with an error
+        self.get_delay = 0.0  # seconds each tasks/get takes to answer
 
     def _task(self, task_id: str) -> dict[str, Any]:
         t = self.tasks[task_id]
@@ -84,6 +86,15 @@ class TasksExtension(Extension):
         return {**self._task(task_id), "resultType": "task"}
 
     async def _get(self, ctx, params: _TaskIdParams):
+        if self.get_delay:
+            import asyncio
+
+            await asyncio.sleep(self.get_delay)
+        if self.fail_gets:
+            from mcp.shared.exceptions import MCPError
+
+            self.fail_gets -= 1
+            raise MCPError(code=-32603, message="temporarily unavailable")
         t = self.tasks.get(params.task_id)
         if t is None:
             from mcp.shared.exceptions import MCPError

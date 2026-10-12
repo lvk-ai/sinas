@@ -38,7 +38,8 @@ class McpTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     status_message: Mapped[Optional[str]] = mapped_column(Text)
     poll_interval_ms: Mapped[Optional[int]] = mapped_column(Integer)
-    # When the poller looks next; NULL once the task is finished.
+    # When the sweep looks next (a poll, or a delivery to retry); NULL once
+    # the task is finished and everything is delivered.
     next_poll_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
     # From the server's ttlMs: past it the server may have dropped the task.
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -48,6 +49,10 @@ class McpTask(Base):
     answered_input_keys: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     # The final result as the agent got it (mapped like any tool result).
     result: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    # Messages for the chat not yet accepted by it (an outbox): written in
+    # the same commit as the state change they report, removed once
+    # delivered, retried by the sweep until then.
+    pending_deliveries: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     # Consecutive polls that could not reach the server.
     failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

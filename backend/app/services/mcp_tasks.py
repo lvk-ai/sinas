@@ -131,6 +131,7 @@ async def keep_task(
         # agent: the poller must not deliver them a second time.
         delivered_input_keys=list(task.input_requests or {}) if waiting_for_input else [],
         answered_input_keys=[],
+        pending_deliveries=[],
         api_key_id=current_api_key_id(),
     )
     db.add(row)
@@ -162,8 +163,9 @@ async def keep_task(
 # ---------------------------------------------------------------------------
 
 async def poll_due_tasks(now: Optional[datetime] = None, limit: int = 50) -> int:
-    """Poll every task whose time has come. The agent worker runs this every
-    few seconds; returns how many tasks were polled."""
+    """Poll every task whose time has come, and retry deliveries that did not
+    get through. The agent worker runs this every few seconds; returns how
+    many tasks it handled."""
     from app.core.database import AsyncSessionLocal
 
     now = now or _now()
@@ -171,7 +173,7 @@ async def poll_due_tasks(now: Optional[datetime] = None, limit: int = 50) -> int
         rows = (
             await db.execute(
                 select(McpTask)
-                .where(McpTask.finished_at.is_(None), McpTask.next_poll_at <= now)
+                .where(McpTask.next_poll_at <= now)
                 .order_by(McpTask.next_poll_at)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
@@ -196,9 +198,10 @@ async def poll_due_tasks(now: Optional[datetime] = None, limit: int = 50) -> int
 
 
 async def poll_task(task_id: uuid.UUID, *, deliver: bool = True) -> Optional[dict[str, Any]]:
-    """One `tasks/get` for a kept task, and whatever follows from it. With
-    `deliver=False` (the status tool) nothing is delivered into the chat: the
-    caller hands the snapshot to the agent itself. Returns the snapshot.
+    """One `tasks/get` for a kept task, and whatever follows from it, then
+    the delivery of anything it produced. With `deliver=False` (the status
+    tool) nothing is delivered into the chat: the caller hands the snapshot
+    to the agent itself. Returns the snapshot.
 
     Acts through the API key the calling turn acted through, so the server
     access check holds the poll to that key's grants, as it held the call."""
@@ -210,7 +213,10 @@ async def poll_task(task_id: uuid.UUID, *, deliver: bool = True) -> Optional[dic
         api_key_id = row.api_key_id if row is not None else None
     key_token = bind_api_key(api_key_id)
     try:
-        return await _poll_task(task_id, deliver=deliver)
+        snap = await _poll_task(task_id, deliver=deliver)
+        if deliver:
+            await _flush_deliveries(task_id)
+        return snap
     finally:
         reset_api_key(key_token)
 
@@ -226,10 +232,9 @@ async def _poll_task(task_id: uuid.UUID, *, deliver: bool) -> Optional[dict[str,
         if row.finished_at is not None:
             return snapshot(row)
         server = await db.get(McpServer, row.mcp_server_id)
-        now = _now()
         user_id = str(row.user_id)
 
-        if row.expires_at is not None and now >= row.expires_at:
+        if row.expires_at is not None and _now() >= row.expires_at:
             return await _finish(
                 db, row, server, "failed",
                 {"error": "The task expired before it finished (the server may have dropped it)."},
@@ -242,48 +247,66 @@ async def _poll_task(task_id: uuid.UUID, *, deliver: bool) -> Optional[dict[str,
         if usable is None:
             return await _finish(db, row, server, "failed", {"error": problem}, deliver=deliver)
 
+        task: Optional[TaskState] = None
+        error: Optional[McpClientError] = None
         try:
             task = await mcp_client.get_task(db, usable, user_id, row.server_task_id)
         except McpClientError as e:
+            error = e
+        result = None
+        if task is not None and task.status in TERMINAL_TASK_STATUSES:
+            # Mapped before the row is locked: storing binary content
+            # commits, which would release the lock.
+            result = await _map_result(db, row, task)
+
+        # The row may have changed while the server answered (a cancel, a
+        # response, another poll): decide on what it holds now.
+        await db.refresh(row, with_for_update=True)
+        if row.finished_at is not None:
+            await db.commit()
+            return snapshot(row)
+        now = _now()
+
+        if error is not None:
             row.failures += 1
             if row.failures >= settings.mcp_task_max_poll_failures:
                 return await _finish(
                     db, row, usable, "failed",
-                    {"error": f"Lost contact with the MCP server while the task ran: {e}"},
+                    {"error": f"Lost contact with the MCP server while the task ran: {error}"},
                     deliver=deliver,
                 )
             backoff = min(settings.mcp_task_max_poll_seconds, settings.mcp_task_min_poll_seconds * 2 ** row.failures)
             row.next_poll_at = now + timedelta(seconds=backoff)
             await db.commit()
-            logger.info("MCP task %s: poll failed (%s), retrying in %ss", row.id, e, backoff)
+            logger.info("MCP task %s: poll failed (%s), retrying in %ss", row.id, error, backoff)
             return snapshot(row)
+
+        if result is not None:
+            return await _finish(
+                db, row, usable, task.status, result, deliver=deliver, status_message=task.status_message
+            )
 
         row.failures = 0
         row.status = task.status
         row.status_message = task.status_message
         row.poll_interval_ms = task.poll_interval_ms
-
-        if task.status in TERMINAL_TASK_STATUSES:
-            result = await _map_result(db, row, task)
-            return await _finish(db, row, usable, task.status, result, deliver=deliver)
-
         row.next_poll_at = now + _interval(task)
-        new_requests: dict[str, Any] = {}
         if task.status == "input_required":
             row.input_requests = task.input_requests or {}
             seen = set(row.delivered_input_keys or []) | set(row.answered_input_keys or [])
             new_requests = {k: v for k, v in row.input_requests.items() if k not in seen}
             if new_requests and deliver:
+                # Recorded with the state that produced it: if delivery
+                # fails, the sweep retries it; it is never silently lost.
                 row.delivered_input_keys = list(row.delivered_input_keys or []) + list(new_requests)
+                _queue_delivery(
+                    row,
+                    f"[mcp task {row.id} needs input: {_label(row, usable)}]\n"
+                    f"{json.dumps(new_requests, default=str)}\n"
+                    f"Answer with {MCP_TASK_RESPOND}('{row.id}', responses), one response per request "
+                    f"key; when a request asks the user for something, ask the user first.",
+                )
         await db.commit()
-        if new_requests and deliver:
-            await _deliver(
-                row,
-                f"[mcp task {row.id} needs input: {_label(row, usable)}]\n"
-                f"{json.dumps(new_requests, default=str)}\n"
-                f"Answer with {MCP_TASK_RESPOND}('{row.id}', responses), one response per request "
-                f"key; when a request asks the user for something, ask the user first.",
-            )
         return snapshot(row)
 
 
@@ -309,31 +332,72 @@ async def _map_result(db, row: McpTask, task: TaskState) -> dict[str, Any]:
 
 
 async def _finish(
-    db, row: McpTask, server: Optional[McpServer], status: str, result: dict[str, Any], *, deliver: bool
+    db, row: McpTask, server: Optional[McpServer], status: str, result: dict[str, Any], *,
+    deliver: bool, status_message: Optional[str] = None,
 ) -> dict[str, Any]:
     """Mark the task finished, once: whoever sets finished_at under the row
-    lock delivers; anyone else (a concurrent sweep or status call) doesn't."""
+    lock queues the delivery; anyone else (a concurrent sweep, a status
+    call, a cancel) doesn't."""
     await db.refresh(row, with_for_update=True)
     if row.finished_at is not None:
         await db.commit()
         return snapshot(row)
     row.status = status
+    if status_message is not None:
+        row.status_message = status_message
     row.result = result
     row.finished_at = _now()
     row.next_poll_at = None
-    await db.commit()
     if deliver:
-        await _deliver(row, f"[mcp task {row.id} {status}: {_label(row, server)}]\n{_clip(result, str(row.id))}")
+        _queue_delivery(row, f"[mcp task {row.id} {status}: {_label(row, server)}]\n{_clip(result, str(row.id))}")
+    await db.commit()
     return snapshot(row)
 
 
-async def _deliver(row: McpTask, content: str) -> None:
+def _queue_delivery(row: McpTask, content: str) -> None:
+    """Add a message to the task's outbox, in the same commit as the state
+    change it reports. `_flush_deliveries` sends it; until it has, the task
+    stays due, so the sweep retries."""
+    row.pending_deliveries = list(row.pending_deliveries or []) + [content]
+    row.next_poll_at = _now()
+
+
+_DELIVERY_RETRY = timedelta(seconds=30)
+
+
+async def _flush_deliveries(task_id: uuid.UUID) -> None:
+    """Send the task's outbox into the chat, in order. A message leaves the
+    outbox only once the chat accepted it (or dropped it: an archived chat,
+    an inactive owner); a failure leaves it there and retries later. The row
+    is locked while a message is handed over, so two flushes never send the
+    same one; a crash between handing it over and committing can send a
+    message twice, never lose one."""
+    from app.core.database import AsyncSessionLocal
     from app.services.chat_wakeups import deliver_to_chat
 
-    try:
-        await deliver_to_chat(str(row.chat_id), content, source="mcp_task", api_key_id=row.api_key_id)
-    except Exception:
-        logger.exception("Delivering MCP task %s into chat %s failed", row.id, row.chat_id)
+    async with AsyncSessionLocal() as db:
+        while True:
+            row = await db.get(McpTask, task_id, with_for_update=True, populate_existing=True)
+            if row is None:
+                await db.commit()
+                return
+            pending = list(row.pending_deliveries or [])
+            if not pending:
+                if row.finished_at is not None:
+                    row.next_poll_at = None  # nothing left to poll or deliver
+                await db.commit()
+                return
+            try:
+                await deliver_to_chat(str(row.chat_id), pending[0], source="mcp_task", api_key_id=row.api_key_id)
+            except Exception:
+                logger.exception("Delivering MCP task %s into chat %s failed; retrying", row.id, row.chat_id)
+                retry = _now() + _DELIVERY_RETRY
+                if row.next_poll_at is None or row.next_poll_at > retry or row.finished_at is not None:
+                    row.next_poll_at = retry
+                await db.commit()
+                return
+            row.pending_deliveries = pending[1:]
+            await db.commit()
 
 
 def snapshot(row: McpTask) -> dict[str, Any]:
@@ -464,9 +528,11 @@ async def execute_tool(db, chat: Optional[Chat], user_id: str, tool_name: str, a
             await mcp_client.update_task(db, usable, user_id, row.server_task_id, responses)
         except McpClientError as e:
             return {"error": str(e)}
+        await db.refresh(row, with_for_update=True)
         row.answered_input_keys = list(row.answered_input_keys or []) + list(responses)
-        row.status = "working"
-        row.next_poll_at = _now()  # look again soon
+        if row.finished_at is None:
+            row.status = "working"
+            row.next_poll_at = _now()  # look again soon
         await db.commit()
         return {"task_id": str(row.id), "status": "working",
                 "hint": "Answer sent; the result is delivered into this chat when the task finishes."}
@@ -483,6 +549,9 @@ async def execute_tool(db, chat: Optional[Chat], user_id: str, tool_name: str, a
             row.result = {"error": "Cancelled by the agent"}
             row.finished_at = _now()
             row.next_poll_at = None
+            # Nothing more about this task reaches the chat, including an
+            # input request still waiting to be delivered.
+            row.pending_deliveries = []
         await db.commit()
         return {"task_id": str(row.id), "status": row.status, "note": note}
 

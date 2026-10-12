@@ -39,6 +39,7 @@ def upgrade() -> None:
         sa.Column("delivered_input_keys", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("answered_input_keys", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("result", sa.JSON(), nullable=True),
+        sa.Column("pending_deliveries", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("failures", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("api_key_id", sa.String(64), nullable=True),
