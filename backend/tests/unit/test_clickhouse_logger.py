@@ -113,3 +113,46 @@ async def test_queries_run_off_the_loop():
     logger = _logger(client=MagicMock(query=query))
     assert await logger.get_execution_logs("e1") == [(1,)]
     assert seen == [False]
+
+
+async def test_close_waits_for_an_insert_under_way(monkeypatch):
+    monkeypatch.setattr(module, "FLUSH_INTERVAL_S", 0.01)
+    events = []
+
+    def slow_insert(table, rows, column_names):
+        time.sleep(0.2)
+        events.append(("insert", len(rows)))
+
+    client = MagicMock(insert=slow_insert, close=lambda: events.append("close"))
+    logger = _logger(client=client)
+    await _log(logger, 3)
+    while not logger._inserts:  # the flusher has taken the rows
+        await asyncio.sleep(0.005)
+    await _log(logger, 1)  # buffered meanwhile
+    await logger.aclose()
+    assert events == [("insert", 3), ("insert", 1), "close"]
+
+
+async def test_a_read_that_loses_the_connection_backs_off():
+    from clickhouse_connect.driver.exceptions import OperationalError
+
+    client = MagicMock()
+    client.query.side_effect = OperationalError("connection refused")
+    logger = _logger(client=client)
+    try:
+        await logger.query("SELECT 1")
+        raise AssertionError("expected ConnectionError")
+    except ConnectionError:
+        pass
+    assert logger.client is None and not logger.available
+
+
+async def test_a_bad_insert_is_not_an_outage():
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    client = MagicMock()
+    client.insert.side_effect = DatabaseError("unknown column")
+    logger = _logger(client=client)
+    await _log(logger)
+    await logger.flush()
+    assert logger.client is client

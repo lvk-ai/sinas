@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import OperationalError, StreamFailureError
 
 from app.core.config import settings
 
@@ -71,6 +72,10 @@ EXECUTION_COLUMNS = [
 
 _COLUMNS = {"request_logs": REQUEST_COLUMNS, "execution_logs": EXECUTION_COLUMNS}
 
+# Failures of the connection, not of the statement: these mean ClickHouse is
+# down or unreachable, so wait before the next attempt.
+_CONNECTION_ERRORS = (OperationalError, StreamFailureError, OSError)
+
 
 class ClickHouseLogger:
     """Centralized ClickHouse logging service."""
@@ -83,6 +88,7 @@ class ClickHouseLogger:
         self._buffers: dict[str, list[list[Any]]] = {table: [] for table in _COLUMNS}
         self._dropped = 0
         self._flusher: Optional[asyncio.Task] = None
+        self._inserts: set[asyncio.Future] = set()
         if not settings.clickhouse_host:
             self._initialize_client()  # logs that it's off
 
@@ -118,29 +124,33 @@ class ClickHouseLogger:
             self.client = None
 
     def _ensure_client(self) -> bool:
-        """Connect if needed. Blocking: call it from a thread.
+        """Connect if needed. Blocking: call it from a thread."""
+        return self._connected() is not None
 
-        After a failure, it doesn't try again for RETRY_AFTER_S.
+    def _connected(self) -> Optional[Client]:
+        """The client, connecting first if needed; None when unavailable.
+
+        Blocking: call it from a thread. After a failure, it doesn't try
+        again for RETRY_AFTER_S. Callers use the client it returns, not
+        `self.client`, which another thread may clear meanwhile.
         """
         if self._disabled:
-            return False
-        if self.client:
-            return True
+            return None
         with self._connect_lock:
-            if self.client:
-                return True
-            if time.monotonic() < self._retry_at:
-                return False
-            self._initialize_client()
-            if self.client is None and not self._disabled:
-                self._retry_at = time.monotonic() + RETRY_AFTER_S
-        return self.client is not None
+            if self.client is None and time.monotonic() >= self._retry_at:
+                self._initialize_client()
+                if self.client is None and not self._disabled:
+                    self._retry_at = time.monotonic() + RETRY_AFTER_S
+            return self.client
 
-    def _lost(self, error: Exception, what: str) -> None:
-        """A call failed: log it, and reconnect later instead of at once."""
+    def _lost(self, client: Client, error: Exception, what: str) -> None:
+        """A call on `client` failed on the connection: reconnect later,
+        not at once."""
         logger.warning(f"ClickHouse {what} failed: {error}")
-        self.client = None
-        self._retry_at = time.monotonic() + RETRY_AFTER_S
+        with self._connect_lock:
+            if self.client is client:
+                self.client = None
+                self._retry_at = time.monotonic() + RETRY_AFTER_S
 
     # --- writes: buffered, inserted in batches off the event loop ---
 
@@ -168,26 +178,42 @@ class ClickHouseLogger:
             await self.flush()
 
     async def flush(self) -> None:
-        """Insert everything buffered so far, from a thread."""
+        """Insert everything buffered so far, from a thread.
+
+        Each insert runs as its own task, shielded: cancelling a flush (at
+        shutdown) doesn't abandon rows already taken from the buffer, and
+        `aclose` waits for them.
+        """
         for table, rows in list(self._buffers.items()):
             if rows:
                 self._buffers[table] = []
-                await asyncio.to_thread(self._insert, table, rows)
+                task = asyncio.ensure_future(asyncio.to_thread(self._insert, table, rows))
+                self._inserts.add(task)
+                task.add_done_callback(self._inserts.discard)
+                await asyncio.shield(task)
 
     def _insert(self, table: str, rows: list[list[Any]]) -> None:
-        if not self._ensure_client():
+        client = self._connected()
+        if client is None:
             return
         try:
-            self.client.insert(table, rows, column_names=_COLUMNS[table])
+            client.insert(table, rows, column_names=_COLUMNS[table])
+        except _CONNECTION_ERRORS as e:
+            self._lost(client, e, f"insert of {len(rows)} {table} rows")
         except Exception as e:
-            self._lost(e, f"insert of {len(rows)} {table} rows")
+            logger.warning(f"ClickHouse insert of {len(rows)} {table} rows failed: {e}")
 
     # --- reads: run in a thread ---
 
     def _query_rows(self, query: str, parameters: Optional[dict[str, Any]] = None) -> list:
-        if not self._ensure_client():
+        client = self._connected()
+        if client is None:
             raise ConnectionError("ClickHouse not available")
-        return self.client.query(query, parameters=parameters or {}).result_rows
+        try:
+            return client.query(query, parameters=parameters or {}).result_rows
+        except _CONNECTION_ERRORS as e:
+            self._lost(client, e, "query")
+            raise ConnectionError("ClickHouse not available") from e
 
     @property
     def available(self) -> bool:
@@ -448,7 +474,8 @@ class ClickHouseLogger:
         data from hot (local) to cold (S3) after hot_retention_days.
         Otherwise, sets TTL to DELETE data after retention_days.
         """
-        if not self._ensure_client():
+        client = self._connected()
+        if client is None:
             return
 
         tables = ["request_logs", "execution_logs"]
@@ -456,7 +483,7 @@ class ClickHouseLogger:
         retention_days = settings.clickhouse_retention_days
 
         try:
-            result = self.client.query(
+            result = client.query(
                 "SELECT policy_name FROM system.storage_policies WHERE policy_name = 'tiered'"
             )
             has_tiered = len(result.result_rows) > 0
@@ -471,13 +498,13 @@ class ClickHouseLogger:
                     f"Hot retention: {hot_days}d, then move to S3."
                 )
                 for table in tables:
-                    self.client.command(
+                    client.command(
                         f"ALTER TABLE {table} MODIFY SETTING storage_policy = 'tiered'"
                     )
-                    self.client.command(
+                    client.command(
                         f"ALTER TABLE {table} MODIFY TTL CAST(timestamp AS DateTime) + INTERVAL {hot_days} DAY TO VOLUME 'cold'"
                     )
-                    self.client.command(f"ALTER TABLE {table} MATERIALIZE TTL")
+                    client.command(f"ALTER TABLE {table} MATERIALIZE TTL")
                     logger.info(f"  {table}: tiered TTL applied")
             else:
                 logger.info(
@@ -485,10 +512,10 @@ class ClickHouseLogger:
                     f"TTL DELETE after {retention_days}d."
                 )
                 for table in tables:
-                    self.client.command(
+                    client.command(
                         f"ALTER TABLE {table} MODIFY TTL CAST(timestamp AS DateTime) + INTERVAL {retention_days} DAY DELETE"
                     )
-                    self.client.command(f"ALTER TABLE {table} MATERIALIZE TTL")
+                    client.command(f"ALTER TABLE {table} MATERIALIZE TTL")
                     logger.info(f"  {table}: delete TTL applied")
         except Exception as e:
             logger.error(f"ClickHouse storage migration: failed to apply: {e}")
@@ -498,6 +525,10 @@ class ClickHouseLogger:
         if self._flusher is not None and not self._flusher.done():
             self._flusher.cancel()
         try:
+            # Inserts already under way finish first (they hold rows that
+            # left the buffer), then the rest is written.
+            if self._inserts:
+                await asyncio.gather(*self._inserts, return_exceptions=True)
             await self.flush()
         except Exception as e:
             logger.warning(f"ClickHouse final flush failed: {e}")
