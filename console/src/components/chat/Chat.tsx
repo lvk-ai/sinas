@@ -33,6 +33,12 @@ export interface ChatProps {
   onError?: (error: string) => void;
   /** Called when messages are refreshed from server (after stream ends) */
   onMessagesRefreshed?: () => void;
+  /** Deliver a message into the running turn (steering). When set, the
+   *  input stays usable while a turn streams. */
+  onSteer?: (chatId: string, text: string) => Promise<void>;
+  /** Stop the running turn server-side (cooperative interrupt), not just
+   *  this stream. Called before the stream is closed. */
+  onInterrupt?: (chatId: string) => Promise<void>;
 }
 
 export function Chat({
@@ -48,6 +54,8 @@ export function Chat({
   onChatCreated,
   onError,
   onMessagesRefreshed,
+  onSteer,
+  onInterrupt,
 }: ChatProps) {
   injectBaseStyles();
   injectMarkdownStyles();
@@ -149,6 +157,24 @@ export function Chat({
     },
     [send],
   );
+
+  const handleSteer = React.useCallback(
+    (text: string) => {
+      if (!chatId || !onSteer) return;
+      onSteer(chatId, text).catch((e: Error) => onError?.(e.message || 'Could not deliver the message'));
+    },
+    [chatId, onSteer, onError],
+  );
+
+  const handleStop = React.useCallback(async () => {
+    try {
+      if (chatId && onInterrupt) await onInterrupt(chatId);
+    } catch (e) {
+      onError?.((e as Error).message || 'Could not stop the turn');
+    } finally {
+      stop();
+    }
+  }, [chatId, onInterrupt, onError, stop]);
 
   const heightValue = typeof height === 'number' ? `${height}px` : height;
 
@@ -339,7 +365,8 @@ export function Chat({
       {/* Input bar */}
       <ChatInput
         onSend={handleSend}
-        onStop={stop}
+        onStop={handleStop}
+        onSteer={onSteer && chatId ? handleSteer : undefined}
         streaming={streaming}
         disabled={loading}
         placeholder={placeholder}

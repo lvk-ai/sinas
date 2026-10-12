@@ -81,6 +81,20 @@ async def with_heartbeat(aiter, interval: int = HEARTBEAT_INTERVAL):
             return
 
 
+# `done` payload for a stream that ends because its round is parked on the user.
+SUSPENDED_DONE = {"event": "done", "data": json.dumps({"status": "suspended"})}
+
+
+def round_waits_only_on_user(event: dict, asked: set[str]) -> bool:
+    """Whether a round_suspended event parks the round on ask_user questions
+    alone. Their answers resume on the fresh channel the answer endpoint
+    returns, never on this one, so nothing more arrives here: the stream ends
+    instead of idling until the relay times out. A round also waiting on a
+    background run or a sub-agent resumes on this channel and stays open."""
+    ids = set(event.get("tool_call_ids") or [])
+    return bool(ids) and ids <= asked
+
+
 @router.get("/agents/default", response_model=AgentResponse)
 async def get_default_agent(
     http_request: Request,
@@ -536,6 +550,7 @@ async def stream_message(
         )
 
         async def keep_alive_generator():
+            asked: set[str] = set()
             try:
                 async for event in stream_relay.subscribe(channel_id, last_id="0"):
                     event_type = event.get("type", "message")
@@ -555,6 +570,11 @@ async def stream_message(
                         "round_suspended",
                     ):
                         yield {"event": event_type, "data": json.dumps(event)}
+                        if event_type == "input_required":
+                            asked.add(event.get("tool_call_id"))
+                        elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
+                            yield SUSPENDED_DONE
+                            return
                     else:
                         yield {"event": "message", "data": json.dumps(event)}
             except asyncio.CancelledError:
@@ -683,6 +703,9 @@ async def reconnect_stream(
         raise HTTPException(403, "Not authorized")
 
     async def event_generator():
+        # Reconnecting past the input_required events leaves `asked` short:
+        # the stream then stays open, as before, rather than ending early.
+        asked: set[str] = set()
         try:
             async for event in stream_relay.subscribe(channel_id, last_id=last_id):
                 event_type = event.get("type", "message")
@@ -706,6 +729,11 @@ async def reconnect_stream(
                     "round_suspended",
                 ):
                     yield {"event": event_type, "data": json.dumps(event)}
+                    if event_type == "input_required":
+                        asked.add(event.get("tool_call_id"))
+                    elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
+                        yield SUSPENDED_DONE
+                        return
                 else:
                     yield {"event": "message", "data": json.dumps(event)}
         except asyncio.CancelledError:

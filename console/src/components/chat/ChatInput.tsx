@@ -5,6 +5,10 @@ import type { MessageContent, ContentPart } from '@sinas/sdk';
 export interface ChatInputProps {
   onSend: (content: MessageContent) => void;
   onStop?: () => void;
+  /** While a turn streams: deliver a text message into the running turn
+   *  (the agent sees it at its next step). Without it, input waits for the
+   *  turn to end. */
+  onSteer?: (text: string) => void;
   streaming?: boolean;
   disabled?: boolean;
   placeholder?: string;
@@ -71,6 +75,24 @@ const FileIcon = () => (
   </svg>
 );
 
+function sendButtonStyle(enabled: boolean): React.CSSProperties {
+  return {
+    width: '40px',
+    height: '42px',
+    borderRadius: v(tokens.radiusMd),
+    border: 'none',
+    backgroundColor: v(tokens.colorPrimary),
+    color: '#fff',
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    opacity: enabled ? 1 : 0.4,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    transition: 'opacity 150ms ease',
+  };
+}
+
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -83,6 +105,7 @@ function fileToBase64(file: File): Promise<string> {
 export function ChatInput({
   onSend,
   onStop,
+  onSteer,
   streaming = false,
   disabled = false,
   placeholder = 'Type a message...',
@@ -151,10 +174,23 @@ export function ChatInput({
     }
   };
 
+  const handleSteer = () => {
+    const trimmed = value.trim();
+    if (!trimmed || !onSteer) return;
+    onSteer(trimmed);
+    setValue('');
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (streaming) return;
+      if (streaming) {
+        handleSteer();
+        return;
+      }
       handleSubmit();
     }
   };
@@ -354,9 +390,19 @@ export function ChatInput({
             maxHeight: '150px',
           }}
         />
+        {streaming && onSteer && value.trim() && (
+          <button
+            onClick={handleSteer}
+            title="Send into the running turn"
+            style={sendButtonStyle(true)}
+          >
+            <SendIcon />
+          </button>
+        )}
         {streaming ? (
           <button
             onClick={onStop}
+            title="Stop"
             style={{
               width: '40px',
               height: '42px',
@@ -377,21 +423,7 @@ export function ChatInput({
           <button
             onClick={handleSubmit}
             disabled={disabled || !hasContent || anyUploading}
-            style={{
-              width: '40px',
-              height: '42px',
-              borderRadius: v(tokens.radiusMd),
-              border: 'none',
-              backgroundColor: v(tokens.colorPrimary),
-              color: '#fff',
-              cursor: disabled || !hasContent || anyUploading ? 'not-allowed' : 'pointer',
-              opacity: disabled || !hasContent || anyUploading ? 0.4 : 1,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-              transition: 'opacity 150ms ease',
-            }}
+            style={sendButtonStyle(!(disabled || !hasContent || anyUploading))}
           >
             <SendIcon />
           </button>

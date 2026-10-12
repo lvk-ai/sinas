@@ -100,6 +100,14 @@ export function ChatDetail() {
               queryClient.invalidateQueries({ queryKey: ['chat-meta', chatId] });
               queryClient.invalidateQueries({ queryKey: ['workbench-files', chatId] });
             }}
+            // Sent while a turn runs, a message is injected into it (the
+            // backend's one-loop-per-chat lock decides send vs inject).
+            onSteer={async (id, text) => {
+              await apiClient.sendMessage(id, { content: text });
+            }}
+            onInterrupt={async (id) => {
+              await apiClient.interruptChat(id);
+            }}
             style={{ border: 'none', borderRadius: 0, backgroundColor: 'transparent' }}
           />
         </div>
