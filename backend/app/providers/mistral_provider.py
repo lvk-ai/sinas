@@ -5,6 +5,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from .base import BaseLLMProvider, reasoning_text
+from .clients import secret_id, shared_client
 
 
 def _split_content(content: Any) -> tuple[Optional[str], Optional[str]]:
@@ -46,7 +47,11 @@ class MistralProvider(BaseLLMProvider):
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         super().__init__(api_key, base_url)
         # Use OpenAI client with Mistral endpoint
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url or "https://api.mistral.ai/v1")
+        base_url = base_url or "https://api.mistral.ai/v1"
+        self.client = shared_client(
+            ("openai", secret_id(api_key), base_url),
+            lambda: AsyncOpenAI(api_key=api_key, base_url=base_url),
+        )
 
     async def complete(
         self,

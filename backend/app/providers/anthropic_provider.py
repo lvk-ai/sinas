@@ -7,6 +7,7 @@ from typing import Any, Optional
 from anthropic import AsyncAnthropic
 
 from .base import BaseLLMProvider
+from .clients import secret_id, shared_client
 
 
 class UnsupportedOutputSchema(ValueError):
@@ -101,7 +102,10 @@ class AnthropicProvider(BaseLLMProvider):
         enable_prompt_caching: bool = True,
     ):
         super().__init__(api_key, base_url)
-        self.client = AsyncAnthropic(api_key=api_key, base_url=base_url)
+        self.client = shared_client(
+            ("anthropic", secret_id(api_key), base_url),
+            lambda: AsyncAnthropic(api_key=api_key, base_url=base_url),
+        )
         self.enable_prompt_caching = enable_prompt_caching
         # output_config.effort, set per agent through provider_overrides
         # (see AGENT_OVERRIDABLE in factory.py). None sends nothing and the

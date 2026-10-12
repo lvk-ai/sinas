@@ -475,6 +475,11 @@ async def shutdown(ctx: dict) -> None:
 
     await clickhouse_logger.aclose()
 
+    # LLM clients this worker opened (agent jobs)
+    from app.providers.clients import close_shared_clients
+
+    await close_shared_clients()
+
     logger.info("Worker stopped")
 
 
