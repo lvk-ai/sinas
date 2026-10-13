@@ -149,10 +149,13 @@ async def deliver_to_chat(
         if guard is not None and fixed_job_id and await _job_known(fixed_job_id):
             # An earlier attempt queued this delivery's turn and died before
             # committing: the message is on its way in that turn already
-            # (which may be the one holding the chat now). Only take it off.
+            # (which may be the one holding the chat now). Only take it off,
+            # and record that turn's stream channel, which rolled back with
+            # the failed commit, so a client can still reconnect to it.
             if not await guard(db):
                 await db.rollback()
                 return {"status": "dropped", "reason": "withdrawn"}
+            chat.active_channel_id = str(fixed)
             await db.commit()
             return {"status": "started", "job_id": fixed_job_id, "channel_id": str(fixed), "already_queued": True}
 

@@ -523,6 +523,10 @@ class TestKeptTasks:
                 select(Message).where(Message.chat_id == env["chat"].id, Message.role == "user")
             )).scalars().all()
         assert injected == []
+        # The queued turn's stream channel is recorded, so a client can reconnect.
+        async with AsyncSessionLocal() as s:
+            chat = await s.get(Chat, env["chat"].id)
+            assert chat.active_channel_id and queued[0] == f"delivery-{chat.active_channel_id}"
 
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}
