@@ -252,6 +252,8 @@ async def run(stop_event: asyncio.Event) -> None:
                     logger.info(f"  Updated: {dict(result.summary.updated)}")
                 if result.summary.unchanged:
                     logger.info(f"  Unchanged: {dict(result.summary.unchanged)}")
+                if result.summary.skipped:
+                    logger.warning(f"  Skipped (owned elsewhere): {dict(result.summary.skipped)}")
 
             except FileNotFoundError:
                 logger.error(f"❌ Config file not found: {settings.config_file}")
