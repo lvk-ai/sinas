@@ -66,7 +66,7 @@ async def apply_users(
                     warnings.append(
                         OwnershipSkip(f"User '{user_config.email}' exists but is not managed by '{managed_by}'. Skipping.")
                     )
-                    track_change("unchanged", "users", user_config.email)
+                    track_change("skipped", "users", user_config.email)
                     user_ids[user_config.email] = str(existing.id)
                     continue
 

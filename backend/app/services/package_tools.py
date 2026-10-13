@@ -438,6 +438,7 @@ def _apply_response_to_dict(result) -> dict[str, Any]:
             "created": summary.created,
             "updated": summary.updated,
             "unchanged": summary.unchanged,
+            "skipped": summary.skipped,
             "deleted": summary.deleted,
         },
         "changes": [

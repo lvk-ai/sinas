@@ -104,6 +104,7 @@ class ConfigApplyService:
             "create": "created",
             "update": "updated",
             "unchanged": "unchanged",
+            "skipped": "skipped",
             "delete": "deleted",
         }
         summary_field = action_field_map.get(action, action)
@@ -444,7 +445,7 @@ class ConfigApplyService:
             if result.warning:
                 self.warnings.append(result.warning)
             self._track_change(
-                "unchanged" if result.action == "skipped" else result.action,
+                result.action,
                 applier.kind,
                 key,
                 changes=result.changes or None,

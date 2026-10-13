@@ -792,7 +792,7 @@ class OwnershipSkip(str):
 class ResourceChange(BaseModel):
     """A single resource change"""
 
-    action: str  # create, update, delete, unchanged
+    action: str  # create, update, delete, unchanged, skipped (left alone: someone else owns it)
     resourceType: str
     resourceName: str
     details: Optional[str] = None
@@ -805,6 +805,10 @@ class ConfigApplySummary(BaseModel):
     created: dict[str, int] = Field(default_factory=dict)
     updated: dict[str, int] = Field(default_factory=dict)
     unchanged: dict[str, int] = Field(default_factory=dict)
+    # Declared but left alone because someone else owns the resource (a hand
+    # edit, another config or package); a warning on the response says who.
+    # Never folded into `unchanged`: the resource may differ from the declaration.
+    skipped: dict[str, int] = Field(default_factory=dict)
     deleted: dict[str, int] = Field(default_factory=dict)
 
 

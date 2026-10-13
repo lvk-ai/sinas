@@ -19,6 +19,7 @@ interface ConfigApplySummary {
   created: { [key: string]: number };
   updated: { [key: string]: number };
   unchanged: { [key: string]: number };
+  skipped?: { [key: string]: number };
   deleted: { [key: string]: number };
 }
 
@@ -151,11 +152,12 @@ export function ConfigManager() {
       { title: 'Created', data: summary.created, color: 'text-green-600' },
       { title: 'Updated', data: summary.updated, color: 'text-blue-600' },
       { title: 'Unchanged', data: summary.unchanged, color: 'text-gray-400' },
+      { title: 'Skipped', data: summary.skipped ?? {}, color: 'text-yellow-500' },
       { title: 'Deleted', data: summary.deleted, color: 'text-red-600' },
     ];
 
     return (
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
         {sections.map(({ title, data, color }) => {
           const total = Object.values(data).reduce((sum, count) => sum + count, 0);
           if (total === 0) return null;
