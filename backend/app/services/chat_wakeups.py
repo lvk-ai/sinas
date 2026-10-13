@@ -144,6 +144,18 @@ async def deliver_to_chat(
                 )
             ).scalar_one_or_none() is not None
 
+        fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
+        fixed_job_id = f"delivery-{fixed}" if fixed else None
+        if guard is not None and fixed_job_id and await _job_known(fixed_job_id):
+            # An earlier attempt queued this delivery's turn and died before
+            # committing: the message is on its way in that turn already
+            # (which may be the one holding the chat now). Only take it off.
+            if not await guard(db):
+                await db.rollback()
+                return {"status": "dropped", "reason": "withdrawn"}
+            await db.commit()
+            return {"status": "started", "job_id": fixed_job_id, "channel_id": str(fixed), "already_queued": True}
+
         if suspended or await chat_steering.is_chat_locked(chat_id):
             withdrawn = False
 
@@ -161,7 +173,6 @@ async def deliver_to_chat(
             return {"status": "injected", "message_id": str(injected.id)}
 
         token = create_access_token(user_id=str(user.id), email=user.email)
-        fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
         channel_id = str(fixed) if fixed else str(uuid.uuid4())
         agent_label = (
             f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_namespace and chat.agent_name else None
@@ -180,7 +191,7 @@ async def deliver_to_chat(
                     agent=agent_label,
                     trigger_type=source,
                     job_timeout=job_timeout,
-                    job_id=f"delivery-{fixed}" if fixed else None,
+                    job_id=fixed_job_id,
                 )
             finally:
                 reset_api_key(key_token)
@@ -200,6 +211,20 @@ async def deliver_to_chat(
         job_id = await enqueue()
     logger.info("Wakeup (%s) started a new turn on chat %s (job %s)", source, chat_id, job_id)
     return {"status": "started", "job_id": job_id, "channel_id": channel_id}
+
+
+async def _job_known(job_id: str) -> bool:
+    """Whether arq has this job: queued, running, or finished within its
+    result retention (an hour by default; delivery retries come within a
+    minute)."""
+    from arq.constants import in_progress_key_prefix, job_key_prefix, result_key_prefix
+
+    from app.core.redis import get_arq_pool
+
+    pool = await get_arq_pool()
+    return bool(await pool.exists(
+        f"{job_key_prefix}{job_id}", f"{in_progress_key_prefix}{job_id}", f"{result_key_prefix}{job_id}"
+    ))
 
 
 # ---------------------------------------------------------------------------

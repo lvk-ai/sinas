@@ -156,6 +156,11 @@ async def env(tasks_mcp, monkeypatch):
     monkeypatch.setattr(chat_wakeups, "deliver_to_chat", fake_deliver)
     monkeypatch.setattr(settings, "mcp_task_min_poll_seconds", 0)
 
+    async def no_such_job(job_id):  # the arq pool isn't reachable from tests
+        return False
+
+    monkeypatch.setattr(chat_wakeups, "_job_known", no_such_job)
+
     async with AsyncSessionLocal() as s:
         user = User(email=f"tasks-{_uid()}@example.com")
         s.add(user)
@@ -481,6 +486,43 @@ class TestKeptTasks:
         await mcp_tasks._flush_deliveries(task_id)  # the retry
         assert len(job_ids) == 2 and job_ids[0] == job_ids[1] and job_ids[0].startswith("delivery-")
         assert (await _row(handle["task_id"])).pending_deliveries == []
+
+    async def test_after_a_crash_whose_turn_already_runs_the_retry_does_not_inject_it_again(self, env, monkeypatch):
+        """Queued, the worker died before committing, and that turn now
+        holds the chat: the retry must not inject the message a second
+        time, only take it off."""
+        from app.services import chat_steering
+        from app.services.queue_service import queue_service
+
+        handle = await _call(env, "forever")
+        task_id = uuid.UUID(handle["task_id"])
+        await self._owe(env, task_id)
+        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", REAL_DELIVER)
+        queued = []
+
+        async def queued_then_crashed(**kwargs):
+            queued.append(kwargs["job_id"])
+            raise RuntimeError("worker died before the commit")
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", queued_then_crashed)
+        await mcp_tasks._flush_deliveries(task_id)
+        assert len(queued) == 1
+
+        async def known(job_id):
+            return job_id == queued[0]
+
+        async def locked(chat_id):
+            return True  # the queued turn is running
+
+        monkeypatch.setattr(chat_wakeups, "_job_known", known)
+        monkeypatch.setattr(chat_steering, "is_chat_locked", locked)
+        await mcp_tasks._flush_deliveries(task_id)
+        assert (await _row(handle["task_id"])).pending_deliveries == []
+        async with AsyncSessionLocal() as s:
+            injected = (await s.execute(
+                select(Message).where(Message.chat_id == env["chat"].id, Message.role == "user")
+            )).scalars().all()
+        assert injected == []
 
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}
