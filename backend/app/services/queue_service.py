@@ -270,8 +270,13 @@ class QueueService:
         depth: int = 0,
         pending_delegation_id: Optional[str] = None,
         parent_tool_call_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """Enqueue an agent message processing job.
+
+        `job_id`, when given, makes the enqueue idempotent: arq refuses a
+        second job with an id that is queued, running or recently finished,
+        so a sender that retries after a crash cannot start the turn twice.
 
         If `execution_id` is provided, the worker will update that Execution
         row to COMPLETED/FAILED on terminal status (used by batch_service).
@@ -286,7 +291,8 @@ class QueueService:
         pool = await get_arq_pool()
         redis = await get_redis()
 
-        job_id = str(uuid.uuid4())
+        fixed_id = job_id is not None
+        job_id = job_id or str(uuid.uuid4())
 
         use_sub_queue = depth > 0 and settings.agent_subagent_queue
         queue_label = "agents:sub" if use_sub_queue else "agents"
@@ -308,6 +314,8 @@ class QueueService:
             f"{JOB_STATUS_PREFIX}{job_id}",
             json.dumps(status_data),
             ex=JOB_TTL,
+            # A retried enqueue must not reset the status of the job it repeats.
+            nx=fixed_id,
         )
 
         enqueue_kwargs: dict[str, Any] = {

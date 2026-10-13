@@ -378,8 +378,9 @@ async def _flush_deliveries(task_id: uuid.UUID) -> None:
     and then this row, in the order that deleting a chat takes them.
 
     A message the chat refuses for good (an archived chat, an inactive
-    owner, a hook that blocks it) is dropped from the outbox; one that fails
-    stays there for the next sweep."""
+    owner, a hook that blocks it) is dropped from the outbox; one whose
+    delivery fails stays there for the next sweep (and a new turn is queued
+    under a job id fixed by the message, so a retry never queues it twice)."""
     from app.core.database import AsyncSessionLocal
     from app.services.chat_wakeups import deliver_to_chat
 
@@ -418,11 +419,15 @@ async def _flush_deliveries(task_id: uuid.UUID) -> None:
 
         try:
             outcome = await deliver_to_chat(
-                str(chat_id), entry["content"], source="mcp_task", api_key_id=api_key_id, guard=take_off
+                str(chat_id), entry["content"], source="mcp_task", api_key_id=api_key_id,
+                guard=take_off, delivery_id=entry["id"],
             )
         except Exception:
+            # Never put the message back: if it left the outbox, the
+            # transaction that delivered it committed. If it is still there,
+            # the next sweep tries again.
             logger.exception("Delivering MCP task %s into chat %s failed; retrying", task_id, chat_id)
-            await _after_failed_delivery(task_id, entry)
+            await _retry_later(task_id)
             return
 
         if outcome.get("status") == "dropped" and outcome.get("reason") != "withdrawn":
@@ -443,21 +448,14 @@ async def _remove_entry(task_id: uuid.UUID, entry_id: str) -> None:
         await db.commit()
 
 
-async def _after_failed_delivery(task_id: uuid.UUID, entry: dict[str, Any]) -> None:
-    """A delivery raised. If it failed before committing, the message is
-    still in the outbox; if it failed after (the new turn could not be
-    queued), it was taken off but never arrived: put it back at the front.
-    Either way, try again later."""
+async def _retry_later(task_id: uuid.UUID) -> None:
     from app.core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
         row = await db.get(McpTask, task_id, with_for_update=True)
-        if row is None:
+        if row is None or not row.pending_deliveries:
+            await db.commit()
             return
-        pending = list(row.pending_deliveries or [])
-        cancelled_by_agent = row.status == "cancelled" and row.result == {"error": "Cancelled by the agent"}
-        if all(e.get("id") != entry["id"] for e in pending) and not cancelled_by_agent:
-            row.pending_deliveries = [entry] + pending
         retry = _now() + _DELIVERY_RETRY
         if row.finished_at is not None or row.next_poll_at is None or row.next_poll_at > retry:
             row.next_poll_at = retry

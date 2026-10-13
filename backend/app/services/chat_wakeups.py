@@ -70,7 +70,8 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 async def deliver_to_chat(
-    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None, guard=None
+    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None, guard=None,
+    delivery_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Put `content` in front of the agent of `chat_id`.
 
@@ -82,11 +83,18 @@ async def deliver_to_chat(
     `active_channel_id` so a client can reconnect.
 
     `guard(db)`, when given, runs in the transaction that writes the
-    delivery (the injected message, or the new turn's channel) and commits
-    with it; returning False withdraws the delivery ("dropped", reason
-    "withdrawn"). A sender with an outbox uses it to take the message off in
-    the same transaction as delivering it: it is then delivered exactly when
-    it leaves the outbox, with no lock held across the delivery.
+    delivery and commits with it; returning False withdraws the delivery
+    ("dropped", reason "withdrawn"). A sender with an outbox uses it to take
+    the message off in the same transaction as delivering it, so the
+    message is delivered exactly when it leaves the outbox:
+
+    - injected: the message row is written in that transaction;
+    - a new turn: the turn is queued inside that transaction, before it
+      commits (a Redis call, which cannot wait on the database, so holding
+      the guard's locks across it can't deadlock). A failed enqueue rolls
+      the guard back. `delivery_id` fixes the job id, so a crash after the
+      enqueue and before the commit is retried without queuing the turn
+      twice.
 
     Returns {"status": "injected" | "started" | "dropped", ...}.
     """
@@ -153,31 +161,43 @@ async def deliver_to_chat(
             return {"status": "injected", "message_id": str(injected.id)}
 
         token = create_access_token(user_id=str(user.id), email=user.email)
-        channel_id = str(uuid.uuid4())
-        if guard is not None and not await guard(db):
-            await db.rollback()
-            return {"status": "dropped", "reason": "withdrawn"}
-        chat.active_channel_id = channel_id
-        await db.commit()
+        fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
+        channel_id = str(fixed) if fixed else str(uuid.uuid4())
         agent_label = (
             f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_namespace and chat.agent_name else None
         )
         job_timeout = chat.job_timeout
 
-    key_token = bind_api_key(api_key_id)
-    try:
-        job_id = await queue_service.enqueue_agent_message(
-            chat_id=chat_id,
-            user_id=str(user.id),
-            user_token=token,
-            content=content,
-            channel_id=channel_id,
-            agent=agent_label,
-            trigger_type=source,
-            job_timeout=job_timeout,
-        )
-    finally:
-        reset_api_key(key_token)
+        async def enqueue() -> str:
+            key_token = bind_api_key(api_key_id)
+            try:
+                return await queue_service.enqueue_agent_message(
+                    chat_id=chat_id,
+                    user_id=str(user.id),
+                    user_token=token,
+                    content=content,
+                    channel_id=channel_id,
+                    agent=agent_label,
+                    trigger_type=source,
+                    job_timeout=job_timeout,
+                    job_id=f"delivery-{fixed}" if fixed else None,
+                )
+            finally:
+                reset_api_key(key_token)
+
+        if guard is not None:
+            if not await guard(db):
+                await db.rollback()
+                return {"status": "dropped", "reason": "withdrawn"}
+            chat.active_channel_id = channel_id
+            job_id = await enqueue()  # inside the guarded transaction
+            await db.commit()
+        else:
+            chat.active_channel_id = channel_id
+            await db.commit()
+
+    if guard is None:
+        job_id = await enqueue()
     logger.info("Wakeup (%s) started a new turn on chat %s (job %s)", source, chat_id, job_id)
     return {"status": "started", "job_id": job_id, "channel_id": channel_id}
 

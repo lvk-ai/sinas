@@ -27,6 +27,8 @@ from app.services.mcp_client import TaskState, task_outcome
 from app.services.mcp_tools import McpToolConverter
 from tests.unit.mcp_tasks_server import TasksMcp
 
+REAL_DELIVER = chat_wakeups.deliver_to_chat
+
 
 def _uid() -> str:
     return uuid.uuid4().hex[:8]
@@ -140,7 +142,7 @@ async def env(tasks_mcp, monkeypatch):
     sessions. Deliveries into the chat are recorded instead of sent."""
     delivered: list[tuple[str, str]] = []
 
-    async def fake_deliver(chat_id, content, *, source, api_key_id=None, guard=None):
+    async def fake_deliver(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
         # Like the real one: the guard runs in the transaction that writes
         # the delivery, and a False withdraws it.
         async with AsyncSessionLocal() as session:
@@ -350,11 +352,11 @@ class TestKeptTasks:
         calls = {"n": 0}
         real = chat_wakeups.deliver_to_chat
 
-        async def flaky(chat_id, content, *, source, api_key_id=None, guard=None):
+        async def flaky(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("redis is down")
-            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard)
+            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard, delivery_id=delivery_id)
 
         monkeypatch.setattr(chat_wakeups, "deliver_to_chat", flaky)
         handle = await _call(env, "slow", {"text": "r"})
@@ -390,13 +392,13 @@ class TestKeptTasks:
         both_in = asyncio.Event()
         arrived = 0
 
-        async def side_by_side(chat_id, content, *, source, api_key_id=None, guard=None):
+        async def side_by_side(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
             nonlocal arrived
             arrived += 1
             if arrived == 2:
                 both_in.set()
             await asyncio.wait_for(both_in.wait(), 5)  # both hold the same message
-            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard)
+            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard, delivery_id=delivery_id)
 
         await _poll_until(handle["task_id"], lambda r: r.status == "input_required" or bool(r.pending_deliveries))
         env["delivered"].clear()
@@ -418,36 +420,67 @@ class TestKeptTasks:
             await s.commit()
         real = chat_wakeups.deliver_to_chat
 
-        async def cancelled_meanwhile(chat_id, content, *, source, api_key_id=None, guard=None):
+        async def cancelled_meanwhile(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
             async with AsyncSessionLocal() as s:  # the agent cancels while it is on its way
                 chat = await s.get(Chat, env["chat"].id)
                 await mcp_tasks.execute_tool(s, chat, str(env["user"].id), mcp_tasks.MCP_TASK_CANCEL,
                                              {"task_id": handle["task_id"]})
-            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard)
+            return await real(chat_id, content, source=source, api_key_id=api_key_id, guard=guard, delivery_id=delivery_id)
 
         monkeypatch.setattr(chat_wakeups, "deliver_to_chat", cancelled_meanwhile)
         await mcp_tasks._flush_deliveries(task_id)
         assert env["delivered"] == []
         assert (await _row(handle["task_id"])).status == "cancelled"
 
-    async def test_a_delivery_lost_after_commit_is_put_back(self, env, monkeypatch):
-        handle = await _call(env, "slow", {"text": "q"})
-        task_id = uuid.UUID(handle["task_id"])
+    async def _owe(self, env, task_id: uuid.UUID) -> None:
         async with AsyncSessionLocal() as s:
             row = await s.get(McpTask, task_id)
-            row.pending_deliveries = [{"id": "m1", "content": "result"}]
+            row.pending_deliveries = [{"id": "m1", "content": "[mcp task x completed]"}]
             await s.commit()
 
-        async def committed_then_failed(chat_id, content, *, source, api_key_id=None, guard=None):
-            async with AsyncSessionLocal() as session:
-                assert await guard(session)
-                await session.commit()  # taken off the outbox...
-            raise RuntimeError("could not queue the turn")  # ...but never arrived
+    async def test_a_new_turn_that_cannot_be_queued_leaves_the_message_owed(self, env, monkeypatch):
+        """Idle chat: delivery starts a turn. The turn is queued inside the
+        transaction that takes the message off; a failed enqueue rolls that
+        back."""
+        from app.services.queue_service import queue_service
 
-        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", committed_then_failed)
+        handle = await _call(env, "forever")
+        task_id = uuid.UUID(handle["task_id"])
+        await self._owe(env, task_id)
+        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", REAL_DELIVER)
+
+        async def down(**kwargs):
+            raise RuntimeError("redis is down")
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", down)
         await mcp_tasks._flush_deliveries(task_id)
         row = await _row(handle["task_id"])
         assert [e["id"] for e in row.pending_deliveries] == ["m1"]
+        async with AsyncSessionLocal() as s:
+            assert (await s.get(Chat, env["chat"].id)).active_channel_id is None
+
+    async def test_a_retry_after_a_crash_reuses_the_job_id(self, env, monkeypatch):
+        """Queued, then the worker died before committing: the retry asks
+        for the same job id, which arq refuses to queue twice."""
+        from app.services.queue_service import queue_service
+
+        handle = await _call(env, "forever")
+        task_id = uuid.UUID(handle["task_id"])
+        await self._owe(env, task_id)
+        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", REAL_DELIVER)
+        job_ids = []
+
+        async def queued_then_crashed(**kwargs):
+            job_ids.append(kwargs["job_id"])
+            if len(job_ids) == 1:
+                raise RuntimeError("worker died before the commit")
+            return kwargs["job_id"]
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", queued_then_crashed)
+        await mcp_tasks._flush_deliveries(task_id)  # the "crash": rolled back, still owed
+        await mcp_tasks._flush_deliveries(task_id)  # the retry
+        assert len(job_ids) == 2 and job_ids[0] == job_ids[1] and job_ids[0].startswith("delivery-")
+        assert (await _row(handle["task_id"])).pending_deliveries == []
 
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}
