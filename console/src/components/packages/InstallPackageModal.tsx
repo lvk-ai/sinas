@@ -18,11 +18,25 @@ export type InstallTarget =
       instance?: string;
       /** Set for an update: the installed version and the one it moves to. */
       update?: { from: string; to?: string | null };
+      /** Set for another instance of a multi-instance package: install names
+       * already in use, which the new one must not take (that would update
+       * the existing install instead). */
+      takenNames?: string[];
     };
 
 type InstallStep = 'input' | 'preview' | 'installing' | 'done';
 
 const BROAD_ROLE_WARNING = 'Broad role permission';
+
+/** The values and install name a preview (or an install) is for, as one
+ * comparable key: Confirm installs exactly what the shown preview was for. */
+const requestKey = (variables: Record<string, any> | undefined, instance: string | undefined) =>
+  JSON.stringify([
+    Object.keys(variables ?? {}).sort().map((k) => [k, variables![k]]),
+    (instance ?? '').trim(),
+  ]);
+
+const isBlank = (v: unknown) => v === undefined || v === null || v === '';
 
 /** Preview → variables → confirm → install, for either kind of target. */
 export function InstallPackageModal({ target, onClose }: { target: InstallTarget; onClose: () => void }) {
@@ -38,7 +52,20 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const [instanceName, setInstanceName] = useState(target.kind === 'repository' ? target.instance ?? '' : '');
   // The broad role permissions the user accepted (as broadKey below), if any.
   const [acceptedBroad, setAcceptedBroad] = useState<string | null>(null);
+  // What the preview on screen was for (requestKey of its values and name).
+  const [previewedKey, setPreviewedKey] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Any edit to what would be installed withdraws the consent: it was given
+  // for the permissions a preview of other values showed.
+  const setVariable = (name: string, value: any) => {
+    setVariableValues((prev) => ({ ...prev, [name]: value }));
+    setAcceptedBroad(null);
+  };
+  const changeInstanceName = (value: string) => {
+    setInstanceName(value);
+    setAcceptedBroad(null);
+  };
 
   const source = (): PackageSource =>
     target.kind === 'repository'
@@ -48,9 +75,12 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const previewMutation = useMutation({
     mutationFn: ({ variables, instance }: { variables?: Record<string, any>; instance?: string }) =>
       apiClient.previewPackage(source(), { variables, instance }),
-    onSuccess: (data) => {
+    onSuccess: (data, request) => {
       setPreviewResult(data);
-      // Pre-fill variable defaults
+      setPreviewedKey(requestKey(request.variables, request.instance));
+      setAcceptedBroad(null);
+      // Pre-fill variable defaults (a preview with them is still to be run:
+      // until then the form differs from what was previewed)
       if (data.variables?.length) {
         const defaults: Record<string, any> = {};
         for (const v of data.variables) {
@@ -115,22 +145,45 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     if (fromRepository || yamlInput.trim()) runPreview();
   };
 
-  // The preview (and its warnings) is for one install name; after editing the
-  // name it no longer describes what Confirm would install.
-  const previewStale =
+  // The preview (its changes, warnings, broad permissions) is for one set of
+  // values and one install name; after any edit it no longer describes what
+  // Confirm would install.
+  const previewStale = !!previewResult && previewedKey !== requestKey(variableValues, instanceName);
+  const instanceStale =
     !!previewResult?.multi_instance &&
     (instanceName.trim() || previewResult.package_name) !== previewResult.instance;
+  // Required values not filled in yet (the preview may still have run, with placeholders).
+  const missingRequired: string[] = (previewResult?.variables || [])
+    .filter((v: any) => v.required !== false && isBlank(v.default) && isBlank(variableValues[v.name]))
+    .map((v: any) => v.name);
+  const previewFailed = !!previewResult && (previewResult.success === false || (previewResult.errors || []).length > 0);
 
   const broadRoleWarnings: string[] = (previewResult?.warnings || []).filter((w: string) =>
     w.startsWith(BROAD_ROLE_WARNING),
   );
-  // Consent covers exactly the permissions it was given for: a preview that
-  // lists others (another package, another version) needs it again.
-  const broadKey = JSON.stringify(broadRoleWarnings);
+  // Consent covers exactly the permissions this preview showed, for exactly
+  // its values: a new preview or any edit withdraws it.
+  const broadKey = `${previewedKey}|${JSON.stringify(broadRoleWarnings)}`;
   const allowBroadRolePermissions = broadRoleWarnings.length > 0 && acceptedBroad === broadKey;
 
+  const takenNames = target.kind === 'repository' ? target.takenNames : undefined;
+  const effectiveName = instanceName.trim() || (target.kind === 'repository' ? target.package : '');
+  const nameTaken = !!takenNames && takenNames.includes(effectiveName);
+
+  const blockedBecause = nameTaken
+    ? `'${effectiveName}' is already installed: choose a new install name`
+    : previewStale
+    ? 'Preview with these values first'
+    : missingRequired.length > 0
+      ? `Fill in ${missingRequired.join(', ')}, then preview`
+      : previewFailed
+        ? 'The preview failed: fix the values, then preview again'
+        : broadRoleWarnings.length > 0 && !allowBroadRolePermissions
+          ? 'Accept the broad role permissions first'
+          : null;
+
   const handleInstall = () => {
-    if (previewStale) return;
+    if (blockedBecause) return;
     setInstallStep('installing');
     const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
     installMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined });
@@ -139,7 +192,9 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const title =
     target.kind === 'yaml'
       ? 'Install Package'
-      : `${isUpdate ? 'Update' : 'Install'} ${target.instance || target.package}`;
+      : target.takenNames
+        ? `Install another ${target.package}`
+        : `${isUpdate ? 'Update' : 'Install'} ${target.instance || target.package}`;
 
   const applyFailed = installResult?.apply && installResult.apply.success === false;
 
@@ -285,6 +340,8 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                     <input
                       type="checkbox"
                       checked={allowBroadRolePermissions}
+                      // Consent is for what this preview showed: not while the values differ from it.
+                      disabled={previewStale}
                       onChange={(e) => setAcceptedBroad(e.target.checked ? broadKey : null)}
                       className="w-4 h-4 mt-0.5 text-primary-600 border-line rounded"
                     />
@@ -315,14 +372,14 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                         type="text"
                         value={instanceName}
                         placeholder={previewResult.package_name || previewResult.instance}
-                        onChange={(e) => setInstanceName(e.target.value)}
+                        onChange={(e) => changeInstanceName(e.target.value)}
                         className="flex-1 px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
                       />
                       <button onClick={handlePreview} className="btn btn-secondary text-sm" disabled={previewMutation.isPending}>
                         Re-preview
                       </button>
                     </div>
-                    {previewStale && (
+                    {instanceStale && (
                       <p className="text-xs text-amber-400 mt-2">
                         The name changed since this preview. Re-preview before installing.
                       </p>
@@ -349,7 +406,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                           <input
                             type="checkbox"
                             checked={variableValues[v.name] ?? v.default ?? false}
-                            onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.checked }))}
+                            onChange={(e) => setVariable(v.name, e.target.checked)}
                             className="w-4 h-4 text-primary-600 border-line rounded"
                           />
                           <span className="text-sm text-gray-300 font-mono">{v.name}</span>
@@ -357,7 +414,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                       ) : v.type === 'enum' && v.choices ? (
                         <select
                           value={variableValues[v.name] ?? v.default ?? ''}
-                          onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
+                          onChange={(e) => setVariable(v.name, e.target.value)}
                           className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
                         >
                           <option value="">Select...</option>
@@ -368,19 +425,19 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                       ) : v.type === 'resource_ref' && v.resource === 'llm_providers' ? (
                         <LLMProviderSelect
                           value={variableValues[v.name] ?? ''}
-                          onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
+                          onChange={(val) => setVariable(v.name, val)}
                         />
                       ) : v.type === 'resource_ref' && v.resource === 'database_connections' ? (
                         <DatabaseConnectionSelect
                           value={variableValues[v.name] ?? ''}
-                          onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
+                          onChange={(val) => setVariable(v.name, val)}
                         />
                       ) : (
                         <input
                           type={v.type === 'secret' ? 'password' : 'text'}
                           value={variableValues[v.name] ?? v.default ?? ''}
                           placeholder={v.example || `Enter ${v.name}`}
-                          onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
+                          onChange={(e) => setVariable(v.name, e.target.value)}
                           className="w-full px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
                         />
                       )}
@@ -412,22 +469,31 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                   Back
                 </button>
               )}
-              <button
-                onClick={handleInstall}
-                className="btn btn-primary flex items-center"
-                disabled={previewStale || (broadRoleWarnings.length > 0 && !allowBroadRolePermissions)}
-                title={
-                  previewStale
-                    ? 'Re-preview with the new install name first'
-                    : broadRoleWarnings.length > 0 && !allowBroadRolePermissions
-                      ? 'Accept the broad role permissions first'
-                      : undefined
-                }
-              >
-                <Check className="w-4 h-4 mr-2" />
-                {isUpdate ? 'Confirm Update' : 'Confirm Install'}
-              </button>
+              <div className="flex items-center gap-2">
+                {(previewStale || previewFailed) && (
+                  <button
+                    onClick={handlePreview}
+                    disabled={previewMutation.isPending}
+                    className="btn btn-secondary flex items-center"
+                  >
+                    <Eye className="w-4 h-4 mr-2" />
+                    {previewMutation.isPending ? 'Previewing...' : 'Preview with these values'}
+                  </button>
+                )}
+                <button
+                  onClick={handleInstall}
+                  className="btn btn-primary flex items-center"
+                  disabled={!!blockedBecause}
+                  title={blockedBecause ?? undefined}
+                >
+                  <Check className="w-4 h-4 mr-2" />
+                  {isUpdate ? 'Confirm Update' : 'Confirm Install'}
+                </button>
+              </div>
             </div>
+            {blockedBecause && (
+              <p className="text-xs text-amber-400 text-right">{blockedBecause}.</p>
+            )}
           </div>
         )}
 

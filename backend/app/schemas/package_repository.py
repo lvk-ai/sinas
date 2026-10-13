@@ -71,5 +71,6 @@ class CatalogEntry(BaseModel):
     description: Optional[str] = None
     author: Optional[str] = None
     readme_url: Optional[str] = None
+    multi_instance: bool = False  # the index says it may be installed more than once
     installed: list[CatalogInstall] = Field(default_factory=list)
     update_available: bool = False

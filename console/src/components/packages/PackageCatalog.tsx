@@ -134,6 +134,16 @@ export function PackageCatalog({
   );
 }
 
+/** records-2, records-3, ...: the first one not taken. Install names are
+ * lowercase letters, digits and dashes, at most 63 characters. */
+function nextInstanceName(packageName: string, taken: string[]): string {
+  const base = packageName.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 55);
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+}
+
 function CatalogCard({
   entry,
   installed,
@@ -163,6 +173,11 @@ function CatalogCard({
   // One install: its Update is the card's button. Several (named instances):
   // each badge carries its own.
   const single = entry.installed.length === 1 ? entry.installed[0] : null;
+  // Every install name in use: this package's installs, and anything else
+  // installed (an install name is unique across packages).
+  const takenNames = Array.from(
+    new Set([...entry.installed.map((i) => i.name), ...(installed || []).map((p) => p.name)]),
+  );
 
   return (
     <div className="card">
@@ -240,22 +255,35 @@ function CatalogCard({
             <Upload className="w-4 h-4 mr-2" />
             Install
           </button>
-        ) : single?.update_available ? (
-          <button onClick={() => update(single)} className="btn btn-primary flex items-center flex-shrink-0">
-            <ArrowUpCircle className="w-4 h-4 mr-2" />
-            Update
-          </button>
-        ) : entry.installed.some((i) => i.name !== entry.name) ? (
-          // Installed under its own install name, so the package is multi-instance:
-          // the flow's "Install as" field takes the next name.
-          <button
-            onClick={() => onInstall({ kind: 'repository', repository: entry.repository, package: entry.name })}
-            className="btn btn-secondary flex items-center flex-shrink-0"
-          >
-            <Plus className="w-4 h-4 mr-2" />
-            Install another
-          </button>
-        ) : null}
+        ) : (
+          <div className="flex flex-col items-end gap-2 flex-shrink-0">
+            {single?.update_available && (
+              <button onClick={() => update(single)} className="btn btn-primary flex items-center">
+                <ArrowUpCircle className="w-4 h-4 mr-2" />
+                Update
+              </button>
+            )}
+            {entry.multi_instance && (
+              // A new install name next to the existing ones; the flow's
+              // "Install as" field starts at a free one.
+              <button
+                onClick={() =>
+                  onInstall({
+                    kind: 'repository',
+                    repository: entry.repository,
+                    package: entry.name,
+                    instance: nextInstanceName(entry.name, takenNames),
+                    takenNames,
+                  })
+                }
+                className="btn btn-secondary flex items-center"
+              >
+                <Plus className="w-4 h-4 mr-2" />
+                Install another
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

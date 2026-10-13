@@ -761,6 +761,8 @@ export interface PackageCatalogEntry {
   description?: string | null;
   author?: string | null;
   readme_url?: string | null;
+  /** The index says it may be installed more than once (package.multiInstance). */
+  multi_instance?: boolean;
   installed: PackageCatalogInstall[];
   update_available: boolean;
 }
