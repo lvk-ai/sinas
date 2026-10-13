@@ -682,6 +682,89 @@ export interface PackageInstall {
   version?: string;
 }
 
+// Installed integration package (GET /packages, GET /packages/{name})
+export interface InstalledPackage {
+  id: string;
+  name: string;                       // install name
+  package_name?: string | null;       // declared name; differs from name for a named instance
+  version: string;
+  description?: string | null;
+  author?: string | null;
+  installed_at: string;
+  source_repository?: string | null;  // the repository it follows for updates
+  latest_version?: string | null;
+  update_available: boolean;
+}
+
+/** Where an install or preview takes its package from: pasted YAML, or a
+ * package repository. */
+export type PackageSource =
+  | { source: string }
+  | { repository: string; package: string };
+
+export interface PackageInstallOptions {
+  variables?: Record<string, any>;
+  instance?: string;
+  allowBroadRolePermissions?: boolean;
+}
+
+// Package repositories
+export type PackageRepositoryAuthType = 'none' | 'bearer' | 'header';
+
+export interface PackageRepositoryAuth {
+  type: PackageRepositoryAuthType;
+  secret?: string | null;   // name of a shared Secret
+  header?: string | null;
+}
+
+export interface PackageRepository {
+  id: string;
+  name: string;
+  url: string;
+  description: string | null;
+  auth: PackageRepositoryAuth;
+  is_active: boolean;
+  managed_by: string | null;
+  last_refreshed_at: string | null;
+  last_error: string | null;
+  package_count: number;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface PackageRepositoryCreate {
+  name: string;
+  url: string;
+  description?: string;
+  auth?: PackageRepositoryAuth;
+  is_active?: boolean;
+}
+
+/** Repositories can't be renamed: PUT refuses `name`. */
+export interface PackageRepositoryUpdate {
+  url?: string;
+  description?: string;
+  auth?: PackageRepositoryAuth;
+  is_active?: boolean;
+}
+
+export interface PackageCatalogInstall {
+  name: string;  // install name (differs from the package name for a named instance)
+  version: string;
+  update_available: boolean;
+}
+
+export interface PackageCatalogEntry {
+  repository: string;
+  name: string;
+  version: string;
+  description?: string | null;
+  author?: string | null;
+  readme_url?: string | null;
+  installed: PackageCatalogInstall[];
+  update_available: boolean;
+}
+
 
 // LLM Providers
 export interface LLMProvider {

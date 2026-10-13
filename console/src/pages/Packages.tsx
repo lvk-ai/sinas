@@ -1,30 +1,36 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { apiClient } from '../lib/api';
-import { Package, Plus, Trash2, Download, Upload, X, Eye, Check, AlertTriangle } from 'lucide-react';
-import { useState, useRef } from 'react';
+import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store } from 'lucide-react';
+import { useState } from 'react';
+import { InstallPackageModal, type InstallTarget } from '../components/packages/InstallPackageModal';
+import { PackageCatalog } from '../components/packages/PackageCatalog';
+import { PackageRepositories } from '../components/packages/PackageRepositories';
+import type { InstalledPackage } from '../types';
 
-type InstallStep = 'input' | 'preview' | 'installing' | 'done';
+type Tab = 'installed' | 'catalog' | 'repositories';
+const TABS: Tab[] = ['installed', 'catalog', 'repositories'];
 
 export function Packages() {
   const queryClient = useQueryClient();
-  const [showInstallModal, setShowInstallModal] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabParam = searchParams.get('tab') as Tab | null;
+  const activeTab: Tab = tabParam && TABS.includes(tabParam) ? tabParam : 'installed';
+  const setActiveTab = (tab: Tab) =>
+    setSearchParams(tab === 'installed' ? {} : { tab }, { replace: true });
+
+  // The install flow, for pasted YAML or a repository package (install or update).
+  const [installTarget, setInstallTarget] = useState<InstallTarget | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const [installStep, setInstallStep] = useState<InstallStep>('input');
-  const [yamlInput, setYamlInput] = useState('');
-  const [previewResult, setPreviewResult] = useState<any>(null);
-  const [installResult, setInstallResult] = useState<any>(null);
-  const [variableValues, setVariableValues] = useState<Record<string, any>>({});
-  // Install name for packages declaring multiInstance; empty = the package's own name.
-  const [instanceName, setInstanceName] = useState('');
   const [createForm, setCreateForm] = useState({ name: '', version: '1.0.0', description: '', author: '', url: '' });
   const [selectedResources, setSelectedResources] = useState<Array<{ type: string; namespace: string; name: string }>>([]);
   const [createdYaml, setCreatedYaml] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { data: packages, isLoading } = useQuery({
     queryKey: ['packages'],
     queryFn: () => apiClient.listPackages(),
   });
+  const updatesAvailable = (packages || []).filter((p) => p.update_available).length;
 
   // Load available resources for create modal
   const { data: agents } = useQuery({ queryKey: ['agents'], queryFn: () => apiClient.listAgents(), enabled: showCreateModal });
@@ -40,39 +46,11 @@ export function Packages() {
   const { data: databaseTriggers } = useQuery({ queryKey: ['database-triggers'], queryFn: () => apiClient.listDatabaseTriggers(), enabled: showCreateModal });
   const { data: connectors } = useQuery({ queryKey: ['connectors'], queryFn: () => apiClient.listConnectors(), enabled: showCreateModal });
 
-  const previewMutation = useMutation({
-    mutationFn: ({ source, variables, instance }: { source: string; variables?: Record<string, any>; instance?: string }) =>
-      apiClient.previewPackage(source, variables, instance),
-    onSuccess: (data) => {
-      setPreviewResult(data);
-      // Pre-fill variable defaults
-      if (data.variables?.length) {
-        const defaults: Record<string, any> = {};
-        for (const v of data.variables) {
-          if (v.default !== undefined && v.default !== null) {
-            defaults[v.name] = v.default;
-          }
-        }
-        setVariableValues(prev => ({ ...defaults, ...prev }));
-      }
-      setInstallStep('preview');
-    },
-  });
-
-  const installMutation = useMutation({
-    mutationFn: ({ source, variables, instance }: { source: string; variables?: Record<string, any>; instance?: string }) =>
-      apiClient.installPackage(source, variables, instance),
-    onSuccess: (data) => {
-      setInstallResult(data);
-      setInstallStep('done');
-      queryClient.invalidateQueries({ queryKey: ['packages'] });
-    },
-  });
-
   const uninstallMutation = useMutation({
     mutationFn: (name: string) => apiClient.uninstallPackage(name),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['packages'] });
+      queryClient.invalidateQueries({ queryKey: ['package-catalog'] });
     },
   });
 
@@ -83,34 +61,17 @@ export function Packages() {
     },
   });
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      setYamlInput(ev.target?.result as string);
-    };
-    reader.readAsText(file);
-  };
-
-  const handlePreview = () => {
-    if (yamlInput.trim()) {
-      const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
-      previewMutation.mutate({ source: yamlInput, variables: vars, instance: instanceName.trim() || undefined });
-    }
-  };
-
-  // The preview (and its warnings) is for one install name; after editing the
-  // name it no longer describes what Confirm would install.
-  const previewStale =
-    !!previewResult?.multi_instance &&
-    (instanceName.trim() || previewResult.package_name) !== previewResult.instance;
-
-  const handleInstall = () => {
-    if (previewStale) return;
-    setInstallStep('installing');
-    const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
-    installMutation.mutate({ source: yamlInput, variables: vars, instance: instanceName.trim() || undefined });
+  /** Update = re-install the repository's latest version under the same install name. */
+  const startUpdate = (pkg: InstalledPackage) => {
+    if (!pkg.source_repository) return;
+    const packageName = pkg.package_name || pkg.name;
+    setInstallTarget({
+      kind: 'repository',
+      repository: pkg.source_repository,
+      package: packageName,
+      instance: pkg.name !== packageName ? pkg.name : undefined,
+      update: { from: pkg.version, to: pkg.latest_version },
+    });
   };
 
   const handleExport = async (name: string) => {
@@ -123,21 +84,9 @@ export function Packages() {
       a.download = `${name}.yaml`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch (err) {
+    } catch {
       // Error handled by API client
     }
-  };
-
-  const closeInstallModal = () => {
-    setShowInstallModal(false);
-    setInstallStep('input');
-    setYamlInput('');
-    setPreviewResult(null);
-    setInstallResult(null);
-    setVariableValues({});
-    setInstanceName('');
-    previewMutation.reset();
-    installMutation.reset();
   };
 
   const toggleResource = (type: string, namespace: string, name: string) => {
@@ -199,6 +148,13 @@ export function Packages() {
     { type: 'connector', label: 'Connectors', items: connectors?.map((c: any) => ({ namespace: c.namespace, name: c.name })) || [] },
   ].filter(s => s.items.length > 0);
 
+  const tabClass = (tab: Tab) =>
+    `py-4 px-1 border-b-2 font-medium text-sm transition-colors flex items-center ${
+      activeTab === tab
+        ? 'border-primary-600 text-primary-600'
+        : 'border-transparent text-gray-500 hover:text-gray-300 hover:border-line'
+    }`;
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -211,39 +167,99 @@ export function Packages() {
             <Plus className="w-5 h-5 mr-2" />
             Create Package
           </button>
-          <button onClick={() => setShowInstallModal(true)} className="btn btn-primary flex items-center">
+          <button onClick={() => setInstallTarget({ kind: 'yaml' })} className="btn btn-primary flex items-center">
             <Upload className="w-5 h-5 mr-2" />
-            Install Package
+            Install from YAML
           </button>
         </div>
       </div>
 
-      {/* Package List */}
-      {isLoading ? (
+      {/* Tabs */}
+      <div className="border-b border-line-soft">
+        <nav className="-mb-px flex space-x-8">
+          <button onClick={() => setActiveTab('installed')} className={tabClass('installed')}>
+            <Package className="w-5 h-5 mr-2" />
+            Installed
+            {updatesAvailable > 0 && (
+              <span
+                className="ml-2 px-1.5 py-0.5 text-xs rounded bg-amber-900/30 text-amber-400"
+                title={`${updatesAvailable} update${updatesAvailable === 1 ? '' : 's'} available`}
+              >
+                {updatesAvailable}
+              </span>
+            )}
+          </button>
+          <button onClick={() => setActiveTab('catalog')} className={tabClass('catalog')}>
+            <Store className="w-5 h-5 mr-2" />
+            Catalog
+          </button>
+          <button onClick={() => setActiveTab('repositories')} className={tabClass('repositories')}>
+            <Library className="w-5 h-5 mr-2" />
+            Repositories
+          </button>
+        </nav>
+      </div>
+
+      {activeTab === 'catalog' && (
+        <PackageCatalog
+          installed={packages}
+          onInstall={setInstallTarget}
+          onShowRepositories={() => setActiveTab('repositories')}
+        />
+      )}
+
+      {activeTab === 'repositories' && <PackageRepositories />}
+
+      {/* Installed packages */}
+      {activeTab === 'installed' && (isLoading ? (
         <div className="text-center py-12">
           <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
         </div>
       ) : packages && packages.length > 0 ? (
         <div className="space-y-3">
-          {packages.map((pkg: any) => (
+          {packages.map((pkg) => (
             <div key={pkg.id} className="card">
               <div className="flex items-center gap-4">
                 <Package className="w-8 h-8 text-primary-400 flex-shrink-0" />
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <h3 className="font-semibold text-gray-100">{pkg.name}</h3>
                     <span className="text-xs px-2 py-0.5 bg-primary-900/30 text-primary-300 rounded font-mono">{pkg.version}</span>
                     {pkg.package_name && pkg.package_name !== pkg.name && (
                       <span className="text-xs text-gray-500">instance of <span className="font-mono">{pkg.package_name}</span></span>
                     )}
+                    {pkg.update_available && (
+                      <span className="flex items-center gap-1 text-xs px-2 py-0.5 bg-amber-900/30 text-amber-400 rounded">
+                        <ArrowUpCircle className="w-3 h-3" />
+                        Update available → <span className="font-mono">{pkg.latest_version}</span>
+                      </span>
+                    )}
                   </div>
                   {pkg.description && <p className="text-sm text-gray-400 mt-0.5">{pkg.description}</p>}
-                  <div className="flex gap-3 mt-1 text-xs text-gray-500">
+                  <div className="flex flex-wrap gap-3 mt-1 text-xs text-gray-500">
                     {pkg.author && <span>by {pkg.author}</span>}
                     <span>Installed {new Date(pkg.installed_at).toLocaleDateString()}</span>
+                    {pkg.source_repository && (
+                      <span className="flex items-center gap-1" title="The repository this package follows for updates">
+                        <Library className="w-3 h-3" />
+                        follows <span className="font-mono">{pkg.source_repository}</span>
+                        {!pkg.update_available && pkg.latest_version && (
+                          <span className="text-green-400 flex items-center gap-0.5 ml-1">
+                            <Check className="w-3 h-3" />
+                            up to date
+                          </span>
+                        )}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  {pkg.update_available && pkg.source_repository && (
+                    <button onClick={() => startUpdate(pkg)} className="btn btn-primary flex items-center text-sm mr-1">
+                      <ArrowUpCircle className="w-4 h-4 mr-1.5" />
+                      Update
+                    </button>
+                  )}
                   <button
                     onClick={() => handleExport(pkg.name)}
                     className="p-2 text-gray-500 hover:text-primary-400 hover:bg-hover-strong rounded-md transition-colors"
@@ -273,254 +289,21 @@ export function Packages() {
           <Package className="w-16 h-16 text-gray-500 mx-auto mb-4" />
           <h3 className="text-lg font-medium text-gray-100 mb-2">No packages installed</h3>
           <p className="text-gray-400 mb-4">Install integration packages to add agents, functions, and more</p>
-          <button onClick={() => setShowInstallModal(true)} className="btn btn-primary">
-            <Upload className="w-5 h-5 mr-2 inline" />
-            Install Package
-          </button>
-        </div>
-      )}
-
-      {/* Install Modal */}
-      {showInstallModal && (
-        <div className="fixed inset-0 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-surface-1 rounded-lg max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold text-gray-100">Install Package</h2>
-              <button onClick={closeInstallModal} className="p-1 text-gray-500 hover:text-gray-400">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Step 1: Input */}
-            {installStep === 'input' && (
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Package YAML</label>
-                  <textarea
-                    value={yamlInput}
-                    onChange={(e) => setYamlInput(e.target.value)}
-                    placeholder="Paste SinasPackage YAML here..."
-                    className="input w-full h-64 font-mono text-sm"
-                  />
-                </div>
-                <div className="flex items-center gap-3">
-                  <input ref={fileInputRef} type="file" accept=".yaml,.yml" onChange={handleFileUpload} className="hidden" />
-                  <button onClick={() => fileInputRef.current?.click()} className="btn btn-secondary text-sm">
-                    Upload File
-                  </button>
-                  <div className="flex-1" />
-                  <button
-                    onClick={handlePreview}
-                    disabled={!yamlInput.trim() || previewMutation.isPending}
-                    className="btn btn-primary flex items-center"
-                  >
-                    <Eye className="w-4 h-4 mr-2" />
-                    {previewMutation.isPending ? 'Previewing...' : 'Preview'}
-                  </button>
-                </div>
-                {previewMutation.isError && (
-                  <div className="p-3 bg-red-900/20 border border-red-900/30 rounded text-sm text-red-400">
-                    {(previewMutation.error as any)?.message || 'Preview failed'}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Step 2: Preview */}
-            {installStep === 'preview' && previewResult && (
-              <div className="space-y-4">
-                <div className="p-3 bg-blue-900/20 border border-blue-900/30 rounded">
-                  <h3 className="text-sm font-medium text-blue-300 mb-2">Preview - Changes to apply:</h3>
-                  {previewResult.changes && previewResult.changes.length > 0 ? (
-                    <div className="space-y-1">
-                      {previewResult.changes.map((change: any, i: number) => (
-                        <div key={i} className="flex items-center gap-2 text-sm">
-                          <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
-                            change.action === 'create' ? 'bg-green-900/30 text-green-400' :
-                            change.action === 'update' ? 'bg-yellow-900/30 text-yellow-400' :
-                            'bg-gray-800 text-gray-400'
-                          }`}>
-                            {change.action}
-                          </span>
-                          <span className="text-gray-300">{change.resourceType}</span>
-                          <span className="text-gray-500 font-mono">{change.resourceName}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-sm text-gray-400">No changes detected</p>
-                  )}
-                </div>
-
-                {previewResult.warnings && previewResult.warnings.length > 0 && (
-                  <div className="p-3 bg-yellow-900/20 border border-yellow-900/30 rounded">
-                    <div className="flex items-center gap-2 mb-1">
-                      <AlertTriangle className="w-4 h-4 text-yellow-400" />
-                      <span className="text-sm font-medium text-yellow-300">Warnings</span>
-                    </div>
-                    {previewResult.warnings.map((w: string, i: number) => (
-                      <p key={i} className="text-sm text-yellow-400/80">{w}</p>
-                    ))}
-                  </div>
-                )}
-
-                {/* Install name (packages that may be installed more than once) */}
-                {previewResult.multi_instance && (
-                  <div className="p-3 bg-surface-2 border border-line-soft rounded">
-                    <h3 className="text-sm font-medium text-gray-200 mb-1">Install as</h3>
-                    <p className="text-xs text-gray-400 mb-2">
-                      This package can be installed more than once. Each install needs its own name
-                      (lowercase, dashes); the preview above is for <span className="font-mono">{previewResult.instance}</span>.
-                    </p>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={instanceName}
-                        placeholder={previewResult.package_name || previewResult.instance}
-                        onChange={(e) => setInstanceName(e.target.value)}
-                        className="flex-1 px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
-                      />
-                      <button onClick={handlePreview} className="btn btn-secondary text-sm" disabled={previewMutation.isPending}>
-                        Re-preview
-                      </button>
-                    </div>
-                    {previewStale && (
-                      <p className="text-xs text-amber-400 mt-2">
-                        The name changed since this preview. Re-preview before installing.
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {/* Variable form (if package requires input) */}
-                {previewResult.variables && previewResult.variables.length > 0 && (
-                  <div className="p-3 bg-surface-2 border border-line-soft rounded">
-                    <h3 className="text-sm font-medium text-gray-200 mb-3">Configuration</h3>
-                    <div className="space-y-3">
-                      {previewResult.variables.map((v: any) => (
-                        <div key={v.name}>
-                          <label className="block text-xs font-medium text-gray-400 mb-1">
-                            {v.description || v.name}
-                            {v.required && !v.default && <span className="text-red-400 ml-1">*</span>}
-                          </label>
-
-                          {v.type === 'boolean' ? (
-                            <label className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={variableValues[v.name] ?? v.default ?? false}
-                                onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.checked }))}
-                                className="w-4 h-4 text-primary-600 border-line rounded"
-                              />
-                              <span className="text-sm text-gray-300 font-mono">{v.name}</span>
-                            </label>
-                          ) : v.type === 'enum' && v.choices ? (
-                            <select
-                              value={variableValues[v.name] ?? v.default ?? ''}
-                              onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
-                              className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
-                            >
-                              <option value="">Select...</option>
-                              {v.choices.map((c: string) => (
-                                <option key={c} value={c}>{c}</option>
-                              ))}
-                            </select>
-                          ) : v.type === 'resource_ref' && v.resource === 'llm_providers' ? (
-                            <LLMProviderSelect
-                              value={variableValues[v.name] ?? ''}
-                              onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
-                            />
-                          ) : v.type === 'resource_ref' && v.resource === 'database_connections' ? (
-                            <DatabaseConnectionSelect
-                              value={variableValues[v.name] ?? ''}
-                              onChange={(val) => setVariableValues(prev => ({ ...prev, [v.name]: val }))}
-                            />
-                          ) : (
-                            <input
-                              type={v.type === 'secret' ? 'password' : 'text'}
-                              value={variableValues[v.name] ?? v.default ?? ''}
-                              placeholder={v.example || `Enter ${v.name}`}
-                              onChange={(e) => setVariableValues(prev => ({ ...prev, [v.name]: e.target.value }))}
-                              className="w-full px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
-                            />
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex justify-between">
-                  <button onClick={() => setInstallStep('input')} className="btn btn-secondary">
-                    Back
-                  </button>
-                  <button
-                    onClick={handleInstall}
-                    className="btn btn-primary flex items-center"
-                    disabled={previewStale}
-                    title={previewStale ? 'Re-preview with the new install name first' : undefined}
-                  >
-                    <Check className="w-4 h-4 mr-2" />
-                    Confirm Install
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Step 3: Installing */}
-            {installStep === 'installing' && (
-              <div className="flex items-center justify-center py-8">
-                <div className="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-primary-600 mr-3"></div>
-                <span className="text-gray-400">Installing package...</span>
-              </div>
-            )}
-
-            {/* Step 4: Done */}
-            {installStep === 'done' && installResult && (
-              <div className="space-y-4">
-                <div className="p-3 bg-green-900/20 border border-green-900/30 rounded">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Check className="w-5 h-5 text-green-400" />
-                    <span className="text-sm font-medium text-green-300">Package installed successfully</span>
-                  </div>
-                  {installResult.package && (
-                    <p className="text-sm text-gray-400">
-                      {installResult.package.name} v{installResult.package.version}
-                    </p>
-                  )}
-                </div>
-
-                {installResult.apply?.changes && installResult.apply.changes.length > 0 && (
-                  <div className="space-y-1">
-                    {installResult.apply.changes.filter((c: any) => c.action !== 'unchanged').map((change: any, i: number) => (
-                      <div key={i} className="flex items-center gap-2 text-sm">
-                        <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
-                          change.action === 'create' ? 'bg-green-900/30 text-green-400' :
-                          'bg-yellow-900/30 text-yellow-400'
-                        }`}>
-                          {change.action}
-                        </span>
-                        <span className="text-gray-300">{change.resourceType}</span>
-                        <span className="text-gray-500 font-mono">{change.resourceName}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {installMutation.isError && (
-                  <div className="p-3 bg-red-900/20 border border-red-900/30 rounded text-sm text-red-400">
-                    {(installMutation.error as any)?.message || 'Install failed'}
-                  </div>
-                )}
-
-                <div className="flex justify-end">
-                  <button onClick={closeInstallModal} className="btn btn-primary">Done</button>
-                </div>
-              </div>
-            )}
+          <div className="flex items-center justify-center gap-3">
+            <button onClick={() => setActiveTab('catalog')} className="btn btn-primary flex items-center">
+              <Store className="w-5 h-5 mr-2" />
+              Browse Catalog
+            </button>
+            <button onClick={() => setInstallTarget({ kind: 'yaml' })} className="btn btn-secondary flex items-center">
+              <Upload className="w-5 h-5 mr-2" />
+              Install from YAML
+            </button>
           </div>
         </div>
-      )}
+      ))}
+
+      {/* Install / update flow */}
+      {installTarget && <InstallPackageModal target={installTarget} onClose={() => setInstallTarget(null)} />}
 
       {/* Create Package Modal */}
       {showCreateModal && (
@@ -662,47 +445,5 @@ export function Packages() {
         </div>
       )}
     </div>
-  );
-}
-
-/** Async dropdown for LLM provider selection in package variables */
-function LLMProviderSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const { data: providers } = useQuery({
-    queryKey: ['llm-providers'],
-    queryFn: () => apiClient.listLLMProviders(),
-  });
-
-  return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
-    >
-      <option value="">Select LLM provider...</option>
-      {(providers || []).map((p: any) => (
-        <option key={p.id} value={p.name}>{p.name} ({p.provider_type})</option>
-      ))}
-    </select>
-  );
-}
-
-/** Async dropdown for database connection selection in package variables */
-function DatabaseConnectionSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const { data: connections } = useQuery({
-    queryKey: ['databaseConnections'],
-    queryFn: () => apiClient.listDatabaseConnections(),
-  });
-
-  return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
-    >
-      <option value="">Select database connection...</option>
-      {(connections || []).map((c: any) => (
-        <option key={c.id} value={c.name}>{c.name}</option>
-      ))}
-    </select>
   );
 }

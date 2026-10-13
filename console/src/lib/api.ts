@@ -1,4 +1,4 @@
-import axios, { type AxiosInstance } from 'axios';
+import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import type {
   AdminCreateResetLinkResponse,
   ConfigRestoreResult,
@@ -89,7 +89,19 @@ import type {
   PipelineRunOutcome,
   WorkbenchFile,
   WorkbenchFileContent,
+  InstalledPackage,
+  PackageSource,
+  PackageInstallOptions,
+  PackageRepository,
+  PackageRepositoryCreate,
+  PackageRepositoryUpdate,
+  PackageCatalogEntry,
 } from '../types';
+
+/** Request config whose listed error statuses don't raise the global error
+ * toast, because the caller shows them in place (e.g. a 403 explained on
+ * the page). */
+type QuietRequestConfig = AxiosRequestConfig & { quietStatuses?: number[] };
 
 // Auto-detect API base URL based on environment.
 // - VITE_API_URL overrides (point a dev console at any backend)
@@ -248,8 +260,14 @@ class APIClient {
           error.message = errorMessage;
         }
 
-        // Show error toast notification (except for 401 which is handled above)
-        if (error.response?.status !== 401 && this.errorHandler) {
+        // Show error toast notification (except for 401 which is handled above,
+        // and statuses the caller explains in place: QuietRequestConfig)
+        const quietStatuses = (originalRequest as QuietRequestConfig | undefined)?.quietStatuses;
+        if (
+          error.response?.status !== 401 &&
+          !quietStatuses?.includes(error.response?.status) &&
+          this.errorHandler
+        ) {
           this.errorHandler(errorMessage);
         }
 
@@ -861,23 +879,67 @@ class APIClient {
   }
 
   // Packages (installable integration packages)
-  async listPackages(): Promise<any[]> {
+  async listPackages(): Promise<InstalledPackage[]> {
     const response = await this.configClient.get('/packages');
     return response.data;
   }
 
-  async getPackage(name: string): Promise<any> {
+  async getPackage(name: string): Promise<InstalledPackage> {
     const response = await this.configClient.get(`/packages/${name}`);
     return response.data;
   }
 
-  async installPackage(source: string, variables?: Record<string, any>, instance?: string): Promise<any> {
-    const response = await this.configClient.post('/packages/install', { source, variables, instance });
+  /** Install from pasted YAML ({source}) or from a package repository
+   * ({repository, package}). Re-installing under the same name upgrades. */
+  async installPackage(from: PackageSource, options: PackageInstallOptions = {}): Promise<any> {
+    const response = await this.configClient.post('/packages/install', { ...from, ...options });
     return response.data;
   }
 
-  async previewPackage(source: string, variables?: Record<string, any>, instance?: string): Promise<any> {
-    const response = await this.configClient.post('/packages/preview', { source, variables, instance });
+  async previewPackage(
+    from: PackageSource,
+    options: Omit<PackageInstallOptions, 'allowBroadRolePermissions'> = {},
+  ): Promise<any> {
+    const response = await this.configClient.post('/packages/preview', { ...from, ...options });
+    return response.data;
+  }
+
+  /** Every package the active repositories offer, with what is installed of each. */
+  async getPackageCatalog(): Promise<PackageCatalogEntry[]> {
+    const response = await this.configClient.get('/packages/catalog', { quietStatuses: [403] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  // Package repositories (admin only)
+  async listPackageRepositories(): Promise<PackageRepository[]> {
+    // A non-admin gets 403 here; the Packages page explains that in place,
+    // so no error toast on every visit.
+    const response = await this.configClient.get('/package-repositories', { quietStatuses: [403] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  async createPackageRepository(data: PackageRepositoryCreate): Promise<PackageRepository> {
+    const response = await this.configClient.post('/package-repositories', data);
+    return response.data;
+  }
+
+  /** Add the Sinas team's official repository; idempotent. */
+  async addOfficialPackageRepository(): Promise<PackageRepository> {
+    const response = await this.configClient.post('/package-repositories/official');
+    return response.data;
+  }
+
+  async updatePackageRepository(name: string, data: PackageRepositoryUpdate): Promise<PackageRepository> {
+    const response = await this.configClient.put(`/package-repositories/${encodeURIComponent(name)}`, data);
+    return response.data;
+  }
+
+  async deletePackageRepository(name: string): Promise<void> {
+    await this.configClient.delete(`/package-repositories/${encodeURIComponent(name)}`);
+  }
+
+  async refreshPackageRepository(name: string): Promise<PackageRepository> {
+    const response = await this.configClient.post(`/package-repositories/${encodeURIComponent(name)}/refresh`);
     return response.data;
   }
 
