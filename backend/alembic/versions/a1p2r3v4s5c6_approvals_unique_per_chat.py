@@ -34,6 +34,19 @@ def downgrade() -> None:
         "uq_pending_tool_approvals_chat_tool_call", "pending_tool_approvals", type_="unique"
     )
     op.drop_index("ix_pending_tool_approvals_tool_call_id", table_name="pending_tool_approvals")
+    # Since upgrade, two chats may hold rows with the same tool_call_id, which
+    # the global unique index below would refuse. Keep the newest of each id
+    # and drop the others: pending approvals are transient (a round waiting
+    # for a yes/no), and the older chats' waiting rounds are what a rollback
+    # to global uniqueness cannot represent.
+    op.execute(
+        """
+        DELETE FROM pending_tool_approvals a
+        USING pending_tool_approvals b
+        WHERE a.tool_call_id = b.tool_call_id
+          AND (a.created_at, a.id::text) < (b.created_at, b.id::text)
+        """
+    )
     op.create_index(
         "ix_pending_tool_approvals_tool_call_id",
         "pending_tool_approvals",
