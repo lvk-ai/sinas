@@ -69,36 +69,51 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 # Delivery
 # ---------------------------------------------------------------------------
 
-async def chat_is_parked(db, chat_id) -> bool:
-    """Whether the chat has a round parked: on a pending completion (an
-    ask_user question, a suspended delegation, a background run being
-    waited on) or an unanswered tool approval. A parked round holds no chat
-    lock, but it has open tool calls: a new turn would "repair" them with
-    synthetic errors and race the round's resume, so a message for such a
-    chat must be injected (read when the round resumes), never start a
-    turn. A checkpoint whose last completion landed (remaining == 0) still
-    parks the chat: its row stays until the saved turn is queued, and a
-    turn started in that gap would run beside the saved one."""
+async def parked_round_channel(db, chat_id) -> Optional[str]:
+    """The stream channel of the chat's parked round, or None when no round
+    is parked. A round is parked on a pending completion (an ask_user
+    question, a suspended delegation, a background run being waited on) or
+    an unanswered tool approval; it resumes on this channel.
+
+    A parked round holds no chat lock, but it has open tool calls: a new
+    turn would "repair" them with synthetic errors and race the round's
+    resume, so a message for such a chat must be injected (read when the
+    round resumes), never start a turn. A checkpoint whose last completion
+    landed (remaining == 0) still parks the chat: its row stays until the
+    saved turn is queued, and a turn started in that gap would run beside
+    the saved one."""
     from app.models.pending_approval import PendingToolApproval
     from app.models.pending_completion import PendingCompletion
+    from app.services.approval_rules import round_channel_id
 
     chat_uuid = chat_id if isinstance(chat_id, uuid.UUID) else uuid.UUID(str(chat_id))
-    if (
-        await db.execute(select(PendingCompletion.id).where(PendingCompletion.chat_id == chat_uuid).limit(1))
-    ).scalar_one_or_none() is not None:
-        return True
-    now = _now()
-    return (
+    channel = (
         await db.execute(
-            select(PendingToolApproval.id)
+            select(PendingCompletion.channel_id)
+            .where(PendingCompletion.chat_id == chat_uuid)
+            .order_by(PendingCompletion.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if channel is not None:
+        return channel
+    approval = (
+        await db.execute(
+            select(PendingToolApproval)
             .where(
                 PendingToolApproval.chat_id == chat_uuid,
                 PendingToolApproval.approved.is_(None),
-                or_(PendingToolApproval.expires_at.is_(None), PendingToolApproval.expires_at > now),
+                or_(PendingToolApproval.expires_at.is_(None), PendingToolApproval.expires_at > _now()),
             )
             .limit(1)
         )
-    ).scalar_one_or_none() is not None
+    ).scalar_one_or_none()
+    return round_channel_id(approval) if approval is not None else None
+
+
+async def chat_is_parked(db, chat_id) -> bool:
+    """Whether the chat has a round parked (see parked_round_channel)."""
+    return await parked_round_channel(db, chat_id) is not None
 
 
 async def deliver_to_chat(

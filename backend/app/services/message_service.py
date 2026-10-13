@@ -497,12 +497,18 @@ class MessageService:
         from app.services.chat_wakeups import chat_is_parked
 
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
-        if lock_token is not None and await chat_is_parked(self.db, chat_id):
-            # A round is parked (on ask_user, a background run, a sub-agent,
-            # an approval): it holds no lock but owns the chat. The message
-            # waits for it like for a running loop.
-            await chat_steering.release_chat_lock(chat_id, lock_token)
-            lock_token = None
+        if lock_token is not None:
+            try:
+                parked = await chat_is_parked(self.db, chat_id)
+            except BaseException:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                raise
+            if parked:
+                # A round is parked (on ask_user, a background run, a
+                # sub-agent, an approval): it holds no lock but owns the
+                # chat. The message waits for it like for a running loop.
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                lock_token = None
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
@@ -705,14 +711,23 @@ class MessageService:
         """
         from app.services import chat_steering
 
-        from app.services.chat_wakeups import chat_is_parked
+        from app.services.chat_wakeups import parked_round_channel
 
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
-        if lock_token is not None and await chat_is_parked(self.db, chat_id):
-            # A parked round owns the chat though it holds no lock (see
-            # send_message): inject, don't start a turn beside it.
-            await chat_steering.release_chat_lock(chat_id, lock_token)
-            lock_token = None
+        if lock_token is not None:
+            try:
+                parked_channel = await parked_round_channel(self.db, chat_id)
+            except BaseException:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                raise
+            if parked_channel is not None:
+                # A parked round owns the chat though it holds no lock (see
+                # send_message): inject, don't start a turn beside it. The
+                # round resumes on its own channel, so a reconnecting client
+                # belongs there, not on this message's (ending) channel.
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                lock_token = None
+                await self._hand_back_active_channel(chat_id, parked_channel)
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
@@ -737,6 +752,22 @@ class MessageService:
                 yield chunk
         finally:
             await chat_steering.release_chat_lock(chat_id, lock_token)
+
+    async def _hand_back_active_channel(self, chat_id: str, owner_channel: str) -> None:
+        """This message was injected into a parked round, not run: if its
+        channel was recorded as the chat's reconnect channel when it was
+        queued, point that back at the channel the round resumes on."""
+        from app.services.delegation import current_channel_id
+
+        channel_id = current_channel_id.get()
+        if not channel_id or channel_id == owner_channel:
+            return
+        await self.db.execute(
+            update(Chat)
+            .where(Chat.id == uuid.UUID(chat_id), Chat.active_channel_id == channel_id)
+            .values(active_channel_id=owner_channel)
+        )
+        await self.db.commit()
 
     async def _claim_active_channel(self, chat_id: str) -> None:
         """The job that owns the turn owns the chat's reconnect channel.
