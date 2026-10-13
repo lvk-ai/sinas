@@ -606,6 +606,53 @@ class TestPreviewMatchesApply:
         assert any("not found or inactive" in e for e in preview.errors), preview.errors
 
 
+    @staticmethod
+    def _pipeline_and_schedule(ns: str, schedule: str, *, schedule_active: bool, declare_pipeline: bool = True):
+        spec: dict = {
+            "schedules": [{
+                "name": schedule, "scheduleType": "pipeline", "pipelineName": f"{ns}/poll",
+                "cronExpression": "*/5 * * * *", "isActive": schedule_active,
+            }],
+        }
+        if declare_pipeline:
+            spec["functions"] = [{"namespace": ns, "name": "job", "code": "def handler(input, context):\n    return {}"}]
+            spec["pipelines"] = [{
+                "namespace": ns, "name": "poll", "isActive": False,
+                "steps": [{"name": "s", "type": "function", "function": f"{ns}/job"}],
+            }]
+        return SinasConfig.model_validate({
+            "apiVersion": "sinas.co/v1", "kind": "SinasConfig", "metadata": {"name": "cfg"}, "spec": spec,
+        })
+
+    async def test_a_disabled_schedule_may_target_a_disabled_pipeline(self, db: AsyncSession, admin_user):
+        """A package can ship a polling pipeline and its schedule both off,
+        to be switched on together (the official telegram package does). A
+        disabled schedule never fires, so its target need only exist."""
+        ns, name = f"ns{_uid()}", f"cfg-{_uid()}"
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        config = self._pipeline_and_schedule(ns, name, schedule_active=False)
+        preview = await svc.apply_config(config, dry_run=True)
+        assert not preview.errors, preview.errors
+        applied = await svc.apply_config(config)
+        assert applied.success and not applied.errors, applied.errors
+        assert (await _row(db, name)).is_active is False
+
+    async def test_switching_it_on_needs_the_pipeline_on(self, db: AsyncSession, admin_user):
+        ns, name = f"ns{_uid()}", f"cfg-{_uid()}"
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        assert (await svc.apply_config(self._pipeline_and_schedule(ns, name, schedule_active=False))).success
+        turned_on = await svc.apply_config(self._pipeline_and_schedule(ns, name, schedule_active=True))
+        assert any("not found or inactive" in e for e in turned_on.errors), turned_on.errors
+
+    async def test_a_disabled_schedule_still_needs_its_target_to_exist(self, db: AsyncSession, admin_user):
+        ns, name = f"ns{_uid()}", f"cfg-{_uid()}"
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        result = await svc.apply_config(
+            self._pipeline_and_schedule(ns, name, schedule_active=False, declare_pipeline=False), dry_run=True
+        )
+        assert any(f"Pipeline '{ns}/poll' not found" in e for e in result.errors), result.errors
+
+
 class TestPackageUninstall:
     async def test_uninstall_records_deletions_and_tells_the_scheduler(
         self, db: AsyncSession, admin_user, published
