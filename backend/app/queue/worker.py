@@ -470,6 +470,16 @@ async def shutdown(ctx: dict) -> None:
             pass
         await redis.aclose()
 
+    # Execution log rows still buffered for ClickHouse
+    from app.services.clickhouse_logger import clickhouse_logger
+
+    await clickhouse_logger.aclose()
+
+    # LLM clients this worker opened (agent jobs)
+    from app.providers.clients import close_shared_clients
+
+    await close_shared_clients()
+
     logger.info("Worker stopped")
 
 
@@ -496,6 +506,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:functions"
+    poll_delay = settings.queue_poll_delay
     max_jobs = settings.queue_function_concurrency
     job_timeout = settings.queue_default_timeout
     # Must exceed the worst-case saturation attempt count (≈ window / 30s
@@ -567,6 +578,7 @@ class AgentWorkerSettings:
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:agents"
+    poll_delay = settings.queue_poll_delay
     max_jobs = settings.queue_agent_concurrency
     job_timeout = settings.agent_job_timeout  # Default timeout, can be overridden per-job
     max_tries = 1  # No retry for agent conversations (side effects)
@@ -585,6 +597,7 @@ class PipelineWorkerSettings:
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:pipelines"
+    poll_delay = settings.queue_poll_delay
     max_jobs = settings.queue_pipeline_concurrency
     job_timeout = settings.pipeline_job_timeout
     max_tries = 1  # runs are re-fired by triggers; never auto-retried (side effects)
@@ -609,6 +622,7 @@ class SubAgentWorkerSettings:
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:agents:sub"
+    poll_delay = settings.queue_poll_delay
     max_jobs = settings.queue_agent_sub_concurrency
     job_timeout = settings.agent_job_timeout
     max_tries = 1  # No retry for agent conversations (side effects)

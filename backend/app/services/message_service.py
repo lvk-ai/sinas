@@ -219,10 +219,13 @@ class MessageService:
         provider_type = None
         provider_config = None
         if provider_name:
-            result = await self.db.execute(
-                select(LLMProvider).where(LLMProvider.name == provider_name)
-            )
-            provider_config = result.scalar_one_or_none()
+            if agent and agent.llm_provider and agent.llm_provider.name == provider_name:
+                provider_config = agent.llm_provider  # loaded with the agent
+            else:
+                result = await self.db.execute(
+                    select(LLMProvider).where(LLMProvider.name == provider_name)
+                )
+                provider_config = result.scalar_one_or_none()
             if provider_config:
                 provider_type = provider_config.provider_type
 
@@ -333,6 +336,7 @@ class MessageService:
                 "source": "chat",
             },
             overrides=agent.provider_overrides if agent else None,
+            config=provider_config,
         )
 
         # If no model specified, use the provider's default model
@@ -382,6 +386,10 @@ class MessageService:
             "response_format": response_format,
             "status_templates": agent.status_templates if agent else {},
             "agent_label": f"{agent.namespace}/{agent.name}" if agent else None,
+            # Held for the turn: the session only keeps loaded rows while
+            # something references them, and later steps get the agent from
+            # the session (no query) instead of loading it again.
+            "agent": agent,
         }
 
     async def inject_user_message(
@@ -647,10 +655,7 @@ class MessageService:
         # Run assistant message hooks
         agent = None
         if prep["chat"].agent_id:
-            agent_result = await self.db.execute(
-                select(Agent).where(Agent.id == prep["chat"].agent_id)
-            )
-            agent = agent_result.scalar_one_or_none()
+            agent = await self.db.get(Agent, prep["chat"].agent_id)
 
         if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
             hook_result = await run_hooks(
@@ -959,13 +964,10 @@ class MessageService:
         # Run assistant message hooks (post-stream, retroactive update)
         final_content = full_content
         if final_content and not tool_calls:
-            chat = await self.db.get(Chat, chat_id)
+            chat = await self.db.get(Chat, uuid.UUID(str(chat_id)))
             agent = None
             if chat and chat.agent_id:
-                agent_result = await self.db.execute(
-                    select(Agent).where(Agent.id == chat.agent_id)
-                )
-                agent = agent_result.scalar_one_or_none()
+                agent = await self.db.get(Agent, chat.agent_id)
 
             if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
                 hook_result = await run_hooks(
@@ -1647,8 +1649,7 @@ class MessageService:
 
         agent = None
         if chat and chat.agent_id:
-            result_agent = await self.db.execute(select(Agent).where(Agent.id == chat.agent_id))
-            agent = result_agent.scalar_one_or_none()
+            agent = await self.db.get(Agent, chat.agent_id)
 
         # Same builder as a fresh send (issue #225): the window, the rolling
         # compaction summary and older-tool-result compaction apply at every
@@ -1813,13 +1814,10 @@ class MessageService:
         # Run assistant hooks on the final response (after all tool calls complete)
         final_content = full_content
         if final_content:
-            chat = await self.db.get(Chat, chat_id)
+            chat = await self.db.get(Chat, uuid.UUID(str(chat_id)))
             agent = None
             if chat and chat.agent_id:
-                agent_result = await self.db.execute(
-                    select(Agent).where(Agent.id == chat.agent_id)
-                )
-                agent = agent_result.scalar_one_or_none()
+                agent = await self.db.get(Agent, chat.agent_id)
 
             if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
                 hook_result = await run_hooks(
