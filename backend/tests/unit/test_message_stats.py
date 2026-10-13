@@ -62,52 +62,64 @@ async def _seed(db, owner: User, ns: str) -> None:
     await db.flush()
 
 
-async def test_stats_fold_one_pass_into_the_same_response(client, db, admin_user):
-    before = await _stats(client, admin_user)
+async def test_stats_fold_one_pass_into_the_same_response(client, db):
+    # A fresh read:own user sees only the chats seeded here, so every figure
+    # is exact whatever else the database holds.
+    reader = await _own_reader(db)
     ns = f"st{uuid.uuid4().hex[:6]}"
-    await _seed(db, admin_user, ns)
-    after = await _stats(client, admin_user)
+    await _seed(db, reader, ns)
+    stats = await _stats(client, reader)
 
-    assert after["total_messages"] - before["total_messages"] == 6
-    assert after["tool_calls"] - before["tool_calls"] == 1
-    assert _delta(after["role_distribution"], before["role_distribution"]) == {"user": 2, "assistant": 3, "tool": 1}
+    assert stats["total_messages"] == 6
+    assert stats["tool_calls"] == 1
+    assert stats["role_distribution"] == {"user": 2, "assistant": 3, "tool": 1}
 
     # Days by the database's own date cast, as before; in order, oldest first
     day_rows = (await db.execute(text(
         "SELECT CAST(m.created_at AS DATE) AS d, count(*) FROM messages m JOIN chats c ON m.chat_id = c.id "
-        "WHERE c.agent_namespace = :ns AND m.created_at >= now() - interval '7 days' GROUP BY 1"
+        "WHERE c.agent_namespace = :ns AND m.created_at >= now() - interval '7 days' GROUP BY 1 ORDER BY 1"
     ), {"ns": ns})).all()
-    assert _delta(after["activity_by_day"], before["activity_by_day"]) == {str(d): n for d, n in day_rows}
-    assert list(after["activity_by_day"]) == sorted(after["activity_by_day"])
+    assert list(stats["activity_by_day"].items()) == [(str(d), n) for d, n in day_rows]
 
-    agents = {u["agent"]: u["count"] for u in after["agent_usage"]}
-    assert agents[f"{ns}/a"] == 4 and agents[f"{ns}/b"] == 2
-    counts = [u["count"] for u in after["agent_usage"]]
-    assert counts == sorted(counts, reverse=True) and len(counts) <= 10
+    assert stats["agent_usage"] == [{"agent": f"{ns}/a", "count": 4}, {"agent": f"{ns}/b", "count": 2}]
 
-    assert set(after) == {
+    assert set(stats) == {
         "total_messages", "tool_calls", "activity_by_day", "agent_usage", "role_distribution",
         "llm_prompt_tokens", "llm_completion_tokens", "llm_total_tokens",
         "llm_cache_read_tokens", "llm_cache_write_tokens", "llm_calls", "days",
     }
 
 
-async def test_agent_usage_keeps_the_top_ten(client, db, admin_user):
+async def test_read_all_counts_every_users_messages(client, db, admin_user):
+    # read:all sees whatever the database already holds, so compare growth.
+    before = await _stats(client, admin_user)
+    await _seed(db, await _own_reader(db), f"all{uuid.uuid4().hex[:6]}")
+    after = await _stats(client, admin_user)
+
+    assert after["total_messages"] - before["total_messages"] == 6
+    assert after["tool_calls"] - before["tool_calls"] == 1
+    assert _delta(after["role_distribution"], before["role_distribution"]) == {"user": 2, "assistant": 3, "tool": 1}
+    assert sum(_delta(after["activity_by_day"], before["activity_by_day"]).values()) == 6
+    assert list(after["activity_by_day"]) == sorted(after["activity_by_day"])
+    counts = [u["count"] for u in after["agent_usage"]]
+    assert counts == sorted(counts, reverse=True) and len(counts) <= 10
+
+
+async def test_agent_usage_keeps_the_top_ten(client, db):
+    reader = await _own_reader(db)
     ns = f"top{uuid.uuid4().hex[:6]}"
     now = datetime.now(timezone.utc)
-    # Twelve agents with 1000+i messages each: more than any other test's
-    # agents, so all ten slots are ours and the two smallest drop out.
+    # Twelve agents with i+1 messages each: the two smallest drop out.
     for i in range(12):
-        chat = Chat(user_id=admin_user.id, agent_namespace=ns, agent_name=f"g{i:02d}", title="t")
+        chat = Chat(user_id=reader.id, agent_namespace=ns, agent_name=f"g{i:02d}", title="t")
         db.add(chat)
         await db.flush()
         await db.execute(text(
             "INSERT INTO messages (id, chat_id, role, created_at) "
             "SELECT gen_random_uuid(), :chat, 'user', :ts FROM generate_series(1, :n)"
-        ), {"chat": chat.id, "ts": now, "n": 1000 + i})
-    stats = await _stats(client, admin_user)
-    assert [u["agent"] for u in stats["agent_usage"]] == [f"{ns}/g{i:02d}" for i in range(11, 1, -1)]
-    assert [u["count"] for u in stats["agent_usage"]] == [1000 + i for i in range(11, 1, -1)]
+        ), {"chat": chat.id, "ts": now, "n": i + 1})
+    stats = await _stats(client, reader)
+    assert stats["agent_usage"] == [{"agent": f"{ns}/g{i:02d}", "count": i + 1} for i in range(11, 1, -1)]
 
 
 async def test_read_own_counts_only_own_chats(client, db, admin_user):
