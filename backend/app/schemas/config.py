@@ -601,6 +601,29 @@ class McpServerConfig(BaseModel):
     isActive: Optional[bool] = None
 
 
+class PackageRepositoryAuthConfig(BaseModel):
+    """Package repository auth configuration"""
+
+    model_config = {"extra": "forbid"}
+
+    type: str = "none"
+    secret: Optional[str] = None
+    header: Optional[str] = None
+
+
+class PackageRepositoryConfig(BaseModel):
+    """Package repository (see ADR 2026-10-13-package-repositories)"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str
+    description: Optional[str] = None
+    url: str
+    auth: PackageRepositoryAuthConfig = Field(default_factory=PackageRepositoryAuthConfig)
+    # Unset: a new repository is active, an existing one keeps its state.
+    isActive: Optional[bool] = None
+
+
 class PipelineConfig(BaseModel):
     """Pipeline configuration (see ADR 2026-07-28-pipelines-triggers-and-linear-steps).
 
@@ -696,6 +719,7 @@ class ConfigSpec(BaseModel):
     secrets: list[SecretConfig] = Field(default_factory=list)
     connectors: list[ConnectorConfig] = Field(default_factory=list)
     mcpServers: list[McpServerConfig] = Field(default_factory=list)
+    packageRepositories: list[PackageRepositoryConfig] = Field(default_factory=list)
 
     skills: list[SkillConfig] = Field(default_factory=list)
     components: list[ComponentConfig] = Field(default_factory=list)

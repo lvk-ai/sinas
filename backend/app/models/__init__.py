@@ -48,6 +48,7 @@ from .user import (
 )
 from .chat_wakeup import ChatWakeup
 from .mcp_task import McpTask
+from .package_repository import PackageRepository
 from .webhook import Webhook
 
 __all__ = [
@@ -57,6 +58,7 @@ __all__ = [
     "Webhook",
     "ChatWakeup",
     "McpTask",
+    "PackageRepository",
     "ConfigRevision",
     "ScheduledJob",
     "Execution",

@@ -30,6 +30,9 @@ class Package(Base):
     description: Mapped[Optional[str]] = mapped_column(Text)
     author: Mapped[Optional[str]] = mapped_column(String(255))
     source_url: Mapped[Optional[str]] = mapped_column(String(1024))
+    # The package repository it was installed from (by name), if any: where
+    # its updates are looked for.
+    source_repository: Mapped[Optional[str]] = mapped_column(String(100))
     source_yaml: Mapped[str] = mapped_column(Text, nullable=False)
     values: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}"

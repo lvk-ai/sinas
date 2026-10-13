@@ -556,6 +556,13 @@ async def poll_mcp_tasks_job(ctx: dict) -> int:
     return await poll_due_tasks()
 
 
+async def refresh_package_repositories_job(ctx: dict) -> int:
+    """Refresh package repository indexes older than the refresh interval."""
+    from app.services.package_repositories import refresh_due
+
+    return await refresh_due()
+
+
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
@@ -573,6 +580,9 @@ class AgentWorkerSettings:
         # Every 5 seconds; each task is polled at its own (server-suggested)
         # interval, at least mcp_task_min_poll_seconds apart.
         cron(poll_mcp_tasks_job, second=set(range(0, 60, 5)), unique=True),
+        # Hourly; each repository is refreshed when its index is older than
+        # package_repository_refresh_hours.
+        cron(refresh_package_repositories_job, minute=17, second=10, unique=True),
     ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown

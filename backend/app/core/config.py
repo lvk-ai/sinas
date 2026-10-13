@@ -411,6 +411,14 @@ class Settings(BaseSettings):
     mcp_task_max_age_seconds: int = 7 * 86400
     mcp_task_poll_concurrency: int = 10
 
+    # Package repositories (ADR 2026-10-13-package-repositories): how often
+    # each repository's index is refreshed, and bounds on what is fetched.
+    # Plain http only for local development.
+    package_repository_refresh_hours: int = 6
+    package_repository_timeout_seconds: int = 20
+    package_repository_max_bytes: int = 2 * 1024 * 1024
+    package_repositories_allow_http: bool = False
+
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
 

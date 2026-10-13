@@ -3,15 +3,31 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
 
 
+def _one_source(model):
+    if (model.source is None) == (model.repository is None and model.package is None):
+        raise ValueError("Give either source (the YAML) or repository and package")
+    if model.source is None and not (model.repository and model.package):
+        raise ValueError("Installing from a repository needs both repository and package")
+    return model
+
+
 class PackageInstallRequest(BaseModel):
-    """Request to install a package from YAML content."""
-    source: str = Field(..., description="YAML content of the SinasPackage")
+    """Request to install a package from YAML content, or from a package
+    repository."""
+
+    check_source = model_validator(mode="after")(_one_source)
+
+    source: Optional[str] = Field(None, description="YAML content of the SinasPackage")
+    # Or, instead of `source`: a package from a package repository, which
+    # Sinas fetches and checks against the repository's index.
+    repository: Optional[str] = Field(None, description="Package repository to install from")
+    package: Optional[str] = Field(None, description="Package name in that repository")
     variables: Optional[dict[str, Any]] = Field(None, description="Install-time variable values")
     instance: Optional[str] = Field(
         None,
@@ -33,7 +49,12 @@ class PackageInstallRequest(BaseModel):
 
 class PackagePreviewRequest(BaseModel):
     """Request to preview a package install (dry run)."""
-    source: str = Field(..., description="YAML content of the SinasPackage")
+
+    check_source = model_validator(mode="after")(_one_source)
+
+    source: Optional[str] = Field(None, description="YAML content of the SinasPackage")
+    repository: Optional[str] = Field(None, description="Package repository to preview from")
+    package: Optional[str] = Field(None, description="Package name in that repository")
     variables: Optional[dict[str, Any]] = Field(None, description="Variable values for substitution")
     instance: Optional[str] = Field(
         None, pattern=INSTANCE_NAME_PATTERN,
@@ -67,6 +88,10 @@ class PackageResponse(BaseModel):
     description: Optional[str]
     author: Optional[str]
     source_url: Optional[str]
+    source_repository: Optional[str] = None
+    # From the repository it follows (see package_repositories.package_status).
+    latest_version: Optional[str] = None
+    update_available: bool = False
     installed_by: uuid.UUID
     installed_at: datetime
     updated_at: Optional[datetime]
@@ -84,6 +109,9 @@ class PackageListResponse(BaseModel):
     description: Optional[str]
     author: Optional[str]
     installed_at: datetime
+    source_repository: Optional[str] = None
+    latest_version: Optional[str] = None
+    update_available: bool = False
 
     class Config:
         from_attributes = True

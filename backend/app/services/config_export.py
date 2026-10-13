@@ -12,6 +12,7 @@ from app.models.agent import Agent
 from app.models.component import Component
 from app.models.connector import Connector
 from app.models.mcp_server import McpServer
+from app.models.package_repository import PackageRepository
 from app.models.dependency import Dependency
 from app.models.file import Collection
 from app.models.function import Function
@@ -36,6 +37,7 @@ from app.services.resource_serializers import (
     serialize_component,
     serialize_connector,
     serialize_mcp_server,
+    serialize_package_repository,
     serialize_database_trigger,
     serialize_function,
     serialize_manifest,
@@ -79,6 +81,7 @@ class ConfigExportService:
         config_dict["spec"]["secrets"] = await self._export_secrets()
         config_dict["spec"]["connectors"] = await self._export_connectors()
         config_dict["spec"]["mcpServers"] = await self._export_mcp_servers()
+        config_dict["spec"]["packageRepositories"] = await self._export_package_repositories()
         config_dict["spec"]["collections"] = await self._export_collections()
         config_dict["spec"]["queries"] = await self._export_queries()
         config_dict["spec"]["functions"] = await self._export_functions()
@@ -294,6 +297,14 @@ class ConfigExportService:
             stmt = stmt.where(McpServer.managed_by == self.managed_by)
         result = await self.db.execute(stmt)
         return [serialize_mcp_server(s) for s in result.scalars().all()]
+
+    async def _export_package_repositories(self) -> list[dict]:
+        """Export package repositories, disabled ones included (as isActive: false)."""
+        stmt = select(PackageRepository).order_by(PackageRepository.name)
+        if self.managed_only:
+            stmt = stmt.where(PackageRepository.managed_by == self.managed_by)
+        result = await self.db.execute(stmt)
+        return [serialize_package_repository(r) for r in result.scalars().all()]
 
     async def _export_pipelines(self) -> list[dict]:
         """Export pipelines, inactive ones included (as isActive: false).

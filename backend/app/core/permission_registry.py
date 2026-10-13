@@ -168,6 +168,12 @@ PERMISSION_REGISTRY: list[dict[str, Any]] = [
         "adminOnly": True,
     },
     {
+        "resource": "package_repositories",
+        "description": "Package repositories: where packages and their updates come from",
+        "actions": ["create", "read", "update", "delete"],
+        "adminOnly": True,
+    },
+    {
         "resource": "config",
         "description": "Declarative YAML configuration",
         "actions": ["validate", "apply", "read"],
