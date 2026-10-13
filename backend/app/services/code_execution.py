@@ -185,11 +185,8 @@ async def execute(
         """Copy-out: persist created/changed files, strip the blob payload."""
         if workbench_chat_id is None:
             return res
-        inner = res.get("result")
-        if not isinstance(inner, dict):
-            return res
-        changes = inner.pop("workbench_changes", None)
-        return_skipped = inner.pop("workbench_return_skipped", None)
+        changes = res.pop("workbench_changes", None)
+        return_skipped = res.pop("workbench_return_skipped", None)
         info: dict[str, Any] = {}
         if changes:
             try:
@@ -481,10 +478,35 @@ async def _run_code_payload(
         return _shape_code_result(envelope["data"], duration_ms)
 
 
+# Keys the wrapper adds next to its stdout/result for the copy-out step.
+_WRAPPER_EXTRAS = ("workbench_changes", "workbench_return_skipped")
+
+
 def _shape_code_result(
     result_data: dict[str, Any], duration_ms: int
 ) -> dict[str, Any]:
-    """Map a wire result dict to the code-execution tool's result shape."""
+    """Map a wire result dict to the code-execution tool's result shape.
+
+    The executor reports the wrapper's return value under "result"
+    ({"status": "completed", "result": <wrapper output>}); the run's own
+    stdout, status and error live in that inner dict. Lift it out, or a run
+    whose code raised reads as completed, with an empty stdout.
+    """
+    inner = result_data.get("result")
+    if (
+        result_data.get("status") == "completed"
+        and isinstance(inner, dict)
+        and inner.get("status") in ("completed", "failed")
+        and "stdout" in inner
+    ):
+        extras = {k: inner[k] for k in _WRAPPER_EXTRAS if k in inner}
+        return {**_shape_wire_result(inner, duration_ms), **extras}
+    return _shape_wire_result(result_data, duration_ms)
+
+
+def _shape_wire_result(
+    result_data: dict[str, Any], duration_ms: int
+) -> dict[str, Any]:
     if result_data.get("status") == "failed":
         return {
             "stdout": result_data.get("stdout", ""),
@@ -528,7 +550,9 @@ def _build_wrapper(user_code: str, workbench: bool = False) -> str:
     _wb_eid = (context or {}).get("execution_id", "")
     _wb_hashes = {}
     _wb_lazy_unfetched = set()
-    _wb_root = _tempfile.mkdtemp(prefix="workbench_")
+    # Resolved: paths are matched against it via relpath(abspath(...)), and
+    # abspath follows the cwd, which the OS reports symlink-free (macOS /tmp).
+    _wb_root = _os.path.realpath(_tempfile.mkdtemp(prefix="workbench_"))
     _wb_old_cwd = _os.getcwd()
     # Blob cache is namespaced per chat, and every OTHER chat's cache is
     # purged here — before any user code runs — so a pooled container that

@@ -66,3 +66,55 @@ def test_failed_constructor():
     assert r.status is ResultStatus.FAILED
     assert r.error == "nope"
     assert r.traceback is None
+
+
+# ---------------------------------------------------------------------------
+# Code-execution result shaping: the in-container executor reports the
+# wrapper's return value under "result"; _shape_code_result must lift the
+# run's own stdout / status / error out of it.
+# ---------------------------------------------------------------------------
+
+
+def _run_wrapped(code: str, workbench_input: dict | None = None) -> dict:
+    """Run the real wrapper in-process and shape it as the executor reports it
+    (container_executor._execute_inline_sandbox)."""
+    from app.services.code_execution import _build_wrapper, _shape_code_result
+
+    ns: dict = {}
+    exec(_build_wrapper(code, workbench=workbench_input is not None), ns)
+    output = ns["handler"](workbench_input or {}, {"execution_id": "e"})
+    return _shape_code_result({"result": output, "execution_id": "e", "status": "completed"}, 5)
+
+
+def test_code_result_lifts_stdout_and_value():
+    out = _run_wrapped("print('hi')\n41 + 1")
+    assert out == {"stdout": "hi\n", "stderr": "", "result": 42, "duration_ms": 5}
+
+
+def test_code_that_raises_is_an_error_at_the_top_level():
+    out = _run_wrapped("print('before')\nraise ValueError('boom')")
+    assert out["stdout"] == "before\n"
+    assert out["result"] is None
+    assert "ValueError: boom" in out["error"]
+
+
+def test_a_returned_dict_shaped_like_the_wrapper_output_stays_the_value():
+    out = _run_wrapped("{'status': 'completed', 'stdout': 'x', 'result': 1}")
+    assert out["result"] == {"status": "completed", "stdout": "x", "result": 1}
+    assert out["stdout"] == ""
+
+
+def test_workbench_changes_are_lifted_for_copy_out():
+    out = _run_wrapped(
+        "open('note.txt', 'w').write('hello')",
+        {"workbench_files": [], "workbench_lazy": [],
+         "workbench_limits": {"max_file_bytes": 4096, "max_total_bytes": 8192}},
+    )
+    assert [c["path"] for c in out["workbench_changes"]] == ["note.txt"]
+
+
+def test_executor_level_failure_is_unchanged():
+    from app.services.code_execution import _shape_code_result
+
+    out = _shape_code_result({"status": "failed", "error": "No 'handler' function found"}, 1)
+    assert out["error"] == "No 'handler' function found" and out["result"] is None

@@ -525,6 +525,34 @@ async def test_finished_job_is_delivered_into_the_chat(committed_chat, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_job_whose_code_raised_is_delivered_as_failed(committed_chat, monkeypatch):
+    from app.services import code_execution
+
+    env = committed_chat
+    delivered = []
+
+    async def fake_exec(code, user_id=None, chat_id=None, timeout=None):
+        # What execute() returns for code that raised (see _shape_code_result).
+        return {"stdout": "about to fail\n", "stderr": "", "result": None, "duration_ms": 3,
+                "error": "Traceback ...\nValueError: boom"}
+
+    async def fake_deliver(chat_id, content, *, source, api_key_id=None):
+        delivered.append(content)
+        return {"status": "started"}
+
+    monkeypatch.setattr(code_execution, "execute", fake_exec)
+    monkeypatch.setattr(chat_wakeups, "deliver_to_chat", fake_deliver)
+    cid = str(env["chat"].id)
+    await chat_wakeups.run_background_code_job(
+        job_id="job-f", chat_id=cid, user_id=str(env["user"].id), code="raise ValueError('boom')",
+        description="failing", tool_call_id=None, pending_completion_id=None, api_key_id=None,
+    )
+    (content,) = delivered
+    assert content.startswith("[background job job-f failed: failing]\n")
+    assert (await chat_wakeups.background_job_status(cid, "job-f"))["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_finished_job_completes_the_suspended_round(committed_chat, monkeypatch):
     from app.services import code_execution
 

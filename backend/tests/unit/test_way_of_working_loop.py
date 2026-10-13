@@ -633,10 +633,10 @@ async def test_exemplar_agent_runs_the_full_loop(
     rerun = files["tool_results/execute_code_call_6.json"]
     assert first.file_metadata == {"origin": "tool", "tool_name": "execute_code", "tool_call_id": "call_4"}
     first_result = json.loads((await _read_current(first)).decode())
-    assert "CHECK total 1950.50" in first_result["result"]["stdout"]
+    assert "CHECK total 1950.50" in first_result["stdout"]
     rerun_result = json.loads((await _read_current(rerun)).decode())
-    assert f"CHECK total {EXPECTED_TOTAL}" in rerun_result["result"]["stdout"]
-    assert f"CHECK dropped {json.dumps(EXPECTED_DROPPED)}" in rerun_result["result"]["stdout"]
+    assert f"CHECK total {EXPECTED_TOTAL}" in rerun_result["stdout"]
+    assert f"CHECK dropped {json.dumps(EXPECTED_DROPPED)}" in rerun_result["stdout"]
     assert set(rerun_result["workbench"]["synced"]) == {"sales_clean.csv", "summary.md", "summary.html"}
     inline = json.loads(next(e for e in events if e.get("tool_call_id") == "call_4" and e["type"] == "tool_end")["result"])
     assert inline["_full_result"]["workbench_file"] == "tool_results/execute_code_call_4.json"
