@@ -40,6 +40,15 @@ _HOOK_LISTS = {"onUserMessage": "on_user_message", "onAssistantMessage": "on_ass
 _HOOK_KEYS = {"onTimeout": "on_timeout", "async_": "async"}
 
 
+class McpBindingRef(BaseModel):
+    """An MCP server bound to an agent, optionally narrowed to tool-name
+    globs. The string form "namespace/name" means every tool the server
+    allows."""
+
+    server: str
+    tools: list[str] = Field(default_factory=list)
+
+
 class AgentSpec(SpecModel):
     namespace: str = Field(default="default", min_length=1, max_length=255, pattern=r"^[^/]+$")
     name: str = Field(min_length=1, max_length=255)
@@ -73,8 +82,26 @@ class AgentSpec(SpecModel):
     # Permission modes: {"default": "auto"|"ask", "rules": [{"match", "action"}]}.
     # Validated at save time so a bad rule never waits to fail in a chat.
     tool_approvals: Optional[dict[str, Any]] = None
+    enabled_mcp_servers: list[McpBindingRef] = Field(default_factory=list)
     is_default: bool = False
     is_active: bool = True
+
+    @field_validator("enabled_mcp_servers", mode="before")
+    @classmethod
+    def _normalize_mcp_bindings(cls, v):
+        """Strings become {"server", "tools": []}; stored sorted by server
+        with sorted tools so the config hash is order-independent."""
+        if v is None:
+            return []
+        normalized = []
+        for item in v:
+            if isinstance(item, str):
+                normalized.append({"server": item, "tools": []})
+                continue
+            data = item if isinstance(item, dict) else item.model_dump()
+            tools = data.get("tools")
+            normalized.append({**data, "tools": sorted(tools or [])})
+        return sorted(normalized, key=lambda x: str(x.get("server", "")))
 
     @field_validator("tool_approvals", mode="before")
     @classmethod

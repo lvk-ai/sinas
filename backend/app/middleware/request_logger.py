@@ -7,6 +7,54 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.services.clickhouse_logger import clickhouse_logger
 
+_SENSITIVE_KEYS = frozenset({
+    "password", "api_key", "secret", "token", "refresh_token", "access_token", "otp",
+})
+# Whole mappings whose values are credentials (an MCP server's or a
+# connector's request headers), and strings that may carry one in their
+# userinfo or query (an MCP server's url).
+_SECRET_MAPPINGS = frozenset({"headers"})
+_URL_KEYS = frozenset({"url"})
+_REDACTED = "***REDACTED***"
+
+
+def _safe_url(value: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return _REDACTED
+    if not parts.scheme and not parts.netloc:
+        return value
+    host = parts.netloc.rsplit("@", 1)[-1]
+    if host != parts.netloc:
+        host = "***@" + host
+    return urlunsplit((parts.scheme, host, parts.path, "***" if parts.query else "", ""))
+
+
+def redact_body(body):
+    """The request body as it may be stored: credential-bearing values
+    masked at every depth (the sensitive keys, every value of a `headers`
+    mapping, the userinfo and query of a `url`), whoever may later read
+    the logs."""
+    if isinstance(body, dict):
+        out = {}
+        for key, value in body.items():
+            lowered = key.lower() if isinstance(key, str) else key
+            if lowered in _SENSITIVE_KEYS:
+                out[key] = _REDACTED
+            elif lowered in _SECRET_MAPPINGS and isinstance(value, dict):
+                out[key] = {k: _REDACTED for k in value}
+            elif lowered in _URL_KEYS and isinstance(value, str):
+                out[key] = _safe_url(value)
+            else:
+                out[key] = redact_body(value)
+        return out
+    if isinstance(body, list):
+        return [redact_body(v) for v in body]
+    return body
+
 
 class RequestLoggerMiddleware:
     """ASGI middleware to log all API requests to ClickHouse with body capture."""
@@ -97,20 +145,7 @@ class RequestLoggerMiddleware:
                     request_body = {"_truncated": True, "_size": len(full_body)}
                 else:
                     try:
-                        request_body = json.loads(full_body.decode())
-                        # Redact sensitive fields
-                        if isinstance(request_body, dict):
-                            for sensitive_key in [
-                                "password",
-                                "api_key",
-                                "secret",
-                                "token",
-                                "refresh_token",
-                                "access_token",
-                                "otp",
-                            ]:
-                                if sensitive_key in request_body:
-                                    request_body[sensitive_key] = "***REDACTED***"
+                        request_body = redact_body(json.loads(full_body.decode()))
                     except Exception:
                         pass
 

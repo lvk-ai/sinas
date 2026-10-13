@@ -15,7 +15,7 @@ from sqlalchemy import select, update
 
 from app.models.agent import Agent
 from app.models.llm_provider import LLMProvider
-from app.schemas.spec.agent import AgentSpec
+from app.schemas.spec.agent import AgentSpec, McpBindingRef
 from app.services.resources.base import ApplierError, ApplyContext, ReferenceNotFound, ResourceApplier
 
 _FIELDS = (
@@ -39,7 +39,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
     reference_fields = (
         "llm_provider_name", "enabled_functions", "enabled_skills", "enabled_queries",
         "enabled_stores", "enabled_collections", "enabled_components", "enabled_connectors",
-        "enabled_pipelines", "enabled_agents", "hooks",
+        "enabled_pipelines", "enabled_agents", "hooks", "enabled_mcp_servers",
     )
     # Operator state: a deleted (switched-off) agent stays off, and the
     # default chosen in the console stays the default, unless config says so.
@@ -112,6 +112,10 @@ class AgentApplier(ResourceApplier[AgentSpec]):
             default_keep_alive=bool(row.default_keep_alive),
             system_tools=list(row.system_tools or []),
             tool_approvals=dict(row.tool_approvals) if row.tool_approvals else None,
+            enabled_mcp_servers=[
+                McpBindingRef.model_construct(**({"tools": [], **b} if isinstance(b, dict) else {"server": str(b), "tools": []}))
+                for b in row.enabled_mcp_servers or []
+            ],
             is_default=bool(row.is_default),
             is_active=row.is_active is not False,
         )
@@ -159,7 +163,38 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         row.enabled_collections = [c.model_dump() for c in spec.enabled_collections]
         row.hooks = dict(spec.hooks) if spec.hooks is not None else None
         row.tool_approvals = dict(spec.tool_approvals) if spec.tool_approvals else None
+        row.enabled_mcp_servers = [b.model_dump() for b in spec.enabled_mcp_servers]
         row.is_default = spec.is_default
+
+    async def _check_mcp_bindings(
+        self, spec: AgentSpec, ctx: ApplyContext, current: Optional[AgentSpec]
+    ) -> None:
+        """A binding is accepted only for a server that exists and that the
+        acting user can read: the chat runtime applies the same check, so a
+        binding nobody could use would only produce a warning per turn — and
+        a user must not be able to point an agent at another owner's server
+        (and credentials) by name. Only bindings added by this write are
+        checked, so an unchanged agent never fails on a server that went away."""
+        from app.core.auth import get_user_permissions
+        from app.models.mcp_server import McpServer
+
+        before = {b.server for b in (current.enabled_mcp_servers if current else [])}
+        added = [b for b in spec.enabled_mcp_servers if b.server not in before]
+        if not added:
+            return
+        actor = ctx.actor_user_id or ctx.owner_user_id
+        permissions = await get_user_permissions(ctx.db, str(actor)) if actor else {}
+        for binding in added:
+            parts = binding.server.split("/", 1)
+            if len(parts) != 2 or not all(parts):
+                raise ApplierError(f"Invalid MCP server reference '{binding.server}' (use namespace/name)")
+            if binding.server in ctx.pending_references.get("mcpServers", {}):
+                continue  # declared by the same config (applied before agents)
+            server = await McpServer.get_by_name(ctx.db, parts[0], parts[1])
+            if server is None:
+                raise ReferenceNotFound(f"MCP server '{binding.server}' not found")
+            if actor and not server.can_user_access(str(actor), permissions, "read"):
+                raise McpServerNotUsable(f"Not authorized to use MCP server '{binding.server}'")
 
     async def _unset_other_defaults(self, row: Agent, ctx: ApplyContext) -> None:
         from app.schemas.spec.base import diff_specs
@@ -195,12 +230,17 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         anything the same config declares (it's applied all-or-nothing)."""
         if spec.llm_provider_name and (current is None or current.llm_provider_name != spec.llm_provider_name):
             await self.check_references(spec, ctx)
+        # MCP bindings are references too, checked here so a preview (dry
+        # run) reports a missing or unreadable server, not only the apply.
+        await self._check_mcp_bindings(spec, ctx, current)
         missing: list[str] = []
         # The stored state in the spec's own spelling (e.g. a bare "lookup"
         # stored long ago reads as "default/lookup"), so an unchanged
         # reference never looks added.
         before = _normalized(current)
         for kind, label, model in _reference_kinds():
+            if kind == "mcp_servers":
+                continue  # _check_mcp_bindings above: existence, activity and permission
             added = _refs(spec, kind) - _refs(before, kind)
             wanted = []
             for ref in sorted(added):
@@ -244,11 +284,16 @@ class MissingAgentReferences(ApplierError):
     status_code = 400
 
 
+class McpServerNotUsable(ApplierError):
+    status_code = 403
+
+
 def _reference_kinds():
     from app.models.component import Component
     from app.models.connector import Connector
     from app.models.file import Collection
     from app.models.function import Function
+    from app.models.mcp_server import McpServer
     from app.models.pipeline import Pipeline
     from app.models.query import Query
     from app.models.skill import Skill
@@ -264,6 +309,7 @@ def _reference_kinds():
         ("connectors", "connector", Connector),
         ("pipelines", "pipeline", Pipeline),
         ("agents", "agent", Agent),
+        ("mcp_servers", "MCP server", McpServer),  # the applier's kind, as prune keys it
     )
 
 
@@ -283,6 +329,8 @@ def _refs(spec: Optional[AgentSpec], kind: str) -> set[str]:
         return {c.collection for c in spec.enabled_collections}
     if kind == "connectors":
         return {c.get("connector") for c in spec.enabled_connectors if isinstance(c, dict) and c.get("connector")}
+    if kind == "mcp_servers":
+        return {b.server for b in (spec.enabled_mcp_servers or [])}
     field = {"queries": "enabled_queries", "components": "enabled_components",
              "pipelines": "enabled_pipelines", "agents": "enabled_agents"}[kind]
     return {r for r in getattr(spec, field) if isinstance(r, str)}

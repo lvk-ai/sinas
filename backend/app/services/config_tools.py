@@ -33,6 +33,7 @@ _RESOURCE_TYPES = {
     "schedules": "app.models.schedule:ScheduledJob",
     "databaseTriggers": "app.models.database_trigger:DatabaseTrigger",
     "connectors": "app.models.connector:Connector",
+    "mcpServers": "app.models.mcp_server:McpServer",
     "packages": "app.models.package:Package",
 }
 
@@ -81,7 +82,7 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "the full detail of a specific one. Supported types: agents, "
                 "functions, queries, skills, collections, stores, components, "
                 "manifests, templates, webhooks, schedules, databaseTriggers, "
-                "connectors, packages."
+                "connectors, mcpServers, packages."
             ),
             "parameters": {
                 "type": "object",
@@ -295,5 +296,16 @@ async def _get(db: AsyncSession, arguments: dict[str, Any]) -> dict[str, Any]:
         elif hasattr(val, "hex"):
             val = str(val)
         data[col_name] = val
+
+    if resource_type == "mcpServers":
+        # Introspection is read-only metadata: never the credentials. The
+        # header values and any credential in the URL are a per-server
+        # secret the chat's user may not hold.
+        from app.services.mcp_client import safe_url
+
+        data.pop("headers", None)
+        data.pop("auth", None)
+        if isinstance(data.get("url"), str):
+            data["url"] = safe_url(data["url"])
 
     return {"type": resource_type, "namespace": namespace, "name": name, "data": data}

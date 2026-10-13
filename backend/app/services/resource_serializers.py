@@ -145,3 +145,11 @@ def serialize_pipeline(pipeline) -> dict:
     from app.services.resources.pipelines import PipelineApplier
 
     return PipelineApplier().spec_from_row(pipeline).to_config()
+
+
+def serialize_mcp_server(server) -> dict:
+    """Config form of an MCP server — delegated to its spec."""
+    from app.services.resources.mcp_servers import McpServerApplier
+
+    return McpServerApplier().spec_from_row(server).to_config()
+

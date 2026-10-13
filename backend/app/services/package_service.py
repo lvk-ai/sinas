@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
 from app.models.connector import Connector
+from app.models.mcp_server import McpServer
 from app.models.manifest import Manifest
 from app.models.component import Component
 from app.models.database_trigger import DatabaseTrigger
@@ -33,6 +34,7 @@ from app.services.resource_serializers import (
     serialize_collection,
     serialize_component,
     serialize_connector,
+    serialize_mcp_server,
     serialize_database_trigger,
     serialize_function,
     serialize_manifest,
@@ -57,7 +59,7 @@ PACKAGE_SKIP_TYPES = {"users", "llmProviders", "databaseConnections"}
 NAMESPACED_PERM_RE = re.compile(r"^sinas\.[a-z_]+/(?P<ns>[^/]+)/")
 
 # Models that support managed_by
-MANAGED_MODELS = [Agent, Connector, Manifest, Component, Collection, DatabaseTrigger, Function, Query, ScheduledJob, Skill, Store, Template, Webhook]
+MANAGED_MODELS = [Agent, Connector, McpServer, Manifest, Component, Collection, DatabaseTrigger, Function, Query, ScheduledJob, Skill, Store, Template, Webhook]
 
 
 def _package_namespaces(config: SinasConfig) -> set[str]:
@@ -543,6 +545,7 @@ class PackageService:
         type_handlers = {
             "agent": (Agent, self._export_agent),
             "connector": (Connector, self._export_connector),
+            "mcp_server": (McpServer, self._export_mcp_server),
             "function": (Function, self._export_function),
             "skill": (Skill, self._export_skill),
             "manifest": (Manifest, self._export_manifest),
@@ -596,6 +599,7 @@ class PackageService:
         mapping = {
             "agent": "agents",
             "connector": "connectors",
+            "mcp_server": "mcpServers",
             "function": "functions",
             "skill": "skills",
             "manifest": "manifests",
@@ -686,6 +690,9 @@ class PackageService:
 
     async def _export_connector(self, conn: Connector) -> dict:
         return serialize_connector(conn)
+
+    async def _export_mcp_server(self, server: McpServer) -> dict:
+        return serialize_mcp_server(server)
 
     # ── Variable substitution ──────────────────────────────
 

@@ -142,9 +142,9 @@ class ConfigApplyService:
         }
         # What agents may refer to: declared in the same apply counts (it's
         # applied all-or-nothing, and before the agents).
-        for kind in ("skills", "queries", "stores", "collections", "components", "connectors"):
+        for kind in ("skills", "queries", "stores", "collections", "components", "connectors", "mcpServers"):
             self._pending_references[kind] = {
-                f"{item.namespace}/{item.name}": True for item in getattr(config.spec, kind)
+                f"{item.namespace}/{item.name}": True for item in getattr(config.spec, kind, None) or []
             }
         # A function or agent the config leaves isActive unset on keeps its
         # current state, so a disabled one stays disabled: a preview must see

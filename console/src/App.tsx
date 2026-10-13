@@ -45,6 +45,8 @@ import { QueryDetail } from './pages/QueryDetail';
 import { DatabaseTriggers } from './pages/DatabaseTriggers';
 import { Connectors } from './pages/Connectors';
 import { ConnectorEditor } from './pages/ConnectorEditor';
+import { McpServers } from './pages/McpServers';
+import { McpServerEditor } from './pages/McpServerEditor';
 import { Pipelines } from './pages/Pipelines';
 import { PipelineEditor } from './pages/PipelineEditor';
 import { Secrets } from './pages/Secrets';
@@ -170,6 +172,9 @@ function App() {
               <Route path="history" element={<ChangeHistory />} />
               <Route path="connectors" element={<Connectors />} />
               <Route path="connectors/:namespace/:name" element={<ConnectorEditor />} />
+              <Route path="mcp-servers" element={<McpServers />} />
+              <Route path="mcp-servers/new" element={<McpServerEditor />} />
+              <Route path="mcp-servers/:namespace/:name" element={<McpServerEditor />} />
               <Route path="pipelines" element={<Pipelines />} />
               <Route path="pipelines/:namespace/:name" element={<PipelineEditor />} />
               <Route path="secrets" element={<Secrets />} />
