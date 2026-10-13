@@ -73,6 +73,8 @@ Sinas fetches each repository's index when it is added, when you click **Refresh
 }
 ```
 
+Optional per entry: `author`, `readme` (a path like `path`), and `multiInstance: true` for a package that declares `package.multiInstance`, so the catalog offers installing another instance. A bad `readme` or a non-boolean `multiInstance` is dropped, never a reason to refuse the index.
+
 A GitHub repository URL (`https://github.com/<owner>/<repo>`, optionally `/tree/<branch>/<folder>`) is read from `raw.githubusercontent.com`; any other URL is the base the index and paths are under. A package file that doesn't match its index checksum is refused. [sinas-platform/packages](https://github.com/sinas-platform/packages) shows how to generate the index (`scripts/build_index.py`).
 
 **Private repositories:** set `auth` to send a token, kept in a shared [Secret](/build-resources/secrets), with every request. `bearer` sends `Authorization: Bearer <value>`; `header` sends the value in the header you name. Credentials never go in the URL.

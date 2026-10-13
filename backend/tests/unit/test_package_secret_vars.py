@@ -107,3 +107,52 @@ class TestPackageSecretVariables:
         ).scalars().all()
         assert len(rows) == 1
         assert encryption_service.decrypt(rows[0].encrypted_value) == "two"
+
+
+def _skill_package(pkg: str, variables: str, content: str) -> str:
+    return (
+        "apiVersion: sinas.co/v1\nkind: SinasPackage\n"
+        f"package:\n  name: {pkg}\n  version: \"1.0.0\"\n"
+        f"spec:\n  variables:\n{variables}"
+        "  skills:\n"
+        f"    - namespace: {pkg}\n      name: hello\n      description: Says hello\n"
+        f"      content: \"{content}\"\n"
+    )
+
+
+class TestPreviewAppliesTheInstallRulesForVariables:
+    """The preview resolves variables exactly as the install does, also with
+    no values given, so a successful preview is the console's only gate."""
+
+    async def test_an_existing_secret_need_not_be_entered_again(self, db: AsyncSession, admin_user):
+        name = f"TOK_{uuid.uuid4().hex[:6].upper()}"
+        db.add(Secret(
+            user_id=admin_user.id, name=name,
+            encrypted_value=encryption_service.encrypt("kept"), visibility="shared",
+        ))
+        await db.flush()
+        pkg = f"p-{uuid.uuid4().hex[:8]}"
+        yaml_text = _skill_package(
+            pkg, f"    - {{name: {name}, type: secret, required: true}}\n", f"Token ${{{{ vars.{name} }}}}."
+        )
+        result, *_ = await PackageService(db).preview(yaml_text, str(admin_user.id))
+        assert result.success, result.errors
+
+    async def test_a_required_value_with_an_empty_default_is_not_missing(self, db: AsyncSession, admin_user):
+        pkg = f"p-{uuid.uuid4().hex[:8]}"
+        yaml_text = _skill_package(
+            pkg, "    - {name: SUFFIX, type: text, required: true, default: ''}\n", "Hello${{ vars.SUFFIX }}."
+        )
+        result, *_ = await PackageService(db).preview(yaml_text, str(admin_user.id))
+        assert result.success, result.errors
+
+    async def test_a_missing_required_value_is_reported_by_the_preview(self, db: AsyncSession, admin_user):
+        pkg = f"p-{uuid.uuid4().hex[:8]}"
+        yaml_text = _skill_package(
+            pkg, "    - {name: GREETING, type: text, required: true}\n", "Say ${{ vars.GREETING }}."
+        )
+        result, declarations, requires_input, _ = await PackageService(db).preview(yaml_text, str(admin_user.id))
+        assert not result.success and "GREETING" in result.errors[0]
+        assert requires_input and [d["name"] for d in declarations] == ["GREETING"]
+        result, *_ = await PackageService(db).preview(yaml_text, str(admin_user.id), variables={"GREETING": "hi"})
+        assert result.success, result.errors

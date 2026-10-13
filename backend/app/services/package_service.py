@@ -24,7 +24,7 @@ from app.models.skill import Skill
 from app.models.store import Store
 from app.models.template import Template
 from app.models.webhook import Webhook
-from app.schemas.config import ConfigApplyResponse, OwnershipSkip, SinasConfig
+from app.schemas.config import ConfigApplyResponse, ConfigApplySummary, OwnershipSkip, SinasConfig
 from app.services.config_apply import ConfigApplyService
 from app.services.config_export import ConfigExportService
 from app.services.config_parser import ConfigParser
@@ -375,18 +375,39 @@ class PackageService:
         variable_declarations = self._extract_variable_declarations(yaml_content)
         requires_input = any(v.get("required", True) and v.get("default") is None for v in variable_declarations)
 
-        # Substitute variables if provided
-        if variables:
-            # Preview is a dry run: validate + substitute, persist nothing.
-            yaml_content, _ = await self._resolve_variables(
-                yaml_content, variables, user_id, persist_secrets=False
+        def needs_input(message: str):
+            """A package with variables that doesn't preview with the values
+            given (none yet, a missing one, a value that doesn't validate):
+            the declarations and the error, so the caller can ask for values
+            and preview again, instead of a bare failure."""
+            failed = ConfigApplyResponse(
+                success=False, summary=ConfigApplySummary(), changes=[], errors=[message]
             )
+            return failed, variable_declarations, True, install_info
+
+        # Resolve variables whenever the package declares any, with the values
+        # given or none: the same rules as the install (defaults, an existing
+        # secret reused, a required value missing), so a successful preview
+        # means the install with these values gets past them too.
+        if variables or variable_declarations:
+            # Preview is a dry run: validate + substitute, persist nothing.
+            try:
+                yaml_content, _ = await self._resolve_variables(
+                    yaml_content, variables or {}, user_id, persist_secrets=False
+                )
+            except ValueError as e:
+                if not variable_declarations:
+                    raise
+                return needs_input(str(e))
 
         config, validation = await ConfigParser.parse_and_validate(yaml_content, db=self.db)
 
         if not validation.is_valid:
             errors = [str(e) for e in validation.errors]
-            raise ValueError(f"Package validation failed: {'; '.join(errors)}")
+            message = f"Package validation failed: {'; '.join(errors)}"
+            if variable_declarations:
+                return needs_input(message)
+            raise ValueError(message)
 
         if config.kind != "SinasPackage":
             raise ValueError("Expected kind: SinasPackage")

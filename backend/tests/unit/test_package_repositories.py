@@ -48,14 +48,16 @@ class FakeRepository:
         self.redirects: dict[str, str] = {}  # full URL -> Location
         self.down = False
 
-    def publish(self, name: str, version: str, *, tamper: bool = False, declares: str | None = None, readme: str | None = None) -> None:
-        body = _package(declares or name, version).encode()
-        self.files[f"packages/{name}/package.yaml"] = body + (b"# changed\n" if tamper else b"")
+    def publish(self, name: str, version: str, *, tamper: bool = False, declares: str | None = None,
+                readme: str | None = None, body: str | None = None, extra: dict | None = None) -> None:
+        raw = (body if body is not None else _package(declares or name, version)).encode()
+        self.files[f"packages/{name}/package.yaml"] = raw + (b"# changed\n" if tamper else b"")
         entries = [e for e in self._index()["packages"] if e["name"] != name]
         entries.append({
             "name": name, "version": version, "description": "A demo", "author": "Acme",
-            "path": f"packages/{name}/package.yaml", "sha256": hashlib.sha256(body).hexdigest(),
+            "path": f"packages/{name}/package.yaml", "sha256": hashlib.sha256(raw).hexdigest(),
             **({"readme": readme} if readme else {}),
+            **(extra or {}),
         })
         self.files["index.json"] = json.dumps({"schema": repos.INDEX_SCHEMA, "packages": entries}).encode()
 
@@ -144,6 +146,19 @@ class TestIndex:
     def test_invalid_indexes_are_refused(self, data):
         with pytest.raises(RepositoryError):
             parse_index(data)
+
+    @pytest.mark.parametrize("value, expected", [
+        (True, True),
+        (False, False),
+        (None, False),     # left out
+        ("true", False),   # not a boolean: dropped
+        (1, False),
+        ({"x": 1}, False),
+    ])
+    def test_multi_instance_is_an_optional_boolean(self, value, expected):
+        entry = self._entry() if value is None else self._entry(multiInstance=value)
+        index = parse_index(json.dumps({"schema": repos.INDEX_SCHEMA, "packages": [entry]}).encode())
+        assert index["packages"][0]["multi_instance"] is expected
 
 
 def test_versions():
@@ -265,6 +280,17 @@ class TestHardening:
                              headers=auth_headers(admin_user))
         assert r.status_code == 422
 
+    async def test_the_catalog_says_which_packages_are_multi_instance(self, client, admin_user, fake_repo):
+        multi, single, odd = f"multi{_uid()}", f"single{_uid()}", f"odd{_uid()}"
+        fake_repo.publish(multi, "1.0.0", extra={"multiInstance": True})
+        fake_repo.publish(single, "1.0.0")
+        fake_repo.publish(odd, "1.0.0", extra={"multiInstance": "yes"})  # not a boolean: dropped
+        repo = await _add(client, admin_user)
+        assert repo["last_error"] is None and repo["package_count"] == 3
+        catalog = await client.get("/api/v1/packages/catalog", headers=auth_headers(admin_user))
+        flags = {e["name"]: e["multi_instance"] for e in catalog.json() if e["name"] in (multi, single, odd)}
+        assert flags == {multi: True, single: False, odd: False}
+
     async def test_a_bad_readme_link_is_dropped_not_fatal(self, client, admin_user, fake_repo):
         name = f"demo{_uid()}"
         fake_repo.publish(name, "1.0.0", readme="/etc/passwd")
@@ -369,6 +395,50 @@ class TestCatalogAndInstall:
         assert (await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name}, headers=h)).status_code == 200
         package = (await client.get(f"/api/v1/packages/{name}", headers=h)).json()
         assert package["version"] == "1.1.0" and not package["update_available"]
+
+    async def test_a_preview_that_needs_variables_returns_their_declarations(self, client, admin_user, fake_repo):
+        """A package whose YAML only validates once its variables are filled
+        (a boolean field) previews as 'needs input' with the declarations,
+        not a bare 400, so the console can ask for the values."""
+        name = f"vars{_uid()}"
+        body = (
+            "apiVersion: sinas.co/v1\nkind: SinasPackage\n"
+            f"package:\n  name: {name}\n  version: \"1.0.0\"\n"
+            "spec:\n"
+            "  variables:\n"
+            "    - {name: ENABLED, type: boolean, required: true}\n"
+            "    - {name: GREETING, type: text, required: true}\n"
+            "  skills:\n"
+            f"    - namespace: {name}\n      name: hello\n      description: Says hello\n"
+            "      content: \"Say ${{ vars.GREETING }}.\"\n"
+            "      isActive: ${{ vars.ENABLED }}\n"
+        )
+        fake_repo.publish(name, "1.0.0", body=body)
+        repo = await _add(client, admin_user)
+        h = auth_headers(admin_user)
+        source = {"repository": repo["name"], "package": name}
+
+        # No values yet: the placeholder isn't a boolean.
+        r = await client.post("/api/v1/packages/preview", json=source, headers=h)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert not data["success"] and data["errors"] and data["requires_input"]
+        assert [v["name"] for v in data["variables"]] == ["ENABLED", "GREETING"]
+
+        # Some values: the missing one is reported the same way.
+        r = await client.post("/api/v1/packages/preview", json={**source, "variables": {"ENABLED": True}}, headers=h)
+        assert r.status_code == 200, r.text
+        assert not r.json()["success"] and "GREETING" in r.json()["errors"][0] and r.json()["variables"]
+
+        # All values: a normal preview.
+        r = await client.post("/api/v1/packages/preview",
+                              json={**source, "variables": {"ENABLED": True, "GREETING": "hi"}}, headers=h)
+        assert r.status_code == 200 and r.json()["success"], r.text
+
+    async def test_a_package_without_variables_still_fails_validation_plainly(self, client, admin_user):
+        bad = "apiVersion: sinas.co/v1\nkind: SinasPackage\npackage:\n  name: plain\n  version: \"1\"\nspec:\n  skills:\n    - {name: x}\n"
+        r = await client.post("/api/v1/packages/preview", json={"source": bad}, headers=auth_headers(admin_user))
+        assert r.status_code == 400
 
     async def test_a_file_that_does_not_match_its_checksum_is_refused(self, client, admin_user, fake_repo):
         name = f"demo{_uid()}"

@@ -216,6 +216,9 @@ def parse_index(raw: bytes) -> dict[str, Any]:
             # A bad readme link is dropped, never a reason to refuse the index.
             "readme": entry.get("readme") if isinstance(entry.get("readme"), str) and _safe_path(entry["readme"]) else None,
             "sha256": sha,
+            # Optional: the package may be installed more than once. Only a
+            # real boolean counts; anything else is dropped, never fatal.
+            "multi_instance": entry.get("multiInstance") is True,
         })
     return {"schema": INDEX_SCHEMA, "packages": clean}
 
@@ -450,6 +453,8 @@ async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
                 "description": entry.get("description"),
                 "author": entry.get("author"),
                 "readme_url": _readme_url(repository, entry),
+                # Indexes stored before the field existed have no key: false.
+                "multi_instance": entry.get("multi_instance") is True,
                 "installed": [
                     {"name": p.name, "version": p.version, "update_available": is_newer(entry["version"], p.version)}
                     for p in mine
