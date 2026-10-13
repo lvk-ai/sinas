@@ -84,6 +84,8 @@ class SecretApplier(ResourceApplier[SecretSpec]):
         # A package may fill in a secret that already exists (its secret
         # variables write it just before the package applies), as it always
         # could. Safe here, unlike other kinds: packages never delete secrets.
+        # So adoptUnmanaged changes nothing for them, and a value is only
+        # replaced when the package declares one (left out, the stored one stays).
         if ctx.origin == "package" and row.managed_by is None:
             return "write"
         return ownership_decision(row.managed_by, ctx, row.config_name)

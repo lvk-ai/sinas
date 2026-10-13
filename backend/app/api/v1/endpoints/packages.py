@@ -87,6 +87,7 @@ async def install_package(
             allow_broad_role_permissions=body.allowBroadRolePermissions,
             instance=body.instance,
             source=(repository, file_url) if repository is not None else None,
+            adopt_unmanaged=body.adoptUnmanaged,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -117,7 +118,8 @@ async def preview_package(
     service = PackageService(db)
     try:
         result, variable_declarations, requires_input, install_info = await service.preview(
-            source, user_id, variables=body.variables, instance=body.instance
+            source, user_id, variables=body.variables, instance=body.instance,
+            adopt_unmanaged=body.adoptUnmanaged,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

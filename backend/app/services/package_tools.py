@@ -83,6 +83,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Install name for a package declaring package.multiInstance: true (lowercase, dashes), so it can be installed more than once. Defaults to the package name.",
                     },
+                    "adopt_unmanaged": {
+                        "type": "boolean",
+                        "description": "Preview taking over resources the package declares that were created or edited by hand (otherwise reported as skipped). Default false.",
+                    },
                 },
             },
             "_metadata": {"system_tool": "packageManagement"},
@@ -116,6 +120,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "instance": {
                         "type": "string",
                         "description": "Install name for a package declaring package.multiInstance: true (lowercase, dashes), so it can be installed more than once. Defaults to the package name.",
+                    },
+                    "adopt_unmanaged": {
+                        "type": "boolean",
+                        "description": "Take over resources the package declares that were created or edited by hand: their hand edits are overwritten and uninstalling the package deletes them. Only when the user asked for it. Default false.",
                     },
                 },
             },
@@ -348,7 +356,8 @@ async def _preview(db, arguments, user_id, permissions):
 
     service = PackageService(db)
     result, variable_declarations, requires_input, install_info = await service.preview(
-        yaml_content, user_id, variables=variables, instance=arguments.get("instance")
+        yaml_content, user_id, variables=variables, instance=arguments.get("instance"),
+        adopt_unmanaged=arguments.get("adopt_unmanaged") is True,
     )
     response = _apply_response_to_dict(result)
     if variable_declarations:
@@ -367,7 +376,8 @@ async def _install(db, arguments, user_id, permissions):
 
     service = PackageService(db)
     package, result = await service.install(
-        yaml_content, user_id, variables=variables, instance=arguments.get("instance")
+        yaml_content, user_id, variables=variables, instance=arguments.get("instance"),
+        adopt_unmanaged=arguments.get("adopt_unmanaged") is True,
     )
     return {
         "package": {
@@ -447,6 +457,7 @@ def _apply_response_to_dict(result) -> dict[str, Any]:
                 "resourceType": c.resourceType,
                 "resourceName": c.resourceName,
                 "details": c.details,
+                "reason": c.reason,
             }
             for c in (result.changes or [])
         ],

@@ -40,8 +40,12 @@ class ConfigApplyService:
         skip_resource_types: Optional[set[str]] = None,
         prune_missing: bool = False,
         supplied_secrets: Optional[set[str]] = None,
+        adopt_unmanaged: bool = False,
     ):
         self.db = db
+        # Package installs: take over resources made or edited by hand
+        # instead of skipping them (see ownership_decision).
+        self.adopt_unmanaged = adopt_unmanaged
         # Shared secrets whose value a package preview has but doesn't save
         # (secret variables): the dry run counts them as present.
         self.supplied_secrets = supplied_secrets or set()
@@ -87,6 +91,7 @@ class ConfigApplyService:
         resource_name: str,
         details: Optional[str] = None,
         changes: Optional[dict[str, Any]] = None,
+        reason: Optional[str] = None,
     ):
         """Track a resource change"""
         self.changes.append(
@@ -96,6 +101,7 @@ class ConfigApplyService:
                 resourceName=resource_name,
                 details=details,
                 changes=changes,
+                reason=reason,
             )
         )
 
@@ -421,6 +427,7 @@ class ConfigApplyService:
             dry_run=dry_run,
             effects=self.effects,
             pending_references=self._pending_references,
+            adopt_unmanaged=self.adopt_unmanaged,
         )
 
     async def _apply_kind(self, applier, items: list, dry_run: bool) -> None:
@@ -449,6 +456,7 @@ class ConfigApplyService:
                 applier.kind,
                 key,
                 changes=result.changes or None,
+                reason=result.reason,
             )
 
 

@@ -45,6 +45,15 @@ class PackageInstallRequest(BaseModel):
             "package's own namespaces (listed by preview). Off by default."
         ),
     )
+    adoptUnmanaged: bool = Field(
+        False,
+        description=(
+            "Take over resources the package declares that exist but were created or "
+            "edited by hand (skipped otherwise): their hand edits are overwritten, and "
+            "uninstalling the package deletes them. Resources another package or "
+            "config manages are still skipped. Off by default."
+        ),
+    )
 
 
 class PackagePreviewRequest(BaseModel):
@@ -59,6 +68,13 @@ class PackagePreviewRequest(BaseModel):
     instance: Optional[str] = Field(
         None, pattern=INSTANCE_NAME_PATTERN,
         description="Install name to preview under (multi-instance packages)",
+    )
+    adoptUnmanaged: bool = Field(
+        False,
+        description=(
+            "Preview the install with adoptUnmanaged: resources created or edited by "
+            "hand are listed as updates the package takes over, each with a warning."
+        ),
     )
 
 

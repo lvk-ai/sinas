@@ -296,6 +296,11 @@ the operator's own declaration, so it still adopts. A restore is a manual
 write too: the restored resource is unmanaged, or a package upgrade would
 prune it straight away again.
 
+The operator may opt in per install (`adoptUnmanaged`, added 2026-10-13):
+the package then takes over manual rows it declares, reported as updates
+with a revision and a warning that uninstalling deletes them. Rows another
+package or config manages stay skipped whatever the flag says.
+
 Changes vs today: (a) detach-on-manual-edit applies to *all* managed resources
 — including secrets, llmProviders, databaseConnections, roles, users, which
 currently keep a stale config linkage after a CRUD edit; (b) adoption always
