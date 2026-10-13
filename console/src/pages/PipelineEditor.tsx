@@ -11,6 +11,7 @@ import CodeEditor from '@uiw/react-textarea-code-editor';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { PipelineStepsEditor } from '../components/pipeline-steps/PipelineStepsEditor';
 import type { Step } from '../components/pipeline-steps/model';
+import { exampleInput, inputSchemaFields } from '../components/pipeline-steps/model';
 import type { PipelineRun, PipelineRunOutcome } from '../types';
 
 const codeEditorStyle = {
@@ -144,6 +145,9 @@ export function PipelineEditor() {
     enabled: !isNew,
     retry: false,
   });
+
+  // The Run box runs the *saved* pipeline, so it describes the saved schema.
+  const runInputFields = inputSchemaFields(pipeline?.input_schema);
 
   const { data: runs } = useQuery({
     queryKey: ['pipelineRuns', namespace, name],
@@ -433,6 +437,25 @@ export function PipelineEditor() {
         </div>
 
         <div className="card space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-gray-300">Run input</h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Every run gets an input object, readable in any step as <span className="font-mono">input</span>{' '}
+              (e.g. <span className="font-mono">input.customer_id</span>). It comes from the Run button or{' '}
+              <span className="font-mono">POST …/run</span>, a schedule's input data, a webhook's request,
+              a database trigger's changes (records under <span className="font-mono">input.rows</span>), or the agent's tool arguments. Declared fields are
+              validated when a run starts and offered in the steps' expression picker.
+            </p>
+          </div>
+          <JSONSchemaEditor
+            label="Input Schema"
+            description="Validates run input; becomes the tool parameters when exposed as a tool"
+            value={inputSchema}
+            onChange={setInputSchema}
+          />
+        </div>
+
+        <div className="card space-y-3">
           <div className="flex items-start justify-between">
             <div>
               <h3 className="text-sm font-medium text-gray-300">Steps</h3>
@@ -476,6 +499,7 @@ export function PipelineEditor() {
               steps={steps}
               onChange={(next) => { setSaveError(null); setSteps(next); }}
               resources={stepResources}
+              inputSchema={inputSchema}
             />
           )}
         </div>
@@ -536,12 +560,9 @@ export function PipelineEditor() {
               />
             </div>
           )}
-          <JSONSchemaEditor
-            label="Input Schema"
-            description="Validates run input; becomes the tool parameters when exposed as a tool"
-            value={inputSchema}
-            onChange={setInputSchema}
-          />
+          <p className="text-xs text-gray-500">
+            The tool's parameters are the pipeline's run input schema (above).
+          </p>
         </div>
 
         <div className="card space-y-3">
@@ -565,7 +586,37 @@ export function PipelineEditor() {
 
       {!isNew && (
         <div className="card space-y-4">
-          <h3 className="text-sm font-medium text-gray-300">Run now</h3>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-medium text-gray-300">Run now</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                {runInputFields.length ? (
+                  <>
+                    Run input:{' '}
+                    {runInputFields.map((f, i) => (
+                      <span key={f.name}>
+                        {i > 0 && ', '}
+                        <span className="font-mono">{f.name}</span>
+                        {f.type && <span className="text-gray-600"> ({f.type}{f.required ? ', required' : ''})</span>}
+                      </span>
+                    ))}
+                  </>
+                ) : (
+                  'No input fields declared; any JSON object is accepted.'
+                )}
+              </p>
+            </div>
+            {runInputFields.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm text-xs flex-shrink-0"
+                title="Replace the run input with the declared fields (defaults or empty values)"
+                onClick={() => setRunInputText(JSON.stringify(exampleInput(pipeline?.input_schema), null, 2))}
+              >
+                Fill from schema
+              </button>
+            )}
+          </div>
           <div className="flex gap-3 items-start">
             <div className="flex-1 min-w-0">
               <CodeEditor

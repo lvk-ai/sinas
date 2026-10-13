@@ -1,4 +1,5 @@
 """Messages API endpoints for analytics and insights."""
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -148,7 +149,8 @@ async def get_message_stats(
 ):
     """
     Dashboard statistics — message counts, activity by day, agent usage, role distribution.
-    Single query, no N+1.
+    Three queries (grouped counts, tool calls, LLM usage), each served by an
+    index on created_at, so the window is read without scanning the tables.
     """
     user_id, permissions = current_user_data
 
@@ -168,11 +170,42 @@ async def get_message_stats(
     if not has_all:
         base_filter = and_(base_filter, Chat.user_id == user_id)
 
-    # Total messages
-    total_q = select(func.count()).select_from(Message).join(Chat, Message.chat_id == Chat.id).where(base_filter)
-    total = (await db.execute(total_q)).scalar() or 0
+    # One pass over the window for everything except the tool-call count:
+    # message counts per (day, agent, role), folded below into the total, the
+    # per-day series, the top agents and the role split. It reads only
+    # ix_messages_created_at (created_at INCLUDE chat_id, role), never the
+    # messages heap.
+    day = cast(Message.created_at, Date)
+    grouped_q = (
+        select(
+            day.label("day"),
+            Chat.agent_namespace,
+            Chat.agent_name,
+            Message.role,
+            func.count().label("count"),
+        )
+        .select_from(Message)
+        .join(Chat, Message.chat_id == Chat.id)
+        .where(base_filter)
+        .group_by(day, Chat.agent_namespace, Chat.agent_name, Message.role)
+    )
+    total = 0
+    by_day: dict[str, int] = defaultdict(int)
+    by_agent: dict[str, int] = defaultdict(int)
+    role_distribution: dict[str, int] = defaultdict(int)
+    for r in (await db.execute(grouped_q)).all():
+        total += r.count
+        by_day[str(r.day)] += r.count
+        by_agent[f"{r.agent_namespace}/{r.agent_name}"] += r.count
+        role_distribution[r.role] += r.count
+    activity_by_day = dict(sorted(by_day.items()))
+    agent_usage = [
+        {"agent": agent, "count": count}
+        for agent, count in sorted(by_agent.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    ]
 
-    # Tool call count
+    # Tool calls are counted apart: tool_calls lives in the heap, and the
+    # partial index ix_messages_created_at_tool_calls holds just those rows.
     tool_q = (
         select(func.count())
         .select_from(Message)
@@ -180,50 +213,6 @@ async def get_message_stats(
         .where(and_(base_filter, Message.tool_calls.isnot(None)))
     )
     tool_calls = (await db.execute(tool_q)).scalar() or 0
-
-    # Activity by day
-    day_q = (
-        select(
-            cast(Message.created_at, Date).label("day"),
-            func.count().label("count"),
-        )
-        .join(Chat, Message.chat_id == Chat.id)
-        .where(base_filter)
-        .group_by(cast(Message.created_at, Date))
-        .order_by(cast(Message.created_at, Date))
-    )
-    day_rows = (await db.execute(day_q)).all()
-    activity_by_day = {str(row.day): row.count for row in day_rows}
-
-    # Agent usage
-    agent_q = (
-        select(
-            Chat.agent_namespace,
-            Chat.agent_name,
-            func.count().label("count"),
-        )
-        .select_from(Message)
-        .join(Chat, Message.chat_id == Chat.id)
-        .where(base_filter)
-        .group_by(Chat.agent_namespace, Chat.agent_name)
-        .order_by(func.count().desc())
-        .limit(10)
-    )
-    agent_rows = (await db.execute(agent_q)).all()
-    agent_usage = [
-        {"agent": f"{r.agent_namespace}/{r.agent_name}", "count": r.count}
-        for r in agent_rows
-    ]
-
-    # Role distribution
-    role_q = (
-        select(Message.role, func.count().label("count"))
-        .join(Chat, Message.chat_id == Chat.id)
-        .where(base_filter)
-        .group_by(Message.role)
-    )
-    role_rows = (await db.execute(role_q)).all()
-    role_distribution = {r.role: r.count for r in role_rows}
 
     # LLM token usage over the same window (same read:all / read:own scoping).
     usage_filter = LLMUsage.created_at >= since
@@ -246,7 +235,7 @@ async def get_message_stats(
         "tool_calls": tool_calls,
         "activity_by_day": activity_by_day,
         "agent_usage": agent_usage,
-        "role_distribution": role_distribution,
+        "role_distribution": dict(role_distribution),
         "llm_prompt_tokens": int(u_prompt),
         "llm_completion_tokens": int(u_completion),
         "llm_total_tokens": int(u_total),
