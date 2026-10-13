@@ -5,6 +5,7 @@ import { apiClient } from '../../lib/api';
 import type { InstalledPackage, PackageCatalogEntry } from '../../types';
 import type { InstallTarget } from './InstallPackageModal';
 import { isForbidden, useAddOfficialRepository, usePackageRepositories } from './hooks';
+import { LoadError } from './LoadError';
 
 /** Packages → Catalog: every package the active repositories offer. */
 export function PackageCatalog({
@@ -17,7 +18,7 @@ export function PackageCatalog({
   onShowRepositories: () => void;
 }) {
   const [search, setSearch] = useState('');
-  const { data: catalog, isLoading, error: catalogError } = useQuery({
+  const { data: catalog, isLoading, error: catalogError, refetch, isFetching } = useQuery({
     queryKey: ['package-catalog'],
     queryFn: () => apiClient.getPackageCatalog(),
     retry: (failureCount, error) => !isForbidden(error) && failureCount < 1,
@@ -51,6 +52,10 @@ export function PackageCatalog({
         <p className="text-gray-400">Viewing the catalog needs permission to read packages. Ask an administrator.</p>
       </div>
     );
+  }
+
+  if (catalogError) {
+    return <LoadError what="the catalog" error={catalogError} onRetry={() => refetch()} retrying={isFetching} />;
   }
 
   if (!catalog || catalog.length === 0) {

@@ -36,7 +36,8 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const [variableValues, setVariableValues] = useState<Record<string, any>>({});
   // Install name for packages declaring multiInstance; empty = the package's own name.
   const [instanceName, setInstanceName] = useState(target.kind === 'repository' ? target.instance ?? '' : '');
-  const [allowBroadRolePermissions, setAllowBroadRolePermissions] = useState(false);
+  // The broad role permissions the user accepted (as broadKey below), if any.
+  const [acceptedBroad, setAcceptedBroad] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const source = (): PackageSource =>
@@ -105,6 +106,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     const reader = new FileReader();
     reader.onload = (ev) => {
       setYamlInput(ev.target?.result as string);
+      setAcceptedBroad(null);
     };
     reader.readAsText(file);
   };
@@ -122,6 +124,10 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const broadRoleWarnings: string[] = (previewResult?.warnings || []).filter((w: string) =>
     w.startsWith(BROAD_ROLE_WARNING),
   );
+  // Consent covers exactly the permissions it was given for: a preview that
+  // lists others (another package, another version) needs it again.
+  const broadKey = JSON.stringify(broadRoleWarnings);
+  const allowBroadRolePermissions = broadRoleWarnings.length > 0 && acceptedBroad === broadKey;
 
   const handleInstall = () => {
     if (previewStale) return;
@@ -174,7 +180,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               <label className="block text-sm font-medium text-gray-300 mb-2">Package YAML</label>
               <textarea
                 value={yamlInput}
-                onChange={(e) => setYamlInput(e.target.value)}
+                onChange={(e) => { setYamlInput(e.target.value); setAcceptedBroad(null); }}
                 placeholder="Paste SinasPackage YAML here..."
                 className="input w-full h-64 font-mono text-sm"
               />
@@ -279,7 +285,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                     <input
                       type="checkbox"
                       checked={allowBroadRolePermissions}
-                      onChange={(e) => setAllowBroadRolePermissions(e.target.checked)}
+                      onChange={(e) => setAcceptedBroad(e.target.checked ? broadKey : null)}
                       className="w-4 h-4 mt-0.5 text-primary-600 border-line rounded"
                     />
                     <span className="text-sm text-gray-300">

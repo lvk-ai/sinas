@@ -13,6 +13,7 @@ import {
   useInvalidatePackageData,
   usePackageRepositories,
 } from './hooks';
+import { LoadError } from './LoadError';
 
 const AUTH_TYPES: { value: PackageRepositoryAuthType; label: string }[] = [
   { value: 'none', label: 'None (public)' },
@@ -20,13 +21,14 @@ const AUTH_TYPES: { value: PackageRepositoryAuthType; label: string }[] = [
   { value: 'header', label: 'Token in a custom header' },
 ];
 
-const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+// As PackageRepositorySpec.name: no dots, at most 100 characters.
+const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/;
 
 /** Packages → Repositories: where Sinas finds packages. Admin only. */
 export function PackageRepositories() {
   const invalidate = useInvalidatePackageData();
   const [showAddModal, setShowAddModal] = useState(false);
-  const { data: repositories, isLoading, error } = usePackageRepositories();
+  const { data: repositories, isLoading, error, refetch, isFetching } = usePackageRepositories();
   const addOfficial = useAddOfficialRepository();
 
   const toggleMutation = useMutation({
@@ -61,6 +63,11 @@ export function PackageRepositories() {
         </p>
       </div>
     );
+  }
+
+  // Any other failed read: say so, rather than an empty list that offers to add repositories.
+  if (error) {
+    return <LoadError what="package repositories" error={error} onRetry={() => refetch()} retrying={isFetching} />;
   }
 
   const officialAdded = hasOfficialRepository(repositories);
@@ -301,7 +308,7 @@ function AddRepositoryModal({ onClose, onAdded }: { onClose: () => void; onAdded
               autoFocus
             />
             {form.name && !nameValid && (
-              <p className="text-xs text-red-400 mt-1">Lowercase letters, digits, dots, dashes and underscores; starting with a letter or digit.</p>
+              <p className="text-xs text-red-400 mt-1">Up to 100 lowercase letters, digits, dashes and underscores; starting with a letter or digit.</p>
             )}
           </div>
           <div>

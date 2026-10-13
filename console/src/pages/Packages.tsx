@@ -1,9 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { apiClient } from '../lib/api';
-import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store } from 'lucide-react';
+import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store, ShieldAlert } from 'lucide-react';
 import { useState } from 'react';
 import { InstallPackageModal, type InstallTarget } from '../components/packages/InstallPackageModal';
+import { LoadError } from '../components/packages/LoadError';
+import { isForbidden } from '../components/packages/hooks';
 import { PackageCatalog } from '../components/packages/PackageCatalog';
 import { PackageRepositories } from '../components/packages/PackageRepositories';
 import type { InstalledPackage } from '../types';
@@ -26,9 +28,11 @@ export function Packages() {
   const [selectedResources, setSelectedResources] = useState<Array<{ type: string; namespace: string; name: string }>>([]);
   const [createdYaml, setCreatedYaml] = useState('');
 
-  const { data: packages, isLoading } = useQuery({
+  const { data: packages, isLoading, error: packagesError, refetch: refetchPackages, isFetching: packagesFetching } = useQuery({
     queryKey: ['packages'],
     queryFn: () => apiClient.listPackages(),
+    // No package access is a 403, explained in place below: not retried.
+    retry: (failureCount, error) => !isForbidden(error) && failureCount < 1,
   });
   const updatesAvailable = (packages || []).filter((p) => p.update_available).length;
 
@@ -215,6 +219,19 @@ export function Packages() {
         <div className="text-center py-12">
           <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
         </div>
+      ) : isForbidden(packagesError) ? (
+        <div className="text-center py-12 card">
+          <ShieldAlert className="w-12 h-12 text-gray-500 mx-auto mb-3" />
+          <h3 className="text-lg font-medium text-gray-100 mb-1">No access to packages</h3>
+          <p className="text-gray-400">Viewing installed packages needs permission to read packages. Ask an administrator.</p>
+        </div>
+      ) : packagesError ? (
+        <LoadError
+          what="installed packages"
+          error={packagesError}
+          onRetry={() => refetchPackages()}
+          retrying={packagesFetching}
+        />
       ) : packages && packages.length > 0 ? (
         <div className="space-y-3">
           {packages.map((pkg) => (

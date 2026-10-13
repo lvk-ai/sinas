@@ -880,7 +880,8 @@ class APIClient {
 
   // Packages (installable integration packages)
   async listPackages(): Promise<InstalledPackage[]> {
-    const response = await this.configClient.get('/packages');
+    // 403 (no package access) is explained on the Packages page itself.
+    const response = await this.configClient.get('/packages', { quietStatuses: [403] } as QuietRequestConfig);
     return response.data;
   }
 
