@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import and_, select
 
@@ -26,7 +26,10 @@ class ScheduleApplier(ResourceApplier[ScheduleSpec]):
     config_section = "schedules"
     spec_model = ScheduleSpec
     model = ScheduledJob
-    reference_fields = ("schedule_type", "target_namespace", "target_name")
+    # is_active too: switching a schedule on needs its target active (see
+    # check_new_references), which an earlier, disabled save didn't check.
+    reference_fields = ("schedule_type", "target_namespace", "target_name", "is_active")
+    _TARGET_FIELDS = ("schedule_type", "target_namespace", "target_name")
 
     _FIELDS = (
         "name", "schedule_type", "target_namespace", "target_name", "description",
@@ -71,45 +74,60 @@ class ScheduleApplier(ResourceApplier[ScheduleSpec]):
         for field in self._FIELDS:
             setattr(row, field, getattr(spec, field))
 
+    async def check_new_references(
+        self, spec: ScheduleSpec, ctx: ApplyContext, current: Optional[ScheduleSpec]
+    ) -> None:
+        """On create, and when the target changes: check it. When only
+        is_active changed: switching on checks the target can run; pausing
+        checks nothing, so a schedule whose target was deleted can still be
+        paused."""
+        target_changed = current is None or any(
+            getattr(spec, f) != getattr(current, f) for f in self._TARGET_FIELDS
+        )
+        switched_on = current is not None and current.is_active is False and spec.is_active is not False
+        if target_changed or switched_on:
+            await self.check_references(spec, ctx)
+
     async def check_references(self, spec: ScheduleSpec, ctx: ApplyContext) -> None:
         """Same rules and messages the REST API always had, now on every
         channel. Config apply previously checked nothing here (it relied on a
         parser pre-pass that `force=true` skips), and a REST PATCH that changed
         the target to a pipeline never checked the pipeline at all."""
         ns, name, db = spec.target_namespace, spec.target_name, ctx.db
+        # A schedule that fires needs a target that can run: functions and
+        # pipelines must be active, agents need only exist. A disabled
+        # schedule never fires, so it only needs its target to exist — a
+        # package can ship a polling pipeline and its schedule both off, to
+        # be switched on together. Turning the schedule on runs this check
+        # again, with the target required active.
+        need_active = spec.schedule_type != "agent" and spec.is_active is not False
         # In a preview the same config may be about to create the target.
         # Only in a preview: in a real apply it has been created by now, and
         # the database (not the config) is the truth — if creating it failed,
-        # this schedule must fail too. Functions and pipelines must be active,
-        # as below; agents need only exist.
+        # this schedule must fail too.
         kind = {"function": "functions", "agent": "agents", "pipeline": "pipelines"}
-        if ctx.declared(
-            kind[spec.schedule_type], spec.target, active=spec.schedule_type != "agent"
-        ):
+        if ctx.declared(kind[spec.schedule_type], spec.target, active=need_active):
             return
         if spec.schedule_type == "function":
             scope = ctx.reference_scope_user_id
-            target = await Function.get_by_name(
-                db, ns, name, uuid.UUID(str(scope)) if scope else None
-            )
-            if not target:
+            query = select(Function.id).where(Function.namespace == ns, Function.name == name)
+            if scope:
+                query = query.where(Function.user_id == uuid.UUID(str(scope)))
+            if need_active:
+                query = query.where(Function.is_active == True)  # noqa: E712
+            if not (await db.execute(query)).first():
                 raise ReferenceNotFound(f"Function '{ns}/{name}' not found")
         elif spec.schedule_type == "pipeline":
             from app.models import Pipeline
 
-            found = (
-                await db.execute(
-                    select(Pipeline.id).where(
-                        and_(
-                            Pipeline.namespace == ns,
-                            Pipeline.name == name,
-                            Pipeline.is_active == True,  # noqa: E712
-                        )
-                    )
+            query = select(Pipeline.id).where(Pipeline.namespace == ns, Pipeline.name == name)
+            if need_active:
+                query = query.where(Pipeline.is_active == True)  # noqa: E712
+            if not (await db.execute(query)).first():
+                raise ReferenceNotFound(
+                    f"Pipeline '{ns}/{name}' not found or inactive" if need_active
+                    else f"Pipeline '{ns}/{name}' not found"
                 )
-            ).first()
-            if not found:
-                raise ReferenceNotFound(f"Pipeline '{ns}/{name}' not found or inactive")
         else:
             found = (
                 await db.execute(
