@@ -130,42 +130,28 @@ export type InputMode = 'fields' | 'expression' | 'json';
 export interface MappingRow {
   key: string;
   /** Displayed value: the expression text, or the literal (strings raw,
-   * everything else JSON-encoded). */
+   * everything else JSON-encoded; see `literalText`). */
   value: string;
   kind: 'expr' | 'literal';
 }
 
-function isScalar(v: any): boolean {
-  return v === null || ['string', 'number', 'boolean'].includes(typeof v);
+export function isPlainObject(v: any): v is Record<string, any> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-/** Which editing mode a step's current input supports without loss. */
+/** Which editing mode a step's current input supports without loss. Any
+ * object is editable as fields (nested values show as JSON literals); only
+ * a non-object `input` (array, scalar) needs the JSON view. */
 export function deriveInputMode(step: Step): InputMode {
   if ('input.$' in step) return 'expression';
   const input = step.input;
   if (input === undefined || input === null) return 'fields';
-  if (typeof input !== 'object' || Array.isArray(input)) return 'json';
-  // Flat object of scalars (expression values are strings by definition)
-  return Object.values(input).every(isScalar) ? 'fields' : 'json';
-}
-
-export function inputToRows(input: Record<string, any> | undefined): MappingRow[] {
-  if (!input) return [];
-  return Object.entries(input).map(([key, value]) => {
-    if (key.endsWith('.$')) {
-      return { key: key.slice(0, -2), value: String(value), kind: 'expr' as const };
-    }
-    return {
-      key,
-      value: typeof value === 'string' ? value : JSON.stringify(value),
-      kind: 'literal' as const,
-    };
-  });
+  return isPlainObject(input) ? 'fields' : 'json';
 }
 
 /** Literal row values round-trip as JSON when they parse as JSON *and* aren't
  * plain words — `42`, `true`, `{"a":1}` become typed values; `hello` stays a
- * string. A leading `=` forces string (rare escape hatch, documented in UI). */
+ * string. A leading `=` forces string (`=42` is the string "42"). */
 export function parseLiteral(text: string): any {
   if (text.startsWith('=')) return text.slice(1);
   const trimmed = text.trim();
@@ -180,33 +166,309 @@ export function parseLiteral(text: string): any {
   return text;
 }
 
+/** Inverse of parseLiteral: the text that parses back to exactly `value`.
+ * Strings that would otherwise read as another type (`"42"`, `"true"`) or
+ * that start with `=` get the `=` escape, so editing never retypes a value. */
+export function literalText(value: any): string {
+  if (typeof value !== 'string') return JSON.stringify(value);
+  return parseLiteral(value) === value ? value : `=${value}`;
+}
+
+export function inputToRows(input: Record<string, any> | undefined): MappingRow[] {
+  if (!isPlainObject(input)) return [];
+  return Object.entries(input).map(([key, value]) => {
+    if (key.endsWith('.$')) {
+      return { key: key.slice(0, -2), value: String(value), kind: 'expr' as const };
+    }
+    return { key, value: literalText(value), kind: 'literal' as const };
+  });
+}
+
 export function literalTypeHint(text: string): string | null {
   const parsed = parseLiteral(text);
-  if (typeof parsed === 'string') return null;
+  if (typeof parsed === 'string') return text.startsWith('=') ? 'string' : null;
   if (parsed === null) return 'null';
+  // Nested `.$` keys are still evaluated at run time, not passed through.
+  if (hasTemplateKeys(parsed)) return 'template';
   if (Array.isArray(parsed)) return 'array';
   return typeof parsed; // number | boolean | object
 }
 
+/** Rows without a key are still being typed: they stay in the editor but
+ * are not part of the input yet. On a duplicate key the last row wins.
+ * Keys are written exactly as typed (whitespace only marks a blank row). */
 export function rowsToInput(rows: MappingRow[]): Record<string, any> {
   const input: Record<string, any> = {};
   for (const row of rows) {
-    if (!row.key.trim()) continue;
-    if (row.kind === 'expr') input[`${row.key}.$`] = row.value;
-    else input[row.key] = parseLiteral(row.value);
+    const key = row.key;
+    if (!key.trim()) continue;
+    // A key can't be both literal and expression (the backend rejects it).
+    delete input[key];
+    delete input[`${key}.$`];
+    if (row.kind === 'expr') input[`${key}.$`] = row.value;
+    else input[key] = parseLiteral(row.value);
   }
   return input;
+}
+
+export function duplicateRowKeys(rows: MappingRow[]): string[] {
+  const seen = new Set<string>();
+  const dups = new Set<string>();
+  for (const row of rows) {
+    const key = row.key;
+    if (!key.trim()) continue;
+    if (seen.has(key)) dups.add(key);
+    seen.add(key);
+  }
+  return [...dups];
+}
+
+// ---------------------------------------------------------------------------
+// Fields ⇄ whole-input expression conversion
+//
+// A fields input `{a: 1, "b.$": "steps.x.output"}` and the expression
+// `{a: \`1\`, b: steps.x.output}` (a JMESPath multiselect hash) resolve to the
+// same value, so switching modes converts instead of discarding. Expressions
+// that are not a top-level multiselect hash can't be split into fields.
+// ---------------------------------------------------------------------------
+
+const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function hasTemplateKeys(v: any): boolean {
+  if (Array.isArray(v)) return v.some(hasTemplateKeys);
+  if (isPlainObject(v)) return Object.entries(v).some(([k, x]) => k.endsWith('.$') || hasTemplateKeys(x));
+  return false;
+}
+
+function jsonLiteral(v: any): string {
+  return '`' + JSON.stringify(v).replace(/`/g, '\\`') + '`';
+}
+
+/** `top`: the input object itself always becomes a hash (so it splits back
+ * into fields); nested values only when they hold `.$` keys. */
+function templateToExpression(v: any, top = false): string {
+  if (isPlainObject(v) && Object.keys(v).length && (top || hasTemplateKeys(v))) {
+    const parts = Object.entries(v).map(([k, x]) => {
+      const isExpr = k.endsWith('.$');
+      const base = isExpr ? k.slice(0, -2) : k;
+      const key = IDENT_RE.test(base) ? base : JSON.stringify(base);
+      return `${key}: ${isExpr ? String(x) : templateToExpression(x)}`;
+    });
+    return `{${parts.join(', ')}}`;
+  }
+  if (Array.isArray(v) && hasTemplateKeys(v)) {
+    return `[${v.map((x) => templateToExpression(x)).join(', ')}]`;
+  }
+  if (typeof v === 'string' && !/['\\]/.test(v)) return `'${v}'`;
+  return jsonLiteral(v);
+}
+
+export const EMPTY_INPUT_EXPRESSION = '`{}`';
+
+/** The whole-input expression equivalent to a fields input. An empty (or
+ * absent) input is the literal `{}`: the backend rejects an empty expression. */
+export function inputToExpression(input: any): string {
+  if (input === undefined || input === null) return EMPTY_INPUT_EXPRESSION;
+  return templateToExpression(input, true);
+}
+
+export function isEmptyInput(input: any): boolean {
+  return input === undefined || input === null || (isPlainObject(input) && Object.keys(input).length === 0);
+}
+
+/** Split `text` on `sep` at nesting depth 0, skipping quoted/literal spans.
+ * Returns null on unbalanced brackets or unterminated quotes. */
+function splitTopLevel(text: string, sep: string): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) j += text[j] === '\\' ? 2 : 1;
+      if (j >= text.length) return null;
+      i = j;
+    } else if (c === '(' || c === '[' || c === '{') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth < 0) return null;
+    } else if (c === sep && depth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (depth !== 0) return null;
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** A whole JMESPath value literal (`` `json` `` or `'raw'`) → its value;
+ * undefined when `expr` is anything else. */
+function parseValueLiteral(expr: string): { value: any } | undefined {
+  const quote = expr[0];
+  if ((quote !== '`' && quote !== "'") || expr.length < 2 || expr[expr.length - 1] !== quote) return undefined;
+  // The literal must span the whole value (`'a' || 'b'` is not one literal).
+  let j = 1;
+  while (j < expr.length && expr[j] !== quote) j += expr[j] === '\\' ? 2 : 1;
+  if (j !== expr.length - 1) return undefined;
+  const body = expr.slice(1, -1);
+  if (quote === "'") return { value: body.replace(/\\'/g, "'") };
+  try {
+    return { value: JSON.parse(body.replace(/\\`/g, '`')) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The fields input equivalent to a whole-input expression, or null when the
+ * expression is not a top-level multiselect hash `{key: expr, ...}`. */
+export function expressionToInput(expr: string): Record<string, any> | null {
+  const text = expr.trim();
+  if (text === '') return {};
+  // A whole JSON-literal object (`{"a": 1}`) is a fields input of literals.
+  const whole = parseValueLiteral(text);
+  if (whole) return isPlainObject(whole.value) && !hasTemplateKeys(whole.value) ? whole.value : null;
+  if (!text.startsWith('{') || !text.endsWith('}')) return null;
+  if (!splitTopLevel(text, '\u0000')) return null; // unbalanced / unterminated
+  // The opening brace must close at the very end: `{a: x}.a` is not a hash.
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) j += text[j] === '\\' ? 2 : 1;
+      i = j;
+    } else if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth === 0 && i !== text.length - 1) return null;
+    }
+  }
+  const entries = splitTopLevel(text.slice(1, -1), ',');
+  if (!entries) return null;
+  const input: Record<string, any> = {};
+  for (const entry of entries) {
+    const kv = splitTopLevel(entry, ':');
+    if (!kv || kv.length < 2) return null;
+    const rawKey = kv[0].trim();
+    const value = kv.slice(1).join(':').trim();
+    if (!value) return null;
+    let key: string;
+    if (IDENT_RE.test(rawKey)) key = rawKey;
+    else if (rawKey.startsWith('"')) {
+      try {
+        key = JSON.parse(rawKey);
+      } catch {
+        return null;
+      }
+      if (typeof key !== 'string') return null;
+    } else return null;
+    // As a fields key, a trailing `.$` would turn it into an expression key.
+    if (key.endsWith('.$')) return null;
+    if (key in input || `${key}.$` in input) return null;
+    const literal = parseValueLiteral(value);
+    // A literal object holding `.$` keys would be *evaluated* as a template,
+    // unlike the JMESPath literal — keep those as expressions.
+    if (literal && !hasTemplateKeys(literal.value)) input[key] = literal.value;
+    else input[`${key}.$`] = value;
+  }
+  return input;
+}
+
+/** What a mode-switch stash (a value a switch couldn't convert, kept so
+ * switching back restores it) should do after the step list changed. The
+ * input editor sits at a list position, so the step it shows changes on a
+ * reorder, delete or rename:
+ * - `keep`: the stashed step still exists (unchanged, or moved elsewhere);
+ * - `carry`: it was renamed — same step count, its name gone, this position
+ *   now shows another name — so the stash follows the new name;
+ * - `clear`: it was deleted (the count changed and its name is gone); a
+ *   step that moves into this position must never inherit its value. */
+export function stashFate(
+  stashStep: string, currentName: string, stepNames: string[], countChanged: boolean
+): 'keep' | 'carry' | 'clear' {
+  if (stepNames.includes(stashStep)) return 'keep';
+  if (countChanged) return 'clear';
+  return currentName !== stashStep ? 'carry' : 'keep';
 }
 
 // ---------------------------------------------------------------------------
 // Expression context help
 // ---------------------------------------------------------------------------
 
-/** JMESPath roots available to a step at `index`, for hint UIs. */
-export function expressionRoots(steps: Step[], index: number): string[] {
-  const roots = ['input', 'cursor', 'run'];
-  const prior = steps.slice(0, index).map((s) => `steps.${s.name}.output`);
-  return [...prior, ...roots];
+export interface InputField {
+  name: string;
+  type?: string;
+  required: boolean;
+}
+
+/** The run-input fields a pipeline declares in its inputSchema. */
+export function inputSchemaFields(schema: any): InputField[] {
+  if (!isPlainObject(schema) || !isPlainObject(schema.properties)) return [];
+  const required: string[] = Array.isArray(schema.required) ? schema.required : [];
+  return Object.entries(schema.properties).map(([name, prop]: [string, any]) => ({
+    name,
+    type: Array.isArray(prop?.type) ? prop.type.join(' | ') : prop?.type,
+    required: required.includes(name),
+  }));
+}
+
+function fieldPath(root: string, name: string): string {
+  return IDENT_RE.test(name) ? `${root}.${name}` : `${root}.${JSON.stringify(name)}`;
+}
+
+export interface SuggestionGroup {
+  label: string;
+  options: string[];
+}
+
+const OUTPUT_FIELDS: Partial<Record<StepType, string[]>> = {
+  connector: ['body', 'statusCode'],
+  query: ['rows', 'rowCount'],
+  load: ['upserted'],
+};
+
+/** Insertable references for the expression picker at step `index`. */
+export function expressionSuggestions(steps: Step[], index: number, inputSchema?: any): SuggestionGroup[] {
+  const groups: SuggestionGroup[] = [
+    { label: 'Run input', options: ['input', ...inputSchemaFields(inputSchema).map((f) => fieldPath('input', f.name))] },
+  ];
+  const prior = steps.slice(0, index).filter((s) => s.name);
+  if (prior.length) {
+    groups.push({
+      label: 'Earlier steps',
+      options: prior.flatMap((s) => {
+        const out = `steps.${s.name}.output`;
+        return [out, ...(OUTPUT_FIELDS[s.type] ?? []).map((f) => `${out}.${f}`)];
+      }),
+    });
+  }
+  groups.push({ label: 'Cursor & run', options: ['cursor', 'run.id', 'run.triggerType', 'run.firedAt', 'run.userId'] });
+  return groups;
+}
+
+/** A starter run-input object from the declared schema (defaults, else empty
+ * values of the declared type). */
+export function exampleInput(schema: any): Record<string, any> {
+  const example: Record<string, any> = {};
+  if (!isPlainObject(schema) || !isPlainObject(schema.properties)) return example;
+  for (const [name, prop] of Object.entries(schema.properties) as [string, any][]) {
+    // Boolean subschemas (`true` = anything) are valid JSON Schema.
+    if (isPlainObject(prop) && 'default' in prop) example[name] = prop.default;
+    else if (Array.isArray(prop?.enum) && prop.enum.length) example[name] = prop.enum[0];
+    else {
+      const type = Array.isArray(prop?.type) ? prop.type[0] : prop?.type;
+      example[name] = type === 'number' || type === 'integer' ? 0
+        : type === 'boolean' ? false
+        : type === 'array' ? []
+        : type === 'object' ? {}
+        : type === 'null' ? null
+        : '';
+    }
+  }
+  return example;
 }
 
 // ---------------------------------------------------------------------------

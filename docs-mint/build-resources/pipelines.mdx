@@ -57,6 +57,46 @@ pipelines:
 | `query` | A saved query | `{rows, rowCount, affectedRows}` |
 | `load` | Idempotent JSONB upsert into a database connection | `{upserted, table}` |
 
+## Run input
+
+Every run gets one input object, available to every step as `input`. Where it
+comes from depends on what fired the run:
+
+| Fired by | Run input |
+|---|---|
+| Console **Run** button / `POST …/run` | the `input` object in the request |
+| Schedule | the schedule's `inputData` |
+| Webhook | the request payload, merged over the webhook's `defaultValues` |
+| Database trigger | `{table, operation, rows, poll_column, count, timestamp}` — the changed records are `input.rows` |
+| Agent tool call (`asTool`) | the tool-call arguments |
+| Replay | the failed run's stored input |
+
+Declare the fields a pipeline expects with `inputSchema` (JSON Schema, checked
+when it declares `properties`; defaults are not filled in). A run whose input
+doesn't match fails before the first step, with the validation
+error on the run record; it is also the tool's parameter schema when the
+pipeline is exposed as a tool.
+
+```yaml
+inputSchema:
+  type: object
+  properties:
+    customer_id: { type: string }
+    dry_run: { type: boolean }
+  required: [customer_id]
+steps:
+  - name: fetch
+    type: connector
+    connector: crm/api
+    operation: get-customer
+    input:
+      id.$: input.customer_id      # the first step reads the run input
+```
+
+The first step has no earlier outputs to read, so its input is built from
+fixed values, `input`, `cursor` and `run`. Later steps can also read
+`steps.<name>.output` of any step before them.
+
 ## Data mapping
 
 One convention everywhere, based on [JMESPath](https://jmespath.org):
@@ -65,11 +105,23 @@ One convention everywhere, based on [JMESPath](https://jmespath.org):
 - `key.$: <expression>` — evaluated against the run context, bound to `key`.
 - A step's whole input can be one expression: `input.$: steps.fetch.output.body`.
 
+A field-by-field input and an object expression are interchangeable: these
+two steps get the same input, and the console's step editor converts between
+its **Fields** and **Expression** views:
+
+```yaml
+input:
+  version.$: steps.fetch.output.body.version
+  source: crm
+# same as
+input.$: "{version: steps.fetch.output.body.version, source: 'crm'}"
+```
+
 The run context:
 
 ```json
 {
-  "input":  { },                        // trigger payload / tool args / run body
+  "input":  { },                        // the run input (see Run input)
   "steps":  { "fetch": { "output": … } },
   "cursor": "…",                        // committed cursor for this run scope
   "run":    { "id", "triggerType", "firedAt", "userId" }
@@ -122,7 +174,7 @@ Pipelines don't embed trigger config. Instead:
   function-only. Webhook events are single occurrences, so perUser pipelines
   do **not** fan out here — the event runs once, as the owner.
 - **Database triggers (CDC)**: `targetType: pipeline` + `pipelineName` — the
-  changed rows become the pipeline input.
+  input is `{table, operation, rows, ...}`, with the changed records in `rows`.
 - **Manual / API**:
 
 ```bash
