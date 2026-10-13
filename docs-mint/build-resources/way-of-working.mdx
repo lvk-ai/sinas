@@ -9,14 +9,16 @@ Sinas ships that as a package: a preloadable skill plus an exemplar agent wired 
 
 ## Install the package
 
-The package lives in the repository at `packages/way-of-working.yaml`. Install it like any [package](/admin/packages):
+The package is in the official package repository, [sinas-platform/packages](https://github.com/sinas-platform/packages/tree/main/packages/way-of-working). In the console, open **Packages → Repositories** and click **Add official repository** (once), then install **way-of-working** from **Packages → Catalog**. Or through the API:
 
 ```bash
+curl -X POST $SINAS_URL/api/v1/package-repositories/official -H "Authorization: Bearer $TOKEN"
 curl -X POST $SINAS_URL/api/v1/packages/install \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"source\": $(jq -Rs . < packages/way-of-working.yaml)}"
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"repository": "sinas-official", "package": "way-of-working"}'
 ```
+
+See [package repositories](/admin/packages#package-repositories).
 
 It installs two resources, both tagged `managed_by: pkg:way-of-working`:
 

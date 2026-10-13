@@ -3,7 +3,7 @@
 No LLM provider key is needed: a scripted provider plays the model and emits
 pre-planned tool calls round by round, reacting to real tool results where
 the loop demands it (the spill pointer, the user's answer). Everything else
-is the real stack — the shipped way-of-working package installed through the
+is the real stack — the way-of-working exemplar agent installed through the
 package service, `MessageService` streaming a turn under the chat lock, tool
 discovery, approval rules, the workbench, `$workbench` references, result
 spill, the deferred ask_user round, and code execution through the real
@@ -59,9 +59,9 @@ from app.services.workbench import PROVENANCE_KEY, get_or_create_workbench
 
 from tests.conftest import auth_headers
 
-PACKAGE_PATH = (
-    Path(__file__).resolve().parents[3] / "packages" / "way-of-working.yaml"
-)
+# The exemplar agent with a shortened skill (the published package lives in
+# sinas-platform/packages and is checked by that repository's CI).
+PACKAGE_PATH = Path(__file__).resolve().parent / "fixtures" / "way_of_working_loop.yaml"
 PACKAGE_NAME = "way-of-working"
 SKILL_MARKER = "# Skill: way-of-working/workbench-loop"
 COLLECTION = "demo/sales"

@@ -1,0 +1,72 @@
+# Test fixture for test_way_of_working_loop.py: the way-of-working exemplar
+# agent as published in sinas-platform/packages (packages/way-of-working),
+# with its skill shortened. The loop test checks Sinas's agent loop, not the
+# skill's wording; the published package is checked by that repository's CI.
+apiVersion: sinas.co/v1
+kind: SinasPackage
+package:
+  name: way-of-working
+  version: "1.0.0"
+  description: Test fixture (see header)
+  author: Sinas
+spec:
+  skills:
+    - namespace: way-of-working
+      name: workbench-loop
+      description: How to work in the workbench (test fixture).
+      content: |
+        # Way of working (fixture)
+        Work in the workbench: look first, verify with code, move content by
+        reference, ask only when blocked.
+  agents:
+    - namespace: way-of-working
+      name: assistant
+      description: >-
+        Exemplar agent for the Claude Code-style loop: workbench, code
+        execution, ask_user, artifacts and background work enabled, the way-of-working skill
+        preloaded, reads auto-approved and publishing/destructive actions
+        gated behind approval.
+      icon: lucide:wrench
+      temperature: 0.2
+      systemPrompt: |
+        You are a hands-on assistant. The user brings files, data and
+        questions; you turn them into verified results that live as files in
+        this chat's workbench.
+
+        How you work here:
+        - Look before you act: `workbench_list`, then read what is relevant.
+          The first lines of a large file are enough to learn its shape.
+        - Python in `execute_code` is your main instrument. The standard
+          library first; a library only when it clearly earns its place.
+        - Derived files keep the original's name with a suffix
+          (`sales.csv` becomes `sales_clean.csv`). Inputs are never
+          overwritten.
+        - A summary states what the code printed. A number you did not
+          compute is not stated as a number.
+        - Chat replies are short: what you did, what you verified, where the
+          files are. The files carry the detail.
+      systemTools:
+        - workbench
+        - codeExecution
+        - askUser
+        - artifacts
+        - background
+      enabledSkills:
+        - skill: way-of-working/workbench-loop
+          preload: true
+      # Permission mode: everything that only reads, computes or changes the
+      # chat's own workbench runs unattended; anything that publishes beyond
+      # the chat or destroys data asks first. First matching rule wins.
+      toolApprovals:
+        default: auto
+        rules:
+          - match: workbench_promote
+            action: ask
+          - match: workbench_delete
+            action: ask
+          - match: "write_file_*"
+            action: ask
+          - match: "edit_file_*"
+            action: ask
+          - match: "delete_file_*"
+            action: ask

@@ -10,7 +10,7 @@
   - `backend/app/queue/worker.py` — `execute_background_code_job` (function worker), `deliver_due_wakeups_job` (agent worker cron)
   - `backend/app/services/message_service.py` `_handle_tool_calls` — `run_in_background(wait=true)` as a deferred call
   - `backend/app/services/deferred_completions.py` — the `background_job` completer
-  - `packages/way-of-working.yaml` — the skill's "work in the background, be woken" section
+  - the way-of-working package (sinas-platform/packages, `packages/way-of-working`) — the skill's "work in the background, be woken" section
 
 ## Context
 
