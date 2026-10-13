@@ -5,6 +5,10 @@ import { apiClient } from '../../lib/api';
 import type { ApplyChange, PackageSource } from '../../types';
 import { errorMessage } from './hooks';
 
+// Kinds a package never deletes on uninstall (deleted_with_package = False
+// in their backend appliers): taking one over doesn't make uninstall remove it.
+const KEPT_ON_UNINSTALL = new Set(['dependencies', 'secrets', 'llmProviders', 'databaseConnections', 'packageRepositories']);
+
 /** What the install flow installs: pasted YAML, or a package from a
  * repository (a fresh install from the catalog, or an update of an installed
  * package, which re-installs under the same install name). */
@@ -202,6 +206,15 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const handEdited: ApplyChange[] = (previewResult?.changes || []).filter(
     (c: ApplyChange) => c.reason === 'edited_by_hand' || c.reason === 'adopted',
   );
+  const keptOnUninstall = handEdited.filter((c) => KEPT_ON_UNINSTALL.has(c.resourceType));
+  const deletedOnUninstall = handEdited.length - keptOnUninstall.length;
+  const uninstallNote =
+    keptOnUninstall.length === 0
+      ? 'and uninstalling the package deletes them.'
+      : deletedOnUninstall === 0
+        ? 'and uninstalling the package leaves them installed.'
+        : `and uninstalling the package deletes ${deletedOnUninstall} of them; the other ` +
+          `${keptOnUninstall.length} (${[...new Set(keptOnUninstall.map((c) => c.resourceType))].join(', ')}) stay installed.`;
 
   const takenNames = target.kind === 'repository' ? target.takenNames : undefined;
   const effectiveName = instanceName.trim() || (target.kind === 'repository' ? target.package : '');
@@ -404,7 +417,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                       Take over {handEdited.length} resource{handEdited.length === 1 ? '' : 's'} edited by hand
                     </span>
                     <span className="block text-xs text-gray-400 mt-0.5">
-                      The package overwrites their hand edits, and uninstalling the package deletes them.
+                      The package overwrites their hand edits, {uninstallNote}
                     </span>
                   </span>
                 </label>

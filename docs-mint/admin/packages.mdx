@@ -58,7 +58,7 @@ A package never takes over a resource that exists but was created or edited by h
 To hand such resources back to the package, install (or update) it with **Take over N resources edited by hand** checked in the install dialog, or `adoptUnmanaged: true` on `POST /api/v1/packages/install`. The package agent tools never take resources over: an operator decides that. The package then:
 
 - overwrites their hand edits with its own version, and records each one in the change history as an update by the package;
-- manages them from then on: an upgrade updates them, and **uninstalling the package deletes them**.
+- manages them from then on: an upgrade updates them, and **uninstalling the package deletes them**, except kinds a package never deletes (dependencies, secrets, LLM providers, database connections), which stay installed. The install dialog says which.
 
 A preview with `adoptUnmanaged: true` lists these resources as updates, each with a warning, and changes nothing. A resource that another package or a config manages is still skipped: the option only applies to resources nobody manages. The default roles are never taken over. Shared secrets are unaffected: a package already fills in an existing secret (for its secret variables) and never deletes one.
 
