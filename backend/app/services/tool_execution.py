@@ -1038,6 +1038,12 @@ async def execute_single_tool(
                     arguments=arguments,
                     create_chat_with_agent_fn=create_chat_with_agent_fn,
                 )
+            elif tool_metadata.get("tool_type") == "mcp_task":
+                from app.services.mcp_tasks import execute_tool as execute_mcp_task_tool
+
+                result = await execute_mcp_task_tool(
+                    db=db, chat=chat, user_id=user_id, tool_name=tool_name, arguments=arguments,
+                )
             elif tool_metadata.get("tool_type") == "background":
                 from app.services.chat_wakeups import execute_background_tool
 

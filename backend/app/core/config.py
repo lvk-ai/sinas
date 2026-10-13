@@ -389,6 +389,22 @@ class Settings(BaseSettings):
     # chat's tool list instead of holding the turn.
     mcp_list_tools_max_pages: int = 50
     mcp_list_tools_total_timeout_seconds: int = 60
+    # MCP Tasks (ADR 2026-10-12-mcp-tasks). A tool call the server answers
+    # with a task is polled inline for up to this long (and never longer
+    # than the server's own timeout); still running after that, it is kept
+    # and polled in the background, its result delivered into the chat.
+    mcp_task_inline_wait_seconds: int = 20
+    # Background polling honours the server's pollIntervalMs within these
+    # bounds; the sweep itself runs every few seconds.
+    mcp_task_min_poll_seconds: int = 5
+    mcp_task_max_poll_seconds: int = 300
+    mcp_task_default_poll_seconds: int = 10
+    # Consecutive polls that cannot reach the server before the task is
+    # reported failed (backing off in between).
+    mcp_task_max_poll_failures: int = 10
+    # A task the server gave no ttlMs is given up after this long.
+    mcp_task_max_age_seconds: int = 7 * 86400
+    mcp_task_poll_concurrency: int = 10
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data

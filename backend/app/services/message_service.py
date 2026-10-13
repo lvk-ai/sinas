@@ -385,12 +385,17 @@ class MessageService:
         }
 
     async def inject_user_message(
-        self, chat_id: str, user_id: str, content: str
+        self, chat_id: str, user_id: str, content: str, *, guard=None
     ) -> Optional[Message]:
         """Steer a running agent loop: persist the user message so the loop's
         next round boundary picks it up (the conversation is rebuilt from the
         DB every round). Runs on_user_message hooks first — a blocked message
-        is not persisted and None is returned."""
+        is not persisted and None is returned.
+
+        `guard(db)`, when given, runs in this session right before the message
+        is written, and commits with it: returning False withdraws the
+        message (None is returned). A sender uses it to take the message off
+        its own outbox in the same transaction as writing it."""
         result = await self.db.execute(
             select(Chat).where(Chat.id == chat_id, Chat.user_id == user_id)
         )
@@ -421,6 +426,9 @@ class MessageService:
             if hook_result.mutated_content:
                 final_content = hook_result.mutated_content
 
+        if guard is not None and not await guard(self.db):
+            await self.db.rollback()
+            return None
         message = Message(
             chat_id=chat_id, role="user", content=strip_base64_data(final_content)
         )
