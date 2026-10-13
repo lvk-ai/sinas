@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Drive the Claude Code-style loop against a running Sinas over HTTP.
 
-Staging gate for the way-of-working stack. It installs the shipped
-packages/way-of-working.yaml, creates a keep-alive chat with its exemplar
+Staging gate for the way-of-working stack. It installs the way-of-working
+package from the official package repository (sinas-platform/packages,
+added if missing; --package installs a local file instead), creates a
+keep-alive chat with its exemplar
 agent, uploads a CSV to the workbench and follows one turn through:
 
   workbench_list -> workbench_read -> [execute_code] -> workbench_write
@@ -45,7 +47,7 @@ from pathlib import Path
 
 import httpx
 
-PACKAGE = Path(__file__).resolve().parents[2] / "packages" / "way-of-working.yaml"
+PACKAGE_NAME = "way-of-working"
 COLLECTION = "e2e/reports"
 INPUT_CSV = "id,amount\n1,10\n2,20\n3,30\n"
 PROMPT = "Clean input/orders.csv, write out/summary.md and publish it to a collection."
@@ -216,7 +218,8 @@ def start_stub(host: str, port: int, with_sandbox: bool, wakeups: bool = False) 
 # ---------------------------------------------------------------------------
 
 class Driver:
-    def __init__(self, url: str, key: str, real: bool, with_sandbox: bool):
+    def __init__(self, url: str, key: str, real: bool, with_sandbox: bool, package_file: Path | None = None):
+        self.package_file = package_file
         self.c = httpx.Client(base_url=url.rstrip("/"), timeout=300)
         self.h = {"X-API-Key": key}
         self.real = real
@@ -281,7 +284,14 @@ class Driver:
         if r.status_code not in (201, 400, 409):
             self.ok(r)
         self.step(2, f"collection {COLLECTION} ready")
-        inst = self.ok(self.c.post("/api/v1/packages/install", headers=self.h, json={"source": PACKAGE.read_text()}))
+        if self.package_file is not None:
+            body = {"source": self.package_file.read_text()}
+        else:
+            repo = self.ok(self.c.post("/api/v1/package-repositories/official", headers=self.h))
+            if repo.get("last_error"):
+                sys.exit(f"FAIL official package repository: {repo['last_error']}")
+            body = {"repository": repo["name"], "package": PACKAGE_NAME}
+        inst = self.ok(self.c.post("/api/v1/packages/install", headers=self.h, json=body))
         self.step(3, f"package installed: {inst['package']['name']} {inst['package']['version']}")
         # The scripted run drives a COPY of the package's agent bound to the
         # stub; the package agent itself is never touched, so a later --real
@@ -476,6 +486,7 @@ def main():
     ap.add_argument("--stub-host", default="127.0.0.1", help="interface the stub listens on; must be reachable from the backend")
     ap.add_argument("--stub-port", type=int, default=8999)
     ap.add_argument("--stub-endpoint", help="URL the backend should use for the stub, if not http://<stub-host>:<port>/v1")
+    ap.add_argument("--package", type=Path, help="install the way-of-working package from this file instead of the official repository")
     a = ap.parse_args()
 
     stub_endpoint = None
@@ -484,7 +495,7 @@ def main():
         stub_endpoint = a.stub_endpoint or f"http://{a.stub_host}:{a.stub_port}/v1"
     if a.wakeups and a.real:
         sys.exit("--wakeups needs the scripted model")
-    d = (WakeupsDriver if a.wakeups else Driver)(a.url, a.key, a.real, a.sandbox)
+    d = (WakeupsDriver if a.wakeups else Driver)(a.url, a.key, a.real, a.sandbox, a.package)
     d.setup(stub_endpoint)
     d.turn()
     d.verify()
