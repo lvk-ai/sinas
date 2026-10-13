@@ -6,7 +6,7 @@ with the same shape; the aliases on SpecModel translate.
 
 from typing import Any, ClassVar, Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.schemas.spec.base import SpecModel
 
@@ -37,6 +37,20 @@ class PackageRepositorySpec(SpecModel):
         if isinstance(data, dict) and data.get("description") == "":
             data = {**data, "description": None}  # the console sends "" for none
         return data
+
+    @field_validator("url")
+    @classmethod
+    def _usable_url(cls, value: str) -> str:
+        """The rules fetching applies (https, no credentials in the URL, a
+        complete GitHub URL), checked on every channel, so config apply
+        refuses a repository that could never supply packages."""
+        from app.services.package_repositories import RepositoryError, base_url
+
+        try:
+            base_url(value)
+        except RepositoryError as e:
+            raise ValueError(str(e)) from e
+        return value
 
     @property
     def key(self) -> str:

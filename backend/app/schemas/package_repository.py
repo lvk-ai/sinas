@@ -21,8 +21,12 @@ class PackageRepositoryCreate(BaseModel):
 
 
 class PackageRepositoryUpdate(BaseModel):
-    """Fields left out (or null) are unchanged; auth is replaced whole."""
-    name: Optional[str] = None
+    """Fields left out (or null) are unchanged; auth is replaced whole. The
+    name can't change: installed packages follow a repository by name (add a
+    new one and remove the old instead)."""
+
+    model_config = {"extra": "forbid"}
+
     url: Optional[str] = None
     description: Optional[str] = None
     auth: Optional[PackageRepositoryAuth] = None

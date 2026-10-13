@@ -43,15 +43,18 @@ class FakeRepository:
     def __init__(self):
         self.files: dict[str, bytes] = {}
         self.requests: list[str] = []
+        self.headers: list[dict] = []  # per request
+        self.redirects: dict[str, str] = {}  # full URL -> Location
         self.down = False
 
-    def publish(self, name: str, version: str, *, tamper: bool = False) -> None:
-        body = _package(name, version).encode()
+    def publish(self, name: str, version: str, *, tamper: bool = False, declares: str | None = None, readme: str | None = None) -> None:
+        body = _package(declares or name, version).encode()
         self.files[f"packages/{name}/package.yaml"] = body + (b"# changed\n" if tamper else b"")
         entries = [e for e in self._index()["packages"] if e["name"] != name]
         entries.append({
             "name": name, "version": version, "description": "A demo", "author": "Acme",
             "path": f"packages/{name}/package.yaml", "sha256": hashlib.sha256(body).hexdigest(),
+            **({"readme": readme} if readme else {}),
         })
         self.files["index.json"] = json.dumps({"schema": repos.INDEX_SCHEMA, "packages": entries}).encode()
 
@@ -60,6 +63,9 @@ class FakeRepository:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(str(request.url))
+        self.headers.append(dict(request.headers))
+        if str(request.url) in self.redirects:
+            return httpx.Response(302, headers={"location": self.redirects[str(request.url)]})
         if self.down:
             return httpx.Response(503)
         path = str(request.url).removeprefix(RAW)
@@ -142,6 +148,9 @@ class TestIndex:
 def test_versions():
     assert is_newer("1.0.1", "1.0.0") and is_newer("1.10.0", "1.9.9") and is_newer("1.0.0", "1.0.0-rc.1")
     assert not is_newer("1.0.0", "1.0.0") and not is_newer("0.5.1", "0.10.0") and not is_newer("weird", "1.0.0")
+    # Build metadata doesn't order versions.
+    assert not is_newer("1.0.0", "1.0.0+build.1") and not is_newer("1.0.0+b2", "1.0.0+b1")
+    assert is_newer("1.0.1+b1", "1.0.0+b9")
 
 
 # ---------------------------------------------------------------- the API
@@ -199,6 +208,75 @@ class TestRepositories:
             .order_by(ConfigRevision.id)
         )).scalars().all()
         assert list(actions) == ["create", "update", "delete"]
+
+
+class TestHardening:
+    async def test_a_redirect_to_plain_http_is_refused(self, client, admin_user, fake_repo):
+        fake_repo.redirects[RAW + "index.json"] = "http://evil.example.com/index.json"
+        repo = await _add(client, admin_user)
+        assert "non-https" in repo["last_error"] and repo["package_count"] == 0
+        assert "http://evil.example.com/index.json" not in fake_repo.requests
+
+    async def test_credentials_never_follow_a_redirect_to_another_host(self, client, db, admin_user, fake_repo):
+        from app.core.encryption import encryption_service
+        from app.models.secret import Secret
+
+        secret_name = f"TOK{_uid()}"
+        db.add(Secret(name=secret_name, encrypted_value=encryption_service.encrypt("s3cret"),
+                      user_id=admin_user.id, visibility="shared"))
+        await db.flush()
+        fake_repo.publish("demo", "1.0.0")
+        fake_repo.redirects[RAW + "index.json"] = "https://cdn.example.net/index.json"
+        r = await client.post("/api/v1/package-repositories", headers=auth_headers(admin_user), json={
+            "name": f"r-{_uid()}", "url": REPO_URL, "auth": {"type": "header", "secret": secret_name, "header": "X-Token"},
+        })
+        assert r.status_code == 201, r.text
+        first, second = fake_repo.headers[0], fake_repo.headers[1]
+        assert first.get("x-token") == "s3cret"
+        assert "x-token" not in second  # another host: no credentials
+
+    async def test_a_refresh_that_finishes_after_a_repoint_is_dropped(self, client, db, admin_user, fake_repo, monkeypatch):
+        fake_repo.publish("demo", "1.0.0")
+        repo_name = (await _add(client, admin_user))["name"]
+        real_get = repos._get
+
+        async def slow_then_repointed(url, headers):
+            data = await real_get(url, headers)
+            row = (await db.execute(select(PackageRepository).where(PackageRepository.name == repo_name))).scalar_one()
+            row.url = "https://pkgs.example.com/elsewhere"  # an update landed meanwhile
+            row.index = None
+            await db.flush()
+            return data
+
+        monkeypatch.setattr(repos, "_get", slow_then_repointed)
+        row = (await db.execute(select(PackageRepository).where(PackageRepository.name == repo_name))).scalar_one()
+        row.url = REPO_URL
+        await repos.refresh(db, row)
+        assert row.url == "https://pkgs.example.com/elsewhere" and row.index is None
+
+    async def test_repositories_cannot_be_renamed(self, client, admin_user, fake_repo):
+        fake_repo.publish("demo", "1.0.0")
+        repo = await _add(client, admin_user)
+        r = await client.put(f"/api/v1/package-repositories/{repo['name']}", json={"name": "other"},
+                             headers=auth_headers(admin_user))
+        assert r.status_code == 422
+
+    async def test_a_bad_readme_link_is_dropped_not_fatal(self, client, admin_user, fake_repo):
+        name = f"demo{_uid()}"
+        fake_repo.publish(name, "1.0.0", readme="/etc/passwd")
+        await _add(client, admin_user)
+        catalog = await client.get("/api/v1/packages/catalog", headers=auth_headers(admin_user))
+        assert catalog.status_code == 200
+        (entry,) = [e for e in catalog.json() if e["name"] == name]
+        assert entry["readme_url"] is None
+
+    async def test_a_file_declaring_another_package_is_refused(self, client, admin_user, fake_repo):
+        name = f"demo{_uid()}"
+        fake_repo.publish(name, "1.0.0", declares=f"other{_uid()}")
+        repo = await _add(client, admin_user)
+        r = await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name},
+                              headers=auth_headers(admin_user))
+        assert r.status_code == 502 and "declares" in r.json()["detail"]
 
 
 class TestCatalogAndInstall:
@@ -274,6 +352,19 @@ class TestConfig:
         from app.services.resource_serializers import serialize_package_repository
 
         assert serialize_package_repository(row) == {"name": name, "description": "Ours", "url": REPO_URL, "isActive": True}
+
+    async def test_config_refuses_an_unusable_url(self, db: AsyncSession, admin_user):
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        result = await svc.apply_config(self._config({"name": f"r-{_uid()}", "url": "http://plain.example.com/"}))
+        assert not result.success and any("https" in e for e in result.errors), result.errors
+
+    async def test_a_config_created_repository_is_refreshed_after_commit(self, db: AsyncSession, admin_user):
+        from app.services.resources.package_repositories import PackageRepositoryRefresh
+
+        name = f"r-{_uid()}"
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        assert (await svc.apply_config(self._config({"name": name, "url": REPO_URL}))).success
+        assert PackageRepositoryRefresh(name) in svc.effects.pending
 
     async def test_a_package_cannot_add_a_repository(self, db: AsyncSession, admin_user):
         from app.services.package_service import PackageService

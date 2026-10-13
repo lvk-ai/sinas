@@ -8,7 +8,8 @@ add a source of further packages.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from sqlalchemy import select
 
@@ -16,6 +17,20 @@ from app.models.package_repository import PackageRepository
 from app.schemas.spec.package_repository import PackageRepositoryAuthSpec, PackageRepositorySpec
 from app.services.resources.base import ApplyContext, ResourceApplier
 from app.services.resources.mcp_servers import _redacted_url
+
+
+@dataclass(frozen=True)
+class PackageRepositoryRefresh:
+    """Fetch a repository's index after the write that created or re-pointed
+    it has committed (config apply, packages, restores; the REST endpoints
+    fetch inline so their response shows the result)."""
+
+    name: str
+
+    async def run(self) -> None:
+        from app.services.package_repositories import refresh_named
+
+        await refresh_named(self.name)
 
 
 class PackageRepositoryApplier(ResourceApplier[PackageRepositorySpec]):
@@ -77,6 +92,14 @@ class PackageRepositoryApplier(ResourceApplier[PackageRepositorySpec]):
         row.url = spec.url
         row.auth = auth
         row.is_active = spec.is_active
+
+    async def write_row(
+        self, row: PackageRepository, spec: PackageRepositorySpec, ctx: ApplyContext,
+        current: Optional[PackageRepositorySpec] = None,
+    ) -> None:
+        self.write_fields(row, spec)
+        if ctx.origin != "api" and row.is_active and row.index is None:
+            ctx.effects.add(PackageRepositoryRefresh(spec.name))
 
     # ---- history: no credentials --------------------------------------------
 

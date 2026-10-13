@@ -90,10 +90,7 @@ def base_url(url: str) -> str:
 def file_url(repository_url: str, path: str) -> str:
     """A package file's URL: its index path resolved against the base. The
     path must stay inside the repository."""
-    if (
-        not path or path.startswith("/") or "\\" in path or "://" in path
-        or any(part in ("", ".", "..") for part in path.split("/"))
-    ):
+    if not _safe_path(path):
         raise RepositoryError(f"Unsafe package path in index: {path!r}")
     return urljoin(base_url(repository_url), path)
 
@@ -127,27 +124,54 @@ async def _auth_headers(db: AsyncSession, repository: PackageRepository) -> dict
     return {auth.get("header") or "X-Api-Key": value}
 
 
+_MAX_REDIRECTS = 5
+
+
+def _check_scheme(url: str) -> None:
+    scheme = urlsplit(url).scheme
+    if scheme != "https" and not (scheme == "http" and settings.package_repositories_allow_http):
+        raise RepositoryError(f"{_safe(url)}: refusing a non-https URL")
+
+
 async def _get(url: str, headers: dict[str, str]) -> bytes:
+    """GET with redirects followed by hand: every hop must be https, and the
+    repository's credentials go only to the host they were configured for —
+    a redirect to another host is followed without them."""
     limit = settings.package_repository_max_bytes
+    origin = (urlsplit(url).hostname or "").lower()
     try:
         async with httpx.AsyncClient(
-            timeout=settings.package_repository_timeout_seconds, follow_redirects=True, max_redirects=5,
+            timeout=settings.package_repository_timeout_seconds, follow_redirects=False,
         ) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                final = urlsplit(str(response.url))
-                if final.scheme != "https" and not settings.package_repositories_allow_http:
-                    raise RepositoryError(f"{_safe(url)} redirected away from https")
-                if response.status_code != 200:
-                    raise RepositoryError(f"{_safe(url)} answered {response.status_code}")
-                chunks, size = [], 0
-                async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > limit:
-                        raise RepositoryError(f"{_safe(url)} is larger than {limit} bytes")
-                    chunks.append(chunk)
-                return b"".join(chunks)
+            for _hop in range(_MAX_REDIRECTS + 1):
+                _check_scheme(url)
+                same_host = (urlsplit(url).hostname or "").lower() == origin
+                async with client.stream("GET", url, headers=headers if same_host else {}) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise RepositoryError(f"{_safe(url)} redirected without a location")
+                        url = urljoin(url, location)
+                        continue
+                    if response.status_code != 200:
+                        raise RepositoryError(f"{_safe(url)} answered {response.status_code}")
+                    chunks, size = [], 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > limit:
+                            raise RepositoryError(f"{_safe(url)} is larger than {limit} bytes")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+            raise RepositoryError(f"{_safe(url)}: too many redirects")
     except httpx.HTTPError as e:
         raise RepositoryError(f"{_safe(url)} could not be fetched: {type(e).__name__}") from e
+
+
+def _safe_path(path: str) -> bool:
+    return not (
+        not path or path.startswith("/") or "\\" in path or "://" in path
+        or any(part in ("", ".", "..") for part in path.split("/"))
+    )
 
 
 def parse_index(raw: bytes) -> dict[str, Any]:
@@ -174,8 +198,8 @@ def parse_index(raw: bytes) -> dict[str, Any]:
             raise RepositoryError(f"index.json: package '{name}' is listed twice")
         if not (isinstance(version, str) and version):
             raise RepositoryError(f"index.json: package '{name}' has no version")
-        if not (isinstance(path, str) and path):
-            raise RepositoryError(f"index.json: package '{name}' has no path")
+        if not (isinstance(path, str) and _safe_path(path)):
+            raise RepositoryError(f"index.json: package '{name}' has no usable path ({path!r})")
         if not (isinstance(sha, str) and _SHA256.match(sha)):
             raise RepositoryError(f"index.json: package '{name}' has no valid sha256")
         seen.add(name)
@@ -185,7 +209,8 @@ def parse_index(raw: bytes) -> dict[str, Any]:
             "description": entry.get("description") if isinstance(entry.get("description"), str) else None,
             "author": entry.get("author") if isinstance(entry.get("author"), str) else None,
             "path": path,
-            "readme": entry.get("readme") if isinstance(entry.get("readme"), str) else None,
+            # A bad readme link is dropped, never a reason to refuse the index.
+            "readme": entry.get("readme") if isinstance(entry.get("readme"), str) and _safe_path(entry["readme"]) else None,
             "sha256": sha,
         })
     return {"schema": INDEX_SCHEMA, "packages": clean}
@@ -194,17 +219,42 @@ def parse_index(raw: bytes) -> dict[str, Any]:
 async def refresh(db: AsyncSession, repository: PackageRepository) -> PackageRepository:
     """Fetch the repository's index now. A failure is recorded on the row and
     the last good index kept, so the catalog keeps working while a
-    repository is briefly unreachable. Does not commit."""
-    repository.last_refreshed_at = _now()
+    repository is briefly unreachable. Nothing is locked while fetching;
+    afterwards the row is locked and re-read, and the result is dropped if
+    the repository was pointed somewhere else meanwhile (its index belongs
+    to the new source). Does not commit."""
+    source = (repository.url, dict(repository.auth or {}))
+    index, error = None, None
     try:
-        url = urljoin(base_url(repository.url), INDEX_FILE)
-        raw = await _get(url, await _auth_headers(db, repository))
-        repository.index = parse_index(raw)
-        repository.last_error = None
+        url = urljoin(base_url(source[0]), INDEX_FILE)
+        index = parse_index(await _get(url, await _auth_headers(db, repository)))
     except RepositoryError as e:
-        repository.last_error = str(e)
+        error = str(e)
         logger.warning("Package repository '%s': %s", repository.name, e)
+    await db.refresh(repository, with_for_update=True)
+    if (repository.url, dict(repository.auth or {})) != source:
+        return repository  # re-pointed while fetching: this result is stale
+    repository.last_refreshed_at = _now()
+    if index is not None:
+        repository.index = index
+        repository.last_error = None
+    else:
+        repository.last_error = error
     return repository
+
+
+async def refresh_named(name: str) -> None:
+    """Refresh one repository in a session of its own (post-commit effect)."""
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        repository = (
+            await db.execute(select(PackageRepository).where(PackageRepository.name == name))
+        ).scalar_one_or_none()
+        if repository is None or not repository.is_active:
+            return
+        await refresh(db, repository)
+        await db.commit()
 
 
 async def refresh_due(now: Optional[datetime] = None) -> int:
@@ -226,14 +276,7 @@ async def refresh_due(now: Optional[datetime] = None) -> int:
             )
         ).scalars().all()
     for name in names:
-        async with AsyncSessionLocal() as db:
-            repository = (
-                await db.execute(select(PackageRepository).where(PackageRepository.name == name).with_for_update(skip_locked=True))
-            ).scalar_one_or_none()
-            if repository is None:
-                continue
-            await refresh(db, repository)
-            await db.commit()
+        await refresh_named(name)
     return len(names)
 
 
@@ -257,25 +300,45 @@ async def fetch_package(db: AsyncSession, repository: PackageRepository, package
         raw = await _get(url, await _auth_headers(db, repository))
         if hashlib.sha256(raw).hexdigest() == entry["sha256"]:
             try:
-                return raw.decode("utf-8"), entry, url
+                text = raw.decode("utf-8")
             except UnicodeDecodeError as e:
                 raise RepositoryError(f"Package '{package}' is not UTF-8 text") from e
+            _check_declared(text, entry)
+            return text, entry, url
     raise RepositoryError(
         f"Package '{package}' from '{repository.name}' does not match the checksum in its index"
     )
+
+
+def _check_declared(text: str, entry: dict[str, Any]) -> None:
+    """The file must be the package the index entry describes: the install
+    target (and later update status) come from what the file declares."""
+    import yaml
+
+    try:
+        meta = (yaml.safe_load(text) or {}).get("package") or {}
+    except Exception as e:
+        raise RepositoryError(f"Package '{entry['name']}' is not valid YAML: {e}") from e
+    declared = (meta.get("name"), str(meta.get("version")) if meta.get("version") is not None else None)
+    if declared != (entry["name"], entry["version"]):
+        raise RepositoryError(
+            f"The file for '{entry['name']}' {entry['version']} declares "
+            f"'{declared[0]}' {declared[1]}; refusing it"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Versions, the catalog, update status
 # ---------------------------------------------------------------------------
 
-_VERSION = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-+.]?([0-9A-Za-z.-]+))?$")
+_VERSION = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-.]?([0-9A-Za-z.-]+))?$")
 
 
 def _version_key(version: str) -> Optional[tuple]:
     """A sortable key for a semver-style version ("1.2.0", "1.2.0-rc.1"), or
     None when it isn't one. A pre-release sorts before its release."""
-    match = _VERSION.match(version.strip())
+    version = version.strip().split("+", 1)[0]  # build metadata doesn't order versions
+    match = _VERSION.match(version)
     if not match:
         return None
     release = tuple(int(part) for part in match.group(1).split("."))
@@ -348,6 +411,13 @@ async def package_status(db: AsyncSession, packages: list[Package]) -> dict[Any,
     return status
 
 
+def _readme_url(repository: PackageRepository, entry: dict[str, Any]) -> Optional[str]:
+    try:
+        return file_url(repository.url, entry["readme"]) if entry.get("readme") else None
+    except RepositoryError:
+        return None
+
+
 async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
     """Every package every active repository offers, with what is installed
     of it and whether an update is available."""
@@ -368,7 +438,7 @@ async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
                 "version": entry["version"],
                 "description": entry.get("description"),
                 "author": entry.get("author"),
-                "readme_url": file_url(repository.url, entry["readme"]) if entry.get("readme") else None,
+                "readme_url": _readme_url(repository, entry),
                 "installed": [
                     {"name": p.name, "version": p.version, "update_available": is_newer(entry["version"], p.version)}
                     for p in mine
