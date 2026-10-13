@@ -9,7 +9,15 @@ Credentials: `auth.secret` names a Secret (private overrides shared for the
 calling user, as for connectors) and is decrypted here, in the backend, at
 call time. The sandbox never sees it.
 
-Connections are per operation: one for a tools/list, one per tools/call.
+Connections are per operation: one for a tools/list, one per tools/call,
+one per tasks/* request. That is also the 2026-07-28 protocol's own model:
+it has no sessions, so state across calls lives in explicit handles.
+
+Tasks (the `io.modelcontextprotocol/tasks` extension, 2026-07-28): every
+connection declares support, so a server may answer `tools/call` with a task
+handle instead of a result. `call_tool` polls it for a short while and
+returns the result when it lands in time; otherwise it returns the task, and
+`mcp_tasks` keeps it durably and polls it in the background.
 The tool list is cached briefly in-process (settings.mcp_tool_list_ttl_seconds)
 so a chat turn does not re-handshake with every enabled server; a failed
 listing is cached too, for a shorter time, so a dead server degrades to "no
@@ -28,15 +36,18 @@ import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional, Union
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx2
 from mcp import Client
+from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
-from mcp.types import CallToolResult
+from mcp.types import CallToolResult, TextContent
+from mcp_types import Request, RequestParams, Result
+from pydantic import ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -59,6 +70,147 @@ BlobStore = Callable[[str, bytes, str], Awaitable[Optional[str]]]
 class McpClientError(Exception):
     """A call that could not be made (auth unresolvable, unreachable server,
     transport failure). The message is safe to show to the model."""
+
+
+# --------------------------------------------------------------- tasks (protocol)
+
+
+TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+class _TaskFields(Result):
+    """The `Task` fields of the ext-tasks schema (2026-07-28). Unknown fields
+    are kept: the extension may grow."""
+
+    model_config = ConfigDict(extra="allow")
+
+    task_id: str
+    status: str
+    status_message: Optional[str] = None
+    created_at: Optional[str] = None
+    last_updated_at: Optional[str] = None
+    ttl_ms: Optional[int] = None
+    poll_interval_ms: Optional[int] = None
+
+
+class CreatedTask(_TaskFields):
+    """`CreateTaskResult`: a `tools/call` answered with a task handle."""
+
+    result_type: Literal["task"]
+
+
+class TaskState(_TaskFields):
+    """A `tasks/get` answer: the task, with `inputRequests` while it waits for
+    input, `result` once completed, `error` once failed."""
+
+    result_type: Optional[str] = None
+    input_requests: Optional[dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
+    error: Optional[dict[str, Any]] = None
+
+
+class _Ack(Result):
+    model_config = ConfigDict(extra="allow")
+    result_type: Optional[str] = None
+
+
+class _TaskParams(RequestParams):
+    task_id: str
+
+
+class _UpdateTaskParams(RequestParams):
+    task_id: str
+    input_responses: dict[str, Any]
+
+
+# Each carries the task id in the Mcp-Name header too (the spec's routing
+# header for tasks/*, so a load balancer can send it where the task lives).
+class _GetTask(Request[_TaskParams, Literal["tasks/get"]]):
+    method: Literal["tasks/get"] = "tasks/get"
+    name_param = "taskId"
+
+
+class _UpdateTask(Request[_UpdateTaskParams, Literal["tasks/update"]]):
+    method: Literal["tasks/update"] = "tasks/update"
+    name_param = "taskId"
+
+
+class _CancelTask(Request[_TaskParams, Literal["tasks/cancel"]]):
+    method: Literal["tasks/cancel"] = "tasks/cancel"
+    name_param = "taskId"
+
+
+class TaskPending(Exception):
+    """Raised out of the claim resolver when a task is still running when the
+    inline wait ends (or needs input); carries the task's latest state."""
+
+    def __init__(self, task: TaskState):
+        super().__init__(f"task {task.task_id} is {task.status}")
+        self.task = task
+
+
+def poll_interval_seconds(task: _TaskFields, *, floor: float, ceiling: float, default: float) -> float:
+    """The server's suggested interval, kept within [floor, ceiling]."""
+    if task.poll_interval_ms is None or task.poll_interval_ms < 0:
+        return default
+    return min(max(task.poll_interval_ms / 1000.0, floor), ceiling)
+
+
+def task_outcome(task: TaskState) -> CallToolResult:
+    """What the original `tools/call` would have returned, for a task that
+    reached a terminal status."""
+    if task.status == "completed":
+        return CallToolResult.model_validate(task.result or {"content": []})
+    if task.status == "failed":
+        error = task.error or {}
+        message = error.get("message") or task.status_message or "the task failed"
+        return CallToolResult(content=[TextContent(type="text", text=f"Task failed: {message}")], is_error=True)
+    message = task.status_message or "the task was cancelled"
+    return CallToolResult(content=[TextContent(type="text", text=f"Task cancelled: {message}")], is_error=True)
+
+
+class _TasksExtension(ClientExtension):
+    """Declares Tasks support and resolves a task answer by polling it for up
+    to `wait_seconds`. Still running after that, or waiting for input, the
+    resolver raises TaskPending: the caller takes it from there."""
+
+    identifier = TASKS_EXTENSION
+
+    def __init__(self, wait_seconds: float):
+        self._wait = max(0.0, wait_seconds)
+
+    def claims(self):
+        return (ResultClaim(result_type="task", model=CreatedTask, resolve=self._resolve),)
+
+    async def _resolve(self, created: CreatedTask, ctx: ClaimContext) -> CallToolResult:
+        task = TaskState.model_validate(created.model_dump(by_alias=True, exclude={"result_type"}))
+        deadline = time.monotonic() + self._wait
+        while True:
+            if task.status in TERMINAL_TASK_STATUSES:
+                return task_outcome(task)
+            if task.status == "input_required":
+                raise TaskPending(task)
+            interval = poll_interval_seconds(task, floor=0.2, ceiling=5.0, default=1.0)
+            if time.monotonic() + interval >= deadline:
+                raise TaskPending(task)
+            await asyncio.sleep(interval)
+            try:
+                # Each look is bounded by what is left of the wait, so a slow
+                # answer can't hold the turn past it.
+                task = await _send_get(ctx.session, task.task_id, timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as e:
+                # The task exists on the server whatever this look did: hand
+                # it on (with what we last knew) to be polled again, rather
+                # than lose the handle.
+                logger.info(f"MCP task {task.task_id}: inline poll failed ({e}); handing it on")
+                raise TaskPending(task) from e
+
+
+async def _send_get(session: Any, task_id: str, timeout: Optional[float] = None) -> TaskState:
+    return await session.send_request(
+        _GetTask(params=_TaskParams(task_id=task_id)), TaskState, request_read_timeout_seconds=timeout
+    )
 
 
 @dataclass(frozen=True)
@@ -134,14 +286,22 @@ async def connect(
     *,
     read_timeout: float,
     headers: Optional[dict[str, str]] = None,
+    task_wait_seconds: float = 0.0,
 ) -> AsyncIterator[Client]:
     """A connected, initialized SDK client for `server`. `headers` are the
-    resolved request headers when the caller already has them."""
+    resolved request headers when the caller already has them.
+    `task_wait_seconds`: how long a tool call answered with a task is polled
+    before it is handed back as a TaskState."""
     if headers is None:
         headers = await resolve_headers(db, server, user_id)
     # Response caching is ours (tools/list below); the SDK's would add a
     # second, per-connection layer that never gets a hit.
-    client = Client(open_transport(server, headers), read_timeout_seconds=read_timeout, cache=None)
+    client = Client(
+        open_transport(server, headers),
+        read_timeout_seconds=read_timeout,
+        cache=None,
+        extensions=[_TasksExtension(task_wait_seconds)],
+    )
     try:
         async with client:
             yield client
@@ -334,10 +494,46 @@ async def call_tool(
     tool_name: str,
     arguments: dict[str, Any],
     user_id: Optional[str],
-) -> CallToolResult:
-    async with connect(db, server, user_id, read_timeout=float(server.timeout_seconds)) as client:
+    *,
+    task_wait_seconds: float = 0.0,
+) -> Union[CallToolResult, TaskState]:
+    """The tool's result; or, when the server answered with a task that is
+    still running after `task_wait_seconds` (or waits for input), the task."""
+    async with connect(
+        db, server, user_id, read_timeout=float(server.timeout_seconds), task_wait_seconds=task_wait_seconds
+    ) as client:
         try:
             return await client.call_tool(tool_name, arguments or {})
+        except TaskPending as pending:
+            return pending.task
+        except Exception as e:
+            raise McpClientError(_describe(server, e)) from e
+
+
+async def get_task(db: AsyncSession, server: McpServer, user_id: Optional[str], task_id: str) -> TaskState:
+    async with connect(db, server, user_id, read_timeout=float(server.connect_timeout_seconds)) as client:
+        try:
+            return await _send_get(client.session, task_id)
+        except Exception as e:
+            raise McpClientError(_describe(server, e)) from e
+
+
+async def update_task(
+    db: AsyncSession, server: McpServer, user_id: Optional[str], task_id: str, input_responses: dict[str, Any]
+) -> None:
+    async with connect(db, server, user_id, read_timeout=float(server.connect_timeout_seconds)) as client:
+        try:
+            await client.session.send_request(
+                _UpdateTask(params=_UpdateTaskParams(task_id=task_id, input_responses=input_responses)), _Ack
+            )
+        except Exception as e:
+            raise McpClientError(_describe(server, e)) from e
+
+
+async def cancel_task(db: AsyncSession, server: McpServer, user_id: Optional[str], task_id: str) -> None:
+    async with connect(db, server, user_id, read_timeout=float(server.connect_timeout_seconds)) as client:
+        try:
+            await client.session.send_request(_CancelTask(params=_TaskParams(task_id=task_id)), _Ack)
         except Exception as e:
             raise McpClientError(_describe(server, e)) from e
 

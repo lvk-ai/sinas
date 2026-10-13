@@ -5,6 +5,7 @@ import logging
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import jsonschema
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -44,7 +45,7 @@ from app.services import batch_service
 from app.core.callback import CallbackURLError, validate_callback_url
 from app.services.message_service import MessageService, refresh_message_tokens
 from app.services.queue_service import queue_service
-from app.services.stream_relay import STREAM_TTL_KEEP_ALIVE, stream_relay
+from app.services.stream_relay import STREAM_TTL_KEEP_ALIVE, SUBSCRIBE_WAIT_TIMEOUT, stream_relay
 from app.services.stream_thinking import ThinkingFilter
 from app.services.template_renderer import render_template
 from app.utils.schema import validate_with_coercion
@@ -80,6 +81,37 @@ async def with_heartbeat(aiter, interval: int = HEARTBEAT_INTERVAL):
             break
         except StopAsyncIteration:
             return
+
+
+# `done` payload for a stream that ends because its round is parked on the user.
+SUSPENDED_DONE = {"event": "done", "data": json.dumps({"status": "suspended"})}
+
+
+def round_waits_only_on_user(event: dict, asked: dict[str, Optional[str]]) -> bool:
+    """Whether a round_suspended event parks the round on ask_user questions
+    alone, none of which can time out while this stream would still be open.
+
+    Answers resume on the fresh channel the answer endpoint returns, never on
+    this one, so nothing more arrives here: the stream ends instead of idling
+    until the relay times out. Two cases keep it open, because the round then
+    resumes on this channel: it also waits on a background run or a
+    sub-agent, or a question expires within the relay's idle window (an
+    unanswered question's timeout resumes the round here, and the user
+    should see that reply live). `asked` maps each asked tool_call_id to
+    its expires_at."""
+    ids = set(event.get("tool_call_ids") or [])
+    if not ids or not ids <= set(asked):
+        return False
+    horizon = datetime.now(timezone.utc) + timedelta(seconds=SUBSCRIBE_WAIT_TIMEOUT)
+    for tool_call_id in ids:
+        expires_at = asked.get(tool_call_id)
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) <= horizon:
+                    return False
+            except ValueError:
+                return False
+    return True
 
 
 @router.get("/agents/default", response_model=AgentResponse)
@@ -537,6 +569,7 @@ async def stream_message(
         )
 
         async def keep_alive_generator():
+            asked: dict[str, Optional[str]] = {}
             show = ThinkingFilter(request.include_thinking)
             try:
                 async for event in stream_relay.subscribe(channel_id, last_id="0"):
@@ -561,6 +594,11 @@ async def stream_message(
                         "round_suspended",
                     ):
                         yield {"event": event_type, "data": json.dumps(event)}
+                        if event_type == "input_required":
+                            asked[event.get("tool_call_id")] = event.get("expires_at")
+                        elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
+                            yield SUSPENDED_DONE
+                            return
                     else:
                         yield {"event": "message", "data": json.dumps(event)}
             except asyncio.CancelledError:
@@ -697,6 +735,9 @@ async def reconnect_stream(
         raise HTTPException(403, "Not authorized")
 
     async def event_generator():
+        # Reconnecting past the input_required events leaves `asked` short:
+        # the stream then stays open, as before, rather than ending early.
+        asked: dict[str, Optional[str]] = {}
         show = ThinkingFilter(include_thinking)
         try:
             async for event in stream_relay.subscribe(channel_id, last_id=last_id):
@@ -725,6 +766,11 @@ async def reconnect_stream(
                     "round_suspended",
                 ):
                     yield {"event": event_type, "data": json.dumps(event)}
+                    if event_type == "input_required":
+                        asked[event.get("tool_call_id")] = event.get("expires_at")
+                    elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
+                        yield SUSPENDED_DONE
+                        return
                 else:
                     yield {"event": "message", "data": json.dumps(event)}
         except asyncio.CancelledError:

@@ -483,10 +483,25 @@ async def shutdown(ctx: dict) -> None:
     logger.info("Worker stopped")
 
 
+async def execute_background_code_job(ctx: dict, **kwargs: Any) -> None:
+    """A run_in_background sandbox run: executes, then either completes the
+    suspended round (wait=true) or delivers the result into the chat."""
+    from app.core.telemetry import attached, extract_trace_context
+    from app.services.chat_wakeups import run_background_code_job
+
+    with attached(extract_trace_context(kwargs.get("trace_context") or {})):
+        await run_background_code_job(
+            job_id=kwargs["job_id"], chat_id=kwargs["chat_id"], user_id=kwargs["user_id"],
+            code=kwargs["code"], description=kwargs.get("description") or "background run",
+            tool_call_id=kwargs.get("tool_call_id"), pending_completion_id=kwargs.get("pending_completion_id"),
+            api_key_id=kwargs.get("api_key_id"),
+        )
+
+
 class WorkerSettings:
     """arq worker settings for function execution."""
 
-    functions = [execute_function_job]
+    functions = [execute_function_job, execute_background_code_job]
     on_startup = function_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
@@ -527,6 +542,20 @@ async def sweep_deferred_expiry_job(ctx: dict) -> int:
     return await deferred_completions.expire_due()
 
 
+async def deliver_due_wakeups_job(ctx: dict) -> int:
+    """Deliver wakeup timers whose due time passed (schedule_wakeup)."""
+    from app.services.chat_wakeups import deliver_due_timers
+
+    return await deliver_due_timers()
+
+
+async def poll_mcp_tasks_job(ctx: dict) -> int:
+    """Poll MCP tasks whose next poll is due; deliver finished ones (MCP Tasks)."""
+    from app.services.mcp_tasks import poll_due_tasks
+
+    return await poll_due_tasks()
+
+
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
@@ -538,7 +567,13 @@ class AgentWorkerSettings:
     # Deferred-round expiry sweep: minutely, deduplicated across workers
     # (arq cron unique=True). Runs here — not on the sub-agent worker — so
     # exactly one worker class owns it.
-    cron_jobs = [cron(sweep_deferred_expiry_job, second=0, unique=True)]
+    cron_jobs = [
+        cron(sweep_deferred_expiry_job, second=0, unique=True),
+        cron(deliver_due_wakeups_job, second=30, unique=True),
+        # Every 5 seconds; each task is polled at its own (server-suggested)
+        # interval, at least mcp_task_min_poll_seconds apart.
+        cron(poll_mcp_tasks_job, second=set(range(0, 60, 5)), unique=True),
+    ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()

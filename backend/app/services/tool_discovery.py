@@ -294,6 +294,10 @@ async def get_available_tools(
             db=db, enabled_mcp_servers=enabled_mcp_servers, user_id=user_id
         )
         tools.extend(mcp_tools)
+        # A server may answer with a task (MCP Tasks); these follow it up.
+        from app.services.mcp_tasks import get_tool_definitions as mcp_task_tools
+
+        tools.extend(mcp_task_tools())
 
     # Get pipeline tools (only if list has items - opt-in)
     enabled_pipelines = getattr(agent, "enabled_pipelines", None) or []
@@ -376,6 +380,12 @@ async def get_available_tools(
     if has_system_tool(system_tools, "askUser"):
         from app.services.ask_user_tools import get_ask_user_tool_definition
         tools.append(get_ask_user_tool_definition())
+    if has_system_tool(system_tools, "background"):
+        from app.services.chat_wakeups import get_background_tool_definitions
+        tools.extend(get_background_tool_definitions(
+            code_execution_available=has_system_tool(system_tools, "codeExecution")
+            and settings.code_execution_enabled
+        ))
 
     # Check for paused executions belonging to this chat
     result = await db.execute(

@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_effective_permissions
+from app.core.config import settings
 from app.models.mcp_server import McpServer
 from app.services import mcp_client
 from app.services.mcp_client import MCP_TOOL_PREFIX, ListedTool, McpClientError
@@ -260,20 +261,51 @@ class McpToolConverter:
             return {"error": binding_problem}
 
         store_blob = await self._blob_store(db, chat, user_id, tool_name) if chat is not None else None
+        # A server may answer with a task (MCP Tasks): it is polled inline
+        # for a short while, then kept and polled in the background with its
+        # result delivered into the chat. Without a chat there is nowhere to
+        # deliver to, so the call waits as long as the server's timeout.
+        task_wait = (
+            min(settings.mcp_task_inline_wait_seconds, server.timeout_seconds) if chat is not None
+            else server.timeout_seconds
+        )
         try:
             logger.info(f"🔌 Calling MCP tool: {namespace}/{name}/{mcp_tool}")
-            result = await mcp_client.call_tool(db, server, mcp_tool, arguments or {}, user_id)
+            result = await mcp_client.call_tool(
+                db, server, mcp_tool, arguments or {}, user_id, task_wait_seconds=task_wait
+            )
         except McpClientError as e:
             logger.warning(f"MCP call failed: {e}")
             return {"error": str(e)}
         except Exception as e:  # pragma: no cover
             logger.error(f"MCP call failed: {namespace}/{name}/{mcp_tool}: {e}", exc_info=True)
             return {"error": str(e)}
+        if isinstance(result, mcp_client.TaskState):
+            return await self._keep_task(db, chat, user_id, server, result, mcp_tool, tool_name, tool_call_id)
         return await mcp_client.map_call_result(
             result,
             tool_name=mcp_tool,
             store_blob=store_blob,
             blob_prefix=mcp_client.blob_prefix_for(tool_name, tool_call_id),
+        )
+
+    async def _keep_task(self, db, chat, user_id, server, task, mcp_tool, tool_name, tool_call_id) -> dict[str, Any]:
+        from app.services import mcp_tasks
+
+        if chat is None:
+            # Nowhere to deliver a later result: give up on it, and say so.
+            try:
+                await mcp_client.cancel_task(db, server, user_id, task.task_id)
+            except McpClientError:
+                pass
+            return {
+                "error": f"MCP tool '{mcp_tool}' runs as a task that did not finish within "
+                         f"{server.timeout_seconds}s (status: {task.status}); it needs a chat to "
+                         f"report back to."
+            }
+        return await mcp_tasks.keep_task(
+            db, chat=chat, user_id=str(user_id), server=server, task=task,
+            tool_name=mcp_tool, model_tool_name=tool_name, tool_call_id=tool_call_id,
         )
 
     async def _blob_store(self, db: AsyncSession, chat: Any, user_id: Optional[str], tool_name: str):

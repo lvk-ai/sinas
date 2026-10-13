@@ -10,6 +10,8 @@ export function ChatDetail() {
   const { chatId } = useParams<{ chatId: string }>();
   const queryClient = useQueryClient();
   const [showWorkbench, setShowWorkbench] = useState(false);
+  // Bumped to reload the chat from the server (remounts <Chat>).
+  const [reloadKey, setReloadKey] = useState(0);
 
   const { data: chat, isLoading } = useQuery({
     queryKey: ['chat-meta', chatId],
@@ -90,6 +92,7 @@ export function ChatDetail() {
       <div className="flex flex-1 min-h-0 pt-4">
         <div className="flex-1 min-w-0">
           <Chat
+            key={reloadKey}
             agent={agentRef}
             chatId={chatId}
             height="100%"
@@ -99,6 +102,17 @@ export function ChatDetail() {
             onMessagesRefreshed={() => {
               queryClient.invalidateQueries({ queryKey: ['chat-meta', chatId] });
               queryClient.invalidateQueries({ queryKey: ['workbench-files', chatId] });
+            }}
+            // Sent while a turn runs, or while its round is parked, a
+            // message is injected into it and answered on the open stream.
+            // If the turn had just ended, the backend runs it as a turn of
+            // its own and returns the reply: reload so it shows.
+            onSteer={async (id, text) => {
+              const reply = await apiClient.sendMessage(id, { content: text });
+              if (reply?.role === 'assistant') setReloadKey((k) => k + 1);
+            }}
+            onInterrupt={async (id) => {
+              await apiClient.interruptChat(id);
             }}
             style={{ border: 'none', borderRadius: 0, backgroundColor: 'transparent' }}
           />

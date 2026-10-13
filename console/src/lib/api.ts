@@ -370,6 +370,12 @@ class APIClient {
     return response.data;
   }
 
+  /** Stop the chat's running agent loop at its next step (cooperative). */
+  async interruptChat(chatId: string): Promise<{ interrupted: boolean; was_running: boolean }> {
+    const response = await this.runtimeClient.post(`/chats/${chatId}/interrupt`);
+    return response.data;
+  }
+
   async listMessages(chatId: string): Promise<Message[]> {
     const response = await this.runtimeClient.get(`/chats/${chatId}/messages`);
     return response.data;

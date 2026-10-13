@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 
 import jsonschema
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -26,6 +26,7 @@ from app.utils.schema import validate_with_coercion
 from app.services.content_tokens import strip_base64_data, refresh_message_tokens  # noqa: F401 — re-exported
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
+from app.services import workbench_refs
 from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
 from app.services import workbench_refs
 from app.services.conversation_history import (
@@ -57,6 +58,16 @@ from app.core.telemetry import get_tracer, otel_attr
 
 logger = logging.getLogger(__name__)
 _tracer = get_tracer()
+
+
+def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
+    """A deferred_completer tool defers unconditionally unless its metadata
+    names an argument (`deferred_if_arg`) that must be truthy for it."""
+    arg = meta.get("deferred_if_arg")
+    if not arg:
+        return True
+    args = safe_parse_arguments(tool_call.get("function", {}).get("arguments", ""))
+    return bool(isinstance(args, dict) and args.get(arg))
 
 
 class MessageService:
@@ -382,12 +393,17 @@ class MessageService:
         }
 
     async def inject_user_message(
-        self, chat_id: str, user_id: str, content: str
+        self, chat_id: str, user_id: str, content: str, *, guard=None
     ) -> Optional[Message]:
         """Steer a running agent loop: persist the user message so the loop's
         next round boundary picks it up (the conversation is rebuilt from the
         DB every round). Runs on_user_message hooks first — a blocked message
-        is not persisted and None is returned."""
+        is not persisted and None is returned.
+
+        `guard(db)`, when given, runs in this session right before the message
+        is written, and commits with it: returning False withdraws the
+        message (None is returned). A sender uses it to take the message off
+        its own outbox in the same transaction as writing it."""
         result = await self.db.execute(
             select(Chat).where(Chat.id == chat_id, Chat.user_id == user_id)
         )
@@ -418,6 +434,9 @@ class MessageService:
             if hook_result.mutated_content:
                 final_content = hook_result.mutated_content
 
+        if guard is not None and not await guard(self.db):
+            await self.db.rollback()
+            return None
         message = Message(
             chat_id=chat_id, role="user", content=strip_base64_data(final_content)
         )
@@ -483,7 +502,21 @@ class MessageService:
         """
         from app.services import chat_steering
 
+        from app.services.chat_wakeups import chat_is_parked
+
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is not None:
+            try:
+                parked = await chat_is_parked(self.db, chat_id)
+            except BaseException:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                raise
+            if parked:
+                # A round is parked (on ask_user, a background run, a
+                # sub-agent, an approval): it holds no lock but owns the
+                # chat. The message waits for it like for a running loop.
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                lock_token = None
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
@@ -683,7 +716,23 @@ class MessageService:
         """
         from app.services import chat_steering
 
+        from app.services.chat_wakeups import parked_round_channel
+
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is not None:
+            try:
+                parked_channel = await parked_round_channel(self.db, chat_id)
+            except BaseException:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                raise
+            if parked_channel is not None:
+                # A parked round owns the chat though it holds no lock (see
+                # send_message): inject, don't start a turn beside it. The
+                # round resumes on its own channel, so a reconnecting client
+                # belongs there, not on this message's (ending) channel.
+                await chat_steering.release_chat_lock(chat_id, lock_token)
+                lock_token = None
+                await self._hand_back_active_channel(chat_id, parked_channel)
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
@@ -701,12 +750,48 @@ class MessageService:
             return
         try:
             await chat_steering.clear_interrupt(chat_id)
+            await self._claim_active_channel(chat_id)
             async for chunk in self._send_message_stream_locked(
                 chat_id=chat_id, user_id=user_id, user_token=user_token, content=content
             ):
                 yield chunk
         finally:
             await chat_steering.release_chat_lock(chat_id, lock_token)
+
+    async def _hand_back_active_channel(self, chat_id: str, owner_channel: str) -> None:
+        """This message was injected into a parked round, not run: if its
+        channel was recorded as the chat's reconnect channel when it was
+        queued, point that back at the channel the round resumes on."""
+        from app.services.delegation import current_channel_id
+
+        channel_id = current_channel_id.get()
+        if not channel_id or channel_id == owner_channel:
+            return
+        await self.db.execute(
+            update(Chat)
+            .where(Chat.id == uuid.UUID(chat_id), Chat.active_channel_id == channel_id)
+            .values(active_channel_id=owner_channel)
+        )
+        await self.db.commit()
+
+    async def _claim_active_channel(self, chat_id: str) -> None:
+        """The job that owns the turn owns the chat's reconnect channel.
+
+        Two queued messages for an idle chat each recorded their own channel
+        as `active_channel_id` when enqueued; only one of them runs the turn,
+        the other just injects and closes its channel. Whichever wrote last
+        would otherwise send a reconnecting client to a finished stream."""
+        from app.services.delegation import current_channel_id
+
+        channel_id = current_channel_id.get()
+        if not channel_id:
+            return
+        await self.db.execute(
+            update(Chat)
+            .where(Chat.id == uuid.UUID(chat_id), Chat.active_channel_id != channel_id)
+            .values(active_channel_id=channel_id)
+        )
+        await self.db.commit()
 
     async def _send_message_stream_locked(
         self,
@@ -1069,6 +1154,7 @@ class MessageService:
 
         delegate_calls: list[dict[str, Any]] = []
         ask_user_calls: list[dict[str, Any]] = []
+        background_calls: list[dict[str, Any]] = []
         _meta_by_name: dict[str, dict[str, Any]] = {}
         if current_channel_id.get() is not None:
             _meta_by_name = (
@@ -1084,6 +1170,8 @@ class MessageService:
                     delegate_calls.append(tc)
                 elif meta.get("deferred_completer") == "human_input":
                     ask_user_calls.append(tc)
+                elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
+                    background_calls.append(tc)
                 else:
                     executable_calls.append(tc)
             valid_tool_calls = executable_calls
@@ -1212,7 +1300,7 @@ class MessageService:
         # Suspend the round on the deferred calls: checkpoint them as pending
         # completions and end this generator instead of blocking a worker
         # slot; the resume job continues once the last completion lands.
-        if delegate_calls or ask_user_calls:
+        if delegate_calls or ask_user_calls or background_calls:
             from app.services import deferred_completions
             from app.services.delegation import (
                 current_delegation_depth,
@@ -1345,6 +1433,63 @@ class MessageService:
                     "expires_at": deadline,
                 })
 
+            # Background runs the model waits on (run_in_background wait=true):
+            # the job is queued only after the checkpoint exists, like
+            # delegation children. A malformed call fails immediately.
+            background_jobs: list[tuple[str, str, str, str]] = []  # (tool_call_id, job_id, code, description)
+            _ref_chat = None
+            for tc in background_calls:
+                args = safe_parse_arguments(tc["function"].get("arguments", ""))
+                if not isinstance(args, dict):
+                    args = {}
+                yield {
+                    "type": "tool_start",
+                    "tool_call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"].get("arguments", "{}"),
+                    "description": build_tool_status(tc["function"]["name"], args, status_templates),
+                }
+                # {"$workbench": path} references resolve here exactly as the
+                # inline path (execute_single_tool) resolves them, so a saved
+                # script runs the same whether or not the model waits on it.
+                if workbench_refs.contains_reference(tc["function"].get("arguments", "")):
+                    if _ref_chat is None:
+                        _ref_chat = (await self.db.execute(select(Chat).where(Chat.id == chat_id))).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(self.db, _ref_chat, user_id, args)
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
+                code = args.get("code")
+                description = str(args.get("description") or "background run")
+                if not code or not isinstance(code, str) or not code.strip() or not settings.code_execution_enabled:
+                    error_content = json.dumps({"error": (
+                        "Code execution is disabled on this deployment." if not settings.code_execution_enabled
+                        else "run_in_background requires non-empty 'code'"
+                    )})
+                    tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                    self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                    await self.db.commit()
+                    yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                    continue
+                job_id = str(uuid.uuid4())
+                entry = {
+                    "completer": deferred_completions.BACKGROUND_JOB,
+                    "job_id": job_id,
+                    "description": description,
+                }
+                deadline = deferred_completions.deadline_from_now(
+                    settings.code_execution_timeout + settings.background_job_grace_seconds
+                )
+                if deadline:
+                    entry["expires_at"] = deadline
+                entries[tc["id"]] = entry
+                background_jobs.append((tc["id"], job_id, code, description))
+
             if entries:
                 row = await deferred_completions.suspend_round(
                     self.db,
@@ -1383,6 +1528,41 @@ class MessageService:
                         user_token=user_token,
                         delegation_depth=current_delegation_depth.get(),
                     )
+                if background_jobs:
+                    from app.services import chat_wakeups
+
+                    for tool_call_id, job_id, code, description in background_jobs:
+                        try:
+                            started = await chat_wakeups.start_background_job(
+                                chat_id, user_id, code, description,
+                                tool_call_id=tool_call_id, pending_completion_id=str(row.id),
+                                job_id=job_id,
+                            )
+                        except Exception as e:
+                            # The round is already parked on this entry: a run
+                            # that never started completes it with the queue
+                            # error now, rather than leaving the chat waiting
+                            # for the deadline and a misleading timeout.
+                            logger.exception("Background run %s could not be queued", job_id)
+                            await deferred_completions.complete(
+                                str(row.id), tool_call_id,
+                                json.dumps({"job_id": job_id, "error": f"Background run could not be queued: {e}"}),
+                                user_token=user_token,
+                            )
+                            yield {
+                                "type": "background_job_failed",
+                                "tool_call_id": tool_call_id,
+                                "job_id": job_id,
+                                "error": f"Background run could not be queued: {e}",
+                            }
+                            continue
+                        yield {
+                            "type": "background_job_started",
+                            "tool_call_id": tool_call_id,
+                            "job_id": started.get("job_id", job_id),
+                            "description": description,
+                            "pending_completion_id": str(row.id),
+                        }
                 for event in ask_events:
                     yield {**event, "pending_completion_id": str(row.id)}
                 if prepared:

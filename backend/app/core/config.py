@@ -366,6 +366,22 @@ class Settings(BaseSettings):
     tool_approval_timeout_seconds: int = 0
     agent_delegate_suspend_timeout_seconds: int = 0
 
+    # Background work and wakeups (`background` system tool; ADR
+    # 2026-10-11-background-jobs-and-wakeups). A background code run that
+    # the agent waits on gets this grace on top of code_execution_timeout
+    # before the round resumes with a timeout error; results delivered into
+    # the chat are clipped to background_job_result_max_chars (the full
+    # result stays readable via background_job_status for 24h). Timers may
+    # be set at most wakeup_max_delay_seconds ahead; watches live
+    # watch_default_ttl_seconds unless asked otherwise (capped at
+    # watch_max_ttl_seconds) and accept payloads up to watch_max_payload_bytes.
+    background_job_grace_seconds: int = 120
+    background_job_result_max_chars: int = 16000
+    wakeup_max_delay_seconds: int = 7 * 86400
+    watch_default_ttl_seconds: int = 86400
+    watch_max_ttl_seconds: int = 30 * 86400
+    watch_max_payload_bytes: int = 65536
+
     # MCP servers (see ADR 2026-10-09-mcp-client). A server's tool list is
     # cached in-process so a chat turn doesn't re-handshake with every
     # enabled server; a failed listing is cached for a shorter time so a dead
@@ -378,6 +394,22 @@ class Settings(BaseSettings):
     # chat's tool list instead of holding the turn.
     mcp_list_tools_max_pages: int = 50
     mcp_list_tools_total_timeout_seconds: int = 60
+    # MCP Tasks (ADR 2026-10-12-mcp-tasks). A tool call the server answers
+    # with a task is polled inline for up to this long (and never longer
+    # than the server's own timeout); still running after that, it is kept
+    # and polled in the background, its result delivered into the chat.
+    mcp_task_inline_wait_seconds: int = 20
+    # Background polling honours the server's pollIntervalMs within these
+    # bounds; the sweep itself runs every few seconds.
+    mcp_task_min_poll_seconds: int = 5
+    mcp_task_max_poll_seconds: int = 300
+    mcp_task_default_poll_seconds: int = 10
+    # Consecutive polls that cannot reach the server before the task is
+    # reported failed (backing off in between).
+    mcp_task_max_poll_failures: int = 10
+    # A task the server gave no ttlMs is given up after this long.
+    mcp_task_max_age_seconds: int = 7 * 86400
+    mcp_task_poll_concurrency: int = 10
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
