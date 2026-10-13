@@ -157,9 +157,9 @@ async def env(tasks_mcp, monkeypatch):
     monkeypatch.setattr(settings, "mcp_task_min_poll_seconds", 0)
 
     async def no_such_job(job_id):  # the arq pool isn't reachable from tests
-        return False
+        return None
 
-    monkeypatch.setattr(chat_wakeups, "_job_known", no_such_job)
+    monkeypatch.setattr(chat_wakeups, "_job_state", no_such_job)
 
     async with AsyncSessionLocal() as s:
         user = User(email=f"tasks-{_uid()}@example.com")
@@ -509,12 +509,12 @@ class TestKeptTasks:
         assert len(queued) == 1
 
         async def known(job_id):
-            return job_id == queued[0]
+            return "running" if job_id == queued[0] else None
 
         async def locked(chat_id):
             return True  # the queued turn is running
 
-        monkeypatch.setattr(chat_wakeups, "_job_known", known)
+        monkeypatch.setattr(chat_wakeups, "_job_state", known)
         monkeypatch.setattr(chat_steering, "is_chat_locked", locked)
         await mcp_tasks._flush_deliveries(task_id)
         assert (await _row(handle["task_id"])).pending_deliveries == []
@@ -527,6 +527,33 @@ class TestKeptTasks:
         async with AsyncSessionLocal() as s:
             chat = await s.get(Chat, env["chat"].id)
             assert chat.active_channel_id and queued[0] == f"delivery-{chat.active_channel_id}"
+
+    async def test_a_finished_earlier_turn_leaves_a_newer_turns_channel_alone(self, env, monkeypatch):
+        from app.services.queue_service import queue_service
+
+        handle = await _call(env, "forever")
+        task_id = uuid.UUID(handle["task_id"])
+        await self._owe(env, task_id)
+        monkeypatch.setattr(chat_wakeups, "deliver_to_chat", REAL_DELIVER)
+
+        async def queued_then_crashed(**kwargs):
+            raise RuntimeError("worker died before the commit")
+
+        monkeypatch.setattr(queue_service, "enqueue_agent_message", queued_then_crashed)
+        await mcp_tasks._flush_deliveries(task_id)
+        async with AsyncSessionLocal() as s:  # meanwhile: that turn ran, a newer one started
+            chat = await s.get(Chat, env["chat"].id)
+            chat.active_channel_id = "newer-turn"
+            await s.commit()
+
+        async def finished(job_id):
+            return "finished"
+
+        monkeypatch.setattr(chat_wakeups, "_job_state", finished)
+        await mcp_tasks._flush_deliveries(task_id)
+        assert (await _row(handle["task_id"])).pending_deliveries == []
+        async with AsyncSessionLocal() as s:
+            assert (await s.get(Chat, env["chat"].id)).active_channel_id == "newer-turn"
 
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}

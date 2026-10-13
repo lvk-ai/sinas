@@ -146,16 +146,20 @@ async def deliver_to_chat(
 
         fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
         fixed_job_id = f"delivery-{fixed}" if fixed else None
-        if guard is not None and fixed_job_id and await _job_known(fixed_job_id):
+        earlier = await _job_state(fixed_job_id) if guard is not None and fixed_job_id else None
+        if earlier is not None:
             # An earlier attempt queued this delivery's turn and died before
             # committing: the message is on its way in that turn already
-            # (which may be the one holding the chat now). Only take it off,
-            # and record that turn's stream channel, which rolled back with
-            # the failed commit, so a client can still reconnect to it.
+            # (which may be the one holding the chat now). Only take it off.
+            # While that turn is still queued or running, record its stream
+            # channel (it rolled back with the failed commit) so a client can
+            # reconnect; once it has finished, leave the channel alone: a
+            # newer turn may own it.
             if not await guard(db):
                 await db.rollback()
                 return {"status": "dropped", "reason": "withdrawn"}
-            chat.active_channel_id = str(fixed)
+            if earlier in ("queued", "running"):
+                chat.active_channel_id = str(fixed)
             await db.commit()
             return {"status": "started", "job_id": fixed_job_id, "channel_id": str(fixed), "already_queued": True}
 
@@ -216,18 +220,22 @@ async def deliver_to_chat(
     return {"status": "started", "job_id": job_id, "channel_id": channel_id}
 
 
-async def _job_known(job_id: str) -> bool:
-    """Whether arq has this job: queued, running, or finished within its
-    result retention (an hour by default; delivery retries come within a
-    minute)."""
+async def _job_state(job_id: str) -> Optional[str]:
+    """Where arq has this job: "running", "queued", "finished" (within its
+    result retention, an hour by default; delivery retries come within a
+    minute), or None when it has no such job."""
     from arq.constants import in_progress_key_prefix, job_key_prefix, result_key_prefix
 
     from app.core.redis import get_arq_pool
 
     pool = await get_arq_pool()
-    return bool(await pool.exists(
-        f"{job_key_prefix}{job_id}", f"{in_progress_key_prefix}{job_id}", f"{result_key_prefix}{job_id}"
-    ))
+    if await pool.exists(f"{in_progress_key_prefix}{job_id}"):
+        return "running"
+    if await pool.exists(f"{job_key_prefix}{job_id}"):
+        return "queued"
+    if await pool.exists(f"{result_key_prefix}{job_id}"):
+        return "finished"
+    return None
 
 
 # ---------------------------------------------------------------------------
