@@ -152,6 +152,9 @@ def test_versions():
     # Build metadata doesn't order versions.
     assert not is_newer("1.0.0", "1.0.0+build.1") and not is_newer("1.0.0+b2", "1.0.0+b1")
     assert is_newer("1.0.1+b1", "1.0.0+b9")
+    # A hyphen stays inside a pre-release label, which then compares as text.
+    assert is_newer("1.0.0-alpha-2", "1.0.0-alpha-10") and not is_newer("1.0.0-alpha-10", "1.0.0-alpha-2")
+    assert is_newer("1.0.0-alpha.10", "1.0.0-alpha.2")
 
 
 # ---------------------------------------------------------------- the API
@@ -291,6 +294,21 @@ class TestHardening:
         r = await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name},
                               headers=auth_headers(admin_user))
         assert r.status_code == 502 and "no package metadata" in r.json()["detail"]
+
+    async def test_a_long_file_url_is_recorded_with_the_install(self, client, db, admin_user, fake_repo):
+        name = f"demo{_uid()}"
+        fake_repo.publish(name, "1.0.0")
+        long_path = f"packages/{'d' * 1100}/{name}.yaml"
+        fake_repo.files[long_path] = fake_repo.files.pop(f"packages/{name}/package.yaml")
+        index = fake_repo._index()
+        index["packages"][0]["path"] = long_path
+        fake_repo.files["index.json"] = json.dumps(index).encode()
+        repo = await _add(client, admin_user)
+        r = await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name},
+                              headers=auth_headers(admin_user))
+        assert r.status_code == 200, r.text
+        row = (await db.execute(select(Package).where(Package.name == name))).scalar_one()
+        assert row.source_repository == repo["name"] and row.source_url == RAW + long_path
 
     async def test_a_malformed_redirect_is_recorded_not_raised(self, client, admin_user, fake_repo):
         fake_repo.redirects[RAW + "index.json"] = "https://["

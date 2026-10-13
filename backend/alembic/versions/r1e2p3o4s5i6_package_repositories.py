@@ -40,9 +40,15 @@ def upgrade() -> None:
     )
     op.create_index("ix_package_repositories_name", "package_repositories", ["name"], unique=True)
     op.add_column("packages", sa.Column("source_repository", sa.String(100), nullable=True))
+    # A file URL is the repository URL (up to 2048) plus the index's path.
+    op.alter_column("packages", "source_url", type_=sa.Text(), existing_type=sa.String(1024), existing_nullable=True)
 
 
 def downgrade() -> None:
+    op.alter_column(
+        "packages", "source_url", type_=sa.String(1024), existing_type=sa.Text(), existing_nullable=True,
+        postgresql_using="left(source_url, 1024)",
+    )
     op.drop_column("packages", "source_repository")
     op.drop_index("ix_package_repositories_name", table_name="package_repositories")
     op.drop_table("package_repositories")

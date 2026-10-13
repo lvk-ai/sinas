@@ -357,7 +357,7 @@ def _version_key(version: str) -> Optional[tuple]:
     pre = match.group(2)
     if pre is None:
         return (release, (1,))
-    return (release, (0, tuple((0, int(p)) if p.isdigit() else (1, p) for p in re.split(r"[.-]", pre))))
+    return (release, (0, tuple((0, int(p)) if p.isdigit() else (1, p) for p in pre.split("."))))  # a hyphen stays inside a label
 
 
 def is_newer(candidate: str, installed: str) -> bool:
