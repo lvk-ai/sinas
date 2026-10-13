@@ -12,19 +12,23 @@
  * - mapping fields with a per-row literal ⇄ JMESPath toggle (`.$` handled
  *   automatically), whole-input expression mode, and a lossless raw-JSON
  *   fallback per step (unknown keys are preserved, never dropped);
- * - cursor / retry sections where the backend allows them;
- * - expression hints listing the roots available at that position.
+ * - switching Fields ⇄ Expression converts (a fields input is a JMESPath
+ *   `{key: expr}` hash) and warns before a switch that can't keep the value;
+ * - expressions are free text with a picker of the references available at
+ *   that position (run input fields, earlier step outputs, cursor, run);
+ * - cursor / retry sections where the backend allows them.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown, ArrowUp, Braces, ChevronDown, ChevronRight, Copy, Plus,
   SigmaSquare, Trash2, Type as TypeIcon,
 } from 'lucide-react';
-import type { MappingRow, Step, StepType } from './model';
+import type { InputMode, MappingRow, Step, StepType, SuggestionGroup } from './model';
 import {
-  STEP_TYPES, deriveInputMode, duplicateStep, expressionRoots, extraKeys,
-  inputToRows, literalTypeHint, moveStep, newStep, removeStep, replaceStep,
-  rowsToInput, setStepKey, stepSummary, updateStep, validateSteps,
+  STEP_TYPES, deriveInputMode, duplicateRowKeys, duplicateStep, expressionSuggestions,
+  expressionToInput, extraKeys, inputSchemaFields, isPlainObject, inputToExpression, inputToRows,
+  literalTypeHint, moveStep, newStep, removeStep, replaceStep, rowsToInput, setStepKey,
+  stepSummary, updateStep, validateSteps,
 } from './model';
 import './steps-editor.css';
 
@@ -45,6 +49,8 @@ export interface PipelineStepsEditorProps {
   steps: Step[];
   onChange: (steps: Step[]) => void;
   resources?: StepResources;
+  /** The pipeline's inputSchema: its properties are offered as `input.<name>`. */
+  inputSchema?: Record<string, any>;
 }
 
 const CUSTOM_SENTINEL = '\u0000custom';
@@ -116,64 +122,168 @@ function Field({ label, children, hint }: { label: string; children: React.React
   );
 }
 
-/** Per-row mapping editor: key, literal/expression toggle, value. */
-function MappingRowsEditor({
-  rows, onRows, roots,
+/** A JMESPath expression: free text (any expression is valid here, not just
+ * the listed references) plus a picker that inserts a reference at the
+ * caret, or replaces the value when the field hasn't been focused yet. */
+function ExpressionInput({
+  value, onChange, suggestions, placeholder, multiline = false, invalid = false,
 }: {
-  rows: MappingRow[];
-  onRows: (rows: MappingRow[]) => void;
-  roots: string[];
+  value: string;
+  onChange: (v: string) => void;
+  suggestions: SuggestionGroup[];
+  placeholder?: string;
+  multiline?: boolean;
+  invalid?: boolean;
 }) {
-  const setRow = (i: number, patch: Partial<MappingRow>) => {
-    const next = rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
-    onRows(next);
+  const ref = useRef<HTMLInputElement & HTMLTextAreaElement>(null);
+  const caret = useRef<[number, number] | null>(null);
+  const remember = () => {
+    const el = ref.current;
+    if (el) caret.current = [el.selectionStart ?? value.length, el.selectionEnd ?? value.length];
+  };
+  const insert = (text: string) => {
+    const [start, end] = caret.current ?? [0, value.length];
+    const next = value.slice(0, start) + text + value.slice(end);
+    onChange(next);
+    const pos = start + text.length;
+    caret.current = [pos, pos];
+    requestAnimationFrame(() => {
+      ref.current?.focus();
+      ref.current?.setSelectionRange(pos, pos);
+    });
+  };
+  const cls = `pse-input pse-mono${invalid ? ' pse-invalid' : ''}`;
+  const common = {
+    ref,
+    className: cls,
+    value,
+    placeholder,
+    spellCheck: false,
+    onSelect: remember,
+    onKeyUp: remember,
+    onClick: remember,
   };
   return (
+    <div className="pse-expr">
+      {multiline ? (
+        <textarea {...common} rows={Math.min(6, Math.max(2, Math.ceil(value.length / 70)))}
+          onChange={(e) => onChange(e.target.value)} />
+      ) : (
+        <input {...common} onChange={(e) => onChange(e.target.value)} />
+      )}
+      <select
+        className="pse-input pse-expr-pick"
+        value=""
+        title="Insert a reference available at this step"
+        onChange={(e) => e.target.value && insert(e.target.value)}
+      >
+        <option value="">Insert…</option>
+        {suggestions.map((g) => (
+          <optgroup key={g.label} label={g.label}>
+            {g.options.map((o) => (
+              <option key={o} value={o}>{o}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+/** Per-row mapping editor: key, literal/expression toggle, value. Rows live
+ * in local state so a row whose key is still empty (just added, or being
+ * retyped) stays on screen; only keyed rows are written to the step. */
+function MappingRowsEditor({
+  input, onInput, suggestions,
+}: {
+  input: Record<string, any> | undefined;
+  onInput: (input: Record<string, any>) => void;
+  suggestions: SuggestionGroup[];
+}) {
+  const [rows, setRows] = useState<MappingRow[]>(() => inputToRows(input));
+  const incoming = JSON.stringify(input ?? {});
+  const emitted = useRef(incoming);
+  useEffect(() => {
+    // Changed from outside (raw JSON edit, mode switch, reorder): re-derive.
+    if (incoming !== emitted.current) {
+      emitted.current = incoming;
+      setRows(inputToRows(JSON.parse(incoming)));
+    }
+  }, [incoming]);
+
+  const commit = (next: MappingRow[]) => {
+    setRows(next);
+    const value = rowsToInput(next);
+    emitted.current = JSON.stringify(value);
+    onInput(value);
+  };
+  const setRow = (i: number, patch: Partial<MappingRow>) => {
+    // Typing `name.$` as a key means "expression": model it as the toggle.
+    if (patch.key?.endsWith('.$')) patch = { ...patch, key: patch.key.slice(0, -2), kind: 'expr' };
+    commit(rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  };
+  const dups = duplicateRowKeys(rows);
+
+  return (
     <div className="pse-mapping">
+      {rows.length === 0 && <span className="pse-hint">No fields — the step gets an empty object.</span>}
       {rows.map((row, i) => {
         const hint = row.kind === 'literal' ? literalTypeHint(row.value) : null;
         return (
           <div key={i} className="pse-mapping-row">
             <input
-              className="pse-input pse-mono pse-mapping-key"
+              className={`pse-input pse-mono pse-mapping-key${dups.includes(row.key.trim()) ? ' pse-invalid' : ''}`}
               value={row.key}
               placeholder="param"
+              autoFocus={row.key === '' && row.value === '' && i === rows.length - 1}
               onChange={(e) => setRow(i, { key: e.target.value })}
             />
             <button
               type="button"
               className={`pse-kind-toggle${row.kind === 'expr' ? ' pse-kind-expr' : ''}`}
               title={row.kind === 'expr'
-                ? 'JMESPath expression (click for literal value)'
-                : 'Literal value (click for JMESPath expression)'}
+                ? 'JMESPath expression (click for a fixed value)'
+                : 'Fixed value (click for a JMESPath expression)'}
               onClick={() => setRow(i, { kind: row.kind === 'expr' ? 'literal' : 'expr' })}
             >
               {row.kind === 'expr' ? <SigmaSquare size={13} /> : <TypeIcon size={13} />}
             </button>
             <div className="pse-mapping-value">
-              <SuggestInput
-                value={row.value}
-                onChange={(v) => setRow(i, { value: v })}
-                options={row.kind === 'expr' ? roots : undefined}
-                placeholder={row.kind === 'expr' ? 'steps.fetch.output.body' : 'value'}
-              />
+              {row.kind === 'expr' ? (
+                <ExpressionInput
+                  value={row.value}
+                  onChange={(v) => setRow(i, { value: v })}
+                  suggestions={suggestions}
+                  placeholder="steps.fetch.output.body"
+                />
+              ) : (
+                <input
+                  className="pse-input pse-mono"
+                  value={row.value}
+                  placeholder='value — 42, true, {"a": 1} are typed; =42 is the string "42"'
+                  onChange={(e) => setRow(i, { value: e.target.value })}
+                />
+              )}
               {hint && <span className="pse-type-badge">{hint}</span>}
             </div>
             <button
               type="button"
               className="pse-icon-btn"
               title="Remove"
-              onClick={() => onRows(rows.filter((_, idx) => idx !== i))}
+              onClick={() => commit(rows.filter((_, idx) => idx !== i))}
             >
               <Trash2 size={13} />
             </button>
           </div>
         );
       })}
+      {dups.length > 0 && (
+        <span className="pse-error">Duplicate field {dups.map((d) => `'${d}'`).join(', ')} — the last one wins.</span>
+      )}
       <button
         type="button"
         className="pse-add-row"
-        onClick={() => onRows([...rows, { key: '', value: '', kind: 'literal' }])}
+        onClick={() => setRows([...rows, { key: '', value: '', kind: 'literal' }])}
       >
         <Plus size={13} /> Add field
       </button>
@@ -181,50 +291,114 @@ function MappingRowsEditor({
   );
 }
 
+/** What a step at `index` can read, in words, for the Input section. */
+function availabilityHint(steps: Step[], index: number, inputSchema?: Record<string, any>): string {
+  const fields = inputSchemaFields(inputSchema);
+  const input = fields.length
+    ? `the run input (${fields.slice(0, 4).map((f) => `input.${f.name}`).join(', ')}${fields.length > 4 ? ', …' : ''})`
+    : 'the run input (input — declare its fields under Run input)';
+  if (index === 0) {
+    return `First step: no earlier step outputs yet. It can use fixed values, ${input}, cursor and run.`;
+  }
+  const prior = steps.slice(0, index).map((s) => `steps.${s.name}.output`);
+  return `Can use fixed values, ${input}, ${prior.join(', ')}, cursor and run.`;
+}
+
+interface PendingSwitch {
+  to: InputMode;
+  message: string;
+}
+
 /** The step `input` editor with its three modes. */
 function InputEditor({
-  step, index, steps, onSteps,
+  step, index, steps, onSteps, inputSchema,
 }: {
   step: Step;
   index: number;
   steps: Step[];
   onSteps: (steps: Step[]) => void;
+  inputSchema?: Record<string, any>;
 }) {
   // The mode is DERIVED from the step's actual shape (reorder/raw-edit safe);
   // the only sticky UI state is "show me the JSON anyway".
   const naturalMode = deriveInputMode(step);
-  const [jsonOverride, setJsonOverride] = useState(false);
-  // Mode switches STASH the value being left behind instead of destroying
-  // it (the spec forbids a step carrying both `input` and `input.$`, so the
-  // memory lives here in UI state): Expression -> Fields -> Expression
-  // round-trips the exact expression, and vice versa.
-  const [stashedExpr, setStashedExpr] = useState<string | null>(null);
-  const [stashedFields, setStashedFields] = useState<Record<string, any> | null>(null);
+  const [jsonView, setJsonView] = useState(false);
   const [jsonText, setJsonText] = useState('');
   const [jsonError, setJsonError] = useState<string | null>(null);
-  const effectiveMode: 'fields' | 'expression' | 'json' =
-    jsonOverride || naturalMode === 'json' ? 'json' : naturalMode;
-  const roots = expressionRoots(steps, index);
+  const [pending, setPending] = useState<PendingSwitch | null>(null);
+  // A switch that can't convert keeps what it replaced here (the spec forbids
+  // carrying both `input` and `input.$`), so switching back restores it.
+  const [stash, setStash] = useState<{ step: string; input?: any; expr?: string } | null>(null);
+  const mode: InputMode = jsonView || naturalMode === 'json' ? 'json' : naturalMode;
+  const suggestions = expressionSuggestions(steps, index, inputSchema);
+  const hasExpr = 'input.$' in step;
+  const mine = stash?.step === step.name ? stash : null;
 
-  const switchMode = (next: 'fields' | 'expression' | 'json') => {
+  const currentJson = () =>
+    JSON.stringify(hasExpr ? { 'input.$': step['input.$'] } : step.input ?? {}, null, 2);
+
+  const write = (value: { input?: any; expr?: string }) => {
+    let s = setStepKey(steps, index, 'input', value.input);
+    s = setStepKey(s, index, 'input.$', value.expr);
+    onSteps(s);
+  };
+
+  const switchMode = (next: InputMode, confirmed = false) => {
+    setPending(null);
     setJsonError(null);
     if (next === 'json') {
-      setJsonText(JSON.stringify(step['input.$'] !== undefined ? { 'input.$': step['input.$'] } : step.input ?? {}, null, 2));
-      setJsonOverride(true);
+      setJsonText(currentJson());
+      setJsonView(true);
       return;
     }
-    setJsonOverride(false);
-    if (next === 'expression' && step['input.$'] === undefined) {
-      if (step.input && Object.keys(step.input).length) setStashedFields(step.input);
-      let s = setStepKey(steps, index, 'input', undefined);
-      s = setStepKey(s, index, 'input.$', stashedExpr ?? '');
-      onSteps(s);
-    } else if (next === 'fields' && step['input.$'] !== undefined) {
-      if (step['input.$']) setStashedExpr(step['input.$']);
-      let s = setStepKey(steps, index, 'input.$', undefined);
-      s = setStepKey(s, index, 'input', stashedFields ?? {});
-      onSteps(s);
+
+    if (next === 'expression') {
+      setJsonView(false);
+      if (hasExpr) return;
+      // Always lossless: a fields input is a JMESPath {key: expr} hash.
+      let expr = inputToExpression(step.input);
+      if (expr === '' && mine) expr = mine.expr ?? inputToExpression(mine.input);
+      write({ expr });
+      return;
     }
+
+    // next === 'fields'
+    if (hasExpr) {
+      const expr: string = step['input.$'] ?? '';
+      const converted = expressionToInput(expr);
+      if (converted) {
+        setJsonView(false);
+        write({ input: Object.keys(converted).length || !mine ? converted : restoreFields(mine) });
+        return;
+      }
+      if (!confirmed) {
+        setPending({
+          to: 'fields',
+          message: "This expression isn't a {key: value} object, so it can't be split into fields. "
+            + 'Switching gives you empty fields; the expression is kept here and comes back if you '
+            + 'switch to Expression again before leaving the page.',
+        });
+        return;
+      }
+      setStash({ step: step.name, expr });
+      setJsonView(false);
+      write({ input: mine ? restoreFields(mine) : {} });
+      return;
+    }
+    if (step.input !== undefined && step.input !== null && !isPlainObject(step.input)) {
+      if (!confirmed) {
+        setPending({
+          to: 'fields',
+          message: `The input is a JSON ${Array.isArray(step.input) ? 'array' : 'value'}, not an object, `
+            + 'so it has no fields. Switching gives you empty fields; the current value comes back '
+            + 'if you switch to Expression or JSON again before leaving the page.',
+        });
+        return;
+      }
+      setStash({ step: step.name, input: step.input });
+      write({ input: {} });
+    }
+    setJsonView(false);
   };
 
   const applyJson = (text: string) => {
@@ -232,15 +406,8 @@ function InputEditor({
     try {
       const parsed = JSON.parse(text);
       setJsonError(null);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'input.$' in parsed) {
-        let s = setStepKey(steps, index, 'input', undefined);
-        s = setStepKey(s, index, 'input.$', parsed['input.$']);
-        onSteps(s);
-      } else {
-        let s = setStepKey(steps, index, 'input.$', undefined);
-        s = setStepKey(s, index, 'input', parsed);
-        onSteps(s);
-      }
+      if (isPlainObject(parsed) && 'input.$' in parsed) write({ expr: parsed['input.$'] });
+      else write({ input: parsed });
     } catch (e: any) {
       setJsonError(e.message);
     }
@@ -255,7 +422,12 @@ function InputEditor({
             <button
               key={m}
               type="button"
-              className={`pse-mode-tab${effectiveMode === m ? ' pse-active' : ''}`}
+              className={`pse-mode-tab${mode === m ? ' pse-active' : ''}`}
+              title={m === 'fields'
+                ? 'One row per input key: a fixed value or an expression each'
+                : m === 'expression'
+                  ? 'The whole input as one JMESPath expression'
+                  : 'The raw input JSON'}
               onClick={() => switchMode(m)}
             >
               {m === 'fields' ? 'Fields' : m === 'expression' ? 'Expression' : 'JSON'}
@@ -263,41 +435,74 @@ function InputEditor({
           ))}
         </div>
       </div>
+      <span className="pse-hint">{availabilityHint(steps, index, inputSchema)}</span>
 
-      {effectiveMode === 'fields' && (
+      {pending && (
+        <div className="pse-notice">
+          <span>{pending.message}</span>
+          <div className="pse-notice-actions">
+            <button type="button" className="pse-notice-btn pse-notice-primary"
+              onClick={() => switchMode(pending.to, true)}>
+              Switch anyway
+            </button>
+            <button type="button" className="pse-notice-btn" onClick={() => setPending(null)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {mode === 'fields' && (
         <MappingRowsEditor
-          rows={inputToRows(step.input)}
-          onRows={(rows) => onSteps(setStepKey(steps, index, 'input', rowsToInput(rows)))}
-          roots={roots}
+          input={step.input}
+          onInput={(input) => onSteps(setStepKey(steps, index, 'input', input))}
+          suggestions={suggestions}
         />
       )}
 
-      {effectiveMode === 'expression' && (
-        <Field label="Whole input as JMESPath" hint={`Roots: ${roots.join(', ')}`}>
-          <SuggestInput
+      {mode === 'expression' && (
+        <Field
+          label="Whole input as one JMESPath expression"
+          hint="An object expression like {key: steps.fetch.output.id, other: input.x} can also be edited as Fields."
+        >
+          <ExpressionInput
             value={step['input.$'] ?? ''}
             onChange={(v) => onSteps(setStepKey(steps, index, 'input.$', v))}
-            options={roots}
+            suggestions={suggestions}
             placeholder="steps.fetch.output.body"
+            multiline
+            invalid={!String(step['input.$'] ?? '').trim()}
           />
         </Field>
       )}
 
-      {effectiveMode === 'json' && (
+      {mode === 'json' && (
         <div className="pse-field">
           <textarea
             className={`pse-input pse-mono pse-json${jsonError ? ' pse-invalid' : ''}`}
             rows={6}
-            value={jsonText || JSON.stringify(step['input.$'] !== undefined ? { 'input.$': step['input.$'] } : step.input ?? {}, null, 2)}
-            onChange={(e) => applyJson(e.target.value)}
+            value={jsonView ? jsonText : currentJson()}
+            onChange={(e) => {
+              if (!jsonView) setJsonView(true);
+              applyJson(e.target.value);
+            }}
             spellCheck={false}
           />
           {jsonError && <span className="pse-error">{jsonError}</span>}
-          <span className="pse-hint">Nested templates: keys ending in `.$` are JMESPath. Fields view is available for flat objects.</span>
+          <span className="pse-hint">
+            Keys ending in `.$` are JMESPath, at any depth. {'{"input.$": "…"}'} sets the whole input as one expression.
+          </span>
         </div>
       )}
     </div>
   );
+}
+
+/** Fields to restore from a stash: its object input, or its expression when
+ * that converts. */
+function restoreFields(stash: { input?: any; expr?: string }): Record<string, any> {
+  if (isPlainObject(stash.input)) return stash.input;
+  return (stash.expr !== undefined && expressionToInput(stash.expr)) || {};
 }
 
 function CursorEditor({
@@ -406,15 +611,16 @@ function RetryEditor({
 }
 
 function StepBody({
-  step, index, steps, onSteps, resources,
+  step, index, steps, onSteps, resources, inputSchema,
 }: {
   step: Step;
   index: number;
   steps: Step[];
   onSteps: (steps: Step[]) => void;
   resources?: StepResources;
+  inputSchema?: Record<string, any>;
 }) {
-  const roots = expressionRoots(steps, index);
+  const suggestions = expressionSuggestions(steps, index, inputSchema);
   const connectorRefs = resources?.connectors?.map((c) => c.ref);
   const operations = useMemo(
     () => resources?.connectors?.find((c) => c.ref === step.connector)?.operations,
@@ -443,7 +649,7 @@ function StepBody({
               />
             </Field>
           </div>
-          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} />
+          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} inputSchema={inputSchema} />
           <CursorEditor step={step} index={index} steps={steps} onSteps={onSteps} />
           <div className="pse-inline-fields">
             <RetryEditor step={step} index={index} steps={steps} onSteps={onSteps} />
@@ -474,7 +680,7 @@ function StepBody({
               placeholder="gmail/extract-messages"
             />
           </Field>
-          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} />
+          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} inputSchema={inputSchema} />
           <CursorEditor step={step} index={index} steps={steps} onSteps={onSteps} />
           <RetryEditor step={step} index={index} steps={steps} onSteps={onSteps} />
         </>
@@ -490,7 +696,7 @@ function StepBody({
               placeholder="gmail/triage"
             />
           </Field>
-          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} />
+          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} inputSchema={inputSchema} />
           <div className="pse-section">
             <div className="pse-section-head">
               <span className="pse-section-title">Message</span>
@@ -512,10 +718,10 @@ function StepBody({
               </button>
             </div>
             {'message.$' in step ? (
-              <SuggestInput
+              <ExpressionInput
                 value={step['message.$'] ?? ''}
                 onChange={(v) => onSteps(setStepKey(steps, index, 'message.$', v))}
-                options={roots}
+                suggestions={suggestions}
                 placeholder="steps.extract.output.summary"
               />
             ) : (
@@ -543,7 +749,7 @@ function StepBody({
               placeholder="search/similar-docs"
             />
           </Field>
-          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} />
+          <InputEditor step={step} index={index} steps={steps} onSteps={onSteps} inputSchema={inputSchema} />
           <RetryEditor step={step} index={index} steps={steps} onSteps={onSteps} />
         </>
       )}
@@ -570,10 +776,10 @@ function StepBody({
           </div>
           <div className="pse-grid-2">
             <Field label="Items (JMESPath)" hint="array to upsert, one row per item">
-              <SuggestInput
+              <ExpressionInput
                 value={step['items.$'] ?? ''}
                 onChange={(v) => onSteps(setStepKey(steps, index, 'items.$', v))}
-                options={roots}
+                suggestions={suggestions}
                 placeholder="steps.extract.output.worklogs"
               />
             </Field>
@@ -594,13 +800,14 @@ function StepBody({
 }
 
 function StepCard({
-  step, index, steps, onSteps, resources, issues,
+  step, index, steps, onSteps, resources, inputSchema, issues,
 }: {
   step: Step;
   index: number;
   steps: Step[];
   onSteps: (steps: Step[]) => void;
   resources?: StepResources;
+  inputSchema?: Record<string, any>;
   issues: string[];
 }) {
   const [collapsed, setCollapsed] = useState(false);
@@ -706,13 +913,13 @@ function StepCard({
           {rawError && <span className="pse-error">{rawError}</span>}
         </div>
       ) : (
-        <StepBody step={step} index={index} steps={steps} onSteps={onSteps} resources={resources} />
+        <StepBody step={step} index={index} steps={steps} onSteps={onSteps} resources={resources} inputSchema={inputSchema} />
       ))}
     </div>
   );
 }
 
-export function PipelineStepsEditor({ steps, onChange, resources }: PipelineStepsEditorProps) {
+export function PipelineStepsEditor({ steps, onChange, resources, inputSchema }: PipelineStepsEditorProps) {
   const issues = validateSteps(steps);
   const [addOpen, setAddOpen] = useState(false);
 
@@ -727,6 +934,7 @@ export function PipelineStepsEditor({ steps, onChange, resources }: PipelineStep
             steps={steps}
             onSteps={onChange}
             resources={resources}
+            inputSchema={inputSchema}
             issues={issues.filter((i) => i.index === index).map((i) => i.message)}
           />
         </div>
