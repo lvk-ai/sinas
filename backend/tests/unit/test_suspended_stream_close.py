@@ -49,10 +49,23 @@ async def _read_stream(client, chat, user):
     return seen
 
 
+def _in(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
 def test_only_a_fully_asked_round_waits_on_the_user():
-    assert round_waits_only_on_user({"tool_call_ids": ["a", "b"]}, {"a", "b"})
-    assert not round_waits_only_on_user({"tool_call_ids": ["a", "bg"]}, {"a"})
-    assert not round_waits_only_on_user({"tool_call_ids": []}, set())
+    assert round_waits_only_on_user({"tool_call_ids": ["a", "b"]}, {"a": None, "b": _in(86400)})
+    assert not round_waits_only_on_user({"tool_call_ids": ["a", "bg"]}, {"a": None})
+    assert not round_waits_only_on_user({"tool_call_ids": []}, {})
+
+
+def test_a_question_that_can_time_out_while_the_stream_is_open_keeps_it_open():
+    """Its timeout resumes the round on this channel: the reply should be
+    seen live, not lost to a closed stream."""
+    assert not round_waits_only_on_user({"tool_call_ids": ["a"]}, {"a": _in(30)})
+    assert not round_waits_only_on_user({"tool_call_ids": ["a", "b"]}, {"a": None, "b": _in(60)})
 
 
 @pytest.mark.asyncio
@@ -72,6 +85,16 @@ async def test_round_also_waiting_on_a_background_run_stays_open(client, chat, t
     monkeypatch.setattr(stream_relay, "subscribe", _fake_subscribe([
         {"type": "input_required", "tool_call_id": "a", "question": "Which?"},
         {"type": "round_suspended", "pending_completion_id": "p", "tool_call_ids": ["a", "bg"]},
+    ]))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(_read_stream(client, chat, test_user), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_question_expiring_soon_keeps_the_stream_open(client, chat, test_user, monkeypatch):
+    monkeypatch.setattr(stream_relay, "subscribe", _fake_subscribe([
+        {"type": "input_required", "tool_call_id": "a", "question": "Which?", "expires_at": _in(30)},
+        {"type": "round_suspended", "pending_completion_id": "p", "tool_call_ids": ["a"]},
     ]))
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(_read_stream(client, chat, test_user), timeout=2)

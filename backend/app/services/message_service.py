@@ -494,7 +494,15 @@ class MessageService:
         """
         from app.services import chat_steering
 
+        from app.services.chat_wakeups import chat_is_parked
+
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is not None and await chat_is_parked(self.db, chat_id):
+            # A round is parked (on ask_user, a background run, a sub-agent,
+            # an approval): it holds no lock but owns the chat. The message
+            # waits for it like for a running loop.
+            await chat_steering.release_chat_lock(chat_id, lock_token)
+            lock_token = None
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
@@ -697,7 +705,14 @@ class MessageService:
         """
         from app.services import chat_steering
 
+        from app.services.chat_wakeups import chat_is_parked
+
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is not None and await chat_is_parked(self.db, chat_id):
+            # A parked round owns the chat though it holds no lock (see
+            # send_message): inject, don't start a turn beside it.
+            await chat_steering.release_chat_lock(chat_id, lock_token)
+            lock_token = None
         if lock_token is None:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:

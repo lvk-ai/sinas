@@ -69,6 +69,38 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 # Delivery
 # ---------------------------------------------------------------------------
 
+async def chat_is_parked(db, chat_id) -> bool:
+    """Whether the chat has a round parked: on a pending completion (an
+    ask_user question, a suspended delegation, a background run being
+    waited on) or an unanswered tool approval. A parked round holds no chat
+    lock, but it has open tool calls: a new turn would "repair" them with
+    synthetic errors and race the round's resume, so a message for such a
+    chat must be injected (read when the round resumes), never start a
+    turn. A checkpoint whose last completion landed (remaining == 0) still
+    parks the chat: its row stays until the saved turn is queued, and a
+    turn started in that gap would run beside the saved one."""
+    from app.models.pending_approval import PendingToolApproval
+    from app.models.pending_completion import PendingCompletion
+
+    chat_uuid = chat_id if isinstance(chat_id, uuid.UUID) else uuid.UUID(str(chat_id))
+    if (
+        await db.execute(select(PendingCompletion.id).where(PendingCompletion.chat_id == chat_uuid).limit(1))
+    ).scalar_one_or_none() is not None:
+        return True
+    now = _now()
+    return (
+        await db.execute(
+            select(PendingToolApproval.id)
+            .where(
+                PendingToolApproval.chat_id == chat_uuid,
+                PendingToolApproval.approved.is_(None),
+                or_(PendingToolApproval.expires_at.is_(None), PendingToolApproval.expires_at > now),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+
+
 async def deliver_to_chat(
     chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None, guard=None,
     delivery_id: Optional[str] = None,
@@ -100,7 +132,6 @@ async def deliver_to_chat(
     """
     from app.core.auth import bind_api_key, create_access_token, reset_api_key
     from app.core.database import AsyncSessionLocal
-    from app.models.pending_completion import PendingCompletion
     from app.services import chat_steering
     from app.services.message_service import MessageService
     from app.services.queue_service import queue_service
@@ -114,35 +145,7 @@ async def deliver_to_chat(
         if user is None or not user.is_active:
             return {"status": "dropped", "reason": "owner_inactive"}
 
-        # Parked rounds: a pending completion (ask_user, delegation, a
-        # background run being waited on) or an unanswered tool approval.
-        # Both released the lock, both have open tool calls a new turn would
-        # "repair" with synthetic errors — so inject, never start a turn.
-        # A checkpoint whose last completion landed (remaining == 0) still
-        # parks the chat: its row stays until the saved turn is queued, and
-        # a turn started in that gap would run beside the saved one.
-        suspended = (
-            await db.execute(
-                select(PendingCompletion.id)
-                .where(PendingCompletion.chat_id == chat.id)
-                .limit(1)
-            )
-        ).scalar_one_or_none() is not None
-        if not suspended:
-            from app.models.pending_approval import PendingToolApproval
-
-            now = _now()
-            suspended = (
-                await db.execute(
-                    select(PendingToolApproval.id)
-                    .where(
-                        PendingToolApproval.chat_id == chat.id,
-                        PendingToolApproval.approved.is_(None),
-                        or_(PendingToolApproval.expires_at.is_(None), PendingToolApproval.expires_at > now),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none() is not None
+        suspended = await chat_is_parked(db, chat.id)
 
         fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
         fixed_job_id = f"delivery-{fixed}" if fixed else None

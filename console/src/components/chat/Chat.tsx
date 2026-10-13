@@ -41,6 +41,10 @@ export interface ChatProps {
   onInterrupt?: (chatId: string) => Promise<void>;
 }
 
+// How long Stop waits for the server-side interrupt before closing the
+// stream regardless.
+const STOP_INTERRUPT_WAIT_MS = 3000;
+
 export function Chat({
   agent,
   chatId: initialChatId,
@@ -168,7 +172,14 @@ export function Chat({
 
   const handleStop = React.useCallback(async () => {
     try {
-      if (chatId && onInterrupt) await onInterrupt(chatId);
+      // Arm the server-side interrupt first, but never let an unreachable
+      // server keep Stop from closing the stream here.
+      if (chatId && onInterrupt) {
+        await Promise.race([
+          onInterrupt(chatId),
+          new Promise<void>((resolve) => setTimeout(resolve, STOP_INTERRUPT_WAIT_MS)),
+        ]);
+      }
     } catch (e) {
       onError?.((e as Error).message || 'Could not stop the turn');
     } finally {
