@@ -74,6 +74,24 @@ Status templates use the key `mcp:<namespace>/<server>/<tool>`, or `mcp:<namespa
 - **Workbench references work.** `{"$workbench": "path"}` argument values are resolved before the call, like for every tool.
 - **Results.** Text blocks are joined into `text`; `structuredContent` is passed through as `structured_content`. Images, audio and binary resources are written to the chat's workbench (`tool_results/<tool name>_<call id>_<n>.<ext>`, one set of files per call) when the agent has one, otherwise inlined as data URLs. Embedded text resources and resource links are returned as `content` entries. A tool that reports `isError` becomes an `{"error": …}` result the model can recover from. Large results spill to the workbench like any other tool result.
 
+## Protocol version
+
+Sinas speaks the current MCP revision, **2026-07-28**, and falls back to the older handshake-based revisions for servers that haven't moved yet. 2026-07-28 has no sessions: every request stands on its own. A server that needs state across calls (a browser, a shopping basket) returns an explicit handle from one tool, such as a `browser_id`, and the agent passes it to the next.
+
+## Tasks
+
+Sinas supports the [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview) (`io.modelcontextprotocol/tasks`). A server may answer a tool call with a task instead of a result when the work takes a while:
+
+1. Sinas polls the task inline for up to `MCP_TASK_INLINE_WAIT_SECONDS` (20), never longer than the server's `timeoutSeconds`. If it finishes in time, the agent gets the result like any other.
+2. Otherwise the agent gets a `task_id` and can carry on or end its turn. Sinas keeps the task and polls it in the background at the server's suggested interval, within `MCP_TASK_MIN_POLL_SECONDS` (5) and `MCP_TASK_MAX_POLL_SECONDS` (300). The result is delivered into the chat as `[mcp task <id> completed: …]`, which wakes the agent like a finished [background job](/build-resources/system-tools).
+3. When the task needs input, the request is delivered once as `[mcp task <id> needs input: …]`. The agent answers with `mcp_task_respond`, and asks the user first when the request is meant for them.
+
+Every agent with an MCP server bound also gets three tools: `mcp_task_status` (a live look; nothing is delivered for it), `mcp_task_respond` and `mcp_task_cancel`. Cancelling is a request to the server; Sinas stops following the task either way. `list_wakeups` lists the chat's running tasks.
+
+Tasks are kept in the database, so polling survives a restart. A task ends as failed when it outlives the server's `ttlMs` (or `MCP_TASK_MAX_AGE_SECONDS`, 7 days, when the server gives none), when the user loses access to the server, or after `MCP_TASK_MAX_POLL_FAILURES` (10) polls in a row can't reach it. Deleting the chat deletes its tasks. Polls act as the chat's user, through the API key the calling turn used, with the same credentials as the call. The agent only sees Sinas's id for a task, never the server's (which a server may use as a bearer token).
+
+A call made outside a chat, with nowhere to deliver to, waits up to the server's `timeoutSeconds`; a task still running after that is cancelled and the call fails.
+
 ## Not supported (yet)
 
-stdio servers; MCP resources, prompts, sampling and elicitation; OAuth sign-in flows for MCP servers (use a bearer token or API-key Secret). See `backend/docs/adrs/2026-10-09-mcp-client.md`.
+stdio servers; MCP resources, prompts and sampling; elicitation outside Tasks; OAuth sign-in flows for MCP servers (use a bearer token or API-key Secret). See `backend/docs/adrs/2026-10-09-mcp-client.md` and `backend/docs/adrs/2026-10-12-mcp-tasks.md`.

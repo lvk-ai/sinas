@@ -70,7 +70,8 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 async def deliver_to_chat(
-    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None
+    chat_id: str, content: str, *, source: str, api_key_id: Optional[str] = None, guard=None,
+    delivery_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Put `content` in front of the agent of `chat_id`.
 
@@ -80,6 +81,20 @@ async def deliver_to_chat(
     loop drains it at its next round boundary. Otherwise starts a new turn
     through the queue, on a fresh channel recorded as the chat's
     `active_channel_id` so a client can reconnect.
+
+    `guard(db)`, when given, runs in the transaction that writes the
+    delivery and commits with it; returning False withdraws the delivery
+    ("dropped", reason "withdrawn"). A sender with an outbox uses it to take
+    the message off in the same transaction as delivering it, so the
+    message is delivered exactly when it leaves the outbox:
+
+    - injected: the message row is written in that transaction;
+    - a new turn: the turn is queued inside that transaction, before it
+      commits (a Redis call, which cannot wait on the database, so holding
+      the guard's locks across it can't deadlock). A failed enqueue rolls
+      the guard back. `delivery_id` fixes the job id, so a crash after the
+      enqueue and before the commit is retried without queuing the turn
+      twice.
 
     Returns {"status": "injected" | "started" | "dropped", ...}.
     """
@@ -129,38 +144,98 @@ async def deliver_to_chat(
                 )
             ).scalar_one_or_none() is not None
 
+        fixed = uuid.uuid5(uuid.NAMESPACE_URL, f"sinas:delivery:{delivery_id}") if delivery_id else None
+        fixed_job_id = f"delivery-{fixed}" if fixed else None
+        earlier = await _job_state(fixed_job_id) if guard is not None and fixed_job_id else None
+        if earlier is not None:
+            # An earlier attempt queued this delivery's turn and died before
+            # committing: the message is on its way in that turn already
+            # (which may be the one holding the chat now). Only take it off.
+            # While that turn is still queued or running, record its stream
+            # channel (it rolled back with the failed commit) so a client can
+            # reconnect; once it has finished, leave the channel alone: a
+            # newer turn may own it.
+            if not await guard(db):
+                await db.rollback()
+                return {"status": "dropped", "reason": "withdrawn"}
+            if earlier in ("queued", "running"):
+                chat.active_channel_id = str(fixed)
+            await db.commit()
+            return {"status": "started", "job_id": fixed_job_id, "channel_id": str(fixed), "already_queued": True}
+
         if suspended or await chat_steering.is_chat_locked(chat_id):
-            injected = await MessageService(db).inject_user_message(chat_id, str(chat.user_id), content)
+            withdrawn = False
+
+            async def checked(session) -> bool:
+                nonlocal withdrawn
+                withdrawn = not await guard(session)
+                return not withdrawn
+
+            injected = await MessageService(db).inject_user_message(
+                chat_id, str(chat.user_id), content, guard=checked if guard is not None else None
+            )
             if injected is None:
-                return {"status": "dropped", "reason": "blocked_by_hook"}
+                return {"status": "dropped", "reason": "withdrawn" if withdrawn else "blocked_by_hook"}
             logger.info("Wakeup (%s) injected into running/suspended chat %s", source, chat_id)
             return {"status": "injected", "message_id": str(injected.id)}
 
         token = create_access_token(user_id=str(user.id), email=user.email)
-        channel_id = str(uuid.uuid4())
-        chat.active_channel_id = channel_id
-        await db.commit()
+        channel_id = str(fixed) if fixed else str(uuid.uuid4())
         agent_label = (
             f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_namespace and chat.agent_name else None
         )
         job_timeout = chat.job_timeout
 
-    key_token = bind_api_key(api_key_id)
-    try:
-        job_id = await queue_service.enqueue_agent_message(
-            chat_id=chat_id,
-            user_id=str(user.id),
-            user_token=token,
-            content=content,
-            channel_id=channel_id,
-            agent=agent_label,
-            trigger_type=source,
-            job_timeout=job_timeout,
-        )
-    finally:
-        reset_api_key(key_token)
+        async def enqueue() -> str:
+            key_token = bind_api_key(api_key_id)
+            try:
+                return await queue_service.enqueue_agent_message(
+                    chat_id=chat_id,
+                    user_id=str(user.id),
+                    user_token=token,
+                    content=content,
+                    channel_id=channel_id,
+                    agent=agent_label,
+                    trigger_type=source,
+                    job_timeout=job_timeout,
+                    job_id=fixed_job_id,
+                )
+            finally:
+                reset_api_key(key_token)
+
+        if guard is not None:
+            if not await guard(db):
+                await db.rollback()
+                return {"status": "dropped", "reason": "withdrawn"}
+            chat.active_channel_id = channel_id
+            job_id = await enqueue()  # inside the guarded transaction
+            await db.commit()
+        else:
+            chat.active_channel_id = channel_id
+            await db.commit()
+
+    if guard is None:
+        job_id = await enqueue()
     logger.info("Wakeup (%s) started a new turn on chat %s (job %s)", source, chat_id, job_id)
     return {"status": "started", "job_id": job_id, "channel_id": channel_id}
+
+
+async def _job_state(job_id: str) -> Optional[str]:
+    """Where arq has this job: "running", "queued", "finished" (within its
+    result retention, an hour by default; delivery retries come within a
+    minute), or None when it has no such job."""
+    from arq.constants import in_progress_key_prefix, job_key_prefix, result_key_prefix
+
+    from app.core.redis import get_arq_pool
+
+    pool = await get_arq_pool()
+    if await pool.exists(f"{in_progress_key_prefix}{job_id}"):
+        return "running"
+    if await pool.exists(f"{job_key_prefix}{job_id}"):
+        return "queued"
+    if await pool.exists(f"{result_key_prefix}{job_id}"):
+        return "finished"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +440,13 @@ async def list_wakeups(db, chat: Chat) -> dict[str, Any]:
         for r in rows if r.kind == WATCH and not (r.expires_at and r.expires_at <= now)
     ]
     jobs = await list_background_jobs(str(chat.id))
-    return {"timers": timers, "watches": watches, "background_jobs": jobs}
+    from app.services.mcp_tasks import list_tasks
+
+    out = {"timers": timers, "watches": watches, "background_jobs": jobs}
+    mcp_tasks = await list_tasks(db, chat)
+    if mcp_tasks:
+        out["mcp_tasks"] = mcp_tasks
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +710,7 @@ def get_background_tool_definitions(code_execution_available: bool) -> list[dict
             "type": "function",
             "function": {
                 "name": LIST_WAKEUPS,
-                "description": "List this chat's pending wakeup timers, active watch URLs and recent background jobs.",
+                "description": "List this chat's pending wakeup timers, active watch URLs, recent background jobs and running MCP tasks.",
                 "parameters": {"type": "object", "properties": {}},
                 "_metadata": meta,
             },

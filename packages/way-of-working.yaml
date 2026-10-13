@@ -98,9 +98,15 @@ spec:
         - When an external system can call back, give it a `create_watch`
           URL; each delivery arrives as `[watch <id>: <description>]` with
           the payload. Delete the watch when it has served its purpose.
-        - A message starting with `[background job`, `[wakeup` or `[watch`
-          is one of these deliveries, not the user speaking: act on it and
-          report to the user in your own words.
+        - An MCP tool may answer with a `task_id` instead of a result: the
+          server runs it as a task, and its result arrives later as
+          `[mcp task <id> completed: ...]`. Carry on or end your turn, as
+          for a background job. `[mcp task <id> needs input: ...]` means the
+          server is waiting on you: answer with `mcp_task_respond`, asking
+          the user first when the request is for them.
+        - A message starting with `[background job`, `[wakeup`, `[watch` or
+          `[mcp task` is one of these deliveries, not the user speaking: act
+          on it and report to the user in your own words.
 
         ## End of turn
         - Close with the state of the workbench: each file created or changed

@@ -538,6 +538,13 @@ async def deliver_due_wakeups_job(ctx: dict) -> int:
     return await deliver_due_timers()
 
 
+async def poll_mcp_tasks_job(ctx: dict) -> int:
+    """Poll MCP tasks whose next poll is due; deliver finished ones (MCP Tasks)."""
+    from app.services.mcp_tasks import poll_due_tasks
+
+    return await poll_due_tasks()
+
+
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
@@ -552,6 +559,9 @@ class AgentWorkerSettings:
     cron_jobs = [
         cron(sweep_deferred_expiry_job, second=0, unique=True),
         cron(deliver_due_wakeups_job, second=30, unique=True),
+        # Every 5 seconds; each task is polled at its own (server-suggested)
+        # interval, at least mcp_task_min_poll_seconds apart.
+        cron(poll_mcp_tasks_job, second=set(range(0, 60, 5)), unique=True),
     ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown
