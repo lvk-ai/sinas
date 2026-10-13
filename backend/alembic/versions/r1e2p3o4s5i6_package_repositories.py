@@ -6,7 +6,7 @@ installed and updates found. packages.source_repository records which
 repository a package was installed from. Additive.
 
 Revision ID: r1e2p3o4s5i6
-Revises: m2t3a4s5k6s7
+Revises: m5s6t7a8t9s0
 Create Date: 2026-10-13
 """
 import sqlalchemy as sa
@@ -14,7 +14,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "r1e2p3o4s5i6"
-down_revision = "m2t3a4s5k6s7"
+down_revision = "m5s6t7a8t9s0"
 branch_labels = None
 depends_on = None
 
