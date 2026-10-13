@@ -1,4 +1,4 @@
-"""A package install must not report a resource it left alone as unchanged.
+"""An apply must not report a resource it left alone as unchanged.
 
 An agent created by hand (managed_by NULL) is never adopted by a package
 (design §4.4): the install skips it. That skip must be visible — counted as
@@ -47,3 +47,26 @@ async def test_a_hand_made_agent_is_reported_as_skipped(db: AsyncSession, admin_
 
     agent = (await db.execute(select(Agent).where(Agent.namespace == ns, Agent.name == "checker"))).scalar_one()
     assert agent.system_prompt == "An older prompt." and agent.managed_by is None
+
+
+async def test_a_user_owned_elsewhere_is_reported_as_skipped(db: AsyncSession, admin_user: User):
+    from app.schemas.config import SinasConfig
+    from app.services.config_apply.service import ConfigApplyService
+
+    email = f"skip-{uuid.uuid4().hex[:8]}@example.com"
+    db.add(User(email=email, is_active=True, managed_by="config:someone-else"))
+    await db.flush()
+    config = SinasConfig.model_validate({
+        "apiVersion": "sinas.co/v1", "kind": "SinasConfig", "metadata": {"name": "cfg"},
+        "spec": {"users": [{"email": email, "isActive": False}]},
+    })
+
+    for dry_run in (True, False):
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        r = await svc.apply_config(config, dry_run=dry_run)
+        assert r.summary.skipped == {"users": 1} and not r.summary.unchanged, r.summary
+        assert [c.action for c in r.changes if c.resourceType == "users"] == ["skipped"]
+        assert any(email in w and "Skipping" in w for w in r.warnings), r.warnings
+
+    user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+    assert user.is_active and user.managed_by == "config:someone-else"
