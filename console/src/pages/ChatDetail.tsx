@@ -1,12 +1,15 @@
+import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient, API_BASE_URL } from '../lib/api';
-import { ArrowLeft, Loader2, Bot } from 'lucide-react';
+import { ArrowLeft, Loader2, Bot, FolderOpen } from 'lucide-react';
 import { Chat } from '../components/chat/Chat';
+import { WorkbenchPanel } from '../components/workbench/WorkbenchPanel';
 
 export function ChatDetail() {
   const { chatId } = useParams<{ chatId: string }>();
   const queryClient = useQueryClient();
+  const [showWorkbench, setShowWorkbench] = useState(false);
 
   const { data: chat, isLoading } = useQuery({
     queryKey: ['chat-meta', chatId],
@@ -40,6 +43,15 @@ export function ChatDetail() {
   }
 
   const agentRef = `${chat.agent_namespace}/${chat.agent_name}`;
+  // The panel only makes sense for an agent that has the workbench: without
+  // it, uploads land where no tool or sandbox run will ever see them.
+  // The chat response says so with chat permission alone; the agent record
+  // (which the user may not be allowed to read) is only a fallback.
+  const agentHasWorkbench =
+    chat.workbench_enabled ??
+    (agent?.system_tools ?? []).some((t) =>
+      typeof t === 'string' ? t === 'workbench' : t?.name === 'workbench'
+    );
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
@@ -61,22 +73,39 @@ export function ChatDetail() {
             </p>
           </div>
         </div>
+        {agentHasWorkbench && (
+          <button
+            title={showWorkbench ? 'Hide workbench' : 'Show workbench'}
+            onClick={() => setShowWorkbench((v) => !v)}
+            className={`p-2 rounded-lg ${
+              showWorkbench ? 'text-primary-600' : 'text-gray-400 hover:text-gray-100'
+            }`}
+          >
+            <FolderOpen className="w-5 h-5" />
+          </button>
+        )}
       </div>
 
-      {/* Chat component from @sinas/ui */}
-      <div className="flex-1 min-h-0 pt-4">
-        <Chat
-          agent={agentRef}
-          chatId={chatId}
-          height="100%"
-          placeholder="Type your message... (Shift+Enter for new line)"
-          agentIconUrl={agent?.icon_url || undefined}
-          apiBaseUrl={API_BASE_URL}
-          onMessagesRefreshed={() => {
-            queryClient.invalidateQueries({ queryKey: ['chat-meta', chatId] });
-          }}
-          style={{ border: 'none', borderRadius: 0, backgroundColor: 'transparent' }}
-        />
+      {/* Chat component from @sinas/ui, with the workbench tree alongside */}
+      <div className="flex flex-1 min-h-0 pt-4">
+        <div className="flex-1 min-w-0">
+          <Chat
+            agent={agentRef}
+            chatId={chatId}
+            height="100%"
+            placeholder="Type your message... (Shift+Enter for new line)"
+            agentIconUrl={agent?.icon_url || undefined}
+            apiBaseUrl={API_BASE_URL}
+            onMessagesRefreshed={() => {
+              queryClient.invalidateQueries({ queryKey: ['chat-meta', chatId] });
+              queryClient.invalidateQueries({ queryKey: ['workbench-files', chatId] });
+            }}
+            style={{ border: 'none', borderRadius: 0, backgroundColor: 'transparent' }}
+          />
+        </div>
+        {showWorkbench && agentHasWorkbench && chatId && (
+          <WorkbenchPanel chatId={chatId} onClose={() => setShowWorkbench(false)} />
+        )}
       </div>
     </div>
   );
