@@ -104,3 +104,6 @@ jobs:
 
       - name: Build (tsc + vite)
         run: npm run build
+
+      - name: Unit tests
+        run: npm test

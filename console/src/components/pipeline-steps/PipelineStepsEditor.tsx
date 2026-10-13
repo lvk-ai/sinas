@@ -26,7 +26,7 @@ import {
 import type { InputMode, MappingRow, Step, StepType, SuggestionGroup } from './model';
 import {
   STEP_TYPES, deriveInputMode, duplicateRowKeys, duplicateStep, expressionSuggestions,
-  expressionToInput, extraKeys, inputSchemaFields, isPlainObject, inputToExpression, inputToRows,
+  expressionToInput, extraKeys, inputSchemaFields, isEmptyInput, isPlainObject, inputToExpression, inputToRows,
   literalTypeHint, moveStep, newStep, removeStep, replaceStep, rowsToInput, setStepKey,
   stepSummary, updateStep, validateSteps,
 } from './model';
@@ -334,8 +334,21 @@ function InputEditor({
   const hasExpr = 'input.$' in step;
   const mine = stash?.step === step.name ? stash : null;
 
-  const currentJson = () =>
-    JSON.stringify(hasExpr ? { 'input.$': step['input.$'] } : step.input ?? {}, null, 2);
+  // This editor sits at a list position, so the step it shows changes on a
+  // reorder or delete as well as on a rename. Only a rename (same number of
+  // steps, the stashed name gone from the list) carries the stash over.
+  const prevCount = useRef(steps.length);
+  useEffect(() => {
+    const sameCount = prevCount.current === steps.length;
+    prevCount.current = steps.length;
+    if (stash && sameCount && stash.step !== step.name && !steps.some((s) => s.name === stash.step)) {
+      setStash({ ...stash, step: step.name });
+    }
+  }, [step.name, steps, stash]);
+
+  const jsonOf = (value: { input?: any; expr?: string }) =>
+    JSON.stringify(value.expr !== undefined ? { 'input.$': value.expr } : value.input ?? {}, null, 2);
+  const currentJson = () => jsonOf(hasExpr ? { expr: step['input.$'] } : { input: step.input });
 
   const write = (value: { input?: any; expr?: string }) => {
     let s = setStepKey(steps, index, 'input', value.input);
@@ -346,8 +359,18 @@ function InputEditor({
   const switchMode = (next: InputMode, confirmed = false) => {
     setPending(null);
     setJsonError(null);
+    // Still-empty fields after a switch that couldn't convert: bring back
+    // what that switch replaced.
+    const restorable = !hasExpr && isEmptyInput(step.input) && mine;
+
     if (next === 'json') {
-      setJsonText(currentJson());
+      if (restorable) {
+        const value = mine.input !== undefined ? { input: mine.input } : { expr: mine.expr };
+        write(value);
+        setJsonText(jsonOf(value));
+      } else {
+        setJsonText(currentJson());
+      }
       setJsonView(true);
       return;
     }
@@ -356,9 +379,11 @@ function InputEditor({
       setJsonView(false);
       if (hasExpr) return;
       // Always lossless: a fields input is a JMESPath {key: expr} hash.
-      let expr = inputToExpression(step.input);
-      if (expr === '' && mine) expr = mine.expr ?? inputToExpression(mine.input);
-      write({ expr });
+      write({
+        expr: restorable
+          ? mine.expr ?? inputToExpression(mine.input)
+          : inputToExpression(step.input),
+      });
       return;
     }
 

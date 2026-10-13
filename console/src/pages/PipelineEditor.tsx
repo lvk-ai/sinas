@@ -443,7 +443,7 @@ export function PipelineEditor() {
               Every run gets an input object, readable in any step as <span className="font-mono">input</span>{' '}
               (e.g. <span className="font-mono">input.customer_id</span>). It comes from the Run button or{' '}
               <span className="font-mono">POST …/run</span>, a schedule's input data, a webhook's request,
-              a database trigger's changed rows, or the agent's tool arguments. Declared fields are
+              a database trigger's changes (records under <span className="font-mono">input.rows</span>), or the agent's tool arguments. Declared fields are
               validated when a run starts and offered in the steps' expression picker.
             </p>
           </div>

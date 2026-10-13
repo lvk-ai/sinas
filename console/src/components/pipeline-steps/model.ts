@@ -188,17 +188,20 @@ export function literalTypeHint(text: string): string | null {
   const parsed = parseLiteral(text);
   if (typeof parsed === 'string') return text.startsWith('=') ? 'string' : null;
   if (parsed === null) return 'null';
+  // Nested `.$` keys are still evaluated at run time, not passed through.
+  if (hasTemplateKeys(parsed)) return 'template';
   if (Array.isArray(parsed)) return 'array';
   return typeof parsed; // number | boolean | object
 }
 
 /** Rows without a key are still being typed: they stay in the editor but
- * are not part of the input yet. On a duplicate key the last row wins. */
+ * are not part of the input yet. On a duplicate key the last row wins.
+ * Keys are written exactly as typed (whitespace only marks a blank row). */
 export function rowsToInput(rows: MappingRow[]): Record<string, any> {
   const input: Record<string, any> = {};
   for (const row of rows) {
-    const key = row.key.trim();
-    if (!key) continue;
+    const key = row.key;
+    if (!key.trim()) continue;
     // A key can't be both literal and expression (the backend rejects it).
     delete input[key];
     delete input[`${key}.$`];
@@ -212,8 +215,8 @@ export function duplicateRowKeys(rows: MappingRow[]): string[] {
   const seen = new Set<string>();
   const dups = new Set<string>();
   for (const row of rows) {
-    const key = row.key.trim();
-    if (!key) continue;
+    const key = row.key;
+    if (!key.trim()) continue;
     if (seen.has(key)) dups.add(key);
     seen.add(key);
   }
@@ -241,8 +244,10 @@ function jsonLiteral(v: any): string {
   return '`' + JSON.stringify(v).replace(/`/g, '\\`') + '`';
 }
 
-function templateToExpression(v: any): string {
-  if (isPlainObject(v) && hasTemplateKeys(v)) {
+/** `top`: the input object itself always becomes a hash (so it splits back
+ * into fields); nested values only when they hold `.$` keys. */
+function templateToExpression(v: any, top = false): string {
+  if (isPlainObject(v) && Object.keys(v).length && (top || hasTemplateKeys(v))) {
     const parts = Object.entries(v).map(([k, x]) => {
       const isExpr = k.endsWith('.$');
       const base = isExpr ? k.slice(0, -2) : k;
@@ -252,16 +257,23 @@ function templateToExpression(v: any): string {
     return `{${parts.join(', ')}}`;
   }
   if (Array.isArray(v) && hasTemplateKeys(v)) {
-    return `[${v.map(templateToExpression).join(', ')}]`;
+    return `[${v.map((x) => templateToExpression(x)).join(', ')}]`;
   }
   if (typeof v === 'string' && !/['\\]/.test(v)) return `'${v}'`;
   return jsonLiteral(v);
 }
 
-/** The whole-input expression equivalent to a fields input ('' when empty). */
+export const EMPTY_INPUT_EXPRESSION = '`{}`';
+
+/** The whole-input expression equivalent to a fields input. An empty (or
+ * absent) input is the literal `{}`: the backend rejects an empty expression. */
 export function inputToExpression(input: any): string {
-  if (input === undefined || (isPlainObject(input) && Object.keys(input).length === 0)) return '';
-  return templateToExpression(input);
+  if (input === undefined || input === null) return EMPTY_INPUT_EXPRESSION;
+  return templateToExpression(input, true);
+}
+
+export function isEmptyInput(input: any): boolean {
+  return input === undefined || input === null || (isPlainObject(input) && Object.keys(input).length === 0);
 }
 
 /** Split `text` on `sep` at nesting depth 0, skipping quoted/literal spans.
@@ -315,6 +327,9 @@ function parseValueLiteral(expr: string): { value: any } | undefined {
 export function expressionToInput(expr: string): Record<string, any> | null {
   const text = expr.trim();
   if (text === '') return {};
+  // A whole JSON-literal object (`{"a": 1}`) is a fields input of literals.
+  const whole = parseValueLiteral(text);
+  if (whole) return isPlainObject(whole.value) && !hasTemplateKeys(whole.value) ? whole.value : null;
   if (!text.startsWith('{') || !text.endsWith('}')) return null;
   if (!splitTopLevel(text, '\u0000')) return null; // unbalanced / unterminated
   // The opening brace must close at the very end: `{a: x}.a` is not a hash.
@@ -350,6 +365,8 @@ export function expressionToInput(expr: string): Record<string, any> | null {
       }
       if (typeof key !== 'string') return null;
     } else return null;
+    // As a fields key, a trailing `.$` would turn it into an expression key.
+    if (key.endsWith('.$')) return null;
     if (key in input || `${key}.$` in input) return null;
     const literal = parseValueLiteral(value);
     // A literal object holding `.$` keys would be *evaluated* as a template,
@@ -421,7 +438,8 @@ export function exampleInput(schema: any): Record<string, any> {
   const example: Record<string, any> = {};
   if (!isPlainObject(schema) || !isPlainObject(schema.properties)) return example;
   for (const [name, prop] of Object.entries(schema.properties) as [string, any][]) {
-    if (prop && 'default' in prop) example[name] = prop.default;
+    // Boolean subschemas (`true` = anything) are valid JSON Schema.
+    if (isPlainObject(prop) && 'default' in prop) example[name] = prop.default;
     else if (Array.isArray(prop?.enum) && prop.enum.length) example[name] = prop.enum[0];
     else {
       const type = Array.isArray(prop?.type) ? prop.type[0] : prop?.type;

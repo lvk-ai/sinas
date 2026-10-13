@@ -67,7 +67,7 @@ comes from depends on what fired the run:
 | Console **Run** button / `POST …/run` | the `input` object in the request |
 | Schedule | the schedule's `inputData` |
 | Webhook | the request payload, merged over the webhook's `defaultValues` |
-| Database trigger | the changed rows |
+| Database trigger | `{table, operation, rows, poll_column, count, timestamp}` — the changed records are `input.rows` |
 | Agent tool call (`asTool`) | the tool-call arguments |
 | Replay | the failed run's stored input |
 
@@ -174,7 +174,7 @@ Pipelines don't embed trigger config. Instead:
   function-only. Webhook events are single occurrences, so perUser pipelines
   do **not** fan out here — the event runs once, as the owner.
 - **Database triggers (CDC)**: `targetType: pipeline` + `pipelineName` — the
-  changed rows become the pipeline input.
+  input is `{table, operation, rows, ...}`, with the changed records in `rows`.
 - **Manual / API**:
 
 ```bash
