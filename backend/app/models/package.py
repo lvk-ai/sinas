@@ -29,7 +29,7 @@ class Package(Base):
     version: Mapped[str] = mapped_column(String(50), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
     author: Mapped[Optional[str]] = mapped_column(String(255))
-    source_url: Mapped[Optional[str]] = mapped_column(String(1024))
+    source_url: Mapped[Optional[str]] = mapped_column(Text)
     # The package repository it was installed from (by name), if any: where
     # its updates are looked for.
     source_repository: Mapped[Optional[str]] = mapped_column(String(100))

@@ -72,5 +72,18 @@ class Message(Base):
     name: Mapped[Optional[str]] = mapped_column(String(255))  # For tool response messages
     created_at: Mapped[created_at]
 
+    __table_args__ = (
+        # Time-window stats (GET /messages/stats) read these instead of the
+        # heap: the INCLUDE columns make the grouped counts index-only, and
+        # the partial index covers the few messages that carry tool calls.
+        Index("ix_messages_created_at", "created_at", postgresql_include=["chat_id", "role"]),
+        Index(
+            "ix_messages_created_at_tool_calls",
+            "created_at",
+            postgresql_include=["chat_id"],
+            postgresql_where=text("tool_calls IS NOT NULL"),
+        ),
+    )
+
     # Relationships
     chat: Mapped["Chat"] = relationship("Chat", back_populates="messages")

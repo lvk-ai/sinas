@@ -86,15 +86,10 @@ async def install_package(
             variables=body.variables,
             allow_broad_role_permissions=body.allowBroadRolePermissions,
             instance=body.instance,
+            source=(repository, file_url) if repository is not None else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if repository is not None and apply_result.success:
-        # Where its updates are looked for from now on.
-        package.source_repository = repository
-        package.source_url = file_url
-        await db.commit()
-        await db.refresh(package)
 
     (shown,) = await _with_status(db, [package], PackageResponse)
     return PackageInstallResponse(

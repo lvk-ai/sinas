@@ -135,13 +135,13 @@
 
 .pse-grid-2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
 .pse-grid-3 {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -385,4 +385,62 @@
 .pse-add-label {
   font-size: 12.5px;
   color: var(--g-200);
+}
+
+/* Expression input + reference picker */
+.pse-expr {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pse-expr > .pse-input:first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.pse-expr textarea.pse-input {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+/* The compound selector outranks `.pse-input { width: 100% }`. */
+.pse-input.pse-expr-pick {
+  width: 88px;
+  flex-shrink: 0;
+  color: var(--g-400);
+}
+
+/* Inline confirmation for a mode switch that can't keep the value */
+.pse-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+  color: var(--g-300);
+  font-size: 11.5px;
+}
+
+.pse-notice-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.pse-notice-btn {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  color: var(--g-300);
+  background: var(--surface-input);
+}
+
+.pse-notice-btn.pse-notice-primary {
+  border-color: rgba(251, 191, 36, 0.5);
+  color: #fbbf24;
 }

@@ -212,6 +212,7 @@ class PackageService:
         variables: Optional[dict[str, Any]] = None,
         allow_broad_role_permissions: bool = False,
         instance: Optional[str] = None,
+        source: Optional[tuple[str, str]] = None,
     ) -> tuple[Package, ConfigApplyResponse]:
         """
         Install a package from YAML content.
@@ -224,6 +225,8 @@ class PackageService:
                 permissions reach outside the package's own namespaces
             instance: install name for a multi-instance package (defaults to
                 the package name); substituted for ${{ install.name }}
+            source: (repository name, file URL) when installed from a package
+                repository; recorded in the same commit as the install
 
         Returns:
             Tuple of (Package record, ConfigApplyResponse)
@@ -337,6 +340,9 @@ class PackageService:
                 installed_by=user_id,
             )
             self.db.add(package)
+        if source is not None:
+            # Where its updates are looked for from now on.
+            package.source_repository, package.source_url = source
 
         # Single commit for everything
         await self.db.commit()
