@@ -28,7 +28,7 @@ import {
   STEP_TYPES, deriveInputMode, duplicateRowKeys, duplicateStep, expressionSuggestions,
   expressionToInput, extraKeys, inputSchemaFields, isEmptyInput, isPlainObject, inputToExpression, inputToRows,
   literalTypeHint, moveStep, newStep, removeStep, replaceStep, rowsToInput, setStepKey,
-  stepSummary, updateStep, validateSteps,
+  stashFate, stepSummary, updateStep, validateSteps,
 } from './model';
 import './steps-editor.css';
 
@@ -334,16 +334,15 @@ function InputEditor({
   const hasExpr = 'input.$' in step;
   const mine = stash?.step === step.name ? stash : null;
 
-  // This editor sits at a list position, so the step it shows changes on a
-  // reorder or delete as well as on a rename. Only a rename (same number of
-  // steps, the stashed name gone from the list) carries the stash over.
+  // Keep the stash tied to its step across reorders, renames and deletes.
   const prevCount = useRef(steps.length);
   useEffect(() => {
-    const sameCount = prevCount.current === steps.length;
+    const countChanged = prevCount.current !== steps.length;
     prevCount.current = steps.length;
-    if (stash && sameCount && stash.step !== step.name && !steps.some((s) => s.name === stash.step)) {
-      setStash({ ...stash, step: step.name });
-    }
+    if (!stash) return;
+    const fate = stashFate(stash.step, step.name, steps.map((s) => s.name), countChanged);
+    if (fate === 'carry') setStash({ ...stash, step: step.name });
+    else if (fate === 'clear') setStash(null);
   }, [step.name, steps, stash]);
 
   const jsonOf = (value: { input?: any; expr?: string }) =>

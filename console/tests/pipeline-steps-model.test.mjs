@@ -139,3 +139,16 @@ test('expression suggestions list run input fields and earlier steps only', () =
   assert.deepEqual(at(0)[0].options, ['input', 'input.fail', 'input."odd key"']);
   assert.deepEqual(at(2)[1].options, ['steps.fetch.output', 'steps.fetch.output.body', 'steps.fetch.output.statusCode', 'steps.enrich.output']);
 });
+
+test('a mode-switch stash follows renames, survives reorders, and dies with its step', () => {
+  // Rename: same count, stashed name gone, this position shows a new name.
+  assert.equal(m.stashFate('fetch', 'fetch2', ['fetch2', 'store'], false), 'carry');
+  // Reorder: the stashed step moved elsewhere — keep it (inactive here).
+  assert.equal(m.stashFate('fetch', 'store', ['store', 'fetch'], false), 'keep');
+  // Unchanged.
+  assert.equal(m.stashFate('fetch', 'fetch', ['fetch', 'store'], false), 'keep');
+  // Delete: the next step moved into this position; it must not inherit.
+  assert.equal(m.stashFate('fetch', 'store', ['store'], true), 'clear');
+  // Deleting another step leaves this one's stash alone.
+  assert.equal(m.stashFate('fetch', 'fetch', ['fetch'], true), 'keep');
+});

@@ -377,6 +377,23 @@ export function expressionToInput(expr: string): Record<string, any> | null {
   return input;
 }
 
+/** What a mode-switch stash (a value a switch couldn't convert, kept so
+ * switching back restores it) should do after the step list changed. The
+ * input editor sits at a list position, so the step it shows changes on a
+ * reorder, delete or rename:
+ * - `keep`: the stashed step still exists (unchanged, or moved elsewhere);
+ * - `carry`: it was renamed — same step count, its name gone, this position
+ *   now shows another name — so the stash follows the new name;
+ * - `clear`: it was deleted (the count changed and its name is gone); a
+ *   step that moves into this position must never inherit its value. */
+export function stashFate(
+  stashStep: string, currentName: string, stepNames: string[], countChanged: boolean
+): 'keep' | 'carry' | 'clear' {
+  if (stepNames.includes(stashStep)) return 'keep';
+  if (countChanged) return 'clear';
+  return currentName !== stashStep ? 'carry' : 'keep';
+}
+
 // ---------------------------------------------------------------------------
 // Expression context help
 // ---------------------------------------------------------------------------
