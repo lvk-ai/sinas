@@ -213,6 +213,7 @@ class PackageService:
         allow_broad_role_permissions: bool = False,
         instance: Optional[str] = None,
         source: Optional[tuple[str, str]] = None,
+        adopt_unmanaged: bool = False,
     ) -> tuple[Package, ConfigApplyResponse]:
         """
         Install a package from YAML content.
@@ -227,6 +228,9 @@ class PackageService:
                 the package name); substituted for ${{ install.name }}
             source: (repository name, file URL) when installed from a package
                 repository; recorded in the same commit as the install
+            adopt_unmanaged: take over declared resources made or edited by
+                hand instead of skipping them (the operator's opt-in; an
+                uninstall then deletes them)
 
         Returns:
             Tuple of (Package record, ConfigApplyResponse)
@@ -287,6 +291,7 @@ class PackageService:
             skip_resource_types=PACKAGE_SKIP_TYPES,
             # An upgrade removes what the new version no longer ships.
             prune_missing=True,
+            adopt_unmanaged=adopt_unmanaged,
         )
 
         result = await apply_service.apply_config(config, dry_run=False)
@@ -360,6 +365,7 @@ class PackageService:
         user_id: str,
         variables: Optional[dict[str, Any]] = None,
         instance: Optional[str] = None,
+        adopt_unmanaged: bool = False,
     ) -> tuple[ConfigApplyResponse, list[dict], bool, dict[str, Any]]:
         """
         Preview a package install (dry run).
@@ -432,6 +438,7 @@ class PackageService:
                 v["name"] for v in variable_declarations
                 if v.get("type") == "secret" and (variables or {}).get(v["name"]) is not None
             },
+            adopt_unmanaged=adopt_unmanaged,
         )
 
         result = await apply_service.apply_config(config, dry_run=True)

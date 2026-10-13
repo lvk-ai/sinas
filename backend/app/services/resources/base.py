@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass, field
@@ -165,6 +166,9 @@ class ApplyContext:
     # history stays one timeline), and mark the revision as a restore.
     restore_resource_id: Optional[Any] = None
     restored_from_id: Optional[int] = None
+    # Package installs only: take over rows made or edited by hand (managed_by
+    # NULL) instead of skipping them. The operator's explicit opt-in.
+    adopt_unmanaged: bool = False
     _actor_email: Optional[str] = field(default=None, repr=False)
 
     def declared(self, kind: str, key: str, *, active: bool = False) -> bool:
@@ -196,6 +200,10 @@ class ApplyResult:
     changes: dict[str, Any] = field(default_factory=dict)
     warning: Optional[str] = None
     revision: Any = None  # the ConfigRevision recorded, if any
+    # Why, for callers that act on it (ResourceChange.reason): "edited_by_hand"
+    # on a skip that adoptUnmanaged would take over, "adopted" on the update
+    # that took it over.
+    reason: Optional[str] = None
 
 
 # --------------------------------------------------------------- errors
@@ -219,7 +227,7 @@ class ReferenceNotFound(ApplierError):
 # --------------------------------------------------------------- ownership
 
 
-OwnershipDecision = Literal["write", "write_detach", "skip"]
+OwnershipDecision = Literal["write", "write_detach", "adopt", "skip"]
 
 
 def _same_source(row_managed_by: str, row_config_name: Optional[str], ctx: ApplyContext) -> bool:
@@ -241,20 +249,26 @@ def ownership_decision(
 ) -> OwnershipDecision:
     """The managed_by state machine (design §4.4), one place for every kind.
 
-    | row managed_by | API write       | config apply     | package install  |
-    |----------------|-----------------|------------------|------------------|
-    | NULL (manual)  | write           | adopt + stamp    | warn + skip      |
-    | same manager   | write + detach  | write, re-stamp  | write, re-stamp  |
-    | other manager  | write + detach  | warn + skip      | warn + skip      |
+    | row managed_by | API write      | config apply    | package install | + adoptUnmanaged |
+    |----------------|----------------|-----------------|-----------------|------------------|
+    | NULL (manual)  | write          | adopt + stamp   | warn + skip     | adopt, reported  |
+    | same manager   | write + detach | write, re-stamp | write, re-stamp | write, re-stamp  |
+    | other manager  | write + detach | warn + skip     | warn + skip     | warn + skip      |
 
-    A package never adopts a manual row: once adopted, uninstalling the
-    package (or an upgrade that drops it) would delete something an operator
-    made by hand. Config apply is the operator's own declaration, so it may.
+    A package never adopts a manual row on its own: once adopted,
+    uninstalling the package (or an upgrade that drops it) deletes something
+    an operator made by hand. Config apply is the operator's own declaration,
+    so it may. A package install may only when the operator opts in
+    (adoptUnmanaged), and then the apply reports it as an update, with a
+    revision and a warning ("adopt"), never as a silent re-stamp. A row
+    another package or config manages is never the flag's to take.
     """
     if ctx.origin == "api":
         return "write_detach" if row_managed_by else "write"
     if row_managed_by is None:
-        return "skip" if ctx.origin == "package" else "write"
+        if ctx.origin == "package":
+            return "adopt" if ctx.adopt_unmanaged else "skip"
+        return "write"
     if _same_source(row_managed_by, row_config_name, ctx):
         return "write"
     return "skip"
@@ -467,11 +481,16 @@ class ResourceApplier(Generic[TSpec]):
         # ---- update ----------------------------------------------------------
         decision = self.ownership(row, ctx)
         if decision == "skip":
+            reason = None
             if row.managed_by is None:
                 warning = (
                     f"{self.label} '{new_key}' exists and was created or edited by "
-                    f"hand; '{ctx.managed_by}' leaves it as is."
+                    f"hand; '{ctx.managed_by}' leaves it as is"
                 )
+                if self._adoptable(row, ctx):
+                    warning += " (install with adoptUnmanaged to take it over)"
+                    reason = "edited_by_hand"
+                warning += "."
             else:
                 manager = row.managed_by
                 if manager == "config" and getattr(row, "config_name", None):
@@ -482,11 +501,12 @@ class ResourceApplier(Generic[TSpec]):
                     f"{self.label} '{new_key}' exists but is managed by "
                     f"{manager}. Skipping."
                 )
-            return ApplyResult("skipped", obj=row, warning=OwnershipSkip(warning))
+            return ApplyResult("skipped", obj=row, warning=OwnershipSkip(warning), reason=reason)
 
         changes = diff_specs(self.history_spec(current), new_canonical)
+        adopting = decision == "adopt"
 
-        if not changes:
+        if not changes and not adopting:
             # Nothing about the resource changes. A config/package apply may
             # still need ownership bookkeeping (adopting a manual row, or a
             # checksum from an older format) — never a revision or an effect.
@@ -500,10 +520,24 @@ class ResourceApplier(Generic[TSpec]):
         if any(field in changes for field in self.reference_fields):
             await self.check_new_references(spec, ctx, current)
 
-        if ctx.dry_run:
-            return ApplyResult("update", obj=row, changes=changes)
+        warning = reason = None
+        if adopting:
+            # Reported even when the content already matches: the row changes
+            # hands, and from now on goes with the package.
+            reason = "adopted"
+            warning = (
+                f"{self.label} '{new_key}' was created or edited by hand and "
+                f"{'will be' if ctx.dry_run else 'was'} taken over by '{ctx.managed_by}'"
+            )
+            if self.deleted_with_package:
+                warning += "; uninstalling the package will delete it"
+            warning += "."
 
-        await self.write_row(row, spec, ctx, current)
+        if ctx.dry_run:
+            return ApplyResult("update", obj=row, changes=changes, warning=warning, reason=reason)
+
+        if changes:
+            await self.write_row(row, spec, ctx, current)
         if decision == "write_detach":
             row.managed_by = None
             row.config_name = None
@@ -512,12 +546,17 @@ class ResourceApplier(Generic[TSpec]):
             self._stamp(row, spec, ctx)
         await ctx.db.flush()
 
+        # An adoption without content changes still gets its revision: it
+        # records the new manager.
         revision = await record_revision(
             ctx, self, row, "update", new_canonical, changes, self.secret_values(spec)
         )
-        for effect in self.effects("update", row):
-            ctx.effects.add(effect)
-        return ApplyResult("update", obj=row, changes=changes, revision=revision)
+        if changes:
+            for effect in self.effects("update", row):
+                ctx.effects.add(effect)
+        return ApplyResult(
+            "update", obj=row, changes=changes, warning=warning, reason=reason, revision=revision
+        )
 
     async def delete(self, row: Any, ctx: ApplyContext) -> None:
         """Delete a resource. History keeps its last state, so it can be
@@ -538,6 +577,14 @@ class ResourceApplier(Generic[TSpec]):
             ctx.effects.add(effect)
 
     # ---- internals ---------------------------------------------------------
+
+    def _adoptable(self, row: Any, ctx: ApplyContext) -> bool:
+        """Would adoptUnmanaged take this skipped row over? Asked of the
+        kind's own `ownership`, so a row it protects for its own reasons
+        (a default role) is never offered."""
+        if ctx.origin != "package" or ctx.adopt_unmanaged:
+            return False
+        return self.ownership(row, dataclasses.replace(ctx, adopt_unmanaged=True)) == "adopt"
 
     def _stamp(self, row: Any, spec: TSpec, ctx: ApplyContext) -> None:
         if ctx.origin == "api":

@@ -797,6 +797,10 @@ class ResourceChange(BaseModel):
     resourceName: str
     details: Optional[str] = None
     changes: Optional[dict[str, Any]] = None
+    # Why, where a caller can act on it: "edited_by_hand" on a package skip
+    # that installing with adoptUnmanaged would take over; "adopted" on the
+    # update that takes it over.
+    reason: Optional[str] = None
 
 
 class ConfigApplySummary(BaseModel):

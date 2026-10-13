@@ -706,6 +706,21 @@ export interface PackageInstallOptions {
   variables?: Record<string, any>;
   instance?: string;
   allowBroadRolePermissions?: boolean;
+  /** Take over declared resources that were created or edited by hand
+   * (skipped otherwise). Uninstalling the package then deletes them. */
+  adoptUnmanaged?: boolean;
+}
+
+/** One resource in a config apply or package install/preview result. */
+export interface ApplyChange {
+  action: 'create' | 'update' | 'unchanged' | 'skipped' | 'delete';
+  resourceType: string;
+  resourceName: string;
+  details?: string | null;
+  changes?: Record<string, { from: unknown; to: unknown }> | null;
+  /** 'edited_by_hand': a package skip that adoptUnmanaged would take over;
+   * 'adopted': the update that takes it over. */
+  reason?: 'edited_by_hand' | 'adopted' | null;
 }
 
 // Package repositories

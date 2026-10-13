@@ -447,6 +447,7 @@ def _apply_response_to_dict(result) -> dict[str, Any]:
                 "resourceType": c.resourceType,
                 "resourceName": c.resourceName,
                 "details": c.details,
+                "reason": c.reason,
             }
             for c in (result.changes or [])
         ],

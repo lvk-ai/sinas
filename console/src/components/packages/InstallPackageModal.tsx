@@ -2,8 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, Eye, RefreshCw, X } from 'lucide-react';
 import { apiClient } from '../../lib/api';
-import type { PackageSource } from '../../types';
+import type { ApplyChange, PackageSource } from '../../types';
 import { errorMessage } from './hooks';
+
+// Kinds a package never deletes on uninstall (deleted_with_package = False
+// in their backend appliers): taking one over doesn't make uninstall remove it.
+const KEPT_ON_UNINSTALL = new Set(['dependencies', 'secrets', 'llmProviders', 'databaseConnections', 'packageRepositories']);
 
 /** What the install flow installs: pasted YAML, or a package from a
  * repository (a fresh install from the catalog, or an update of an installed
@@ -28,13 +32,21 @@ type InstallStep = 'input' | 'preview' | 'installing' | 'done';
 
 const BROAD_ROLE_WARNING = 'Broad role permission';
 
-/** The values and install name a preview (or an install) is for, as one
- * comparable key: Confirm installs exactly what the shown preview was for. */
-const requestKey = (variables: Record<string, any> | undefined, instance: string | undefined) =>
+/** The values, install name and take-over choice a preview (or an install)
+ * is for, as one comparable key: Confirm installs exactly what the shown
+ * preview was for. */
+const requestKey = (
+  variables: Record<string, any> | undefined,
+  instance: string | undefined,
+  adoptUnmanaged: boolean | undefined,
+) =>
   JSON.stringify([
     Object.keys(variables ?? {}).sort().map((k) => [k, variables![k]]),
     (instance ?? '').trim(),
+    !!adoptUnmanaged,
   ]);
+
+type PreviewRequest = { variables?: Record<string, any>; instance?: string; adoptUnmanaged?: boolean };
 
 /** Preview → variables → confirm → install, for either kind of target. */
 export function InstallPackageModal({ target, onClose }: { target: InstallTarget; onClose: () => void }) {
@@ -52,6 +64,8 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const [acceptedBroad, setAcceptedBroad] = useState<string | null>(null);
   // What the preview on screen was for (requestKey of its values and name).
   const [previewedKey, setPreviewedKey] = useState<string | null>(null);
+  // Take over resources the package declares that were edited by hand.
+  const [adoptUnmanaged, setAdoptUnmanaged] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Any edit to what would be installed withdraws the consent: it was given
@@ -71,11 +85,11 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
       : { source: yamlInput };
 
   const previewMutation = useMutation({
-    mutationFn: ({ variables, instance }: { variables?: Record<string, any>; instance?: string }) =>
-      apiClient.previewPackage(source(), { variables, instance }),
+    mutationFn: ({ variables, instance, adoptUnmanaged }: PreviewRequest) =>
+      apiClient.previewPackage(source(), { variables, instance, adoptUnmanaged: adoptUnmanaged || undefined }),
     onSuccess: (data, request) => {
       setPreviewResult(data);
-      setPreviewedKey(requestKey(request.variables, request.instance));
+      setPreviewedKey(requestKey(request.variables, request.instance, request.adoptUnmanaged));
       setAcceptedBroad(null);
       // Pre-fill variable defaults (a preview with them is still to be run:
       // until then the form differs from what was previewed)
@@ -93,11 +107,12 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   });
 
   const installMutation = useMutation({
-    mutationFn: ({ variables, instance }: { variables?: Record<string, any>; instance?: string }) =>
+    mutationFn: ({ variables, instance, adoptUnmanaged }: PreviewRequest) =>
       apiClient.installPackage(source(), {
         variables,
         instance,
         allowBroadRolePermissions: allowBroadRolePermissions || undefined,
+        adoptUnmanaged: adoptUnmanaged || undefined,
       }),
     onSuccess: (data) => {
       setInstallResult(data);
@@ -125,9 +140,16 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     return Object.keys(sent).length > 0 ? sent : undefined;
   };
 
-  const runPreview = () => {
+  const runPreview = (adopt: boolean = adoptUnmanaged) => {
     const vars = payloadValues();
-    previewMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined });
+    previewMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined, adoptUnmanaged: adopt });
+  };
+
+  // Taking over hand-edited resources changes what the install does to
+  // them: show it, by previewing again with the choice.
+  const changeAdoptUnmanaged = (adopt: boolean) => {
+    setAdoptUnmanaged(adopt);
+    runPreview(adopt);
   };
 
   // A repository package has nothing to paste: preview it straight away
@@ -148,6 +170,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     reader.onload = (ev) => {
       setYamlInput(ev.target?.result as string);
       setAcceptedBroad(null);
+      setAdoptUnmanaged(false);
     };
     reader.readAsText(file);
   };
@@ -159,7 +182,8 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   // The preview (its changes, warnings, broad permissions) is for one set of
   // values and one install name; after any edit it no longer describes what
   // Confirm would install.
-  const previewStale = !!previewResult && previewedKey !== requestKey(payloadValues(), instanceName);
+  const previewStale =
+    !!previewResult && previewedKey !== requestKey(payloadValues(), instanceName, adoptUnmanaged);
   const instanceStale =
     !!previewResult?.multi_instance &&
     (instanceName.trim() || previewResult.package_name) !== previewResult.instance;
@@ -176,6 +200,21 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   // its values: a new preview or any edit withdraws it.
   const broadKey = `${previewedKey}|${JSON.stringify(broadRoleWarnings)}`;
   const allowBroadRolePermissions = broadRoleWarnings.length > 0 && acceptedBroad === broadKey;
+
+  // Resources this preview skips because they were edited by hand (or, when
+  // previewed with adoptUnmanaged, takes over): the server marks them.
+  const handEdited: ApplyChange[] = (previewResult?.changes || []).filter(
+    (c: ApplyChange) => c.reason === 'edited_by_hand' || c.reason === 'adopted',
+  );
+  const keptOnUninstall = handEdited.filter((c) => KEPT_ON_UNINSTALL.has(c.resourceType));
+  const deletedOnUninstall = handEdited.length - keptOnUninstall.length;
+  const uninstallNote =
+    keptOnUninstall.length === 0
+      ? 'and uninstalling the package deletes them.'
+      : deletedOnUninstall === 0
+        ? 'and uninstalling the package leaves them installed.'
+        : `and uninstalling the package deletes ${deletedOnUninstall} of them; the other ` +
+          `${keptOnUninstall.length} (${[...new Set(keptOnUninstall.map((c) => c.resourceType))].join(', ')}) stay installed.`;
 
   const takenNames = target.kind === 'repository' ? target.takenNames : undefined;
   const effectiveName = instanceName.trim() || (target.kind === 'repository' ? target.package : '');
@@ -195,7 +234,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     if (blockedBecause) return;
     setInstallStep('installing');
     const vars = payloadValues();
-    installMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined });
+    installMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined, adoptUnmanaged });
   };
 
   const title =
@@ -244,7 +283,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               <label className="block text-sm font-medium text-gray-300 mb-2">Package YAML</label>
               <textarea
                 value={yamlInput}
-                onChange={(e) => { setYamlInput(e.target.value); setAcceptedBroad(null); }}
+                onChange={(e) => { setYamlInput(e.target.value); setAcceptedBroad(null); setAdoptUnmanaged(false); }}
                 placeholder="Paste SinasPackage YAML here..."
                 className="input w-full h-64 font-mono text-sm"
               />
@@ -359,6 +398,29 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                     </span>
                   </label>
                 )}
+              </div>
+            )}
+
+            {/* Resources edited by hand: skipped, unless the user takes them over */}
+            {(handEdited.length > 0 || adoptUnmanaged) && (
+              <div className="p-3 bg-surface-2 border border-line-soft rounded">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={adoptUnmanaged}
+                    disabled={previewMutation.isPending}
+                    onChange={(e) => changeAdoptUnmanaged(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 text-primary-600 border-line rounded"
+                  />
+                  <span>
+                    <span className="block text-sm text-gray-200">
+                      Take over {handEdited.length} resource{handEdited.length === 1 ? '' : 's'} edited by hand
+                    </span>
+                    <span className="block text-xs text-gray-400 mt-0.5">
+                      The package overwrites their hand edits, {uninstallNote}
+                    </span>
+                  </span>
+                </label>
               </div>
             )}
 
