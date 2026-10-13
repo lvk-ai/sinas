@@ -4,6 +4,7 @@ from typing import Any, Optional
 from openai import AsyncAzureOpenAI
 
 from .base import BaseLLMProvider
+from .clients import secret_id, shared_client
 from .openai_provider import OpenAIProvider
 
 # Azure requires an explicit API version; this is a recent stable default used
@@ -76,11 +77,14 @@ class AzureOpenAIProvider(OpenAIProvider):
         self.max_tokens_param = max_tokens_param or DEFAULT_MAX_TOKENS_PARAM
         self.drop_params = list(drop_params or [])
         self.extra_params = dict(extra_params or {})
-        self.client = AsyncAzureOpenAI(
-            api_key=api_key,
-            api_version=self.api_version,
-            azure_endpoint=azure_endpoint,
-            azure_deployment=azure_deployment,
+        self.client = shared_client(
+            ("azure", secret_id(api_key), azure_endpoint, self.api_version, azure_deployment),
+            lambda: AsyncAzureOpenAI(
+                api_key=api_key,
+                api_version=self.api_version,
+                azure_endpoint=azure_endpoint,
+                azure_deployment=azure_deployment,
+            ),
         )
 
     def _prepare_params(

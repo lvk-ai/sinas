@@ -1,11 +1,13 @@
 """Ollama LLM provider implementation."""
 import json
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import httpx
 
 from .base import BaseLLMProvider
+from .clients import shared_client
 
 
 class OllamaProvider(BaseLLMProvider):
@@ -17,6 +19,10 @@ class OllamaProvider(BaseLLMProvider):
         super().__init__(api_key, base_url)
         self.base_url = base_url or "http://localhost:11434"
 
+    def _http(self):
+        """The shared HTTP client, in a context that leaves it open."""
+        return nullcontext(shared_client(("ollama",), lambda: httpx.AsyncClient(timeout=300.0)))
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -27,7 +33,7 @@ class OllamaProvider(BaseLLMProvider):
         **kwargs,
     ) -> dict[str, Any]:
         """Generate a completion using Ollama API."""
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with self._http() as client:
             payload = {
                 "model": model,
                 "messages": messages,
@@ -87,7 +93,7 @@ class OllamaProvider(BaseLLMProvider):
         **kwargs,
     ) -> AsyncIterator[dict[str, Any]]:
         """Generate a streaming completion using Ollama API."""
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with self._http() as client:
             payload = {
                 "model": model,
                 "messages": messages,
@@ -124,6 +130,11 @@ class OllamaProvider(BaseLLMProvider):
                             "tool_calls": None,
                             "finish_reason": "stop" if done else None,
                         }
+
+                        # Thinking models (with thinking on) send it apart
+                        # from the answer.
+                        if message.get("thinking"):
+                            result["thinking"] = message["thinking"]
 
                         if done:
                             # Final chunk carries prompt_eval_count/eval_count

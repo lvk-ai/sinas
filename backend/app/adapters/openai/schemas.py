@@ -30,6 +30,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     stop: Optional[str | list[str]] = None
+    # Sinas extension: stream the model's thinking text as
+    # `delta.reasoning_content`. Without it a stream gets one empty
+    # `reasoning_content` when the model starts thinking.
+    include_thinking: bool = False
 
 
 # --- Response schemas ---
@@ -67,6 +71,9 @@ class ChatCompletionResponse(BaseModel):
 class DeltaContent(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    # The model's thinking, as it streams (the common `reasoning_content`
+    # extension; clients that don't know it ignore it).
+    reasoning_content: Optional[str] = None
 
 
 class StreamChoice(BaseModel):

@@ -7,6 +7,7 @@ from typing import Any, Optional
 from anthropic import AsyncAnthropic
 
 from .base import BaseLLMProvider
+from .clients import secret_id, shared_client
 
 
 class UnsupportedOutputSchema(ValueError):
@@ -101,7 +102,10 @@ class AnthropicProvider(BaseLLMProvider):
         enable_prompt_caching: bool = True,
     ):
         super().__init__(api_key, base_url)
-        self.client = AsyncAnthropic(api_key=api_key, base_url=base_url)
+        self.client = shared_client(
+            ("anthropic", secret_id(api_key), base_url),
+            lambda: AsyncAnthropic(api_key=api_key, base_url=base_url),
+        )
         self.enable_prompt_caching = enable_prompt_caching
         # output_config.effort, set per agent through provider_overrides
         # (see AGENT_OVERRIDABLE in factory.py). None sends nothing and the
@@ -263,7 +267,14 @@ class AnthropicProvider(BaseLLMProvider):
                         cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
 
                 elif event.type == "content_block_start":
-                    if event.content_block.type == "text":
+                    if event.content_block.type in ("thinking", "redacted_thinking"):
+                        # The model is thinking. On current Claude models it
+                        # thinks by default, often for seconds before any
+                        # text: say so at once, so a client can show it's
+                        # working (the text follows as thinking deltas when
+                        # the model shows it; it may not).
+                        chunk_data["thinking"] = ""
+                    elif event.content_block.type == "text":
                         pass  # Text will come in content_block_delta
                     elif event.content_block.type == "tool_use":
                         # Start tracking a new tool call
@@ -280,7 +291,9 @@ class AnthropicProvider(BaseLLMProvider):
                         }
 
                 elif event.type == "content_block_delta":
-                    if hasattr(event.delta, "text"):
+                    if getattr(event.delta, "type", None) == "thinking_delta":
+                        chunk_data["thinking"] = event.delta.thinking
+                    elif hasattr(event.delta, "text"):
                         chunk_data["content"] = event.delta.text
                         current_content += event.delta.text
                     elif hasattr(event.delta, "partial_json"):
