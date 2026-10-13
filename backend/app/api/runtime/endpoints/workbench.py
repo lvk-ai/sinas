@@ -220,7 +220,7 @@ async def upload_workbench_file(
         )
         if "error" in outcome:
             raise HTTPException(
-                status_code=422,
+                status_code=504 if outcome.get("timed_out") else 422,
                 detail=outcome.get("message") or outcome.get("error", "Rejected by content filter"),
             )
         # What the filter approved is what gets stored.

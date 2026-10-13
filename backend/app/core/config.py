@@ -316,6 +316,12 @@ class Settings(BaseSettings):
     # applied to workbench file uploads, mirroring collection content filters
     # (e.g. the sensitive-image filter). Unset = uploads are not filtered.
     workbench_content_filter_function: Optional[str] = None
+    # How long an upload waits for its content filter (a collection's
+    # content_filter_function, or the workbench filter above) to answer,
+    # time spent queued for a worker included. On expiry the upload is
+    # rejected with 504 and nothing is stored: a filter that can't answer
+    # never lets a file through unfiltered.
+    content_filter_timeout_seconds: int = 60
     # Lazy fetch: files above the eager cap materialize as stubs and are
     # fetched on first read over the sandbox pause channel, bounded per fetch
     # and per execution.
@@ -434,6 +440,15 @@ class Settings(BaseSettings):
 
     # Role assigned to users auto-provisioned via POST /auth/token/exchange
     token_exchange_default_role: str = "GuestUsers"
+
+    @field_validator("content_filter_timeout_seconds")
+    @classmethod
+    def _validate_content_filter_timeout(cls, v: int) -> int:
+        # 0 would fall back to queue_default_timeout (the wait this bounds)
+        # and a negative value rejects every filtered upload: refuse both.
+        if v <= 0:
+            raise ValueError(f"CONTENT_FILTER_TIMEOUT_SECONDS must be positive, got {v}")
+        return v
 
     @field_validator("auth_mode")
     @classmethod

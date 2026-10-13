@@ -576,12 +576,15 @@ async def run_content_filter(
     candidate file and must return {"approved": true} for the write to
     proceed; it may replace the bytes (`modified_content`, base64) and add
     `metadata`. Returns {"content": bytes, "metadata": dict} on approval —
-    the caller must write THOSE, not the candidate — or {"error": ...}.
+    the caller must write THOSE, not the candidate — or {"error": ...}
+    (with "timed_out": True when the filter didn't answer within
+    content_filter_timeout_seconds).
     Used by workbench_promote (the target collection's filter) and by
     workbench uploads (the deployment-wide workbench filter setting).
     """
     import base64
 
+    from app.core.config import settings
     from app.models.execution import TriggerType
     from app.models.function import Function
     from app.services.queue_service import queue_service
@@ -613,7 +616,19 @@ async def run_content_filter(
             trigger_type=TriggerType.MANUAL.value,
             trigger_id=f"content_filter:{namespace}/{collection_name}",
             user_id=user_id,
+            timeout=settings.content_filter_timeout_seconds,
         )
+    except TimeoutError:
+        # Fail closed. A late result from the still-running job lands only in
+        # its Redis keys and Execution row; nothing here waits for it.
+        return {
+            "error": "Content filter timed out",
+            "message": (
+                f"The content filter '{function_ref}' did not answer within "
+                f"{settings.content_filter_timeout_seconds}s; the file was not stored"
+            ),
+            "timed_out": True,
+        }
     except Exception as e:
         return {"error": f"Content filter failed to run: {e}"}
     if not (isinstance(filter_result, dict) and filter_result.get("approved")):

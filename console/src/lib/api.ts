@@ -144,6 +144,12 @@ export function getComponentRenderUrl(renderToken: string, namespace: string, na
 const CONFIG_API_BASE_URL = `${API_BASE_URL}/api/v1`;
 const RUNTIME_API_BASE_URL = API_BASE_URL;
 
+/** Client-side ceiling on one file upload. Above the server's content
+ * filter timeout (CONTENT_FILTER_TIMEOUT_SECONDS, 60s by default) so a slow
+ * filter surfaces as the server's own message; this only catches a request
+ * that never answers at all. */
+const UPLOAD_TIMEOUT_MS = 90_000;
+
 /** Encode a workbench path for a URL: each segment percent-encoded so
  * reserved characters (#, ?, %) in filenames survive, slashes preserved. */
 function encodeWorkbenchPath(path: string): string {
@@ -416,7 +422,10 @@ class APIClient {
     chatId: string,
     data: { name: string; content_base64: string; content_type?: string }
   ): Promise<WorkbenchFile> {
-    const response = await this.runtimeClient.post(`/chats/${chatId}/workbench/files`, data);
+    const response = await this.runtimeClient.post(`/chats/${chatId}/workbench/files`, data, {
+      timeout: UPLOAD_TIMEOUT_MS,
+      timeoutErrorMessage: 'Upload timed out',
+    });
     return response.data;
   }
 
