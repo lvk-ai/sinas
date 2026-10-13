@@ -280,7 +280,13 @@ async def test_due_timers_fire_once(committed_chat, monkeypatch):
     env = committed_chat
     delivered = []
 
-    async def fake_deliver(chat_id, content, *, source, api_key_id=None):
+    async def fake_deliver(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
+        # Like the real one: the guard runs in the delivering transaction.
+        async with AsyncSessionLocal() as session:
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return {"status": "dropped", "reason": "withdrawn"}
+            await session.commit()
         delivered.append((chat_id, content, source, api_key_id))
         return {"status": "started"}
 
@@ -719,3 +725,48 @@ async def test_cancelled_job_still_reports_back(committed_chat, monkeypatch):
 async def test_inline_wait_is_refused_with_guidance(db, chat, test_user):
     out = await chat_wakeups.execute_background_tool(db, chat, str(test_user.id), "run_in_background", {"code": "1", "description": "d", "wait": True})
     assert "keep_alive" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_timer_whose_delivery_fails_stays_due(committed_chat, monkeypatch):
+    """It is marked delivered only by the transaction that delivers it."""
+    env = committed_chat
+    attempts = []
+
+    async def flaky(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
+        attempts.append(delivery_id)
+        if len(attempts) == 1:
+            raise RuntimeError("redis is down")
+        async with AsyncSessionLocal() as session:
+            assert await guard(session)
+            await session.commit()
+        return {"status": "started"}
+
+    monkeypatch.setattr(chat_wakeups, "deliver_to_chat", flaky)
+    async with AsyncSessionLocal() as s:
+        s.add(ChatWakeup(chat_id=env["chat"].id, user_id=env["user"].id, kind=TIMER, note="due",
+                         due_at=datetime.now(timezone.utc) - timedelta(seconds=5)))
+        await s.commit()
+    assert await chat_wakeups.deliver_due_timers() == 0  # failed: still owed
+    assert await chat_wakeups.deliver_due_timers() == 1  # retried
+    assert await chat_wakeups.deliver_due_timers() == 0  # and only once
+    assert len(attempts) == 2 and attempts[0] == attempts[1] and attempts[0].startswith("wakeup:")
+
+
+@pytest.mark.asyncio
+async def test_a_timer_for_an_archived_chat_is_retired(committed_chat, monkeypatch):
+    env = committed_chat
+    calls = []
+
+    async def refused(chat_id, content, *, source, api_key_id=None, guard=None, delivery_id=None):
+        calls.append(1)
+        return {"status": "dropped", "reason": "chat_unavailable"}
+
+    monkeypatch.setattr(chat_wakeups, "deliver_to_chat", refused)
+    async with AsyncSessionLocal() as s:
+        s.add(ChatWakeup(chat_id=env["chat"].id, user_id=env["user"].id, kind=TIMER, note="due",
+                         due_at=datetime.now(timezone.utc) - timedelta(seconds=5)))
+        await s.commit()
+    await chat_wakeups.deliver_due_timers()
+    await chat_wakeups.deliver_due_timers()
+    assert len(calls) == 1  # not retried forever

@@ -165,48 +165,78 @@ async def keep_task(
 async def poll_due_tasks(now: Optional[datetime] = None, limit: int = 50) -> int:
     """Poll every task whose time has come, and retry deliveries that did not
     get through. The agent worker runs this every few seconds; returns how
-    many tasks it handled."""
+    many tasks it handled.
+
+    Each task is claimed when its own poll starts (not when the sweep picks
+    it): a lease taken up front could run out while the task still waits for
+    a polling slot, and another sweep would then poll it too."""
+    from sqlalchemy import update
+
     from app.core.database import AsyncSessionLocal
 
     now = now or _now()
     async with AsyncSessionLocal() as db:
-        rows = (
+        ids = (
             await db.execute(
-                select(McpTask)
+                select(McpTask.id)
                 .where(McpTask.next_poll_at <= now)
                 .order_by(McpTask.next_poll_at)
                 .limit(limit)
-                .with_for_update(skip_locked=True)
             )
         ).scalars().all()
-        for row in rows:
-            row.next_poll_at = now + _LEASE  # claimed; the poll sets the real next time
-        ids = [row.id for row in rows]
-        await db.commit()
 
     gate = asyncio.Semaphore(max(1, settings.mcp_task_poll_concurrency))
+    handled = 0
 
     async def one(task_id: uuid.UUID) -> None:
+        nonlocal handled
         async with gate:
+            async with AsyncSessionLocal() as db:
+                claimed = (
+                    await db.execute(
+                        update(McpTask)
+                        .where(McpTask.id == task_id, McpTask.next_poll_at <= now)
+                        # Claimed until past the sweep's own "now" too, so a
+                        # sweep running at that time can't take it as well;
+                        # the poll sets the real next time.
+                        .values(next_poll_at=max(now, _now()) + _LEASE)
+                        .returning(McpTask.id)
+                    )
+                ).scalar_one_or_none()
+                await db.commit()
+            if claimed is None:
+                return  # another sweep took it, or it is no longer due
+            handled += 1
             try:
                 await poll_task(task_id)
             except Exception:
                 logger.exception("Polling MCP task %s failed", task_id)
 
     await asyncio.gather(*(one(i) for i in ids))
-    return len(ids)
+    return handled
 
 
-async def poll_task(task_id: uuid.UUID, *, deliver: bool = True) -> Optional[dict[str, Any]]:
+async def poll_task(
+    task_id: uuid.UUID, *, deliver: bool = True, as_caller: bool = False
+) -> Optional[dict[str, Any]]:
     """One `tasks/get` for a kept task, and whatever follows from it, then
     the delivery of anything it produced. With `deliver=False` (the status
     tool) nothing is delivered into the chat: the caller hands the snapshot
     to the agent itself. Returns the snapshot.
 
-    Acts through the API key the calling turn acted through, so the server
-    access check holds the poll to that key's grants, as it held the call."""
+    A background poll acts through the API key the calling turn acted
+    through, so the server access check holds it to that key's grants, as it
+    held the call. With `as_caller` (the agent's status tool) it acts as
+    whoever is calling now instead: a later turn on a narrower key must not
+    reach the server through the key that created the task."""
     from app.core.auth import bind_api_key, reset_api_key
     from app.core.database import AsyncSessionLocal
+
+    if as_caller:
+        snap = await _poll_task(task_id, deliver=deliver)
+        if deliver:
+            await _flush_deliveries(task_id)
+        return snap
 
     async with AsyncSessionLocal() as db:
         row = await db.get(McpTask, task_id)
@@ -562,14 +592,13 @@ async def execute_tool(db, chat: Optional[Chat], user_id: str, tool_name: str, a
     if row is None:
         return {"error": "Unknown task_id for this chat"}
 
-    if tool_name == MCP_TASK_STATUS:
-        if row.finished_at is not None:
-            return snapshot(row)
-        # A live look; nothing is delivered for it, the agent has it here.
-        return await poll_task(row.id, deliver=False) or {"error": "Unknown task_id for this chat"}
-
     if row.finished_at is not None:
+        if tool_name == MCP_TASK_STATUS:
+            return snapshot(row)  # stored here; the server isn't asked
         return {"error": f"The task already finished ({row.status})", **snapshot(row)}
+
+    # Every call that reaches the server is held to the CURRENT caller's
+    # access (the turn's own API key), not the key that created the task.
     server = await db.get(McpServer, row.mcp_server_id)
     usable, problem = (
         await accessible_server(db, server.namespace, server.name, user_id) if server is not None
@@ -577,6 +606,10 @@ async def execute_tool(db, chat: Optional[Chat], user_id: str, tool_name: str, a
     )
     if usable is None:
         return {"error": problem}
+
+    if tool_name == MCP_TASK_STATUS:
+        # A live look; nothing is delivered for it, the agent has it here.
+        return await poll_task(row.id, deliver=False, as_caller=True) or {"error": "Unknown task_id for this chat"}
 
     if tool_name == MCP_TASK_RESPOND:
         responses = arguments.get("responses")

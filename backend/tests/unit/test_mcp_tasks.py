@@ -555,6 +555,34 @@ class TestKeptTasks:
         async with AsyncSessionLocal() as s:
             assert (await s.get(Chat, env["chat"].id)).active_channel_id == "newer-turn"
 
+    async def test_status_is_held_to_the_current_callers_access(self, env):
+        """A later turn without access to the server can't reach it through
+        the task (the background poll acts as the creating turn; this doesn't)."""
+        handle = await _call(env, "forever")
+        async with AsyncSessionLocal() as s:
+            await s.execute(delete(RolePermission).where(RolePermission.role_id == env["role"].id))
+            await s.commit()
+        async with AsyncSessionLocal() as s:
+            chat = await s.get(Chat, env["chat"].id)
+            out = await mcp_tasks.execute_tool(s, chat, str(env["user"].id), mcp_tasks.MCP_TASK_STATUS,
+                                               {"task_id": handle["task_id"]})
+        assert "not authorized" in out["error"]
+
+    async def test_two_sweeps_at_once_poll_a_task_once(self, env, monkeypatch):
+        await _call(env, "forever")
+        real_get = mcp_client.get_task
+        polls = []
+
+        async def counted(*args, **kwargs):
+            polls.append(1)
+            await asyncio.sleep(0.2)
+            return await real_get(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_client, "get_task", counted)
+        later = _in(minutes=5)
+        await asyncio.gather(mcp_tasks.poll_due_tasks(now=later), mcp_tasks.poll_due_tasks(now=later))
+        assert len(polls) == 1
+
     async def test_the_agent_gets_the_task_tools_with_an_mcp_server(self):
         names = {t["function"]["name"] for t in mcp_tasks.get_tool_definitions()}
         assert names == {"mcp_task_status", "mcp_task_respond", "mcp_task_cancel"}

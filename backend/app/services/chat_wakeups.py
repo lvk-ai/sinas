@@ -292,41 +292,78 @@ async def cancel_timer(db, chat: Chat, wakeup_id: str) -> dict[str, Any]:
 
 async def deliver_due_timers(now: Optional[datetime] = None) -> int:
     """Sweep: deliver every timer whose due time has passed. Minutely, from
-    the agent worker's cron. Marks a row delivered before delivering so a
-    concurrent sweep (SKIP LOCKED) or a crash mid-delivery can't double-fire."""
+    the agent worker's cron. Returns how many were delivered.
+
+    A timer is marked delivered in the same transaction that delivers it
+    (`deliver_to_chat`'s guard), never before: one whose delivery fails stays
+    due and the next sweep tries again. The guard only marks a timer still
+    undelivered and uncancelled, so two sweeps never both deliver it, and the
+    fixed delivery id keeps a retry after a crash from queuing its turn
+    twice."""
     from app.core.database import AsyncSessionLocal
 
     now = now or _now()
-    due: list[tuple[str, str, Optional[str], str]] = []
     async with AsyncSessionLocal() as db:
-        rows = (
-            await db.execute(
-                select(ChatWakeup)
-                .where(
-                    ChatWakeup.kind == TIMER,
-                    ChatWakeup.cancelled.is_(False),
-                    ChatWakeup.delivered_at.is_(None),
-                    ChatWakeup.due_at <= now,
+        due = [
+            (str(r.chat_id), r.id, r.note, r.api_key_id)
+            for r in (
+                await db.execute(
+                    select(ChatWakeup).where(
+                        ChatWakeup.kind == TIMER,
+                        ChatWakeup.cancelled.is_(False),
+                        ChatWakeup.delivered_at.is_(None),
+                        ChatWakeup.due_at <= now,
+                    )
                 )
-                .with_for_update(skip_locked=True)
-            )
-        ).scalars().all()
-        for row in rows:
-            row.delivered_at = now
-            row.fired_count = (row.fired_count or 0) + 1
-            row.last_fired_at = now
-            due.append((str(row.chat_id), str(row.id), row.note, row.api_key_id))
-        await db.commit()
+            ).scalars().all()
+        ]
 
+    delivered = 0
     for chat_id, wakeup_id, note, api_key_id in due:
+        async def mark_delivered(session, chat_id=chat_id, wakeup_id=wakeup_id) -> bool:
+            # The chat row, then the timer: the order a chat deletion takes them.
+            await session.execute(
+                select(Chat.id).where(Chat.id == uuid.UUID(chat_id)).with_for_update(key_share=True)
+            )
+            row = (
+                await session.execute(
+                    select(ChatWakeup).where(ChatWakeup.id == wakeup_id).with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if row is None or row.cancelled or row.delivered_at is not None:
+                return False
+            fired = _now()
+            row.delivered_at = fired
+            row.fired_count = (row.fired_count or 0) + 1
+            row.last_fired_at = fired
+            return True
+
         try:
-            await deliver_to_chat(
+            outcome = await deliver_to_chat(
                 chat_id, f"[wakeup {wakeup_id}] {note or ''}".rstrip(),
                 source="wakeup", api_key_id=api_key_id,
+                guard=mark_delivered, delivery_id=f"wakeup:{wakeup_id}",
             )
         except Exception:
-            logger.exception("Delivering wakeup %s to chat %s failed", wakeup_id, chat_id)
-    return len(due)
+            logger.exception("Delivering wakeup %s to chat %s failed; retrying next sweep", wakeup_id, chat_id)
+            continue
+        if outcome.get("status") == "dropped" and outcome.get("reason") != "withdrawn":
+            # Refused for good (chat archived, owner inactive, a hook): stop.
+            await _retire_timer(wakeup_id)
+        elif outcome.get("status") != "dropped":
+            delivered += 1
+    return delivered
+
+
+async def _retire_timer(wakeup_id) -> None:
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        row = await db.get(ChatWakeup, wakeup_id, with_for_update=True)
+        if row is not None and row.delivered_at is None:
+            row.delivered_at = _now()
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
