@@ -26,6 +26,7 @@ from app.utils.schema import validate_with_coercion
 from app.services.content_tokens import strip_base64_data, refresh_message_tokens  # noqa: F401 — re-exported
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
+from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -43,6 +44,7 @@ from app.services.tool_discovery import (
 from app.services.tool_execution import (
     build_tool_status,
     check_approval_requirements,
+    resolve_tool_approval_actions,
     execute_single_tool,
     is_sequential_tool,
     safe_parse_arguments,
@@ -378,10 +380,123 @@ class MessageService:
             "agent": agent,
         }
 
+    async def inject_user_message(
+        self, chat_id: str, user_id: str, content: str
+    ) -> Optional[Message]:
+        """Steer a running agent loop: persist the user message so the loop's
+        next round boundary picks it up (the conversation is rebuilt from the
+        DB every round). Runs on_user_message hooks first — a blocked message
+        is not persisted and None is returned."""
+        result = await self.db.execute(
+            select(Chat).where(Chat.id == chat_id, Chat.user_id == user_id)
+        )
+        chat = result.scalar_one_or_none()
+        if not chat:
+            raise ValueError("Chat not found")
+
+        agent = None
+        if chat.agent_id:
+            agent = (
+                await self.db.execute(select(Agent).where(Agent.id == chat.agent_id))
+            ).scalar_one_or_none()
+
+        final_content = content
+        if agent and agent.hooks and agent.hooks.get("on_user_message"):
+            hook_result = await run_hooks(
+                hooks=agent.hooks["on_user_message"],
+                message_content=content,
+                message_role="user",
+                chat_id=chat_id,
+                agent_namespace=agent.namespace,
+                agent_name=agent.name,
+                user_id=user_id,
+                session_key=getattr(chat, "session_key", None),
+            )
+            if hook_result.blocked:
+                return None
+            if hook_result.mutated_content:
+                final_content = hook_result.mutated_content
+
+        message = Message(
+            chat_id=chat_id, role="user", content=strip_base64_data(final_content)
+        )
+        self.db.add(message)
+        await self.db.commit()
+        await self.db.refresh(message)
+        from app.services import chat_steering
+
+        await chat_steering.note_injection(chat_id)
+        return message
+
+    async def answer_pending_injections(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        user_token: str,
+        provider: Optional[str],
+        model: Optional[str],
+        temperature: float,
+        max_tokens: Optional[int],
+        tools: list[dict[str, Any]],
+        status_templates: dict[str, str] = {},
+        agent_label: Optional[str] = None,
+        max_rounds: int = 3,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """A turn that ends in plain text has no round boundary left to pick
+        up a message injected while it ran. Before the lock is released, run
+        one more follow-up per batch of injections (bounded) so nothing a
+        user said mid-turn goes unanswered. Caller holds the chat lock and
+        knows the turn did not suspend."""
+        from app.services import chat_steering
+
+        for _ in range(max_rounds):
+            if not await chat_steering.take_injections(chat_id):
+                return
+            yield {"type": "injection_followup"}
+            async for chunk in self._stream_followup_after_tools(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_token=user_token,
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                status_templates=status_templates,
+                agent_label=agent_label,
+                tool_summary="messages injected during the turn",
+            ):
+                yield chunk
+                if chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    return
+
     async def send_message(
         self, chat_id: str, user_id: str, user_token: str, content: str
     ) -> Message:
-        """Send a message and get LLM response (non-streaming)."""
+        """Send a message and get LLM response (non-streaming).
+
+        One loop per chat: if another loop is already running this chat, the
+        message is injected into it (picked up at the next tool-round
+        boundary) instead of starting a concurrent loop.
+        """
+        from app.services import chat_steering
+
+        lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is None:
+            injected = await self.inject_user_message(chat_id, user_id, content)
+            if injected is None:
+                raise ValueError("Message blocked by hook")
+            return injected
+        try:
+            await chat_steering.clear_interrupt(chat_id)
+            return await self._send_message_locked(chat_id, user_id, user_token, content)
+        finally:
+            await chat_steering.release_chat_lock(chat_id, lock_token)
+
+    async def _send_message_locked(
+        self, chat_id: str, user_id: str, user_token: str, content: str
+    ) -> Message:
         prep = await self._prepare_message_context(
             chat_id=chat_id,
             user_id=user_id,
@@ -450,27 +565,22 @@ class MessageService:
         )
 
         if response.get("tool_calls"):
-            # Build tool name → metadata lookup
-            _tool_meta = {t["function"]["name"]: t["function"].get("_metadata", {}) for t in prep["tools"]} if prep.get("tools") else {}
+            # The same decision the streaming path makes (agent rules and
+            # session grants over the intrinsic flags): a call the rules
+            # would ask about cannot be parked here, so it is refused; one
+            # they allow runs, even if its function is flagged.
+            actions = await resolve_tool_approval_actions(
+                self.db, response["tool_calls"], chat_id, prep.get("tools")
+            )
             for tool_call in response["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                meta = _tool_meta.get(tool_name, {})
-                if meta.get("system_tool") and meta.get("requires_approval"):
+                if actions.get(tool_call["id"]) == "ask":
                     _llm_span.end()
                     raise ValueError(
-                        f"System tool {tool_name} requires user approval. "
+                        f"Tool {tool_call['function']['name']} requires user approval. "
                         "Please use streaming mode to handle approval flow."
                     )
-                namespace, name = meta.get("namespace"), meta.get("name")
-                if namespace and name:
-                    function = await Function.get_by_name(self.db, namespace, name)
-                    if function and function.requires_approval:
-                        _llm_span.end()
-                        raise ValueError(
-                            f"Function {namespace}/{name} requires user approval. "
-                            "Please use streaming mode to handle approval flow."
-                        )
 
+            suspended = False
             async for chunk in self._handle_tool_calls(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -484,7 +594,16 @@ class MessageService:
                 tools=prep["tools"],
                 agent_label=agent_label,
             ):
-                pass
+                if isinstance(chunk, dict) and chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    suspended = True  # parked or stopped: no follow-through
+            if not suspended:
+                async for _ in self.answer_pending_injections(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    provider=prep["provider_name"], model=prep["final_model"],
+                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"], agent_label=agent_label,
+                ):
+                    pass
 
             result = await self.db.execute(
                 select(Message)
@@ -530,6 +649,21 @@ class MessageService:
         _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
         _llm_span.end()
 
+        # A message injected while this reply streamed has no boundary left
+        # to be read at: answer it now, still under the lock.
+        answered = False
+        async for _ in self.answer_pending_injections(
+            chat_id=chat_id, user_id=user_id, user_token=user_token,
+            provider=prep["provider_name"], model=prep["final_model"],
+            temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+            tools=prep["tools"], agent_label=agent_label,
+        ):
+            answered = True
+        if answered:
+            result = await self.db.execute(
+                select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+            )
+            return result.scalar_one()
         return assistant_message
 
     async def send_message_stream(
@@ -539,7 +673,47 @@ class MessageService:
         user_token: str,
         content: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Send a message and stream LLM response."""
+        """Send a message and stream LLM response.
+
+        One loop per chat: if a loop is already running this chat, the
+        message is injected into it (the running loop drains it at its next
+        tool-round boundary) and a single "injected" event is emitted
+        instead of starting a concurrent loop.
+        """
+        from app.services import chat_steering
+
+        lock_token = await chat_steering.acquire_chat_lock(chat_id)
+        if lock_token is None:
+            injected = await self.inject_user_message(chat_id, user_id, content)
+            if injected is None:
+                yield {"type": "error", "error": "Message blocked by hook"}
+            else:
+                yield {
+                    "type": "injected",
+                    "message_id": str(injected.id),
+                    "content": (
+                        "Message delivered into the running turn — the agent "
+                        "will see it at its next step."
+                    ),
+                }
+            yield {"type": "done", "status": "injected"}
+            return
+        try:
+            await chat_steering.clear_interrupt(chat_id)
+            async for chunk in self._send_message_stream_locked(
+                chat_id=chat_id, user_id=user_id, user_token=user_token, content=content
+            ):
+                yield chunk
+        finally:
+            await chat_steering.release_chat_lock(chat_id, lock_token)
+
+    async def _send_message_stream_locked(
+        self,
+        chat_id: str,
+        user_id: str,
+        user_token: str,
+        content: str,
+    ) -> AsyncIterator[dict[str, Any]]:
         prep = await self._prepare_message_context(
             chat_id=chat_id,
             user_id=user_id,
@@ -577,6 +751,7 @@ class MessageService:
         _turn_ctx = trace.set_span_in_context(turn_span)
 
         _turn_output_parts: list[str] = []
+        _ended_early = False  # suspended or interrupted: no follow-through
         try:
             async for chunk in self._stream_response(
                 llm_provider=prep["llm_provider"],
@@ -594,7 +769,22 @@ class MessageService:
             ):
                 if chunk.get("content"):
                     _turn_output_parts.append(chunk["content"])
+                if chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
+                    _ended_early = True
                 yield chunk
+            if not _ended_early:
+                # Anything injected while the final reply streamed would
+                # otherwise sit unanswered until the user speaks again.
+                async for chunk in self.answer_pending_injections(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    provider=prep["provider_name"], model=prep["final_model"],
+                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"], status_templates=prep["status_templates"],
+                    agent_label=agent_label,
+                ):
+                    if chunk.get("content"):
+                        _turn_output_parts.append(chunk["content"])
+                    yield chunk
         except Exception as e:
             print(f"❌ Error during message streaming: {e}", flush=True)
             turn_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
@@ -735,45 +925,10 @@ class MessageService:
             )
 
             if approval_needed:
-                _tool_meta = {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools} if tools else {}
-                for tool_call in tool_calls:
-                    tool_name = tool_call["function"]["name"]
-                    arguments_str = tool_call["function"]["arguments"]
-
-                    meta = _tool_meta.get(tool_name, {})
-
-                    # System tool with approval (e.g. sinas_package_install)
-                    if meta.get("system_tool") and meta.get("requires_approval"):
-                        parsed_args = arguments_str
-                        if isinstance(arguments_str, str):
-                            parsed_args = json.loads(arguments_str) if arguments_str.strip() else {}
-                        yield {
-                            "type": "approval_required",
-                            "tool_call_id": tool_call["id"],
-                            "function_namespace": "sinas",
-                            "function_name": tool_name,
-                            "arguments": parsed_args,
-                        }
-                        continue
-
-                    namespace, name = meta.get("namespace"), meta.get("name")
-                    if not namespace or not name:
-                        continue
-
-                    function = await Function.get_by_name(self.db, namespace, name)
-                    if function and function.requires_approval:
-                        parsed_args = arguments_str
-                        if isinstance(arguments_str, str):
-                            parsed_args = json.loads(arguments_str) if arguments_str.strip() else {}
-
-                        yield {
-                            "type": "approval_required",
-                            "tool_call_id": tool_call["id"],
-                            "function_namespace": namespace,
-                            "function_name": name,
-                            "arguments": parsed_args,
-                        }
-
+                # check_approval_requirements already resolved rules and
+                # created the PendingToolApproval rows — announce each.
+                for entry in approval_needed:
+                    yield {"type": "approval_required", **entry}
                 return
 
             async for chunk in self._handle_tool_calls(
@@ -808,8 +963,12 @@ class MessageService:
         status_templates: dict[str, str] = {},
         depth: int = 0,
         agent_label: Optional[str] = None,
+        rejected_tool_call_ids: Optional[list[str]] = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Execute tool calls, stream LLM follow-up response, and save final message."""
+        """Execute tool calls, stream LLM follow-up response, and save final message.
+
+        `rejected_tool_call_ids`: calls of this round the user refused at
+        the approval gate — answered with a rejection result, never run."""
         import sys
         print(f"🔧 _handle_tool_calls: {len(tool_calls)} calls: {[tc['function']['name'] for tc in tool_calls]}", flush=True, file=sys.stderr)
         if permissions is None:
@@ -850,6 +1009,48 @@ class MessageService:
 
         # Separate tool calls into parallel and sequential groups
         valid_tool_calls = [tc for tc in tool_calls if tc.get("id")]
+
+        rejected_ids = set(rejected_tool_call_ids or [])
+        if rejected_ids:
+            # The user said no to these at the approval gate: the model gets
+            # a rejection result (so the transcript stays valid and it can
+            # react), and nothing of them executes.
+            rejected_content = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+            for tc in valid_tool_calls:
+                if tc["id"] in rejected_ids:
+                    self.db.add(
+                        Message(chat_id=chat_id, role="tool", content=rejected_content,
+                                tool_call_id=tc["id"], name=tc["function"]["name"])
+                    )
+                    yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": rejected_content}
+            await self.db.commit()
+            valid_tool_calls = [tc for tc in valid_tool_calls if tc["id"] not in rejected_ids]
+
+        # Cooperative interrupt (issue #142): boundary check before executing
+        # this round's tools. Synthetic tool results keep the transcript
+        # provider-valid — an assistant message with tool_calls must never be
+        # left without matching tool results.
+        from app.services import chat_steering
+
+        await chat_steering.refresh_chat_lock(chat_id)  # heartbeat at the round boundary
+        if await chat_steering.consume_interrupt(chat_id):
+            interrupted_result = json.dumps({"error": "Interrupted by operator before execution"})
+            for tc in valid_tool_calls:
+                self.db.add(
+                    Message(
+                        chat_id=chat_id,
+                        role="tool",
+                        content=interrupted_result,
+                        tool_call_id=tc["id"],
+                        name=tc["function"]["name"],
+                    )
+                )
+            self.db.add(
+                Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER)
+            )
+            await self.db.commit()
+            yield {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER}
+            return
 
         # Deferred calls are split off — they don't execute (and block) here.
         # After the regular tools finish, this generator suspends the round
@@ -1201,7 +1402,23 @@ class MessageService:
         are persisted as Message rows. Called inline by _handle_tool_calls,
         and re-entered by execute_agent_delegate_resume_job once suspended
         sub-agents have reported back (issue #90).
+
+        This is the tool-round boundary: the conversation is rebuilt from
+        the DB here, which is also what makes mid-turn injection work — a
+        user message persisted while the round ran is picked up now. The
+        cooperative interrupt is checked at the same point.
         """
+        from app.services import chat_steering
+
+        await chat_steering.refresh_chat_lock(chat_id)  # heartbeat at the round boundary
+        if await chat_steering.consume_interrupt(chat_id):
+            self.db.add(
+                Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER)
+            )
+            await self.db.commit()
+            yield {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER}
+            return
+
         result_chat = await self.db.execute(select(Chat).where(Chat.id == chat_id))
         chat = result_chat.scalar_one_or_none()
 
@@ -1352,39 +1569,10 @@ class MessageService:
             )
 
             if approval_needed:
-                _tool_meta = {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools} if tools else {}
-                for tool_call in final_tool_calls:
-                    tc_name = tool_call["function"]["name"]
-                    tc_args = tool_call["function"]["arguments"]
-                    meta = _tool_meta.get(tc_name, {})
-
-                    if meta.get("system_tool") and meta.get("requires_approval"):
-                        parsed_args = tc_args
-                        if isinstance(tc_args, str):
-                            parsed_args = json.loads(tc_args) if tc_args.strip() else {}
-                        yield {
-                            "type": "approval_required",
-                            "tool_call_id": tool_call["id"],
-                            "function_namespace": "sinas",
-                            "function_name": tc_name,
-                            "arguments": parsed_args,
-                        }
-                        continue
-
-                    ns, nm = meta.get("namespace"), meta.get("name")
-                    if ns and nm:
-                        function = await Function.get_by_name(self.db, ns, nm)
-                        if function and function.requires_approval:
-                            parsed_args = tc_args
-                            if isinstance(tc_args, str):
-                                parsed_args = json.loads(tc_args) if tc_args.strip() else {}
-                            yield {
-                                "type": "approval_required",
-                                "tool_call_id": tool_call["id"],
-                                "function_namespace": ns,
-                                "function_name": nm,
-                                "arguments": parsed_args,
-                            }
+                # check_approval_requirements already resolved rules and
+                # created the PendingToolApproval rows — announce each.
+                for entry in approval_needed:
+                    yield {"type": "approval_required", **entry}
                 return
 
             async for result_chunk in self._handle_tool_calls(

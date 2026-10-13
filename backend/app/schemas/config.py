@@ -268,6 +268,22 @@ class AgentConfig(BaseModel):
             "(per-chat persistent working tree)."
         ),
     )
+    toolApprovals: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Tool approval rules: {'default': 'auto'|'ask', 'rules': "
+            "[{'match': '<glob>', 'action': 'auto'|'ask'}]}. First matching "
+            "rule wins; 'auto' overrides a function's requiresApproval."
+        ),
+    )
+
+    @field_validator("toolApprovals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
 
 
 class WebhookDedupConfig(BaseModel):

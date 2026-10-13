@@ -132,6 +132,24 @@ class AgentCreate(BaseModel):
             "(per-chat persistent working tree)."
         ),
     )
+    tool_approvals: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Tool approval rules: {'default': 'auto'|'ask', 'rules': "
+            "[{'match': '<glob>', 'action': 'auto'|'ask'}]}. First matching "
+            "rule wins; an explicit 'auto' overrides a function's "
+            "requires_approval; unmatched tools fall back to "
+            "requires_approval, then to 'default'."
+        ),
+    )
+
+    @field_validator("tool_approvals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
 
 
 class AgentUpdate(BaseModel):
@@ -194,6 +212,15 @@ class AgentUpdate(BaseModel):
     default_job_timeout: Optional[int] = Field(None, gt=0)
     default_keep_alive: Optional[bool] = None
     system_tools: Optional[list[Union[str, SystemToolConfig]]] = None
+    tool_approvals: Optional[dict[str, Any]] = None
+
+    @field_validator("tool_approvals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
+
 
 
 class AgentResponse(BaseModel):
@@ -231,6 +258,7 @@ class AgentResponse(BaseModel):
     default_job_timeout: Optional[int] = None
     default_keep_alive: bool = False
     system_tools: list[Union[str, SystemToolConfig]] = []
+    tool_approvals: Optional[dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 

@@ -111,6 +111,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
             default_job_timeout=row.default_job_timeout,
             default_keep_alive=bool(row.default_keep_alive),
             system_tools=list(row.system_tools or []),
+            tool_approvals=dict(row.tool_approvals) if row.tool_approvals else None,
             is_default=bool(row.is_default),
             is_active=row.is_active is not False,
         )
@@ -157,6 +158,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         row.enabled_stores = [s.model_dump() for s in spec.enabled_stores]
         row.enabled_collections = [c.model_dump() for c in spec.enabled_collections]
         row.hooks = dict(spec.hooks) if spec.hooks is not None else None
+        row.tool_approvals = dict(spec.tool_approvals) if spec.tool_approvals else None
         row.is_default = spec.is_default
 
     async def _unset_other_defaults(self, row: Agent, ctx: ApplyContext) -> None:

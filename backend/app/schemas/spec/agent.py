@@ -70,8 +70,18 @@ class AgentSpec(SpecModel):
     default_job_timeout: Optional[int] = None
     default_keep_alive: bool = False
     system_tools: list[Any] = Field(default_factory=list)
+    # Permission modes: {"default": "auto"|"ask", "rules": [{"match", "action"}]}.
+    # Validated at save time so a bad rule never waits to fail in a chat.
+    tool_approvals: Optional[dict[str, Any]] = None
     is_default: bool = False
     is_active: bool = True
+
+    @field_validator("tool_approvals", mode="before")
+    @classmethod
+    def _validate_tool_approvals(cls, v):
+        from app.services.approval_rules import validate_tool_approvals
+
+        return validate_tool_approvals(v)
 
     @field_validator("description", "llm_provider_name", "model", "system_prompt", "icon", mode="before")
     @classmethod

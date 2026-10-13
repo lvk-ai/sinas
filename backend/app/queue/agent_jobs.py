@@ -115,6 +115,63 @@ async def _terminate_execution_row(
             await batch_service.on_execution_terminated(db=db, batch_id=execution.batch_id)
 
 
+_BUSY_RETRY_SECONDS = 30
+_BUSY_MAX_ATTEMPTS = 20  # ~10 minutes of a chat staying busy
+
+
+async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue, redis=None, base_fields=None) -> bool:
+    """A continuation that could not take the chat lock is queued again
+    later rather than abandoned (its work exists nowhere else). Returns
+    True when requeued; past the attempt cap, reports and gives up."""
+    from app.services.stream_relay import stream_relay
+
+    attempt = int(kwargs.get("attempt", 0)) + 1
+    if attempt > _BUSY_MAX_ATTEMPTS:
+        await stream_relay.publish_error(
+            channel_id,
+            "Chat stayed busy with another running turn for too long; this continuation was dropped",
+        )
+        return False
+    try:
+        await enqueue(attempt)
+    except Exception as e:
+        logger.exception("Could not requeue busy continuation: %s", e)
+        await stream_relay.publish_error(channel_id, f"Chat is busy and the retry could not be queued: {e}")
+        return False
+    await stream_relay.publish(
+        channel_id,
+        {"type": "status", "status": "waiting", "message": f"Chat is busy; retrying in {_BUSY_RETRY_SECONDS}s (attempt {attempt})"},
+    )
+    # This attempt is over; the retry runs under a new job id, so record
+    # that here or this record reads "running" until it expires.
+    if redis is not None and kwargs.get("job_id"):
+        await redis.set(
+            f"{JOB_STATUS_PREFIX}{kwargs['job_id']}",
+            json.dumps({**(base_fields or {}), "status": "requeued", "retry_attempt": attempt}),
+            ex=JOB_TTL,
+        )
+    return True
+
+
+async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db) -> bool:
+    """A continuation queued before an operator interrupt must not run on,
+    even though the running turn may have consumed the flag already."""
+    from app.models.chat import Message
+    from app.services import chat_steering
+    from app.services.stream_relay import stream_relay
+
+    requested_at = await chat_steering.interrupt_requested_at(chat_id)
+    enqueued_at = kwargs.get("enqueued_at")
+    if requested_at is None or enqueued_at is None or float(enqueued_at) > requested_at:
+        return False
+    await chat_steering.consume_interrupt(chat_id)
+    db.add(Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER))
+    await db.commit()
+    await stream_relay.publish(channel_id, {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER})
+    await stream_relay.publish_done(channel_id)
+    return True
+
+
 @_acting_as_job_key
 async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     """
@@ -386,6 +443,8 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
     Handles the approval flow continuation and publishes results to Redis Stream.
     """
+    from app.services.queue_service import queue_service
+
     from redis.asyncio import Redis
 
     from app.core.database import AsyncSessionLocal
@@ -403,6 +462,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     user_token = kwargs["user_token"]
     pending_approval_id = kwargs["pending_approval_id"]
     approved = kwargs["approved"]
+    rejected_tool_call_ids = list(kwargs.get("rejected_tool_call_ids") or [])
     channel_id = kwargs["channel_id"]
 
     from app.services.delegation import current_channel_id, current_delegation_depth
@@ -478,32 +538,65 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                     status_templates = agent_obj.status_templates or {}
 
             if approved:
-                # Execute the approved tool calls and stream the LLM response
-                async for chunk in message_service._handle_tool_calls(
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    user_token=user_token,
-                    messages=pending_approval.conversation_context["messages"],
-                    tool_calls=pending_approval.all_tool_calls,
-                    provider=pending_approval.conversation_context.get("provider"),
-                    model=pending_approval.conversation_context.get("model"),
-                    temperature=pending_approval.conversation_context.get("temperature", 0.7),
-                    max_tokens=pending_approval.conversation_context.get("max_tokens"),
-                    tools=pending_approval.conversation_context.get("tools", []),
-                    status_templates=status_templates,
-                ):
-                    if isinstance(chunk, dict):
-                        if _is_suspension_chunk(chunk):
-                            _suspended = True
-                        await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+                # Continuations re-enter the loop, so they hold the chat lock
+                # like any other loop (waiting briefly for a running one).
+                from app.services import chat_steering
+
+                lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
+                if lock_token is None:
+                    # The approval is already resolved; giving up would strand
+                    # it. Come back when the running turn is done.
+                    if await _requeue_when_busy(
+                        kwargs, channel_id,
+                        lambda attempt: queue_service.enqueue_agent_resume(
+                            chat_id=chat_id, user_id=user_id, user_token=user_token,
+                            pending_approval_id=pending_approval_id, approved=approved,
+                            channel_id=channel_id, agent=base_fields.get("agent"),
+                            defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                            enqueued_at=kwargs.get("enqueued_at"),
+                            rejected_tool_call_ids=rejected_tool_call_ids,
+                        ),
+                        redis=redis, base_fields=base_fields,
+                    ):
+                        completed = True
+                    return
+                try:
+                    # Inside the release-protected block: a failure in the
+                    # stop check must not leave the chat locked.
+                    if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                        completed = True
+                        return
+                    # Execute the approved tool calls and stream the LLM response
+                    async for chunk in message_service._handle_tool_calls(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        user_token=user_token,
+                        messages=pending_approval.conversation_context["messages"],
+                        tool_calls=pending_approval.all_tool_calls,
+                        provider=pending_approval.conversation_context.get("provider"),
+                        model=pending_approval.conversation_context.get("model"),
+                        temperature=pending_approval.conversation_context.get("temperature", 0.7),
+                        max_tokens=pending_approval.conversation_context.get("max_tokens"),
+                        tools=pending_approval.conversation_context.get("tools", []),
+                        status_templates=status_templates,
+                        rejected_tool_call_ids=rejected_tool_call_ids,
+                    ):
+                        if isinstance(chunk, dict):
+                            if _is_suspension_chunk(chunk):
+                                _suspended = True
+                            await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+                finally:
+                    await chat_steering.release_chat_lock(chat_id, lock_token)
             else:
-                # Handle rejection - publish rejection info
-                await stream_relay.publish(channel_id, {
-                    "type": "tool_rejected",
-                    "tool_call_id": pending_approval.tool_call_id,
-                    "function_namespace": pending_approval.function_namespace,
-                    "function_name": pending_approval.function_name,
-                }, ttl=stream_ttl)
+                # Nothing in the round was allowed: report each rejection.
+                for tc in pending_approval.all_tool_calls or []:
+                    if tc.get("id") in rejected_tool_call_ids or tc.get("id") == pending_approval.tool_call_id:
+                        await stream_relay.publish(channel_id, {
+                            "type": "tool_rejected",
+                            "tool_call_id": tc.get("id"),
+                            "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
+                            "function_name": tc.get("function", {}).get("name"),
+                        }, ttl=stream_ttl)
 
         if _suspended:
             # The approved round suspended again (delegations or an ask_user
@@ -570,6 +663,8 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     conversation from the DB, stream the next LLM turn, and keep going
     (further tool rounds included). Issue #90.
     """
+    from app.services.queue_service import queue_service
+
     from redis.asyncio import Redis
 
     from app.core.database import AsyncSessionLocal
@@ -623,8 +718,61 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     completed = False
     _suspended = False
     _output_parts: list[str] = []
+    lock_token = None
+    from app.services import chat_steering
+
     try:
+        lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
+        if lock_token is None:
+            # The checkpoint is gone once this job was queued; this is the
+            # only continuation. Come back when the running turn is done.
+            if await _requeue_when_busy(
+                kwargs, channel_id,
+                lambda attempt: queue_service.enqueue_agent_delegate_resume(
+                    chat_id=chat_id, user_id=user_id, user_token=user_token,
+                    channel_id=channel_id, conversation_context=context,
+                    defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                    enqueued_at=kwargs.get("enqueued_at"),
+                ),
+                redis=redis, base_fields=base_fields,
+            ):
+                completed = True
+                return
+            # Dropped for good: a batch or delegated child must still close
+            # its Execution and tell its parent, or the parent waits forever.
+            if execution_id:
+                await _terminate_execution_row(
+                    execution_id, ExecutionStatus.FAILED, error="Chat stayed busy; continuation dropped",
+                )
+            if parent_pending_delegation_id and parent_tool_call_id:
+                from app.services.delegation import on_child_complete
+
+                await on_child_complete(
+                    parent_pending_delegation_id, parent_tool_call_id,
+                    json.dumps({"error": "Chat stayed busy; continuation dropped", "chat_id": chat_id}),
+                    user_token=user_token,
+                )
+            completed = True
+            return
         async with AsyncSessionLocal() as db:
+            if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
+                # A delegated or batch child that stops must still close its
+                # Execution and tell its parent, or the parent waits forever.
+                if execution_id:
+                    await _terminate_execution_row(
+                        execution_id, ExecutionStatus.CANCELLED, error="Interrupted by operator",
+                    )
+                if parent_pending_delegation_id and parent_tool_call_id:
+                    from app.services.delegation import on_child_complete
+
+                    await on_child_complete(
+                        parent_pending_delegation_id,
+                        parent_tool_call_id,
+                        json.dumps({"error": "Interrupted by operator", "chat_id": chat_id}),
+                        user_token=user_token,
+                    )
+                completed = True
+                return
             message_service = MessageService(db)
             async for chunk in message_service._stream_followup_after_tools(
                 chat_id=chat_id,
@@ -724,6 +872,8 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         raise
 
     finally:
+        if lock_token is not None:
+            await chat_steering.release_chat_lock(chat_id, lock_token)
         ping_task.cancel()
         if not completed:
             logger.warning(f"Delegate-resume job {job_id} cancelled/timed out")

@@ -602,3 +602,78 @@ async def test_a_repeated_resume_enqueue_never_rewrites_the_jobs_status(monkeypa
         chat_id="c", user_id="u", user_token="", channel_id="ch", conversation_context={},
     )
     assert [s.get("nx") for s in sets] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_expiring_the_last_open_ask_resumes_an_approved_round(env, monkeypatch):
+    """One call approved, the other left to expire: the round was waiting
+    for the second decision, and the sweep's auto-rejection is it."""
+    from app.services.queue_service import queue_service
+
+    resumed = []
+
+    async def fake_resume(**kwargs):
+        resumed.append(kwargs)
+        return "job"
+
+    monkeypatch.setattr(queue_service, "enqueue_agent_resume", fake_resume)
+    async with AsyncSessionLocal() as s:
+        anchor = Message(chat_id=env["chat_id"], role="assistant", content="x")
+        s.add(anchor)
+        await s.flush()
+        approved_id = f"appr-yes-{uuid.uuid4().hex[:6]}"
+        expired_id = f"appr-late-{uuid.uuid4().hex[:6]}"
+        for cid, decided, exp in ((approved_id, True, FUTURE), (expired_id, None, PAST)):
+            s.add(PendingToolApproval(
+                chat_id=env["chat_id"], message_id=anchor.id, user_id=env["user_id"], tool_call_id=cid,
+                function_namespace="ns", function_name="fn", arguments={}, all_tool_calls=[],
+                conversation_context={}, expires_at=datetime.fromisoformat(exp), approved=decided,
+            ))
+        await s.commit()
+
+    await dc.expire_due()
+    assert len(resumed) == 1
+    assert resumed[0]["approved"] is True and resumed[0]["rejected_tool_call_ids"] == [expired_id]
+
+
+@pytest.mark.asyncio
+async def test_sweep_resume_acts_through_the_rounds_key_and_survives_a_queue_outage(env, monkeypatch):
+    from app.core.auth import current_api_key_id
+    from app.services.queue_service import queue_service
+
+    seen_keys = []
+    outage = {"on": True}
+
+    async def fake_resume(**kwargs):
+        if outage["on"]:
+            raise RuntimeError("queue down")
+        seen_keys.append(current_api_key_id())
+        return "job"
+
+    monkeypatch.setattr(queue_service, "enqueue_agent_resume", fake_resume)
+    async with AsyncSessionLocal() as s:
+        anchor = Message(chat_id=env["chat_id"], role="assistant", content="x")
+        s.add(anchor)
+        await s.flush()
+        expired_id = f"appr-late-{uuid.uuid4().hex[:6]}"
+        for cid, decided, exp in ((f"appr-yes-{uuid.uuid4().hex[:6]}", True, FUTURE), (expired_id, None, PAST)):
+            s.add(PendingToolApproval(
+                chat_id=env["chat_id"], message_id=anchor.id, user_id=env["user_id"], tool_call_id=cid,
+                function_namespace="ns", function_name="fn", arguments={}, all_tool_calls=[],
+                conversation_context={"api_key_id": "key-of-the-round"}, expires_at=datetime.fromisoformat(exp),
+                approved=decided,
+            ))
+        await s.commit()
+
+    # Queue down: the expired row stays open so the next sweep retries.
+    await dc.expire_due()
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(select(PendingToolApproval).where(PendingToolApproval.tool_call_id == expired_id))).scalar_one()
+        assert row.approved is None
+
+    outage["on"] = False
+    await dc.expire_due()
+    assert seen_keys == ["key-of-the-round"]  # the key the round ran under, not the owner's
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(select(PendingToolApproval).where(PendingToolApproval.tool_call_id == expired_id))).scalar_one()
+        assert row.approved is False

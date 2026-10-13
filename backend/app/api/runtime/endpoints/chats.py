@@ -817,19 +817,75 @@ async def approve_tool_call(
         raise HTTPException(409, "This approval was already resolved or has expired")
     await db.commit()
 
+    # "Always allow": remember the user's decision for this chat so the
+    # same tool skips the ask next time (session-scoped grant).
+    if request.approved and request.always_allow:
+        from app.services import approval_rules
+
+        # Session grants key on the tool name the model calls. For function
+        # tools the pending row stores namespace/name; the tool name is the
+        # call's function name — recover it from the stored call.
+        tool_name = None
+        for tc in pending_approval.all_tool_calls or []:
+            if tc.get("id") == tool_call_id:
+                tool_name = tc.get("function", {}).get("name")
+                break
+        if tool_name:
+            # The approval is already resolved: a grant that fails to store
+            # must not stop the approved work from resuming (the user is at
+            # worst asked again next time).
+            try:
+                await approval_rules.add_session_grant(chat_id, tool_name)
+            except Exception as e:
+                logger.warning("Session grant for %s in chat %s not stored: %s", tool_name, chat_id, e)
+
+    # A round with several asked calls resumes once, after the last
+    # decision: every approval row stores the whole round, so resuming now
+    # would run the still-undecided calls unchecked.
+    from app.services import approval_rules
+
+    decision = await approval_rules.round_decision(db, pending_approval)
+    channel_id = approval_rules.round_channel_id(pending_approval)
+    if decision is None:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "approved" if request.approved else "rejected",
+                "tool_call_id": tool_call_id,
+                "channel_id": channel_id,
+                "resume": "waiting",
+                "message": "Decision recorded; the round resumes once every requested approval is answered.",
+            },
+        )
+
     # Extract token and enqueue resume job
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
-    channel_id = str(uuid.uuid4())
 
     await queue_service.enqueue_agent_resume(
         chat_id=chat_id,
         user_id=user_id,
         user_token=user_token,
         pending_approval_id=str(pending_approval.id),
-        approved=request.approved,
+        approved=bool(decision["approved_ids"]),
         channel_id=channel_id,
         agent=f"{chat.agent_namespace}/{chat.agent_name}",
+        rejected_tool_call_ids=decision["rejected_ids"],
+        job_id=approval_rules.round_job_id(pending_approval),
     )
+
+    # Queued: an expired sibling counted as rejected above is recorded as
+    # such now, so the expiry sweep has nothing left to resume. Had the
+    # enqueue failed, it stays undecided and the sweep resumes the round
+    # (the fixed job id makes any overlap a no-op).
+    await db.execute(
+        update(PendingToolApproval)
+        .where(
+            PendingToolApproval.message_id == pending_approval.message_id,
+            PendingToolApproval.approved.is_(None),
+        )
+        .values(approved=False)
+    )
+    await db.commit()
 
     return JSONResponse(
         status_code=202,
@@ -837,6 +893,7 @@ async def approve_tool_call(
             "status": "approved" if request.approved else "rejected",
             "tool_call_id": tool_call_id,
             "channel_id": channel_id,
+            "resume": "queued",
             "message": f"Resume job enqueued. Connect to /chats/{chat_id}/stream/{channel_id} for results.",
         },
     )
@@ -1174,6 +1231,44 @@ async def update_chat(
         updated_at=chat.updated_at,
         last_message_at=last_message_at,
     )
+
+
+@router.post("/chats/{chat_id}/interrupt")
+async def interrupt_chat(
+    chat_id: str,
+    http_request: Request,
+    current_user_data: tuple = Depends(get_current_user_with_permissions),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop the chat's running agent loop without touching the transcript
+    (issue #142).
+
+    Arms a cooperative interrupt: the loop stops at its next tool-round
+    boundary and appends an 'interrupted by operator' system marker; queued
+    continuation jobs that start within the flag's TTL stop immediately.
+    The chat and its messages stay intact, and the next user message clears
+    the flag and starts a fresh turn.
+    """
+    user_id, permissions = current_user_data
+
+    result = await db.execute(select(Chat).where(Chat.id == chat_id, Chat.user_id == user_id))
+    chat = result.scalar_one_or_none()
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+
+    agent_chat_perm = f"sinas.agents/{chat.agent_namespace}/{chat.agent_name}.chat:all"
+    if not check_permission(permissions, agent_chat_perm):
+        set_permission_used(http_request, agent_chat_perm, has_perm=False)
+        raise HTTPException(
+            403, f"Not authorized to chat with agent '{chat.agent_namespace}/{chat.agent_name}'"
+        )
+    set_permission_used(http_request, agent_chat_perm)
+
+    from app.services import chat_steering
+
+    was_running = await chat_steering.is_chat_locked(chat_id)
+    await chat_steering.request_interrupt(chat_id, requested_by=user_id)
+    return {"interrupted": True, "was_running": was_running}
 
 
 @router.delete("/chats/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
