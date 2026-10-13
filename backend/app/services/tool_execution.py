@@ -782,6 +782,21 @@ async def execute_single_tool(
             result_chat = await db.execute(select(Chat).where(Chat.id == chat_id))
             chat = result_chat.scalar_one_or_none()
 
+            # Workbench file references: {"$workbench": "path"} parameter
+            # values are replaced by the file's content before dispatch, so
+            # content never has to travel through the model. A failed
+            # reference fails the whole call — the sentinel must not leak
+            # through to the tool as literal arguments.
+            from app.services import workbench_refs
+
+            if workbench_refs.contains_reference(arguments):
+                try:
+                    arguments = await workbench_refs.resolve_references(
+                        db, chat, user_id, arguments
+                    )
+                except workbench_refs.ReferenceError_ as e:
+                    return (tool_call["id"], tool_name, json.dumps({"error": str(e)}))
+
             # Look up tool metadata from the tools list (set during tool discovery)
             tool_metadata = {}
             tool_found_in_list = False
@@ -820,6 +835,60 @@ async def execute_single_tool(
                 )
                 if stored:
                     result = stored
+                    # The messages row holds the clipped inline copy. If the
+                    # excess was spilled to the workbench (#180), serve the
+                    # full copy — that is what the agent came back for.
+                    retrieve_limit = TOOL_RESULT_SIZE_OVERRIDES.get(
+                        "retrieve_tool_result", settings.tool_result_context_max_size
+                    )
+                    # Follow the pointer in the chat that produced the result
+                    # (a cross-chat lookup through the cache): the spill is in
+                    # that chat's workbench. Ownership is checked there.
+                    source_chat = chat
+                    source_chat_id = stored.get("chat_id")
+                    if source_chat_id and (chat is None or source_chat_id != str(chat.id)):
+                        try:
+                            source_chat = await db.get(Chat, uuid.UUID(source_chat_id))
+                        except (ValueError, TypeError):
+                            source_chat = None
+                    full = await workbench_refs.load_spilled_result(
+                        db, source_chat, user_id, stored.get("result"), retrieve_limit
+                    )
+                    if full and "result" in full:
+                        result = {
+                            **stored,
+                            "result": full["result"],
+                            "source": "workbench",
+                            "workbench_file": full["path"],
+                        }
+                    elif full:
+                        readable_path = full["path"]
+                        if source_chat is not chat and chat is not None:
+                            # The caller can only read its own workbench: give
+                            # it a copy there, or the pointer is useless.
+                            readable_path = await workbench_refs.copy_spilled_result(
+                                db, source_chat, chat, user_id, full["path"]
+                            )
+                        if readable_path:
+                            result = {
+                                **stored,
+                                "workbench_file": readable_path,
+                                "note": (
+                                    f"The full result is larger than this tool can "
+                                    f"return inline; read '{readable_path}' with "
+                                    "workbench_read (offset/limit) or process it "
+                                    "with code execution."
+                                ),
+                            }
+                        else:
+                            result = {
+                                **stored,
+                                "note": (
+                                    "The full result lives in another chat's workbench "
+                                    "and is too large to return inline or copy here; "
+                                    "only its clipped copy is available."
+                                ),
+                            }
                 else:
                     # Help the agent self-correct instead of giving up. Most
                     # "not found" hits are hallucinated ids — surface the
@@ -1114,7 +1183,23 @@ async def execute_single_tool(
             )
             if len(result_content) > max_result_size:
                 print(f"⚠️ Truncating tool result for {tool_name}: {len(result_content)} -> {max_result_size} bytes", flush=True)
-                result_content = truncate_tool_result(result_content, max_result_size)
+                # Spill the FULL result to the workbench before truncating —
+                # otherwise the excess is gone for good (truncation runs
+                # before any persistence). The inline copy then carries a
+                # pointer the model can follow with workbench_read or code
+                # execution. No workbench → today's truncate-only behavior.
+                spill_path = await workbench_refs.spill_result(
+                    db, chat, user_id, tool_name, tool_call["id"], result_content
+                )
+                if spill_path:
+                    # Leave room for the pointer: the persisted copy is capped
+                    # at the same size, and a clipped copy loses the pointer.
+                    budget = max(1024, max_result_size - workbench_refs.spill_pointer_reserve(spill_path))
+                    result_content = workbench_refs.attach_spill_pointer(
+                        truncate_tool_result(result_content, budget), spill_path, max_size=max_result_size
+                    )
+                else:
+                    result_content = truncate_tool_result(result_content, max_result_size)
 
     except Exception as e:
         print(f"❌ Tool execution failed: {tool_name}: {e}", flush=True)

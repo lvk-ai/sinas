@@ -27,6 +27,7 @@ from app.services.content_tokens import strip_base64_data, refresh_message_token
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
 from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
+from app.services import workbench_refs
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -1227,6 +1228,7 @@ class MessageService:
             # before suspending; a failed prepare (unknown agent, permissions,
             # depth bound) records an immediate error result instead.
             prepared: list[dict[str, Any]] = []
+            _ref_chat_for_delegates = None
             for tc in delegate_calls:
                 args = safe_parse_arguments(tc["function"].get("arguments", ""))
                 yield {
@@ -1236,6 +1238,25 @@ class MessageService:
                     "arguments": tc["function"].get("arguments", "{}"),
                     "description": build_tool_status(tc["function"]["name"], args, status_templates),
                 }
+                # Suspended delegations bypass execute_single_tool, so
+                # {"$workbench": path} references resolve here — the child
+                # must receive the parent's file content, not the sentinel.
+                if workbench_refs.contains_reference(args):
+                    if _ref_chat_for_delegates is None:
+                        _ref_chat_for_delegates = (
+                            await self.db.execute(select(Chat).where(Chat.id == chat_id))
+                        ).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(
+                            self.db, _ref_chat_for_delegates, user_id, args
+                        )
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
                 meta = _meta_by_name.get(tc["function"]["name"], {})
                 prep = await prepare_agent_delegation(
                     self.db, user_id, meta.get("agent_id"), args
@@ -1263,7 +1284,6 @@ class MessageService:
                 args = safe_parse_arguments(tc["function"].get("arguments", ""))
                 if not isinstance(args, dict):
                     args = {}  # valid JSON but not an object (null, []): no question
-                question = args.get("question")
                 yield {
                     "type": "tool_start",
                     "tool_call_id": tc["id"],
@@ -1271,6 +1291,25 @@ class MessageService:
                     "arguments": tc["function"].get("arguments", "{}"),
                     "description": build_tool_status(tc["function"]["name"], args, status_templates),
                 }
+                # Deferred like delegations, so {"$workbench": path} references
+                # (a saved question, saved options) resolve here too.
+                if workbench_refs.contains_reference(args):
+                    if _ref_chat_for_delegates is None:
+                        _ref_chat_for_delegates = (
+                            await self.db.execute(select(Chat).where(Chat.id == chat_id))
+                        ).scalar_one_or_none()
+                    try:
+                        args = await workbench_refs.resolve_references(
+                            self.db, _ref_chat_for_delegates, user_id, args
+                        )
+                    except workbench_refs.ReferenceError_ as e:
+                        error_content = json.dumps({"error": str(e)})
+                        tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
+                        self.db.add(Message(chat_id=chat_id, role="tool", content=error_content, tool_call_id=tc["id"], name=tc["function"]["name"]))
+                        await self.db.commit()
+                        yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
+                        continue
+                question = args.get("question")
                 if not question or not isinstance(question, str):
                     error_content = json.dumps({"error": "ask_user requires a non-empty 'question' string"})
                     tool_results[tc["id"]] = (tc["id"], tc["function"]["name"], error_content)
@@ -1279,6 +1318,12 @@ class MessageService:
                     yield {"type": "tool_end", "tool_call_id": tc["id"], "name": tc["function"]["name"], "result": error_content}
                     continue
                 options = args.get("options")
+                if isinstance(options, str):
+                    # A saved options file resolves to its text: a JSON list.
+                    try:
+                        options = json.loads(options)
+                    except (ValueError, TypeError):
+                        options = None
                 if not (isinstance(options, list) and all(isinstance(o, str) for o in options)):
                     options = None
                 entry: dict[str, Any] = {
@@ -1422,43 +1467,36 @@ class MessageService:
         result_chat = await self.db.execute(select(Chat).where(Chat.id == chat_id))
         chat = result_chat.scalar_one_or_none()
 
-        updated_messages = []
         agent = None
-
         if chat and chat.agent_id:
             agent = await self.db.get(Agent, chat.agent_id)
-            if agent:
-                template_vars = None
-                if chat.chat_metadata and "agent_input" in chat.chat_metadata:
-                    template_vars = chat.chat_metadata["agent_input"]
-                system_content = await build_agent_system_content(
-                    self.db, agent, self.skill_converter, template_vars
-                )
-                if system_content:
-                    updated_messages.append({"role": "system", "content": system_content})
 
-        result = await self.db.execute(
-            select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at)
+        # Same builder as a fresh send (issue #225): the window, the rolling
+        # compaction summary and older-tool-result compaction apply at every
+        # round boundary, so a long autonomous turn can't outgrow the context
+        # the way a fresh send on the same chat never would.
+        template_vars = None
+        if chat and chat.chat_metadata and "agent_input" in chat.chat_metadata:
+            template_vars = chat.chat_metadata["agent_input"]
+        template_vars = merge_user_template_context(
+            template_vars, await load_user_context(self.db, user_id)
         )
-        for msg in result.scalars().all():
-            message_dict = {"role": msg.role}
-            if msg.content:
-                message_dict["content"] = msg.content
-            if msg.tool_calls:
-                validated_tc = validate_tool_calls(msg.tool_calls)
-                if validated_tc:
-                    message_dict["tool_calls"] = [
-                        {k: v for k, v in tc.items() if k != "description"}
-                        for tc in validated_tc
-                    ]
-                elif msg.tool_calls:
-                    print(f"\u26a0\ufe0f Skipping message {msg.id} with corrupted tool calls")
-                    continue
-            if msg.tool_call_id:
-                message_dict["tool_call_id"] = msg.tool_call_id
-            if msg.name:
-                message_dict["name"] = msg.name
-            updated_messages.append(message_dict)
+        # The rebuild below reads everything injected so far: those are
+        # answered by this turn, not by the end-of-turn drain.
+        await chat_steering.take_injections(chat_id)
+        updated_messages = (
+            await build_conversation_history(
+                db=self.db,
+                chat=chat,
+                skill_converter=self.skill_converter,
+                inject_context=False,
+                user_id=user_id,
+                template_variables=template_vars,
+                provider_type=None,
+            )
+            if chat
+            else []
+        )
 
         _agent_label = (
             f"{chat.agent_namespace}/{chat.agent_name}"

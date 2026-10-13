@@ -5,6 +5,7 @@ prior summary folded into the next), the injection of the stored summary
 into the built history when windowing applies, and the schedule trigger
 when the summary lags the window.
 """
+import json
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -142,3 +143,200 @@ class TestHistoryInjection:
         assert not any(
             "should not appear" in (m.get("content") or "") for m in messages
         )
+
+
+class TestFollowupUsesWindowing:
+    """Issue #225: the tool-round boundary rebuild must apply the same
+    windowing and compaction as a fresh send, or a long autonomous turn
+    outgrows the context a fresh send on the same chat would never see."""
+
+    class _FakeProvider:
+        def __init__(self):
+            self.seen: list[list[dict]] = []
+
+        async def stream(self, messages, model, tools, temperature, max_tokens):
+            self.seen.append(messages)
+            yield {"content": "ok", "tool_calls": None, "finish_reason": "stop"}
+
+    async def _run_followup(self, db, chat, user, monkeypatch):
+        from app.services import message_service as ms
+
+        fake = self._FakeProvider()
+
+        async def fake_create_provider(*_a, **_k):
+            return fake
+
+        monkeypatch.setattr(ms, "create_provider", fake_create_provider)
+        service = ms.MessageService(db)
+        async for _ in service._stream_followup_after_tools(
+            chat_id=str(chat.id), user_id=str(user.id), user_token="",
+            provider=None, model=None, temperature=0.7, max_tokens=None, tools=[],
+        ):
+            pass
+        assert len(fake.seen) == 1
+        return fake.seen[0]
+
+    @pytest.mark.asyncio
+    async def test_followup_is_windowed(self, db, long_chat, test_user, monkeypatch):
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, long_chat, test_user, monkeypatch)
+        assert [m["content"] for m in sent] == [f"message {i}" for i in range(6, 10)]
+
+    @pytest.mark.asyncio
+    async def test_followup_injects_compaction_summary(self, db, long_chat, test_user, monkeypatch):
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", True)
+        monkeypatch.setattr(compaction, "maybe_schedule_compaction", lambda _cid: None)
+        long_chat.chat_metadata = {
+            "compaction": {"summary": "earlier: six messages", "covered_count": 6}
+        }
+        await db.flush()
+        sent = await self._run_followup(db, long_chat, test_user, monkeypatch)
+        assert "earlier: six messages" in sent[0]["content"]
+        assert [m["content"] for m in sent[1:]] == [f"message {i}" for i in range(6, 10)]
+
+    @pytest.mark.asyncio
+    async def test_followup_keeps_tool_pairs_and_compacts_old_results(
+        self, db, test_user, monkeypatch
+    ):
+        chat = Chat(user_id=test_user.id, title="tool-heavy turn")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        for i in range(6):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"c{i}",
+                           content=json.dumps({"big": "x" * 50, "i": i})))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 5)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        monkeypatch.setattr(settings, "tool_result_max_inline", 1)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        # Window boundary never splits a tool call from its result, and no
+        # orphaned tool result survives.
+        ids_called = {tc["id"] for m in sent if m.get("tool_calls") for tc in m["tool_calls"]}
+        ids_answered = {m["tool_call_id"] for m in sent if m["role"] == "tool"}
+        assert ids_called == ids_answered
+        # Only the newest result stays inline; older ones are pointers.
+        tool_msgs = [m for m in sent if m["role"] == "tool"]
+        assert tool_msgs[-1]["content"].startswith("{")
+        assert all("retrieve_tool_result" in m["content"] for m in tool_msgs[:-1])
+
+    @pytest.mark.asyncio
+    async def test_followup_pins_the_turn_opener(self, db, test_user, monkeypatch):
+        """A long turn's opening user message is the oldest of its messages
+        and would be the first to fall out of the window; it is pinned so the
+        model always sees what it was asked."""
+        chat = Chat(user_id=test_user.id, title="long turn")
+        db.add(chat)
+        await db.flush()
+        # previous turn, finished
+        db.add(Message(chat_id=chat.id, role="user", content="old ask"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="old reply"))
+        await db.flush()
+        # current turn: opener + many tool rounds
+        db.add(Message(chat_id=chat.id, role="user", content="THE TASK"))
+        await db.flush()
+        for i in range(5):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"r{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"r{i}", content="{}"))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 4)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        users = [m["content"] for m in sent if m["role"] == "user"]
+        assert users == ["THE TASK"]  # pinned; the previous turn's ask stays out
+        assert sent[0]["role"] == "user"  # ahead of the windowed tail
+        assert [m["tool_call_id"] for m in sent if m["role"] == "tool"] == ["r3", "r4"]
+
+    @pytest.mark.asyncio
+    async def test_window_cutting_a_batch_keeps_its_real_results(self, db, test_user, monkeypatch):
+        """When the window starts inside a batch of tool results, the whole
+        exchange comes back: the call and the batch's earlier results, not
+        synthetic 'interrupted' errors for calls that completed."""
+        chat = Chat(user_id=test_user.id, title="batch")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+            {"id": f"b{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}} for i in range(3)
+        ]))
+        await db.flush()
+        for i in range(3):
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"b{i}", content=json.dumps({"ok": i})))
+            await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="then"))
+        await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 2)  # window: [tool b2, assistant]
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        tools = [m for m in sent if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tools] == ["b0", "b1", "b2"]
+        assert all("interrupted" not in m["content"] for m in tools)
+
+
+    @pytest.mark.asyncio
+    async def test_window_starting_at_an_injected_message_still_restores_the_batch(self, db, test_user, monkeypatch):
+        """A steering message injected mid-batch sits between the batch's
+        results. When the window opens on it, the results behind it must
+        still find their call before the window."""
+        chat = Chat(user_id=test_user.id, title="batch+steer")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="go"))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+            {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}} for i in range(3)
+        ]))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id="c0", content=json.dumps({"ok": 0})))
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="also check the totals"))  # injected mid-batch
+        await db.flush()
+        for i in (1, 2):
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"c{i}", content=json.dumps({"ok": i})))
+            await db.flush()
+        db.add(Message(chat_id=chat.id, role="assistant", content="then"))
+        await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 4)  # window: [user(injected), tool c1, tool c2, assistant]
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        tools = [m for m in sent if m["role"] == "tool"]
+        assert sorted(m["tool_call_id"] for m in tools) == ["c0", "c1", "c2"]
+        assert all("interrupted" not in m["content"] for m in tools)
+        # Results follow their call directly; the injected message comes after the exchange.
+        roles = [m["role"] for m in sent]
+        call_idx = next(i for i, m in enumerate(sent) if m["role"] == "assistant" and m.get("tool_calls"))
+        assert roles[call_idx + 1:call_idx + 4] == ["tool", "tool", "tool"]
+
+    @pytest.mark.asyncio
+    async def test_every_steering_message_of_the_turn_is_pinned(self, db, test_user, monkeypatch):
+        chat = Chat(user_id=test_user.id, title="steered")
+        db.add(chat)
+        await db.flush()
+        db.add(Message(chat_id=chat.id, role="user", content="THE TASK"))
+        await db.flush()
+        for i in range(4):
+            db.add(Message(chat_id=chat.id, role="assistant", content=None, tool_calls=[
+                {"id": f"s{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+            ]))
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="user", content=f"steer {i}"))  # injected mid-round
+            await db.flush()
+            db.add(Message(chat_id=chat.id, role="tool", name="t", tool_call_id=f"s{i}", content="{}"))
+            await db.flush()
+        monkeypatch.setattr(settings, "max_history_messages", 3)
+        monkeypatch.setattr(settings, "compaction_enabled", False)
+        sent = await self._run_followup(db, chat, test_user, monkeypatch)
+        users = [m["content"] for m in sent if m["role"] == "user"]
+        assert users == ["THE TASK", "steer 0", "steer 1", "steer 2", "steer 3"]

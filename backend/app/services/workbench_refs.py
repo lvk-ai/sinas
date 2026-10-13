@@ -1,0 +1,419 @@
+"""Workbench file references in tool calls, and result spill.
+
+Two halves of one idea: file content should not have to travel through the
+model.
+
+Outbound — references: a tool-call parameter whose value is the typed
+object {"$workbench": "<path>"} (optionally {"encoding": "text"|"base64"})
+is resolved by the tool executor at dispatch time: the file's current
+version is loaded from the calling chat's workbench and the object is
+replaced by the content. The model passes a reference; the tool receives
+bytes. Works for every tool kind with zero per-service code, and the
+typed-object sentinel cannot collide with legitimate string content.
+
+Inbound — spill: a tool result too large for the context is saved in full
+to the chat's workbench (tool_results/<tool>_<call-id>…) before the inline
+copy is truncated, and the truncated copy carries a pointer. The model can
+then read the full result with workbench_read (offsets) or process it with
+code execution — and, unlike before, the full bytes actually survive
+(truncation used to run before any persistence).
+
+Resolution is chat-scoped by construction: only the calling chat's own
+workbench is reachable. Design: the workbench file-references ADR.
+"""
+import json
+import logging
+import re
+from typing import Any, Optional
+
+from sqlalchemy import select
+
+from app.core.config import settings
+from app.models.file import File, FileVersion
+
+logger = logging.getLogger(__name__)
+
+SENTINEL_KEY = "$workbench"
+_ALLOWED_KEYS = {SENTINEL_KEY, "encoding"}
+
+_TEXTUAL_TYPES = ("text/",)
+_TEXTUAL_EXACT = {
+    "application/json",
+    "application/x-yaml",
+    "application/sql",
+    "application/javascript",
+    "application/typescript",
+    "application/xml",
+}
+
+
+class ReferenceError_(Exception):
+    """A workbench reference could not be resolved (bad path, missing file,
+    over the size cap). The whole tool call fails with this message — a
+    sentinel must never leak through to the tool as literal arguments."""
+
+
+def contains_reference(arguments: Any) -> bool:
+    """Cheap pre-check so the common case (no references) costs nothing.
+
+    A JSON string is parsed first: the key may be spelled with escapes
+    (`"\\u0024workbench"`) and must still count as a reference."""
+    if isinstance(arguments, str):
+        if f'"{SENTINEL_KEY}"' in arguments:
+            return True
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            return False
+    if isinstance(arguments, (dict, list)):
+        return f'"{SENTINEL_KEY}"' in json.dumps(arguments)
+    return False
+
+
+def _is_reference(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and SENTINEL_KEY in value
+        and set(value.keys()) <= _ALLOWED_KEYS
+        and isinstance(value[SENTINEL_KEY], str)
+    )
+
+
+def _default_encoding(content_type: str) -> str:
+    if content_type.startswith(_TEXTUAL_TYPES) or content_type in _TEXTUAL_EXACT:
+        return "text"
+    return "base64"
+
+
+async def resolve_references(db, chat, user_id: str, arguments: Any) -> Any:
+    """Replace every {"$workbench": path} object in `arguments` with the
+    referenced file's content. Raises ReferenceError_ on any failure."""
+    from app.services.workbench import _validate_path, get_or_create_workbench
+    from app.services.file_storage import get_storage
+
+    if chat is None:
+        raise ReferenceError_("Workbench references require a chat context")
+    if str(chat.user_id) != str(user_id):
+        raise ReferenceError_("Workbench belongs to a different user")
+
+    workbench = await get_or_create_workbench(db, chat)
+    storage = get_storage()
+    # Aggregate budget across ALL references in one call (the per-file cap
+    # alone lets a compact argument expand to many times its size), plus a
+    # per-call cache so the same file referenced twice is read once.
+    budget = {"remaining": settings.workbench_ref_max_bytes}
+    resolved_cache: dict[tuple[str, str], str] = {}
+
+    async def _resolve_one(ref: dict[str, Any]) -> str:
+        path = ref[SENTINEL_KEY]
+        encoding = ref.get("encoding")
+        if encoding is not None and not isinstance(encoding, str):
+            raise ReferenceError_(
+                f"Invalid workbench reference {path!r}: 'encoding' must be a string"
+            )
+        cache_key = (path, encoding or "")
+        if cache_key in resolved_cache:
+            return resolved_cache[cache_key]
+        err = _validate_path(path)
+        if err:
+            raise ReferenceError_(f"Invalid workbench reference {path!r}: {err}")
+        f = (
+            await db.execute(
+                select(File).where(File.collection_id == workbench.id, File.name == path)
+            )
+        ).scalar_one_or_none()
+        if not f:
+            raise ReferenceError_(
+                f"Workbench reference {path!r} not found — list files with workbench_list"
+            )
+        version = (
+            await db.execute(
+                select(FileVersion).where(
+                    FileVersion.file_id == f.id,
+                    FileVersion.version_number == f.current_version,
+                )
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            raise ReferenceError_(f"Workbench reference {path!r} has no stored version")
+        if version.size_bytes > settings.workbench_ref_max_bytes:
+            raise ReferenceError_(
+                f"Workbench reference {path!r} is {version.size_bytes} bytes, above the "
+                f"{settings.workbench_ref_max_bytes}-byte reference limit"
+            )
+        if version.size_bytes > budget["remaining"]:
+            raise ReferenceError_(
+                f"Workbench references in this call exceed the combined "
+                f"{settings.workbench_ref_max_bytes}-byte limit at {path!r}"
+            )
+        budget["remaining"] -= version.size_bytes
+        try:
+            content = await storage.read(version.storage_path)
+        except Exception as e:
+            raise ReferenceError_(f"Failed to read workbench reference {path!r}: {e}")
+
+        encoding = ref.get("encoding") or _default_encoding(f.content_type)
+        if encoding == "base64":
+            import base64
+
+            resolved_cache[cache_key] = base64.b64encode(content).decode()
+            return resolved_cache[cache_key]
+        if encoding == "text":
+            try:
+                resolved_cache[cache_key] = content.decode("utf-8")
+                return resolved_cache[cache_key]
+            except UnicodeDecodeError:
+                raise ReferenceError_(
+                    f"Workbench reference {path!r} is not valid UTF-8 text — "
+                    'pass {"encoding": "base64"} in the reference'
+                )
+        raise ReferenceError_(
+            f"Unknown encoding {encoding!r} in workbench reference {path!r} "
+            "(use 'text' or 'base64')"
+        )
+
+    async def _walk(node: Any) -> Any:
+        if _is_reference(node):
+            return await _resolve_one(node)
+        if isinstance(node, dict):
+            return {k: await _walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [await _walk(v) for v in node]
+        return node
+
+    return await _walk(arguments)
+
+
+def _spill_filename(tool_name: str, tool_call_id: str, content: str) -> str:
+    """One file per tool call. The call id is kept in full (sanitized) and,
+    when it is long enough that a prefix would be ambiguous, suffixed with a
+    hash of the whole id — two calls must never share a spill path, or the
+    earlier pointer would silently serve the later call's result."""
+    import hashlib
+
+    safe_tool = re.sub(r"[^A-Za-z0-9_-]", "_", tool_name)[:60]
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", tool_call_id)
+    if len(safe_id) > 48 or safe_id != tool_call_id:
+        digest = hashlib.sha256(tool_call_id.encode()).hexdigest()[:12]
+        safe_id = f"{safe_id[:48]}_{digest}"
+    try:
+        json.loads(content)
+        ext = "json"
+    except (ValueError, TypeError):
+        ext = "txt"
+    return f"tool_results/{safe_tool}_{safe_id}.{ext}"
+
+
+async def spill_result(
+    db, chat, user_id: str, tool_name: str, tool_call_id: str, content: str
+) -> Optional[str]:
+    """Save a full oversized tool result into the chat's workbench.
+
+    Returns the workbench path, or None when spilling isn't possible (no
+    chat, workbench not enabled for the agent, write failure) — in which
+    case the caller keeps today's truncate-only behavior.
+    """
+    from app.services.collection_tools import _infer_content_type
+    from app.services.file_storage import get_storage
+    from app.services.workbench import (
+        _write_bytes,
+        chat_has_workbench_enabled,
+        get_or_create_workbench,
+    )
+
+    try:
+        if chat is None or str(chat.user_id) != str(user_id):
+            return None
+        if not await chat_has_workbench_enabled(db, chat):
+            return None
+        workbench = await get_or_create_workbench(db, chat)
+        # workbench_read pages by line: a JSON result saved as one line
+        # could only ever be read whole (and clipped again). Pretty-print
+        # it so an agent without code execution can page through it.
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            content = json.dumps(parsed, indent=2, ensure_ascii=False)
+        path = _spill_filename(tool_name, tool_call_id, content)
+        result = await _write_bytes(
+            db,
+            get_storage(),
+            workbench,
+            filename=path,
+            content=content.encode("utf-8"),
+            content_type=_infer_content_type(path),
+            user_id=str(chat.user_id),
+            visibility="private",
+            file_metadata={"origin": "tool", "tool_name": tool_name, "tool_call_id": tool_call_id},
+        )
+        if "error" in result:
+            logger.warning(f"Result spill failed for {tool_name}: {result['error']}")
+            return None
+        await db.commit()
+        return path
+    except Exception as e:
+        logger.warning(f"Result spill failed for {tool_name}: {e}")
+        return None
+
+
+def _spill_pointer(path: str) -> dict[str, str]:
+    note = (
+        f"Full result saved to workbench file '{path}' — read it with "
+        "workbench_read (supports offset/limit) or process it with code execution."
+    )
+    return {"workbench_file": path, "hint": note}
+
+
+def spill_pointer_reserve(path: str) -> int:
+    """Bytes to leave free when truncating a result that will carry a spill
+    pointer: the pointer itself plus the wrapper and JSON escaping
+    attach_spill_pointer may add. The inline copy and the persisted copy
+    share one size cap, so a pointer attached on top of a full-size
+    truncation would push the persisted copy over it and get clipped away."""
+    return len(json.dumps({"text": "", "_full_result": _spill_pointer(path)})) + 256
+
+
+def attach_spill_pointer(truncated_content: str, path: str, max_size: Optional[int] = None) -> str:
+    """Point the truncated inline result at the spilled workbench file.
+
+    With `max_size`, the wrapped result is measured and clipped to fit:
+    plain text is JSON-escaped on wrapping (newlines, quotes, non-ASCII),
+    which can grow it past a reserve computed on the raw text."""
+    pointer = _spill_pointer(path)
+    try:
+        parsed = json.loads(truncated_content)
+    except (ValueError, TypeError):
+        # Plain text too gets a structured pointer, so retrieve_tool_result
+        # can follow it instead of serving the clipped text again.
+        text = truncated_content
+        out = json.dumps({"text": text, "_full_result": pointer})
+        while max_size and len(out) > max_size and text:
+            # Shrink proportionally; escaping is at most a few bytes per char.
+            keep = int(len(text) * max_size / len(out)) - 1
+            text = text[: max(0, keep)]
+            out = json.dumps({"text": text, "_full_result": pointer})
+        return out
+    if isinstance(parsed, dict):
+        parsed["_full_result"] = pointer
+        return json.dumps(parsed)
+    # A JSON array (or scalar) stays valid JSON: wrap it so the pointer
+    # travels with it and retrieve_tool_result can still follow it.
+    return json.dumps({"result": parsed, "_full_result": pointer})
+
+
+def spill_pointer(stored_result: Any) -> Optional[str]:
+    """The workbench path a stored (truncated) tool result points at, if any."""
+    if not isinstance(stored_result, dict):
+        return None
+    pointer = stored_result.get("_full_result")
+    if isinstance(pointer, dict) and isinstance(pointer.get("workbench_file"), str):
+        return pointer["workbench_file"]
+    return None
+
+
+async def load_spilled_result(
+    db, chat, user_id: str, stored_result: Any, max_bytes: int
+) -> Optional[dict[str, Any]]:
+    """Follow a truncated result's spill pointer back to the full copy.
+
+    `retrieve_tool_result` reads the messages row, which holds the clipped
+    inline copy. When that copy points at a workbench spill, serve the full
+    content instead. Returns {"path", "result"} with the parsed full result,
+    {"path", "too_large"} when the full copy exceeds the retrieve tool's own
+    size limit (the pointer stays the way to read it, in pages), or None
+    when there is nothing to follow or the file is gone.
+    """
+    from app.services.workbench import chat_has_workbench_enabled, fetch_file_bytes
+
+    path = spill_pointer(stored_result)
+    if path is None:
+        return None
+    try:
+        if chat is None or str(chat.user_id) != str(user_id):
+            return None
+        if not await chat_has_workbench_enabled(db, chat):
+            return None
+        fetched = await fetch_file_bytes(db, chat, path, max_bytes)
+    except Exception as e:
+        logger.warning(f"Could not load spilled result '{path}': {e}")
+        return None
+    if "error" in fetched:
+        if "above the lazy-fetch limit" in fetched["error"]:
+            return {"path": path, "too_large": True}
+        return None
+    import base64
+
+    content = base64.b64decode(fetched["content_b64"]).decode("utf-8", errors="replace")
+    try:
+        parsed: Any = json.loads(content)
+    except (ValueError, TypeError):
+        parsed = {"raw": content}
+    return {"path": path, "result": parsed}
+
+
+async def copy_spilled_result(db, source_chat, target_chat, user_id: str, path: str) -> Optional[str]:
+    """Copy a spilled result from another chat's workbench into `target_chat`'s.
+
+    A cross-chat lookup that finds a full copy too large to return inline
+    can only point the caller at a file it can read: workbench_read and
+    code execution see the calling chat's workbench alone. Returns the
+    path of the copy (under tool_results/, naming the source chat), or
+    None when the copy isn't possible."""
+    from app.services.collection_tools import _infer_content_type
+    from app.services.file_storage import get_storage
+    from app.services.workbench import (
+        _write_bytes,
+        chat_has_workbench_enabled,
+        get_or_create_workbench,
+    )
+
+    try:
+        for c in (source_chat, target_chat):
+            if c is None or str(c.user_id) != str(user_id):
+                return None
+        if not await chat_has_workbench_enabled(db, target_chat):
+            return None
+        source_wb = await get_or_create_workbench(db, source_chat)
+        f = (
+            await db.execute(select(File).where(File.collection_id == source_wb.id, File.name == path))
+        ).scalar_one_or_none()
+        if f is None:
+            return None
+        version = (
+            await db.execute(
+                select(FileVersion).where(
+                    FileVersion.file_id == f.id, FileVersion.version_number == f.current_version
+                )
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            return None
+        content = await get_storage().read(version.storage_path)
+        target_wb = await get_or_create_workbench(db, target_chat)
+        base = path.rsplit("/", 1)[-1]
+        copy_path = f"tool_results/from_{str(source_chat.id)[:8]}_{base}"
+        existing = (
+            await db.execute(select(File).where(File.collection_id == target_wb.id, File.name == copy_path))
+        ).scalar_one_or_none()
+        result = await _write_bytes(
+            db,
+            get_storage(),
+            target_wb,
+            filename=copy_path,
+            content=content,
+            content_type=_infer_content_type(copy_path),
+            user_id=str(target_chat.user_id),
+            visibility="private",
+            file_metadata={"origin": "tool", "copied_from_chat": str(source_chat.id), "source_path": path},
+            existing=existing,
+        )
+        if "error" in result:
+            logger.warning(f"Could not copy spilled result '{path}': {result['error']}")
+            return None
+        await db.commit()
+        return copy_path
+    except Exception as e:
+        logger.warning(f"Could not copy spilled result '{path}': {e}")
+        return None

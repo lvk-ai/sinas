@@ -2,6 +2,7 @@
 before its deadline — the expiry sweep resolves it the same way, so a late
 "approve" can never run a call the sweep already rejected."""
 
+import pytest
 import uuid
 
 import pytest
@@ -77,6 +78,47 @@ async def test_an_expired_approval_is_refused(client, db, admin_user, monkeypatc
     )
     assert r.status_code == 409
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_same_tool_call_id_in_two_chats_is_fine(db, test_user):
+    """Provider tool-call ids are only unique per response; two chats seeing
+    the same id must both get their approval row (uniqueness is per chat)."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy.exc import IntegrityError
+
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    rows = []
+    for title in ("chat a", "chat b"):
+        chat = Chat(user_id=test_user.id, title=title)
+        db.add(chat)
+        await db.flush()
+        anchor = Message(chat_id=chat.id, role="assistant", content="x")
+        db.add(anchor)
+        await db.flush()
+        row = PendingToolApproval(
+            chat_id=chat.id, message_id=anchor.id, user_id=test_user.id,
+            tool_call_id="call_promote", function_namespace="tool",
+            function_name="workbench_promote", arguments={}, all_tool_calls=[],
+            conversation_context={}, expires_at=expires_at,
+        )
+        db.add(row)
+        await db.flush()
+        rows.append(row)
+    assert rows[0].chat_id != rows[1].chat_id
+
+    # ...while the same id twice within one chat is still rejected.
+    dup = PendingToolApproval(
+        chat_id=rows[0].chat_id, message_id=rows[0].message_id, user_id=test_user.id,
+        tool_call_id="call_promote", function_namespace="tool",
+        function_name="workbench_promote", arguments={}, all_tool_calls=[],
+        conversation_context={}, expires_at=expires_at,
+    )
+    db.add(dup)
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
 
 
 async def test_a_round_with_several_asks_resumes_once_after_the_last_decision(client, db, admin_user, monkeypatch):

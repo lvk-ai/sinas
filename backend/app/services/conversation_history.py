@@ -193,11 +193,36 @@ async def build_conversation_history(
 
         chat_messages = all_messages[-settings.max_history_messages:]
 
+        # Pin the current turn's opening user message (and the latest user
+        # message, if different). On a fresh send the newest message is the
+        # user's and the window always holds it; at a tool-round boundary
+        # the turn's opener is the OLDEST of the turn's messages and the
+        # first to fall out — after which a long autonomous turn no longer
+        # knows what it was asked to do. The turn starts after the previous
+        # final assistant reply (content, no tool calls).
+        window_start_idx = len(all_messages) - settings.max_history_messages
+        turn_start = 0
+        for i in range(len(all_messages) - 1, -1, -1):
+            m = all_messages[i]
+            if m.role == "assistant" and m.content and not m.tool_calls:
+                turn_start = i + 1
+                break
+        # Every user message of the current turn is pinned, not only the
+        # opener: messages injected mid-turn (steering) are read at a round
+        # boundary and must not fall out of the window before the model
+        # has seen them.
+        pinned = [m for m in all_messages[turn_start:window_start_idx] if m.role == "user"]
+        if not pinned and chat_messages and not any(m.role == "user" for m in chat_messages):
+            latest_user = next(
+                (m for m in reversed(all_messages[:window_start_idx]) if m.role == "user"), None
+            )
+            if latest_user is not None:
+                pinned.append(latest_user)
+
         # Ensure tool call/result pairs aren't split by the window boundary.
         # Walk backwards from the start of the window to include any orphaned
         # assistant messages that contain tool_calls referenced by tool results
         # at the start of the window, and vice versa.
-        window_start_idx = len(all_messages) - settings.max_history_messages
         prepend = []
 
         # Collect tool_call_ids referenced by tool messages at the start of the window
@@ -205,21 +230,34 @@ async def build_conversation_history(
         for msg in chat_messages:
             if msg.role == "tool" and msg.tool_call_id:
                 referenced_tc_ids.add(msg.tool_call_id)
-            elif msg.role != "tool":
-                break  # Stop once we hit non-tool messages
+            elif msg.role == "assistant":
+                break  # a new exchange starts here
+            # A user/system message injected mid-batch (loop controls) sits
+            # between the batch's results: scan past it, or the results
+            # behind it look unmatched and the call is never restored.
 
         if referenced_tc_ids:
-            # Scan messages before the window for assistant messages with matching tool_calls
-            for msg in reversed(all_messages[:window_start_idx]):
+            # Scan messages before the window for assistant messages with
+            # matching tool_calls. Bring the whole exchange back: the call
+            # AND the results of its batch that also fell before the window
+            # — otherwise those completed calls get synthetic "interrupted"
+            # results from the repair below and the model may redo them.
+            before = all_messages[:window_start_idx]
+            for idx in range(len(before) - 1, -1, -1):
+                msg = before[idx]
                 if msg.tool_calls:
                     msg_tc_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
                     if msg_tc_ids & referenced_tc_ids:
-                        prepend.insert(0, msg)
+                        batch_results = [
+                            m for m in before[idx + 1:]
+                            if m.role == "tool" and m.tool_call_id in msg_tc_ids
+                        ]
+                        prepend[0:0] = [msg] + batch_results
                         referenced_tc_ids -= msg_tc_ids
                 if not referenced_tc_ids:
                     break
 
-        chat_messages = prepend + list(chat_messages)
+        chat_messages = pinned + prepend + list(chat_messages)
     else:
         chat_messages = all_messages
 
@@ -274,9 +312,11 @@ async def build_conversation_history(
         if not (msg.role == "tool" and msg.tool_call_id and msg.tool_call_id not in all_tool_call_ids)
     ]
 
-    # Compact older tool results: keep last N inline, replace older with references.
-    # Safe here because build_conversation_history only runs for the initial LLM call —
-    # the follow-up after tool execution rebuilds from raw DB messages, bypassing this.
+    # Compact older tool results: keep last N inline, replace older with
+    # references the model can follow with retrieve_tool_result. Runs for the
+    # initial call and at every tool-round boundary (the follow-up rebuild
+    # goes through this builder too), so the newest results stay inline
+    # while a long turn's older ones shrink to pointers.
     max_inline = settings.tool_result_max_inline
     tool_result_indices = [
         idx for idx, msg in enumerate(chat_messages)
