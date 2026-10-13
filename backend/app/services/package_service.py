@@ -385,12 +385,15 @@ class PackageService:
             )
             return failed, variable_declarations, True, install_info
 
-        # Substitute variables if provided
-        if variables:
+        # Resolve variables whenever the package declares any, with the values
+        # given or none: the same rules as the install (defaults, an existing
+        # secret reused, a required value missing), so a successful preview
+        # means the install with these values gets past them too.
+        if variables or variable_declarations:
             # Preview is a dry run: validate + substitute, persist nothing.
             try:
                 yaml_content, _ = await self._resolve_variables(
-                    yaml_content, variables, user_id, persist_secrets=False
+                    yaml_content, variables or {}, user_id, persist_secrets=False
                 )
             except ValueError as e:
                 if not variable_declarations:

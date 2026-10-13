@@ -36,8 +36,6 @@ const requestKey = (variables: Record<string, any> | undefined, instance: string
     (instance ?? '').trim(),
   ]);
 
-const isBlank = (v: unknown) => v === undefined || v === null || v === '';
-
 /** Preview → variables → confirm → install, for either kind of target. */
 export function InstallPackageModal({ target, onClose }: { target: InstallTarget; onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -114,8 +112,21 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     },
   });
 
+  /** The values to send. A blank secret is left out: the server then keeps
+   * an existing secret of that name (or reports it missing), where an empty
+   * string would overwrite it with nothing. */
+  const payloadValues = (): Record<string, any> | undefined => {
+    const secretNames = new Set(
+      (previewResult?.variables || []).filter((v: any) => v.type === 'secret').map((v: any) => v.name),
+    );
+    const sent = Object.fromEntries(
+      Object.entries(variableValues).filter(([k, v]) => !(secretNames.has(k) && (v === '' || v == null))),
+    );
+    return Object.keys(sent).length > 0 ? sent : undefined;
+  };
+
   const runPreview = () => {
-    const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
+    const vars = payloadValues();
     previewMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined });
   };
 
@@ -148,14 +159,14 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   // The preview (its changes, warnings, broad permissions) is for one set of
   // values and one install name; after any edit it no longer describes what
   // Confirm would install.
-  const previewStale = !!previewResult && previewedKey !== requestKey(variableValues, instanceName);
+  const previewStale = !!previewResult && previewedKey !== requestKey(payloadValues(), instanceName);
   const instanceStale =
     !!previewResult?.multi_instance &&
     (instanceName.trim() || previewResult.package_name) !== previewResult.instance;
-  // Required values not filled in yet (the preview may still have run, with placeholders).
-  const missingRequired: string[] = (previewResult?.variables || [])
-    .filter((v: any) => v.required !== false && isBlank(v.default) && isBlank(variableValues[v.name]))
-    .map((v: any) => v.name);
+  // Whether values are missing is the server's call, not ours: the preview
+  // resolves variables by the install's rules (an existing secret reused, a
+  // default, even an empty one) and fails when one is missing. So a
+  // successful preview for exactly these values is the gate.
   const previewFailed = !!previewResult && (previewResult.success === false || (previewResult.errors || []).length > 0);
 
   const broadRoleWarnings: string[] = (previewResult?.warnings || []).filter((w: string) =>
@@ -173,9 +184,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const blockedBecause = nameTaken
     ? `'${effectiveName}' is already installed: choose a new install name`
     : previewStale
-    ? 'Preview with these values first'
-    : missingRequired.length > 0
-      ? `Fill in ${missingRequired.join(', ')}, then preview`
+      ? 'Preview with these values first'
       : previewFailed
         ? 'The preview failed: fix the values, then preview again'
         : broadRoleWarnings.length > 0 && !allowBroadRolePermissions
@@ -185,7 +194,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const handleInstall = () => {
     if (blockedBecause) return;
     setInstallStep('installing');
-    const vars = Object.keys(variableValues).length > 0 ? variableValues : undefined;
+    const vars = payloadValues();
     installMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined });
   };
 
@@ -436,7 +445,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                         <input
                           type={v.type === 'secret' ? 'password' : 'text'}
                           value={variableValues[v.name] ?? v.default ?? ''}
-                          placeholder={v.example || `Enter ${v.name}`}
+                          placeholder={v.example || (v.type === 'secret' ? 'Leave blank to keep an existing secret' : `Enter ${v.name}`)}
                           onChange={(e) => setVariable(v.name, e.target.value)}
                           className="w-full px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
                         />
