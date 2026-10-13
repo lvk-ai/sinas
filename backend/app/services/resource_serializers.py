@@ -153,3 +153,11 @@ def serialize_mcp_server(server) -> dict:
 
     return McpServerApplier().spec_from_row(server).to_config()
 
+
+
+def serialize_package_repository(repository) -> dict:
+    """Config form of a package repository — delegated to its spec. The
+    cached index and refresh state are runtime, not config."""
+    from app.services.resources.package_repositories import PackageRepositoryApplier
+
+    return PackageRepositoryApplier().spec_from_row(repository).to_config()

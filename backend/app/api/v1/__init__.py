@@ -16,6 +16,7 @@ from .endpoints import (
     functions,
     llm_providers,
     mcp_servers,
+    package_repositories,
 
     messages,
     dependencies,
@@ -47,6 +48,7 @@ router.include_router(collections.router)
 router.include_router(stores.router)
 router.include_router(connectors.router)
 router.include_router(mcp_servers.router)
+router.include_router(package_repositories.router)
 router.include_router(llm_providers.router, prefix="/llm-providers", tags=["llm-providers"])
 router.include_router(database_connections.router, prefix="/database-connections", tags=["database-connections"])
 router.include_router(database_schema.router, prefix="/database-connections", tags=["database-schema"])

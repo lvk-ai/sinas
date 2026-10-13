@@ -1,4 +1,6 @@
 """Packages API endpoints — installable integration packages."""
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +17,47 @@ from app.schemas.package import (
     PackageResponse,
 )
 from app.services.package_service import PackageService
+from app.schemas.package_repository import CatalogEntry
+
+
+async def _source(db: AsyncSession, body) -> tuple[str, Optional[str], Optional[str]]:
+    """The YAML to install: given, or fetched from a package repository and
+    checked against its index. Returns (yaml, repository name, file URL)."""
+    if body.source is not None:
+        return body.source, None, None
+    from sqlalchemy import select
+
+    from app.models.package_repository import PackageRepository
+    from app.services import package_repositories as repos
+
+    repository = (
+        await db.execute(select(PackageRepository).where(PackageRepository.name == body.repository))
+    ).scalar_one_or_none()
+    if repository is None:
+        raise HTTPException(status_code=404, detail=f"Package repository '{body.repository}' not found")
+    try:
+        yaml_content, _entry, url = await repos.fetch_package(db, repository, body.package)
+    except repos.RepositoryError as e:
+        await db.commit()  # keep a refresh it did (or its error) on the row
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    await db.commit()
+    return yaml_content, repository.name, url
+
+
+async def _with_status(db: AsyncSession, packages: list, model):
+    """Packages as `model`, with the repository each follows and whether an
+    update is published there."""
+    from app.services import package_repositories as repos
+
+    status_by_id = await repos.package_status(db, packages)
+    out = []
+    for package in packages:
+        item = model.model_validate(package).model_dump()
+        status = dict(status_by_id.get(package.id, {}))
+        item["source_repository"] = status.pop("repository", None) or package.source_repository
+        item.update(status)
+        out.append(model(**item))
+    return out
 
 router = APIRouter(prefix="/packages", tags=["packages"])
 
@@ -34,20 +77,23 @@ async def install_package(
         raise HTTPException(status_code=403, detail="Not authorized to install packages")
     set_permission_used(request, "sinas.packages.install:all", has_perm=True)
 
+    source, repository, file_url = await _source(db, body)
     service = PackageService(db)
     try:
         package, apply_result = await service.install(
-            body.source,
+            source,
             user_id,
             variables=body.variables,
             allow_broad_role_permissions=body.allowBroadRolePermissions,
             instance=body.instance,
+            source=(repository, file_url) if repository is not None else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    (shown,) = await _with_status(db, [package], PackageResponse)
     return PackageInstallResponse(
-        package=PackageResponse.model_validate(package).model_dump(mode="json"),
+        package=shown.model_dump(mode="json"),
         apply=apply_result.model_dump(mode="json"),
     )
 
@@ -67,10 +113,11 @@ async def preview_package(
         raise HTTPException(status_code=403, detail="Not authorized to preview packages")
     set_permission_used(request, "sinas.packages.install:all", has_perm=True)
 
+    source, _repository, _url = await _source(db, body)
     service = PackageService(db)
     try:
         result, variable_declarations, requires_input, install_info = await service.preview(
-            body.source, user_id, variables=body.variables, instance=body.instance
+            source, user_id, variables=body.variables, instance=body.instance
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -126,7 +173,27 @@ async def list_packages(
     set_permission_used(request, "sinas.packages.read:own", has_perm=True)
 
     service = PackageService(db)
-    return await service.list_packages()
+    return await _with_status(db, await service.list_packages(), PackageListResponse)
+
+
+@router.get("/catalog", response_model=list[CatalogEntry])
+async def package_catalog(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user_data: tuple = Depends(get_current_user_with_permissions),
+):
+    """Every package the active package repositories offer, with what is
+    installed of each and whether an update is published."""
+    user_id, permissions = current_user_data
+
+    if not check_permission(permissions, "sinas.packages.read:own"):
+        set_permission_used(request, "sinas.packages.read:own", has_perm=False)
+        raise HTTPException(status_code=403, detail="Not authorized to view packages")
+    set_permission_used(request, "sinas.packages.read:own", has_perm=True)
+
+    from app.services import package_repositories as repos
+
+    return await repos.catalog(db)
 
 
 @router.get("/{name}", response_model=PackageResponse)
@@ -149,7 +216,8 @@ async def get_package(
     if not package:
         raise HTTPException(status_code=404, detail=f"Package '{name}' not found")
 
-    return package
+    (shown,) = await _with_status(db, [package], PackageResponse)
+    return shown
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)

@@ -48,8 +48,60 @@ spec:
 - **Detach-on-edit**: Editing a package-managed resource clears `managed_by` — the resource survives uninstall
 - **Uninstall**: Deletes all resources where `managed_by = "pkg:<name>"` + the package record
 - **Upgrade**: Re-installing an existing package updates its resources in place (idempotent apply)
-- **Excluded types**: Packages cannot include roles, users, LLM providers, or database connections (these are environment-specific)
+- **Excluded types**: Packages cannot include users, LLM providers, database connections or package repositories (these are environment-specific). A package can define roles but never assign them.
 - **Dependencies**: Packages can declare Python dependencies — these are recorded in the database and installed in containers on worker restart
+
+## Package repositories
+
+A **package repository** is a place Sinas finds packages: the official one maintained by the Sinas team, or your own. Add repositories under **Packages → Repositories**. **Add official repository** adds [sinas-platform/packages](https://github.com/sinas-platform/packages) in one click. Then:
+
+- **Browse and install:** **Packages → Catalog** lists every package your repositories offer. Install goes through the same preview and variables as a pasted package.
+- **Updates:** an installed package shows **Update available** when its repository publishes a newer version. Updating installs the new version over the old one (an upgrade), after the same preview.
+- **Nothing installs or updates on its own.**
+
+Sinas fetches each repository's index when it is added, when you click **Refresh**, and every `PACKAGE_REPOSITORY_REFRESH_HOURS` (6) after that. This needs outbound HTTPS from the Sinas server. If a refresh fails, the error is shown on the repository and the last good index stays in use.
+
+**A repository is a URL serving `index.json`.** The index lists each package's name, version, the path of its `package.yaml` relative to that URL, and the file's SHA-256:
+
+```json
+{
+  "schema": "sinas.package-index/v1",
+  "packages": [
+    {"name": "github", "version": "0.1.0", "description": "GitHub integration",
+     "path": "packages/github/package.yaml", "sha256": "…"}
+  ]
+}
+```
+
+A GitHub repository URL (`https://github.com/<owner>/<repo>`, optionally `/tree/<branch>/<folder>`) is read from `raw.githubusercontent.com`; any other URL is the base the index and paths are under. A package file that doesn't match its index checksum is refused. [sinas-platform/packages](https://github.com/sinas-platform/packages) shows how to generate the index (`scripts/build_index.py`).
+
+**Private repositories:** set `auth` to send a token, kept in a shared [Secret](/build-resources/secrets), with every request. `bearer` sends `Authorization: Bearer <value>`; `header` sends the value in the header you name. Credentials never go in the URL.
+
+```yaml
+packageRepositories:
+  - name: sinas-official
+    url: https://github.com/sinas-platform/packages
+  - name: internal
+    url: https://packages.internal.example.com/sinas
+    auth: {type: bearer, secret: PACKAGES_TOKEN}
+```
+
+**API:**
+
+```
+GET    /api/v1/package-repositories                 # List, with refresh state
+POST   /api/v1/package-repositories                 # Add (fetches the index)
+POST   /api/v1/package-repositories/official        # Add the official repository
+PUT    /api/v1/package-repositories/{name}          # Update
+DELETE /api/v1/package-repositories/{name}          # Remove (installed packages stay)
+POST   /api/v1/package-repositories/{name}/refresh  # Fetch the index now
+GET    /api/v1/packages/catalog                     # Packages on offer, installed versions, updates
+POST   /api/v1/packages/install  {"repository": "sinas-official", "package": "github"}
+```
+
+`GET /api/v1/packages` and `GET /api/v1/packages/{name}` include `source_repository`, `latest_version` and `update_available`. A package installed by pasting its YAML follows the first repository that offers a package by its name.
+
+Repositories are admin-only: `sinas.package_repositories.{create,read,update,delete}:all`. Installing from one needs `sinas.packages.install:all`, like any install.
 
 ## Installing a package more than once
 
