@@ -6,6 +6,7 @@ against the index's checksum), and reports when an installed package has a
 newer version published. The repository here is served by an httpx
 MockTransport: no network.
 """
+import contextlib
 import hashlib
 import json
 import uuid
@@ -277,6 +278,46 @@ class TestHardening:
         r = await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name},
                               headers=auth_headers(admin_user))
         assert r.status_code == 502 and "declares" in r.json()["detail"]
+
+    @pytest.mark.parametrize("body", ["package: demo\n", "package: [1, 2]\n", "- just\n- a list\n"])
+    async def test_a_file_without_package_metadata_is_refused(self, client, admin_user, fake_repo, body):
+        name = f"demo{_uid()}"
+        fake_repo.publish(name, "1.0.0")
+        fake_repo.files[f"packages/{name}/package.yaml"] = body.encode()
+        index = fake_repo._index()
+        index["packages"][0]["sha256"] = hashlib.sha256(body.encode()).hexdigest()
+        fake_repo.files["index.json"] = json.dumps(index).encode()
+        repo = await _add(client, admin_user)
+        r = await client.post("/api/v1/packages/install", json={"repository": repo["name"], "package": name},
+                              headers=auth_headers(admin_user))
+        assert r.status_code == 502 and "no package metadata" in r.json()["detail"]
+
+    async def test_a_malformed_redirect_is_recorded_not_raised(self, client, admin_user, fake_repo):
+        fake_repo.redirects[RAW + "index.json"] = "https://["
+        repo = await _add(client, admin_user)
+        assert "could not be fetched" in repo["last_error"] and repo["package_count"] == 0
+
+    async def test_one_failing_repository_does_not_stop_the_scheduled_refresh(self, db, admin_user, monkeypatch):
+        names = [f"r-{_uid()}", f"r-{_uid()}"]
+        for name in names:
+            db.add(PackageRepository(name=name, url=REPO_URL, auth={}, is_active=True, user_id=admin_user.id))
+        await db.flush()
+        tried = []
+
+        @contextlib.asynccontextmanager
+        async def this_session():
+            yield db
+
+        monkeypatch.setattr("app.core.database.AsyncSessionLocal", this_session)
+
+        async def flaky(name):
+            tried.append(name)
+            if name == names[0]:
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(repos, "refresh_named", flaky)
+        await repos.refresh_due()
+        assert set(names) <= set(tried)
 
 
 class TestCatalogAndInstall:

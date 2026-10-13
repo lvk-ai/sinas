@@ -97,7 +97,10 @@ def file_url(repository_url: str, path: str) -> str:
 
 def _safe(url: str) -> str:
     """A URL as error messages may show it: no query (tokens sit there)."""
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "(malformed URL)"
     return f"{parts.scheme}://{parts.hostname or ''}{parts.path}"
 
 
@@ -163,7 +166,8 @@ async def _get(url: str, headers: dict[str, str]) -> bytes:
                         chunks.append(chunk)
                     return b"".join(chunks)
             raise RepositoryError(f"{_safe(url)}: too many redirects")
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        # ValueError: a malformed URL, e.g. a redirect to `https://[`.
         raise RepositoryError(f"{_safe(url)} could not be fetched: {type(e).__name__}") from e
 
 
@@ -276,7 +280,11 @@ async def refresh_due(now: Optional[datetime] = None) -> int:
             )
         ).scalars().all()
     for name in names:
-        await refresh_named(name)
+        try:
+            await refresh_named(name)
+        except Exception:
+            # One repository going wrong must not hold up the others.
+            logger.exception("Refreshing package repository '%s' failed", name)
     return len(names)
 
 
@@ -316,9 +324,12 @@ def _check_declared(text: str, entry: dict[str, Any]) -> None:
     import yaml
 
     try:
-        meta = (yaml.safe_load(text) or {}).get("package") or {}
+        doc = yaml.safe_load(text)
     except Exception as e:
         raise RepositoryError(f"Package '{entry['name']}' is not valid YAML: {e}") from e
+    meta = doc.get("package") if isinstance(doc, dict) else None
+    if not isinstance(meta, dict):
+        raise RepositoryError(f"The file for '{entry['name']}' has no package metadata; refusing it")
     declared = (meta.get("name"), str(meta.get("version")) if meta.get("version") is not None else None)
     if declared != (entry["name"], entry["version"]):
         raise RepositoryError(
