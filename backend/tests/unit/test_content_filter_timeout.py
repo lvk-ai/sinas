@@ -176,3 +176,13 @@ class TestWorkbench:
         assert (await db.execute(
             select(func.count()).select_from(File).where(File.collection_id == target.id)
         )).scalar_one() == 0
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_the_timeout_must_be_positive(value):
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError, match="CONTENT_FILTER_TIMEOUT_SECONDS"):
+        Settings(content_filter_timeout_seconds=value)

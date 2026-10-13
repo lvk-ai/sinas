@@ -1,5 +1,5 @@
 import React from 'react';
-import { useChat, useClient, generateFileUrl } from '@sinas/sdk';
+import { useChat, useClient } from '@sinas/sdk';
 import type { ChatSessionMessage, MessageContent } from '@sinas/sdk';
 
 import { v, tokens, injectBaseStyles } from './tokens';
@@ -156,10 +156,11 @@ export function Chat({
         }, UPLOAD_TIMEOUT_MS);
       });
       const upload = async () => {
-        // uploadFile from the SDK, plus an abort signal (it takes none), so
-        // a timed-out request is cancelled rather than left holding a
-        // connection.
-        await client.fetch(`${client.getConfig().apiBase}/files/default/chat-uploads`, {
+        // uploadFile and generateFileUrl from the SDK, plus an abort signal
+        // (they take none), so a timed-out request is cancelled rather than
+        // left holding a connection.
+        const apiBase = client.getConfig().apiBase;
+        await client.fetch(`${apiBase}/files/default/chat-uploads`, {
           method: 'POST',
           body: JSON.stringify({
             name: uniqueName,
@@ -169,10 +170,11 @@ export function Chat({
           }),
           signal: controller.signal,
         });
-        const urlResult = await generateFileUrl(
-          client, 'default', 'chat-uploads', uniqueName, 2592000,
+        const res = await client.fetch(
+          `${apiBase}/files/default/chat-uploads/${encodeURIComponent(uniqueName)}/url?expires_in=2592000`,
+          { method: 'POST', signal: controller.signal },
         );
-        return urlResult.url;
+        return (await res.json()).url;
       };
       try {
         // Server errors (a content filter rejection or timeout) reject with

@@ -441,6 +441,15 @@ class Settings(BaseSettings):
     # Role assigned to users auto-provisioned via POST /auth/token/exchange
     token_exchange_default_role: str = "GuestUsers"
 
+    @field_validator("content_filter_timeout_seconds")
+    @classmethod
+    def _validate_content_filter_timeout(cls, v: int) -> int:
+        # 0 would fall back to queue_default_timeout (the wait this bounds)
+        # and a negative value rejects every filtered upload: refuse both.
+        if v <= 0:
+            raise ValueError(f"CONTENT_FILTER_TIMEOUT_SECONDS must be positive, got {v}")
+        return v
+
     @field_validator("auth_mode")
     @classmethod
     def _validate_auth_mode(cls, v: str) -> str:
