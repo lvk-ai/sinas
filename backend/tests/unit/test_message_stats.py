@@ -128,10 +128,13 @@ async def test_read_own_counts_only_own_chats(client, db, admin_user):
 
 
 async def test_stats_indexes_exist(db):
-    """The migration and the model declare the same two indexes."""
+    """The migration and the model declare the same two indexes, and the
+    migration keeps the newest pages all-visible for index-only scans."""
     rows = dict((await db.execute(text(
         "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'messages' "
         "AND indexname IN ('ix_messages_created_at', 'ix_messages_created_at_tool_calls')"
     ))).all())
     assert "INCLUDE (chat_id, role)" in rows["ix_messages_created_at"]
     assert "WHERE (tool_calls IS NOT NULL)" in rows["ix_messages_created_at_tool_calls"]
+    reloptions = (await db.execute(text("SELECT reloptions FROM pg_class WHERE relname = 'messages'"))).scalar()
+    assert "autovacuum_vacuum_insert_scale_factor=0.01" in reloptions
