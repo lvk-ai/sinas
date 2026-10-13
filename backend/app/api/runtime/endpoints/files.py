@@ -362,6 +362,7 @@ async def upload_file(
                 trigger_type=TriggerType.MANUAL.value,
                 trigger_id=f"content_filter:{namespace}/{collection}",
                 user_id=user_id,
+                timeout=settings.content_filter_timeout_seconds,
             )
 
             # Validate result structure
@@ -395,6 +396,18 @@ async def upload_file(
 
         except HTTPException:
             raise
+        except TimeoutError:
+            # Fail closed. The filter job may still finish later, but its
+            # result only lands in the job's Redis keys and Execution row —
+            # this request is the only thing that stores the upload, and it
+            # ends here.
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"The content filter '{coll.content_filter_function}' did not answer "
+                    f"within {settings.content_filter_timeout_seconds}s; the file was not stored"
+                ),
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=500,

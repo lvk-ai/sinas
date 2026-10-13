@@ -1,5 +1,5 @@
 import React from 'react';
-import { useChat, useClient, uploadFile, generateFileUrl } from '@sinas/sdk';
+import { useChat, useClient, generateFileUrl } from '@sinas/sdk';
 import type { ChatSessionMessage, MessageContent } from '@sinas/sdk';
 
 import { v, tokens, injectBaseStyles } from './tokens';
@@ -44,6 +44,12 @@ export interface ChatProps {
 // How long Stop waits for the server-side interrupt before closing the
 // stream regardless.
 const STOP_INTERRUPT_WAIT_MS = 3000;
+
+// Client-side ceiling on one attachment upload. Above the server's content
+// filter timeout (CONTENT_FILTER_TIMEOUT_SECONDS, 60s by default) so a slow
+// filter surfaces as the server's own message; this only catches a request
+// that never answers at all.
+const UPLOAD_TIMEOUT_MS = 90_000;
 
 export function Chat({
   agent,
@@ -141,16 +147,46 @@ export function Chat({
       });
 
       const uniqueName = `${chatId || 'new'}-${Date.now()}-${file.name}`;
-      await uploadFile(client, 'default', 'chat-uploads', {
-        name: uniqueName,
-        content_base64: base64,
-        content_type: file.type,
-        visibility: 'private',
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('Upload timed out'));
+          controller.abort();
+        }, UPLOAD_TIMEOUT_MS);
       });
-      const urlResult = await generateFileUrl(
-        client, 'default', 'chat-uploads', uniqueName, 2592000,
-      );
-      return urlResult.url;
+      const upload = async () => {
+        // uploadFile from the SDK, plus an abort signal (it takes none), so
+        // a timed-out request is cancelled rather than left holding a
+        // connection.
+        await client.fetch(`${client.getConfig().apiBase}/files/default/chat-uploads`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: uniqueName,
+            content_base64: base64,
+            content_type: file.type,
+            visibility: 'private',
+          }),
+          signal: controller.signal,
+        });
+        const urlResult = await generateFileUrl(
+          client, 'default', 'chat-uploads', uniqueName, 2592000,
+        );
+        return urlResult.url;
+      };
+      try {
+        // Server errors (a content filter rejection or timeout) reject with
+        // the server's detail as the message; ChatInput shows it.
+        return await Promise.race([upload(), timedOut]);
+      } catch (err) {
+        if (err instanceof Error && err.message) throw err;
+        // A proxy's error page has no detail, and over HTTP/2 no status
+        // text either: never let that become an empty (invisible) error.
+        const status = (err as { status?: number } | null)?.status;
+        throw new Error(status ? `Upload failed (HTTP ${status})` : 'Upload failed');
+      } finally {
+        clearTimeout(timer);
+      }
     },
     [client, chatId],
   );

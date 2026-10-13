@@ -22,7 +22,7 @@ Collections are containers for file uploads with versioning, metadata validation
 - **Versioning** — Every upload creates a new version. Previous versions are preserved.
 - **Metadata** — Each file carries JSON metadata validated against the collection's schema.
 - **Visibility** — Files can be `private` (owner only) or `shared` (users with collection `:all` access).
-- **Content filtering** — Optional function runs on upload that can approve, reject, or modify the file.
+- **Content filtering** — Optional function runs on upload that can approve, reject, or modify the file. The filter must answer within `CONTENT_FILTER_TIMEOUT_SECONDS` (default 60s, time spent queued for a worker included); otherwise the upload fails with `504` and nothing is stored. Uploads never fall back to storing the file unfiltered. The same timeout applies to the workbench filter (`WORKBENCH_CONTENT_FILTER_FUNCTION`).
 
 **Management endpoints:**
 

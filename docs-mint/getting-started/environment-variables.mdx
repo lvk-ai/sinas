@@ -69,6 +69,7 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `MAX_FUNCTION_CPU` | `1.0` | CPU cores per function |
 | `MAX_FUNCTION_STORAGE` | `1g` | Disk storage limit |
 | `FUNCTION_CONTAINER_IDLE_TIMEOUT` | `3600` | Idle container cleanup (seconds) |
+| `CONTENT_FILTER_TIMEOUT_SECONDS` | `60` | How long an upload waits for its content filter (a collection's `content_filter_function` or `WORKBENCH_CONTENT_FILTER_FUNCTION`), queue wait included. On expiry the upload is rejected with `504` and nothing is stored |
 | `ALLOW_PACKAGE_INSTALLATION` | `true` | Allow `pip install` in functions |
 | `ALLOWED_PACKAGES` | _(all)_ | Comma-separated package whitelist |
 | `MAX_EXECUTION_DEPTH` | _(= workers)_ | Max nesting depth for execution chains (a function/agent invoking another execution). A deeper call is rejected fast instead of deadlocking the shared pool. Defaults to `DEFAULT_WORKER_COUNT`; `0` disables. |
