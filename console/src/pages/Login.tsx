@@ -66,7 +66,11 @@ export function Login() {
 
     try {
       // A domain that must use single sign-on goes straight to its provider.
-      const sso = enforced ?? (ssoProviders.length > 0 ? await apiClient.discoverSsoProvider(email).catch(() => null) : null);
+      const asked = email;
+      const sso = enforced ?? (ssoProviders.length > 0 ? await apiClient.discoverSsoProvider(asked).catch(() => null) : null);
+      // Edited while the lookup ran: that answer is for an address no longer
+      // in the box. Stop here; the next submit looks up the new one.
+      if (emailRef.current !== asked) return;
       if (sso) {
         await signInWith(sso);
         return;
