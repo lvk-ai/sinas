@@ -81,6 +81,15 @@ executor:
   installDependencies: true
   podReadyTimeout: 120
 
+## System page (console → System) on Kubernetes: the backend lists this
+## release's pods and, when metrics-server is installed, reads their
+## CPU/memory from metrics.k8s.io. rbac renders a read-only Role for that
+## (get/list on pods and pods.metrics.k8s.io, this namespace only), bound to
+## the backend's service account. Set false if you manage RBAC yourself; the
+## page then says what it can't read instead of showing numbers.
+systemStats:
+  rbac: true
+
 ## Pull secret for private registries (applies to sinas images AND sandbox
 ## pods, via their ServiceAccounts). Leave username empty for public images.
 registry:

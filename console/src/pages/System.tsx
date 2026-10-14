@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
-import { useState, Fragment } from 'react';
+import { useState, Fragment, type ReactNode } from 'react';
 import { Server, Plus, Minus, RefreshCw, AlertTriangle, RotateCcw, Box, X, AlertCircle, Info, RotateCw, Trash2, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 
 function formatAge(seconds: number): string {
@@ -41,13 +41,22 @@ function ResourceBar({ value, label, unit }: { value: number | null; label: stri
   );
 }
 
+function UnavailableNote({ children }: { children: ReactNode }) {
+  return (
+    <div className="mb-4 p-3 bg-surface-1 border border-line-soft rounded-lg text-sm text-gray-400 flex items-start gap-2">
+      <Info className="w-4 h-4 flex-shrink-0 mt-0.5" />
+      <span>{children}</span>
+    </div>
+  );
+}
+
 export function System() {
   const queryClient = useQueryClient();
   const [jobStatusFilter, setJobStatusFilter] = useState<string>('');
   const [restartingContainer, setRestartingContainer] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
 
-  const { data: systemHealth } = useQuery({
+  const { data: systemHealth, isError: systemHealthError } = useQuery({
     queryKey: ['system-health'],
     queryFn: () => apiClient.getSystemHealth(false),
     refetchInterval: 10000,
@@ -198,8 +207,8 @@ export function System() {
   const getServiceStatusColor = (status: string) => {
     switch (status) {
       case 'running': return 'text-green-400';
-      case 'exited': case 'dead': return 'text-red-400';
-      case 'restarting': return 'text-yellow-400';
+      case 'exited': case 'dead': case 'failed': return 'text-red-400';
+      case 'restarting': case 'pending': case 'terminating': return 'text-yellow-400';
       default: return 'text-gray-400';
     }
   };
@@ -225,6 +234,11 @@ export function System() {
     ...(poolStats?.idle_containers || []).map((c: any) => ({ ...c, state: 'idle' as const })),
   ];
 
+  // Only the Docker pool / Docker shared workers can be scaled from here;
+  // an older backend doesn't send `scalable`, so missing means scalable.
+  const poolScalable = poolStats?.scalable !== false;
+  const sharedScalable = sharedPoolCount?.scalable !== false;
+
   const poolUtilPct = poolMax ? Math.round((poolTotal / poolMax) * 100) : 0;
   const poolBusyPct = poolTotal > 0 ? Math.round((poolInUse / poolTotal) * 100) : 0;
 
@@ -243,12 +257,26 @@ export function System() {
   const statsServices = systemHealthWithStats?.services || [];
   const statsMap = new Map(statsServices.map((s: any) => [s.name, s]));
   const services = fastServices.map((s: any) => ({ ...s, ...(statsMap.get(s.name) || {}) }));
+  // On Kubernetes the services are the release's pods (no Docker socket):
+  // no restart action, and CPU/memory only where metrics-server is installed.
+  const isK8s = (systemHealth?.deployment ?? systemHealthWithStats?.deployment) === 'kubernetes';
+  const servicesUnavailable = systemHealthError
+    ? 'Could not load service status.'
+    : systemHealth?.services_unavailable_reason;
+  const metricsUnavailable = systemHealthWithStats?.metrics_unavailable_reason;
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold text-gray-100">System</h1>
-        <p className="text-gray-400 mt-1">Workers, queues, and execution infrastructure</p>
+        <p className="text-gray-400 mt-1">
+          Workers, queues, and execution infrastructure
+          {systemHealth?.deployment && (
+            <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-surface-1 text-gray-400">
+              {isK8s ? 'Kubernetes' : 'Docker'}
+            </span>
+          )}
+        </p>
       </div>
 
       {/* Health Warnings */}
@@ -354,9 +382,9 @@ export function System() {
           </div>
         </div>
 
-        {/* Host Resources */}
-        <div className="card">
-          <h3 className="text-sm font-medium text-gray-500 uppercase tracking-wider">Host</h3>
+        {/* Host Resources — on Kubernetes, /proc in the backend pod shows its node */}
+        <div className="card" title={isK8s ? 'Resources of the node running this backend pod' : undefined}>
+          <h3 className="text-sm font-medium text-gray-500 uppercase tracking-wider">{isK8s ? 'Node' : 'Host'}</h3>
           <div className="mt-3 space-y-2">
             <ResourceBar value={host.cpu_percent} label="CPU" unit="%" />
             <ResourceBar value={host.memory_percent} label="Mem" unit="%" />
@@ -389,10 +417,13 @@ export function System() {
       )}
 
       {/* Services */}
-      {services.length > 0 && (
+      {(services.length > 0 || servicesUnavailable) && (
         <div className="card">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-gray-100">Services</h2>
+            <div>
+              <h2 className="text-lg font-semibold text-gray-100">Services</h2>
+              {isK8s && <p className="text-sm text-gray-400 mt-1">Pods of this release</p>}
+            </div>
             <button
               onClick={() => queryClient.invalidateQueries({ queryKey: ['system-health'] })}
               className="btn btn-secondary flex items-center"
@@ -401,6 +432,13 @@ export function System() {
               <RefreshCw className="w-4 h-4" />
             </button>
           </div>
+          {servicesUnavailable && (
+            <UnavailableNote>{servicesUnavailable}</UnavailableNote>
+          )}
+          {metricsUnavailable && services.length > 0 && (
+            <UnavailableNote>{metricsUnavailable}</UnavailableNote>
+          )}
+          {services.length > 0 && (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
               <thead>
@@ -408,10 +446,11 @@ export function System() {
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">Service</th>
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">Status</th>
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">Health</th>
+                  {isK8s && <th className="text-left py-2 pr-4 font-medium text-gray-500">Restarts</th>}
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">Uptime</th>
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">CPU</th>
                   <th className="text-left py-2 pr-4 font-medium text-gray-500">Memory</th>
-                  <th className="text-right py-2 font-medium text-gray-500">Action</th>
+                  {!isK8s && <th className="text-right py-2 font-medium text-gray-500">Action</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.04]">
@@ -427,12 +466,21 @@ export function System() {
                       <span className={`font-medium ${getServiceStatusColor(svc.status)}`}>
                         {svc.status}
                       </span>
+                      {svc.status_reason && (
+                        <div className="text-xs text-gray-500">{svc.status_reason}</div>
+                      )}
                     </td>
                     <td className="py-2 pr-4">
                       <span className={`${getHealthColor(svc.health)}`}>
                         {svc.health === 'none' ? '-' : svc.health}
                       </span>
+                      {svc.ready && <span className="text-xs text-gray-500 ml-1">{svc.ready}</span>}
                     </td>
+                    {isK8s && (
+                      <td className={`py-2 pr-4 ${svc.restarts > 0 ? 'text-yellow-400' : 'text-gray-400'}`}>
+                        {svc.restarts ?? '-'}
+                      </td>
+                    )}
                     <td className="py-2 pr-4 text-gray-400">
                       {svc.uptime_seconds > 0 ? formatUptimeSeconds(svc.uptime_seconds) : '-'}
                     </td>
@@ -443,12 +491,15 @@ export function System() {
                       {svc.status === 'running' && svc.memory ? (
                         <span>
                           {svc.memory.used_mb}MB
-                          <span className="text-gray-500 text-xs ml-1">
-                            ({svc.memory.percent}%)
-                          </span>
+                          {svc.memory.percent != null && (
+                            <span className="text-gray-500 text-xs ml-1">
+                              ({svc.memory.percent}%)
+                            </span>
+                          )}
                         </span>
                       ) : '-'}
                     </td>
+                    {!isK8s && (
                     <td className="py-2 text-right">
                       <button
                         onClick={() => {
@@ -471,11 +522,13 @@ export function System() {
                         {restartingContainer === svc.name ? 'Confirm' : 'Restart'}
                       </button>
                     </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          )}
         </div>
       )}
 
@@ -489,6 +542,7 @@ export function System() {
               <p className="text-sm text-gray-400 mt-1">Isolated containers for function and code execution</p>
             </div>
             <div className="flex items-center gap-2">
+              {poolScalable && (<>
               <button
                 onClick={() => handlePoolScale(-1)}
                 disabled={poolTotal === 0 || poolScaleMutation.isPending}
@@ -506,6 +560,7 @@ export function System() {
               >
                 {poolScaleMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
               </button>
+              </>)}
               <button
                 onClick={() => queryClient.invalidateQueries({ queryKey: ['container-stats'] })}
                 className="btn btn-secondary flex items-center"
@@ -533,6 +588,9 @@ export function System() {
               Failed to scale sandbox containers.
             </div>
           )}
+
+          {poolStats?.unavailable_reason && <UnavailableNote>{poolStats.unavailable_reason}</UnavailableNote>}
+          {poolStats?.note && <p className="mb-4 text-xs text-gray-500">{poolStats.note}</p>}
 
           {allSandboxContainers.length === 0 ? (
             <div className="text-center py-4">
@@ -562,10 +620,16 @@ export function System() {
                         </span>
                       </td>
                       <td className="py-2 pr-4 text-gray-400">
-                        {c.executions}
-                        <span className="text-gray-500"> / {poolStats?.max_executions ?? '?'}</span>
+                        {c.executions == null ? (
+                          <span className="text-gray-500">single-use</span>
+                        ) : (
+                          <>
+                            {c.executions}
+                            <span className="text-gray-500"> / {poolStats?.max_executions ?? '?'}</span>
+                          </>
+                        )}
                       </td>
-                      <td className="py-2 text-gray-400">{formatAge(c.age_seconds)}</td>
+                      <td className="py-2 text-gray-400">{c.age_seconds != null ? formatAge(c.age_seconds) : '-'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -582,6 +646,7 @@ export function System() {
               <p className="text-sm text-gray-400 mt-1">Persistent containers for <code className="px-1 py-0.5 bg-surface-1 rounded text-xs">shared</code> execution mode functions</p>
             </div>
             <div className="flex items-center gap-2">
+              {sharedScalable && (<>
               <button
                 onClick={() => handleSharedPoolScale(-1)}
                 disabled={sharedCount === 0 || sharedPoolScaleMutation.isPending}
@@ -599,6 +664,7 @@ export function System() {
               >
                 {sharedPoolScaleMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
               </button>
+              </>)}
               <button
                 onClick={() => queryClient.invalidateQueries({ queryKey: ['shared-pool'] })}
                 className="btn btn-secondary flex items-center"
@@ -614,6 +680,9 @@ export function System() {
               Failed to scale shared containers.
             </div>
           )}
+
+          {sharedPoolCount?.unavailable_reason && <UnavailableNote>{sharedPoolCount.unavailable_reason}</UnavailableNote>}
+          {sharedPoolCount?.note && <p className="mb-4 text-xs text-gray-500">{sharedPoolCount.note}</p>}
 
           {!sharedPoolContainers || sharedPoolContainers.length === 0 ? (
             <div className="text-center py-4">

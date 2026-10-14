@@ -30,9 +30,14 @@ class ScaleWorkersResponse(BaseModel):
 
 
 class WorkerCountResponse(BaseModel):
-    """Response for worker count."""
+    """Response for worker count, plus which trusted executor it describes."""
 
     count: int
+    executor: str | None = None
+    deployment: str | None = None
+    scalable: bool = True
+    note: str | None = None
+    unavailable_reason: str | None = None
 
 
 class WorkerReloadResponse(BaseModel):

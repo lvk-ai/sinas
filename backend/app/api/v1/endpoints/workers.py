@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import check_permission
 from app.schemas.worker import (
@@ -14,6 +15,7 @@ from app.schemas.worker import (
     WorkerResponse,
 )
 from app.services.container_pool import container_pool
+from app.services.executor_status import trusted_worker_count, trusted_workers
 from app.services.shared_worker_manager import shared_worker_manager
 
 router = APIRouter(prefix="/workers", tags=["workers"])
@@ -39,7 +41,7 @@ async def list_workers(
 
     set_permission_used(request, permission)
 
-    workers = await shared_worker_manager.list_workers()
+    workers, _ = await trusted_workers()
 
     return workers
 
@@ -64,6 +66,13 @@ async def scale_workers(
         raise HTTPException(status_code=403, detail="Not authorized to scale workers")
 
     set_permission_used(request, permission)
+
+    if settings.trusted_executor != "docker_shared":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only docker_shared workers can be scaled; this deployment uses "
+            f"{settings.trusted_executor}.",
+        )
 
     # Validate target count
     if scale_request.target_count < 0:
@@ -95,9 +104,7 @@ async def get_worker_count(
 
     set_permission_used(request, permission)
 
-    count = shared_worker_manager.get_worker_count()
-
-    return WorkerCountResponse(count=count)
+    return WorkerCountResponse(**await trusted_worker_count())
 
 
 @router.post("/reload")

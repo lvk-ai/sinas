@@ -1295,7 +1295,14 @@ class APIClient {
     return response.data;
   }
 
-  async getWorkerCount(): Promise<{ count: number }> {
+  async getWorkerCount(): Promise<{
+    count: number;
+    executor?: string;
+    deployment?: string;
+    scalable?: boolean;
+    note?: string | null;
+    unavailable_reason?: string | null;
+  }> {
     const response = await this.configClient.get('/workers/count');
     return response.data;
   }

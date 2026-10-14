@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.auth import require_permission
 from app.core.config import settings
 from app.schemas.system import ContainerRestartResponse, HealthResponse
+from app.services import k8s_stats
+from app.services.k8s_stats import deployment_mode
 from app.services.queue_service import queue_service
 
 logger = logging.getLogger(__name__)
@@ -257,13 +259,8 @@ def _generate_warnings(
     return warnings
 
 
-@router.get("/health")
-async def get_system_health(
-    include_stats: bool = Query(False, description="Include per-container CPU/memory stats (slow)"),
-    user_id: str = Depends(require_permission("sinas.system.read:all")),
-) -> HealthResponse:
-    """Comprehensive system health check — queries Docker directly."""
-    services = []
+async def _docker_services(include_stats: bool) -> tuple[list[dict], str | None]:
+    """Sinas containers from the Docker socket. Returns (services, unavailable_reason)."""
     try:
         client = docker.from_env()
 
@@ -273,39 +270,71 @@ async def get_system_health(
             all=True,
             filters={"name": "sinas"},
         )
-
-        compose_containers = []
-        for c in all_containers:
-            # Skip the executor image-builder container (exits immediately by design)
-            if c.name.startswith("sinas-executor"):
-                continue
-            labels = c.labels or {}
-            service = labels.get("com.docker.compose.service", c.name)
-            # Sandbox/shared containers inherit service=executor from the image,
-            # use a more descriptive service name instead
-            if c.name.startswith("sinas-sandbox-"):
-                service = "sandbox"
-            elif c.name.startswith("sinas-shared-"):
-                service = "shared"
-            compose_containers.append((c, service))
-
-        # Get container info in parallel
-        async def get_info(container, service_name):
-            info = await asyncio.to_thread(_get_container_info, container, include_stats)
-            info["service"] = service_name
-            return info
-
-        services = await asyncio.gather(
-            *[get_info(c, svc) for c, svc in compose_containers],
-            return_exceptions=True,
-        )
-        services = [s for s in services if isinstance(s, dict)]
-
-        # Sort: critical infra first, then alphabetical
-        priority = {"redis": 0, "postgres": 1, "pgbouncer": 2, "clickhouse": 3, "backend": 4}
-        services.sort(key=lambda s: (priority.get(s["service"], 99), s["name"]))
     except Exception as e:
         logger.warning(f"Failed to query Docker for health check: {e}")
+        return [], (
+            f"Docker API not reachable from the backend ({type(e).__name__}); "
+            "service status needs the Docker socket mounted into this container."
+        )
+
+    compose_containers = []
+    for c in all_containers:
+        # Skip the executor image-builder container (exits immediately by design)
+        if c.name.startswith("sinas-executor"):
+            continue
+        labels = c.labels or {}
+        service = labels.get("com.docker.compose.service", c.name)
+        # Sandbox/shared containers inherit service=executor from the image,
+        # use a more descriptive service name instead
+        if c.name.startswith("sinas-sandbox-"):
+            service = "sandbox"
+        elif c.name.startswith("sinas-shared-"):
+            service = "shared"
+        compose_containers.append((c, service))
+
+    # Get container info in parallel
+    async def get_info(container, service_name):
+        info = await asyncio.to_thread(_get_container_info, container, include_stats)
+        info["service"] = service_name
+        return info
+
+    services = await asyncio.gather(
+        *[get_info(c, svc) for c, svc in compose_containers],
+        return_exceptions=True,
+    )
+    services = [s for s in services if isinstance(s, dict)]
+
+    # Sort: critical infra first, then alphabetical
+    priority = {"redis": 0, "postgres": 1, "pgbouncer": 2, "clickhouse": 3, "backend": 4}
+    services.sort(key=lambda s: (priority.get(s["service"], 99), s["name"]))
+    return services, None
+
+
+@router.get("/health")
+async def get_system_health(
+    include_stats: bool = Query(False, description="Include per-container CPU/memory stats (slow)"),
+    user_id: str = Depends(require_permission("sinas.system.read:all")),
+) -> HealthResponse:
+    """Comprehensive system health check.
+
+    Services come from the Docker socket on docker deployments and from the
+    Kubernetes API (release pods + metrics.k8s.io) on Kubernetes. A source
+    that can't be read degrades to an `*_unavailable_reason` instead of a 500.
+    """
+    deployment = deployment_mode()
+    services: list[dict] = []
+    services_reason: str | None = None
+    metrics_reason: str | None = None
+    try:
+        if deployment == "kubernetes":
+            services, services_reason, metrics_reason = await k8s_stats.list_services(
+                include_stats
+            )
+        else:
+            services, services_reason = await _docker_services(include_stats)
+    except Exception as e:
+        logger.warning(f"Failed to list services for health check: {e}")
+        services_reason = f"Service status unavailable ({type(e).__name__})."
 
     # Get host resources (blocking /proc reads, run in thread)
     try:
@@ -335,7 +364,18 @@ async def get_system_health(
 
     warnings = _generate_warnings(services, queue_workers, dlq_size, queue_stats, host)
 
-    return HealthResponse(warnings=warnings, services=services, host=host)
+    return HealthResponse(
+        warnings=warnings,
+        services=services,
+        host=host,
+        deployment=deployment,
+        executors={
+            "sandbox": settings.sandbox_executor,
+            "trusted": settings.trusted_executor,
+        },
+        services_unavailable_reason=services_reason,
+        metrics_unavailable_reason=metrics_reason,
+    )
 
 
 @router.post("/containers/{container_name}/restart")
@@ -343,12 +383,24 @@ async def restart_container(
     container_name: str,
     user_id: str = Depends(require_permission("sinas.system.update:all")),
 ) -> dict[str, str]:
-    """Restart a Docker container by name."""
-    client = docker.from_env()
+    """Restart a Docker container by name (docker deployments only)."""
+    if deployment_mode() == "kubernetes":
+        raise HTTPException(
+            status_code=409,
+            detail="Restarting from the console is only available on Docker deployments; "
+            "on Kubernetes use `kubectl rollout restart` (or delete the pod).",
+        )
     try:
+        client = docker.from_env()
         container = await asyncio.to_thread(client.containers.get, container_name)
     except docker.errors.NotFound:
-        raise HTTPException(status_code=404, detail=f"Container '{container_name}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Container '{container_name}' not found"
+        ) from None
+    except docker.errors.DockerException as e:
+        raise HTTPException(
+            status_code=503, detail=f"Docker API not reachable from the backend ({type(e).__name__})"
+        ) from e
 
     await asyncio.to_thread(container.restart, timeout=15)
     return ContainerRestartResponse(status="restarted", container=container_name)

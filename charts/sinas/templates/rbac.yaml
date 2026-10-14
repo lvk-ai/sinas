@@ -56,3 +56,41 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "sinas.executorManagerSA" . }}
     namespace: {{ .Release.Namespace }}
+{{- /* On unless explicitly false; a --reuse-values upgrade from a release
+       without the key keeps it on. */}}
+{{- $systemStats := .Values.systemStats | default dict }}
+{{- if or (not (hasKey $systemStats "rbac")) $systemStats.rbac }}
+---
+## System page stats — read-only. The console's System page lists the
+## release's pods (phase, ready, restarts, age) and, where metrics-server is
+## installed, their CPU/memory from metrics.k8s.io. Bound to the backend's
+## SA. Without metrics-server the metrics rule is simply unused.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-system-stats
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-system-stats
+  labels:
+    {{- include "sinas.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-system-stats
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sinas.executorManagerSA" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
