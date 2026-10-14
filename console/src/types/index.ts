@@ -855,6 +855,16 @@ export interface PackageCatalogEntry {
 
 
 // LLM Providers
+// Per-token USD prices, in LiteLLM's field names
+export interface ModelPricing {
+  input_cost_per_token?: number;
+  output_cost_per_token?: number;
+  cache_read_input_token_cost?: number;
+  cache_creation_input_token_cost?: number;
+  input_cost_per_token_batches?: number;
+  output_cost_per_token_batches?: number;
+}
+
 export interface LLMProvider {
   id: string;
   name: string;
@@ -864,6 +874,9 @@ export interface LLMProvider {
   config: Record<string, any>;
   is_default: boolean;
   is_active: boolean;
+  pricing: Record<string, ModelPricing>;
+  model_aliases: Record<string, string>;
+  discount: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -877,6 +890,9 @@ export interface LLMProviderCreate {
   config?: Record<string, any>;
   is_default?: boolean;
   is_active?: boolean;
+  pricing?: Record<string, ModelPricing>;
+  model_aliases?: Record<string, string>;
+  discount?: number | null;
 }
 
 export interface LLMProviderUpdate {
@@ -888,6 +904,95 @@ export interface LLMProviderUpdate {
   config?: Record<string, any>;
   is_default?: boolean;
   is_active?: boolean;
+  pricing?: Record<string, ModelPricing>;
+  model_aliases?: Record<string, string>;
+  // null clears it
+  discount?: number | null;
+}
+
+// LLM usage and cost (/api/v1/usage)
+export interface UsageMetrics {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+  unpriced_calls: number;
+  errors: number;
+}
+
+export type UsageDimension = 'agent' | 'provider' | 'model' | 'user' | 'source' | 'chat' | 'batch' | 'day' | 'hour';
+
+export interface UsageFilters {
+  from?: string;
+  to?: string;
+  agent?: string[];
+  provider?: string[];
+  model?: string[];
+  user_id?: string[];
+  source?: string[];
+  chat_id?: string[];
+}
+
+export interface UsageSummary {
+  from: string | null;
+  to: string;
+  group_by: UsageDimension[];
+  totals: UsageMetrics;
+  groups: Array<UsageMetrics & { key: Record<string, string | boolean | null> }>;
+  truncated: boolean;
+}
+
+export interface UsageTimeseries {
+  from: string;
+  to: string;
+  interval: 'hour' | 'day';
+  points: Array<UsageMetrics & { bucket: string }>;
+}
+
+export interface RatecardSource {
+  source: 'json' | 'file' | 'url';
+  configured: boolean;
+  models: number;
+  error: string | null;
+  path?: string | null;
+  url?: string | null;
+  fetched_at?: string | null;
+  checked_at?: string | null;
+}
+
+export interface RatecardModelInUse {
+  provider: string | null;
+  provider_type: string | null;
+  model: string;
+  calls: number;
+  unpriced_calls: number;
+  last_used: string | null;
+  priced_as: string | null;
+  matched_key: string | null;
+  source: 'provider' | 'deployment' | null;
+  origin: string | null;
+  discount: number | null;
+  price: ModelPricing | null;
+}
+
+export interface Ratecard {
+  sources: RatecardSource[];
+  deployment_models: number;
+  providers: Array<{
+    name: string;
+    provider_type: string;
+    is_active: boolean;
+    pricing: Record<string, ModelPricing>;
+    model_aliases: Record<string, string>;
+    discount: number | null;
+  }>;
+  days: number;
+  models_in_use: RatecardModelInUse[];
+  unpriced_models: RatecardModelInUse[];
+  deployment_entries: Array<{ model: string; origin: string; litellm_provider: string | null; price: ModelPricing }>;
 }
 
 // Templates

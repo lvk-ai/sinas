@@ -86,6 +86,11 @@ export function Dashboard() {
     return `${n}`;
   };
   const cacheTokens = (messageStats?.llm_cache_read_tokens || 0) + (messageStats?.llm_cache_write_tokens || 0);
+  const cost = messageStats?.llm_cost_usd || 0;
+  const tokenSubtitle = [
+    cost > 0 ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}` : '',
+    cacheTokens > 0 ? `${formatTokens(cacheTokens)} cached` : '',
+  ].filter(Boolean).join(' · ');
 
   const stats: Array<{ name: string; value: number | string; icon: any; color: string; subtitle?: string }> = [
     { name: 'Messages (7d)', value: messageStats?.total_messages || 0, icon: MessageSquare, color: 'blue' },
@@ -97,7 +102,7 @@ export function Dashboard() {
       value: formatTokens(messageStats?.llm_total_tokens || 0),
       icon: Coins,
       color: 'cyan',
-      subtitle: cacheTokens > 0 ? `${formatTokens(cacheTokens)} cached` : undefined,
+      subtitle: tokenSubtitle || undefined,
     },
   ];
 

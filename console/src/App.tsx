@@ -23,6 +23,7 @@ import { WebhookEditor } from './pages/WebhookEditor';
 import { Schedules } from './pages/Schedules';
 import { ScheduleEditor } from './pages/ScheduleEditor';
 import { RequestLogs } from './pages/RequestLogs';
+import { Usage } from './pages/Usage';
 import { LLMProviders } from './pages/LLMProviders';
 import { ChangeHistory } from './pages/ChangeHistory';
 import { ConfigManager } from './pages/ConfigManager';
@@ -184,6 +185,7 @@ function App() {
               <Route path="secrets" element={<Secrets />} />
               <Route path="stores" element={<Stores />} />
               <Route path="logs" element={<RequestLogs />} />
+              <Route path="usage" element={<Usage />} />
               <Route path="system" element={<System />} />
               <Route path="users" element={<Users />} />
               <Route path="identity-providers" element={<IdentityProviders />} />

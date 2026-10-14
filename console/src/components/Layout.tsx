@@ -35,6 +35,7 @@ import {
   Plug,
   Workflow,
   Fingerprint,
+  CircleDollarSign,
 } from 'lucide-react';
 import { useState } from 'react';
 
@@ -91,6 +92,7 @@ const navigationSections = [
       { name: 'Single Sign-On', href: '/identity-providers', icon: Fingerprint },
       { name: 'API Keys', href: '/api-keys', icon: Key },
       { name: 'Logs', href: '/logs', icon: Activity },
+      { name: 'Usage', href: '/usage', icon: CircleDollarSign },
       { name: 'System', href: '/system', icon: Server },
       { name: 'Config Manager', href: '/config', icon: Settings },
       { name: 'Change History', href: '/history', icon: History },

@@ -101,6 +101,11 @@ import type {
   SsoProvider,
   SsoExchangeResponse,
   PackageCatalogEntry,
+  UsageDimension,
+  UsageFilters,
+  UsageSummary,
+  UsageTimeseries,
+  Ratecard,
 } from '../types';
 
 /** Request config whose listed error statuses don't raise the global error
@@ -1485,6 +1490,43 @@ class APIClient {
 
   async getMessageStats(days: number = 7): Promise<any> {
     const response = await this.configClient.get('/messages/stats', { params: { days } });
+    return response.data;
+  }
+
+  // LLM usage and cost. Repeated filters go out as agent=a&agent=b.
+  async getUsageSummary(filters: UsageFilters, groupBy: UsageDimension[] = [], limit = 1000): Promise<UsageSummary> {
+    const response = await this.configClient.get('/usage/summary', {
+      params: { ...filters, group_by: groupBy, limit },
+      paramsSerializer: { indexes: null },
+    });
+    return response.data;
+  }
+
+  async getUsageTimeseries(filters: UsageFilters, interval: 'hour' | 'day'): Promise<UsageTimeseries> {
+    const response = await this.configClient.get('/usage/timeseries', {
+      params: { ...filters, interval },
+      paramsSerializer: { indexes: null },
+    });
+    return response.data;
+  }
+
+  // Admins only: a 403 is how the page learns to leave the ratecard out.
+  async getRatecard(params: { days?: number; search?: string } = {}): Promise<Ratecard> {
+    const response = await this.configClient.get('/usage/ratecard', { params, quietStatuses: [403] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  async refreshRatecard(): Promise<{ refreshed: boolean; models: number; fetched_at: string | null; error: string | null }> {
+    const response = await this.configClient.post('/usage/ratecard/refresh');
+    return response.data;
+  }
+
+  async backfillUsageCosts(range: { from?: string; to?: string }): Promise<{
+    examined_calls: number;
+    priced_calls: number;
+    unpriced_calls: number;
+  }> {
+    const response = await this.configClient.post('/usage/backfill', range);
     return response.data;
   }
 
