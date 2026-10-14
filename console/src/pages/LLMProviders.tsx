@@ -118,7 +118,7 @@ function PricingFields({
           autoFocus={focus === 'family'}
           onChange={(e) => {
             const value = e.target.value;
-            if (value === OTHER_FAMILY) onChange({ ...draft, otherFamily: true, pricingProvider: known ? '' : family });
+            if (value === OTHER_FAMILY) onChange({ ...draft, otherFamily: true, pricingProvider: family });
             else onChange({ ...draft, otherFamily: false, pricingProvider: value });
           }}
           className="input"
@@ -398,6 +398,7 @@ export function LLMProviders() {
     mutationFn: (providerId: string) => apiClient.deleteLLMProvider(providerId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['llmProviders'] });
+      queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
     },
   });
 
