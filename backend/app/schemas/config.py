@@ -91,11 +91,12 @@ class LLMProviderConfig(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     isActive: Optional[bool] = None
     # Pricing (docs/design/usage-cost.md): {model: LiteLLM per-token fields},
-    # {model as called: ratecard model}, and a multiplier on deployment
-    # ratecard prices.
+    # {model as called: ratecard model}, a multiplier on deployment
+    # ratecard prices, and the LiteLLM provider family to price models as.
     pricing: Optional[dict[str, dict[str, Any]]] = None
     modelAliases: Optional[dict[str, str]] = None
     discount: Optional[float] = None
+    pricingProvider: Optional[str] = None
 
 
 class DatabaseAnnotationConfig(BaseModel):

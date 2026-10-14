@@ -665,3 +665,111 @@ def test_concurrent_indexes_have_a_revision_of_their_own():
     source = (versions / "c2u3s4i5d6x7_llm_usage_cost_indexes.py").read_text()
     for index in ("idx_llm_usage_agent_created", "idx_llm_usage_provider_created"):
         assert source.index(f"DROP INDEX CONCURRENTLY IF EXISTS {index}") < source.index(f"CREATE INDEX CONCURRENTLY {index}")
+
+
+# OpenAI-compatible APIs of other providers, as LiteLLM lists them.
+COMPATIBLE = {
+    **LITELLM,
+    "mistral/mistral-large-latest": {
+        "input_cost_per_token": 2e-06, "output_cost_per_token": 6e-06, "litellm_provider": "mistral",
+    },
+    "mistral/gpt-4o": {  # a clash, to show the family's own key wins
+        "input_cost_per_token": 9e-06, "output_cost_per_token": 9e-06, "litellm_provider": "mistral",
+    },
+    "groq/llama-3.1-8b-instant": {
+        "input_cost_per_token": 5e-08, "output_cost_per_token": 8e-08, "litellm_provider": "groq",
+    },
+    "vertex_ai/claude-sonnet-4-5": {
+        "input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05,
+        "litellm_provider": "vertex_ai-anthropic_models",
+    },
+    "gemini-1.5-pro": {
+        "input_cost_per_token": 1.25e-06, "output_cost_per_token": 5e-06,
+        "litellm_provider": "vertex_ai-language-models",
+    },
+    "low/1024-x-1024/some-image-model": {  # a size prefix, not a family
+        "input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06, "litellm_provider": "openai",
+    },
+}
+
+
+class TestPricingProvider:
+    """pricing_provider: an openai-type provider pointed at another
+    provider's OpenAI-compatible API is priced as that provider's family."""
+
+    def test_the_family_replaces_the_provider_types_prefix(self):
+        card = parse_ratecard(COMPATIBLE, "json")
+        # The openai type alone never looks under mistral/.
+        assert match(card, "mistral-large-latest", "openai") is None
+        assert match(card, "mistral-large-latest", "openai", "mistral")[0] == "mistral/mistral-large-latest"
+        assert match(card, "llama-3.1-8b-instant", "openai", "groq")[0] == "groq/llama-3.1-8b-instant"
+        # In place of the type's prefixes, not besides them.
+        assert match(card, "gpt-4o", "azure", "mistral")[0] == "mistral/gpt-4o"
+        assert match(card, "gpt-4o", "azure")[0] == "azure/gpt-4o"
+
+    def test_falls_back_to_the_bare_name(self):
+        card = parse_ratecard(COMPATIBLE, "json")
+        assert match(card, "claude-sonnet-4-5", "openai", "groq")[0] == "claude-sonnet-4-5"
+        assert match(card, "claude-sonnet-4-5-20250929", "openai", "vertex_ai")[0] == "vertex_ai/claude-sonnet-4-5"
+        assert match(card, "nobody-has-this", "openai", "groq") is None
+
+    def test_an_alias_and_the_family_together(self):
+        deployment = parse_ratecard(COMPATIBLE, "json")
+        provider = ProviderPricing.from_values(
+            "la-plateforme", "openai",
+            {"own-model": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06}},
+            {"large": "mistral-large-latest"}, 0.5, "mistral",
+        )
+        hit = resolve("large", "openai", provider, deployment)
+        assert (hit.source, hit.key, hit.priced_as, hit.multiplier) == (
+            "deployment", "mistral/mistral-large-latest", "mistral-large-latest", Decimal("0.5"),
+        )
+        own = resolve("own-model", "openai", provider, deployment)
+        assert (own.source, own.key) == ("provider", "own-model")
+
+    def test_unset_prices_as_before(self):
+        deployment = parse_ratecard(COMPATIBLE, "json")
+        for unset in (None, "", "  "):
+            provider = ProviderPricing.from_values("p", "openai", None, None, None, unset)
+            assert provider.pricing_provider is None
+            assert resolve("gpt-4o", "openai", provider, deployment).key == "gpt-4o"
+            assert resolve("mistral-large-latest", "openai", provider, deployment) is None
+        # The five-argument form older callers use.
+        assert ProviderPricing.from_values("p", "openai", None, None, None).pricing_provider is None
+
+    def test_provider_families(self):
+        families = llm_pricing.provider_families(parse_ratecard(COMPATIBLE, "json"))
+        assert families == {
+            "anthropic": 1, "azure": 1, "gemini": 1, "groq": 1, "mistral": 2, "openai": 3,
+            # A prefix naming its entry's provider family counts as one.
+            "vertex_ai": 1, "vertex_ai-anthropic_models": 1, "vertex_ai-language-models": 1,
+        }
+        assert "low" not in families
+        assert llm_pricing.provider_families({}) == {}
+
+    async def test_new_calls_and_the_backfill_use_it(self, db, monkeypatch):
+        monkeypatch.setattr(settings, "model_prices_json", json.dumps(COMPATIBLE))
+        provider = await _provider(db, pricing_provider="mistral")
+        values = _values(provider, "mistral-large-latest")
+        await price_usage(db, values)
+        # 1000 * 2e-6 + 100 * 6e-6
+        assert (values["cost_usd"], values["price_source"]) == (Decimal("0.0026"), "deployment")
+
+        # Recorded before pricing_provider was set: one unpriced, and one
+        # already priced that the backfill must leave alone.
+        later = await _provider(db)
+        now = datetime.now(timezone.utc)
+        unpriced = LLMUsage(created_at=now - timedelta(minutes=5), **_values(later, "mistral-large-latest"))
+        priced = LLMUsage(
+            created_at=now - timedelta(minutes=5), cost_usd=Decimal("1"), price_source="provider",
+            **_values(later, "mistral-large-latest"),
+        )
+        db.add_all([unpriced, priced])
+        await db.flush()
+        later.pricing_provider = "mistral"
+        await db.flush()
+        await llm_pricing.backfill(db, start=now - timedelta(hours=1), end=now)
+        await db.refresh(unpriced)
+        await db.refresh(priced)
+        assert (unpriced.cost_usd, unpriced.price_source) == (Decimal("0.0026"), "backfill")
+        assert (priced.cost_usd, priced.price_source) == (Decimal("1"), "provider")
