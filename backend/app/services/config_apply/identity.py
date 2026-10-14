@@ -195,7 +195,13 @@ async def apply_user_roles(
     now = datetime.now(UTC)
     for role_id in declared:
         held = [m for m in memberships if m.role_id == role_id]
-        if any(m.active for m in held):
+        active = [m for m in held if m.active]
+        if active:
+            # Declared here, so the config's now, even if an identity
+            # provider granted it: a later SSO login that no longer maps the
+            # role must not end it.
+            for membership in active:
+                membership.source = None
             continue
         if held:  # ended before: reactivate the most recent row
             latest = max(held, key=lambda m: m.added_at or now)

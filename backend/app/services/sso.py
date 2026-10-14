@@ -19,7 +19,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -316,7 +316,20 @@ async def with_userinfo(doc: dict, claims: dict, access_token: Optional[str]) ->
     info = await _get_json(doc["userinfo_endpoint"], "userinfo endpoint", {"Authorization": f"Bearer {access_token}"})
     if info.get("sub") != claims["sub"]:
         raise SsoError("The identity provider's userinfo is for someone else.")
-    return {**info, **claims}
+    return _fill_missing(claims, info)
+
+
+def _fill_missing(claims: dict, extra: dict) -> dict:
+    """`claims` with what only `extra` has added, at every depth: an ID
+    token holding realm_access without roles still gets userinfo's
+    realm_access.roles. A value the ID token has is never replaced."""
+    merged = dict(claims)
+    for key, value in extra.items():
+        if key not in merged:
+            merged[key] = value
+        elif isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _fill_missing(merged[key], value)
+    return merged
 
 
 # ------------------------------------------------------------------ claims
@@ -441,6 +454,13 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
                     "The superadmin account is never linked by email. Link its identity explicitly, "
                     "or sign in with a password or code."
                 )
+            # Locked until the caller commits: two first sign-ins with
+            # different subjects for this address would otherwise both find
+            # no identity at this issuer and both link. The second waits
+            # here, then sees the first's identity.
+            await db.execute(
+                select(User.id).where(User.id == existing.id).with_for_update()
+            )
             other = (
                 await db.execute(
                     select(UserIdentity.id).where(
@@ -580,17 +600,42 @@ def enforced_message(provider: IdentityProvider, email: str) -> str:
     return f"Accounts at {_domain(normalize_email(email))} sign in with {provider.display_name}."
 
 
-async def refresh_blocked(db: AsyncSession, email: str, plain_token: str) -> Optional[str]:
+@dataclass(frozen=True)
+class RefreshSession:
+    """What a refresh token says about its session."""
+
+    identity_provider: Optional[str]  # the SSO login that issued it, if any
+    expires_at: datetime  # for an SSO session: its hard end
+
+
+async def refresh_session(db: AsyncSession, plain_token: str) -> Optional[RefreshSession]:
+    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
+    row = (
+        await db.execute(
+            select(RefreshToken.identity_provider, RefreshToken.expires_at).where(RefreshToken.token_hash == token_hash)
+        )
+    ).first()
+    return RefreshSession(row[0], row[1]) if row else None
+
+
+async def refresh_blocked(db: AsyncSession, email: str, session: Optional[RefreshSession]) -> Optional[str]:
     """Why a refresh token may no longer be used: it came from a password or
     code login, and the user's domain now has to use SSO."""
     provider = await enforcing_provider(db, email)
     if provider is None:
         return None
-    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
-    issued_by = (
-        await db.execute(select(RefreshToken.identity_provider).where(RefreshToken.token_hash == token_hash))
-    ).scalar_one_or_none()
-    return None if issued_by else enforced_message(provider, email)
+    return None if session and session.identity_provider else enforced_message(provider, email)
+
+
+def access_token_lifetime(session: Optional[RefreshSession]) -> Optional[timedelta]:
+    """An access token minted for an SSO session ends with the session: a
+    refresh just before the deadline must not stretch it by a full access
+    token lifetime. None: the usual lifetime."""
+    if session is None or not session.identity_provider:
+        return None
+    usual = timedelta(minutes=settings.access_token_expire_minutes)
+    left = session.expires_at - datetime.now(UTC)
+    return max(left, timedelta(seconds=1)) if left < usual else None
 
 
 # ------------------------------------------------------------------ login state (Redis)

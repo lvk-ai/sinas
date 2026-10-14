@@ -761,3 +761,134 @@ class TestResourceKind:
         assert r.status_code == 200, r.text
         restored = (await db.execute(select(IdentityProvider).where(IdentityProvider.name == name))).scalar_one()
         assert restored.session_hours == 4
+
+
+# ---------------------------------------------------------------- review round
+
+
+class TestReviewRound:
+    async def test_concurrent_first_logins_with_one_email_link_only_one_subject(self):
+        """Two first sign-ins, different subjects, same verified address: the
+        second waits on the user row until the first commits, then finds its
+        identity and is refused. Real connections, real commits."""
+        import asyncio
+
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from tests.conftest import _test_db_url
+
+        engine = create_async_engine(_test_db_url)
+        email = f"race-{_uid()}@acme.com"
+        provider = IdentityProvider(
+            name=f"kc-{_uid()}", display_name="Acme SSO", issuer=ISSUER, client_id=CLIENT_ID,
+            groups_claim="groups", email_claim="email", role_mappings=[], allowed_domains=[],
+            enforce_for_domains=[], auto_provision=False,
+        )
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as setup:
+                user = User(email=email)
+                setup.add(user)
+                await setup.commit()
+
+            first = AsyncSession(engine, expire_on_commit=False)
+            second = AsyncSession(engine, expire_on_commit=False)
+            try:
+                await sso.sign_in(first, provider, ISSUER, _claims(email, sub=f"a-{_uid()}"))
+                racing = asyncio.create_task(sso.sign_in(second, provider, ISSUER, _claims(email, sub=f"b-{_uid()}")))
+                await asyncio.sleep(0.5)
+                assert not racing.done(), "the second sign-in didn't wait for the first"
+                await first.commit()
+                with pytest.raises(sso.SsoError, match="already linked"):
+                    await asyncio.wait_for(racing, timeout=10)
+            finally:
+                await second.rollback()
+                await first.close()
+                await second.close()
+
+            async with AsyncSession(engine) as check:
+                linked = (await check.execute(select(UserIdentity).where(UserIdentity.user_id == user.id))).scalars().all()
+                assert len(linked) == 1
+        finally:
+            async with AsyncSession(engine) as cleanup:
+                from sqlalchemy import delete
+
+                ids = select(User.id).where(User.email == email).scalar_subquery()
+                await cleanup.execute(delete(UserIdentity).where(UserIdentity.user_id == ids))
+                await cleanup.execute(delete(User).where(User.email == email))
+                await cleanup.commit()
+            await engine.dispose()
+
+    async def test_config_declaring_an_sso_granted_role_takes_it_over(self, db, admin_user):
+        team = await _role(db)
+        provider = await _provider(db, role_mappings=[{"group": "team", "roles": [team.name]}])
+        user = User(email=f"cfg-{_uid()}@acme.com", managed_by="config", config_name="cfg")
+        db.add(user)
+        await db.flush()
+        db.add(UserRole(user_id=user.id, role_id=team.id, active=True, source=f"idp:{provider.name}"))
+        await db.flush()
+
+        svc = ConfigApplyService(db, "cfg", owner_user_id=str(admin_user.id), auto_commit=False)
+        result = await svc.apply_config(_config({"users": [{"email": user.email, "roles": [team.name]}]}))
+        assert result.success, result.errors
+        membership = (await _memberships(db, user.id))[team.name]
+        assert membership.active and membership.source is None
+
+        # A login that no longer maps the role leaves the config's membership.
+        await sso.sync_roles(db, user, provider, groups=set(), email_domain="acme.com")
+        assert (await _memberships(db, user.id))[team.name].active
+
+    def test_userinfo_fills_nested_claims_without_replacing_the_id_tokens(self):
+        id_token = {"sub": "s", "realm_access": {"other": ["x"]}, "email": "a@acme.com"}
+        userinfo = {"sub": "s", "realm_access": {"roles": ["team"], "other": ["y"]}, "email": "b@acme.com", "name": "A"}
+        merged = sso._fill_missing(id_token, userinfo)
+        assert merged["realm_access"] == {"other": ["x"], "roles": ["team"]}
+        assert (merged["email"], merged["name"]) == ("a@acme.com", "A")
+
+    async def test_userinfo_roles_under_an_object_the_id_token_has(self, client, db, idp):
+        team = await _role(db)
+        provider = await _provider(
+            db, groups_claim="realm_access.roles", role_mappings=[{"group": "team", "roles": [team.name]}],
+        )
+        claims = _claims(f"ned-{_uid()}@acme.com", realm_access={"account": ["view"]})
+        idp.userinfo = {"sub": claims["sub"], "realm_access": {"roles": ["team"]}}
+        body = await _login(client, provider, idp, claims)
+        assert team.name in body["user"]["roles"]
+
+    async def test_access_tokens_never_outlive_the_sso_session(self, client, db, idp):
+        from app.core.token_signing import decode_access_token
+
+        provider = await _provider(db, session_hours=1)
+        body = await _login(client, provider, idp, _claims(f"ova-{_uid()}@acme.com"))
+        import hashlib
+
+        token_hash = hashlib.sha256(body["refresh_token"].encode()).hexdigest()
+        row = (await db.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))).scalar_one()
+        deadline = datetime.now(UTC) + timedelta(minutes=2)
+        row.expires_at = deadline
+        await db.flush()
+
+        r = await client.post("/auth/refresh", json={"refresh_token": body["refresh_token"]})
+        assert r.status_code == 200
+        assert r.json()["expires_in"] <= 120
+        exp = datetime.fromtimestamp(decode_access_token(r.json()["access_token"])["exp"], UTC)
+        assert exp <= deadline + timedelta(seconds=1)
+
+    async def test_other_sessions_keep_the_usual_access_lifetime(self, client, db, idp):
+        from app.core.auth import create_refresh_token
+
+        user = User(email=f"pam-{_uid()}@other.com")
+        db.add(user)
+        await db.flush()
+        plain, _ = await create_refresh_token(db, str(user.id))
+        r = await client.post("/auth/refresh", json={"refresh_token": plain})
+        assert r.status_code == 200 and r.json()["expires_in"] == settings.access_token_expire_minutes * 60
+
+    async def test_the_first_access_token_is_capped_too(self, client, db, idp, monkeypatch):
+        from app.core.token_signing import decode_access_token
+
+        monkeypatch.setattr(settings, "access_token_expire_minutes", 180)
+        provider = await _provider(db, session_hours=1)
+        body = await _login(client, provider, idp, _claims(f"quy-{_uid()}@acme.com"))
+        assert body["expires_in"] == 3600
+        exp = datetime.fromtimestamp(decode_access_token(body["access_token"])["exp"], UTC)
+        assert exp <= datetime.now(UTC) + timedelta(hours=1, seconds=5)

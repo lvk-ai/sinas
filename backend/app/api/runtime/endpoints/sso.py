@@ -217,15 +217,14 @@ async def exchange_sso_code(body: SsoExchangeRequest, db: AsyncSession = Depends
     user = await db.get(User, payload["user_id"])
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account is deactivated.")
+    session = timedelta(hours=int(payload["session_hours"]))
     access_token, refresh_token, user_resp = await _issue_tokens(
-        db, user,
-        max_lifetime=timedelta(hours=int(payload["session_hours"])),
-        identity_provider=payload["provider"],
+        db, user, max_lifetime=session, identity_provider=payload["provider"],
     )
     return SsoExchangeResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=settings.access_token_expire_minutes * 60,
+        expires_in=int(min(session, timedelta(minutes=settings.access_token_expire_minutes)).total_seconds()),
         user=user_resp,
         return_to=sso.safe_return_to(payload.get("return_to")),
     )
