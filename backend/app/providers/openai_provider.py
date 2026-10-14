@@ -1,12 +1,24 @@
 """OpenAI LLM provider implementation."""
 import json
 from collections.abc import AsyncIterator
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from .base import BaseLLMProvider, reasoning_text
-from .clients import secret_id, shared_client
+from .clients import guard_trace_context, secret_id, shared_client
+
+C = TypeVar("C", bound=AsyncOpenAI)
+
+
+def openai_client(client_class: type[C] = AsyncOpenAI, *, http_client: Any = None, **options: Any) -> C:
+    """The SDK client an OpenAI-style provider (OpenAI, Azure, Mistral,
+    Gemini) talks through: `client_class(**options)`, whose requests carry
+    trace context only when the provider asks (`propagate_context`), however
+    a future SDK might send its own (see `clients.guard_trace_context`)."""
+    return client_class(
+        http_client=guard_trace_context(http_client or DefaultAsyncHttpxClient()), **options
+    )
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -18,7 +30,7 @@ class OpenAIProvider(BaseLLMProvider):
         super().__init__(api_key, base_url)
         self.client = shared_client(
             ("openai", secret_id(api_key), base_url),
-            lambda: AsyncOpenAI(api_key=api_key, base_url=base_url),
+            lambda: openai_client(api_key=api_key, base_url=base_url),
         )
 
     def _prepare_params(
@@ -245,7 +257,7 @@ class OpenAIProvider(BaseLLMProvider):
         input_file = await self.client.files.create(
             file=("batch.jsonl", jsonl),
             purpose="batch",
-            extra_headers=self._context_headers() or None,
+            extra_headers=self._sdk_context_headers() or None,
         )
         return input_file.id
 
@@ -280,7 +292,7 @@ class OpenAIProvider(BaseLLMProvider):
             input_file_id=input_file_id,
             endpoint="/v1/chat/completions",
             completion_window="24h",
-            extra_headers=self._context_headers() or None,
+            extra_headers=self._sdk_context_headers() or None,
         )
         return batch.id
 
