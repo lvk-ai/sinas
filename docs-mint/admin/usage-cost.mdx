@@ -74,15 +74,49 @@ llmProviders:
 - `modelAliases` maps a model name as it is called to the name it is priced as. The alias replaces the name before any lookup.
 - `pricing` maps a model to the per-token fields above. A model needs `input_cost_per_token` and/or `output_cost_per_token`; unknown fields are refused.
 - `discount` (between 0 and 1) multiplies prices taken from the deployment ratecard for this provider's calls. It does not apply to the provider's own `pricing`, which is taken as the actual price.
+- `pricingProvider` is the LiteLLM provider family the provider's models are priced as, in place of the one its `type` maps to. See below.
+
+### OpenAI-compatible providers
+
+Mistral, Groq, Together, DeepSeek and others offer OpenAI-compatible APIs, and so does a LiteLLM proxy: you can call them through a provider of type `openai` with their `endpoint`. Such a provider is priced as OpenAI by default, so its models come out unpriced, or matched to the wrong entry. Sinas never guesses the real provider from the endpoint URL (proxies and self-hosted gateways would defeat that). Set `pricingProvider` to the family the ratecard lists those models under instead:
+
+```yaml
+llmProviders:
+  # Mistral's API through the openai type: priced as mistral/<model>
+  - name: la-plateforme
+    type: openai
+    endpoint: https://api.mistral.ai/v1
+    models: [mistral-large-latest, mistral-small-latest]
+    pricingProvider: mistral
+
+  - name: groq
+    type: openai
+    endpoint: https://api.groq.com/openai/v1
+    models: [llama-3.1-8b-instant]
+    pricingProvider: groq
+
+  # A LiteLLM proxy in front of several providers: alias each model it
+  # serves to its ratecard entry; pricingProvider covers the common family
+  - name: litellm-proxy
+    type: openai
+    endpoint: http://litellm:4000
+    pricingProvider: together_ai
+    modelAliases:
+      fast: groq/llama-3.1-8b-instant
+```
+
+`pricingProvider` is a lowercase LiteLLM provider name, as in the ratecard's `litellm_provider` field or its key prefixes: `mistral`, `groq`, `together_ai`, `deepseek`, `vertex_ai`, `bedrock` and so on. It isn't checked against the ratecard, which can change, but applying the config warns when the deployment ratecard has no models for it, and the console says so too. `GET /api/v1/usage/ratecard` lists the families the deployment ratecard has (`provider_families`, with their model counts). Leaving it out prices the provider as its `type`, as before.
+
+Setting it doesn't change calls already priced. Calls that were recorded unpriced can be priced with the new family by a [backfill](#backfill).
 
 ### How a model is matched
 
-For a call to model `M` through a provider of type `T`:
+For a call to model `M` through a provider of type `T` (or with `pricingProvider: P`):
 
-1. `T/M` (for example `azure/gpt-4o` or `gemini/gemini-2.0-flash`), then the bare `M` (`gpt-4o`).
+1. `T/M` (for example `azure/gpt-4o` or `gemini/gemini-2.0-flash`), or `P/M` when `pricingProvider` is set (`mistral/mistral-large-latest`), then the bare `M` (`gpt-4o`).
 2. Only if neither exists: `M` without a trailing release date (`-2024-08-06`, `-20241022` or `@20241022`), again provider-qualified first. So `gpt-4o-2024-11-20` is priced as `gpt-4o` when the ratecard doesn't list that snapshot.
 
-Names are matched case-insensitively. No other guessing is done: a model that doesn't match is unpriced, and `GET /api/v1/usage/ratecard` lists it so you can add a price or an alias.
+Names are matched case-insensitively. No other guessing is done: a model that doesn't match is unpriced, and `GET /api/v1/usage/ratecard` lists it so you can add a price, an alias or a `pricingProvider`.
 
 ## How cost is calculated
 
@@ -150,5 +184,7 @@ Admins have all three through `sinas.*:all`.
 
 **Admin › Usage** shows totals and cost for a date range, a chart over time (cost, calls or tokens per hour or day), and a breakdown table by agent, provider, model, user, source, batch, chat or day. Admins also see the ratecard: which deployment sources are set, the models called in the last 30 days that have no price, and the prices in use with where each comes from. From there they can fetch the URL ratecard now and price the unpriced calls in the selected range.
 
-Per-provider pricing (model prices, aliases and the discount) is edited in the **Pricing** section of the LLM provider's form.
+Per-provider pricing (model prices, aliases, the discount and **Price models as**, the `pricingProvider`) is edited in the **Pricing** section of the LLM provider's form. **Price models as** offers the families of the deployment ratecard with their model counts, or any other family typed in.
+
+The **LLM Providers** page shows the same ratecard as it applies to the providers (to those who can read it): the deployment sources, each provider's pricing and the family it prices as, and the models called in the last 30 days that have no price, grouped by provider, each with a shortcut to set **Price models as** or add an alias.
 

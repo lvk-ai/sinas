@@ -8,7 +8,8 @@
   - `backend/app/services/usage_reports.py`, `backend/app/api/v1/endpoints/usage.py`: `/api/v1/usage/*`
   - `backend/app/providers/tracking.py`, `backend/app/scheduler/jobs/poll_provider_batches.py`: where rows are priced
   - `backend/app/schemas/spec/llm_provider.py`, `backend/app/services/resources/llm_providers.py`: provider pricing
-  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migrations `c1o2s3t4u5s6` (columns, table) and `c2u3s4i5d6x7` (indexes)
+  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migrations `c1o2s3t4u5s6` (columns, table), `c2u3s4i5d6x7` (indexes) and `c3p4r5f6a7m8` (`pricing_provider`)
+  - `console/src/pages/Usage.tsx`, `console/src/pages/LLMProviders.tsx`, `console/src/components/Ratecard.tsx`, `console/src/lib/ratecard.ts`: Admin › Usage, the provider form's Pricing section and the providers' pricing overview
 - **Related docs:** `docs-mint/admin/usage-cost.mdx`
 
 ## 1. Context
@@ -92,16 +93,50 @@ that app can stop reading the table.
 ### Matching
 
 For model `M` through a provider of type `T` (mapped to LiteLLM's provider
-name: `azure_openai` → `azure`, otherwise the same):
+name: `azure_openai` → `azure`, otherwise the same), or the provider's
+`pricingProvider` `P` when set:
 
-1. `T/M`, then bare `M`.
+1. `T/M` (or `P/M`), then bare `M`.
 2. Only if neither exists, `M` without a trailing release date
-   (`-YYYY-MM-DD`, `-YYYYMMDD`, `@YYYYMMDD`), again `T/` first.
+   (`-YYYY-MM-DD`, `-YYYYMMDD`, `@YYYYMMDD`), again `T/` (`P/`) first.
 
 Case-insensitive. No prefix or fuzzy matching: `gpt-4o-mini` must never be
 priced as `gpt-4o`. A model alias replaces the name before any lookup (in
 the provider's pricing and the ratecard alike); aliases are the answer to
 names that don't match, such as Azure deployment names.
+
+### OpenAI-compatible providers (`pricingProvider`)
+
+A provider of type `openai` pointed at Mistral, Groq, Together, DeepSeek or
+a LiteLLM proxy was priced as OpenAI: its models came out unpriced, or
+matched an OpenAI entry of the same name, unless every model got an alias.
+`pricingProvider` (`pricing_provider`, a column on `llm_providers`) names
+the LiteLLM family to look the models up under instead.
+
+- **Explicit, never inferred from the endpoint.** Guessing the family from
+  the base URL breaks with proxies, gateways and self-hosting, and would
+  silently change prices when a URL changes.
+- **In place of the type's prefixes, not besides them.** Set, `P/M` is
+  tried and `T/M` is not; the bare-name fallback is unchanged. Trying both
+  would let an OpenAI entry win for a model the operator said is Mistral's.
+  It applies to the provider's own `pricing` keys too (they are normally
+  bare names, so this rarely matters).
+- **Validated as a lowercase identifier** (`[a-z0-9][a-z0-9_-]*`, ≤ 64),
+  not against the ratecard: the ratecard is fetched and changes, and a
+  config valid today must not fail tomorrow. Config apply warns when the
+  deployment ratecard as loaded has no models for the family; the console
+  shows the same next to the field and in the LLM Providers overview.
+- **Families** (`provider_families` in `GET /usage/ratecard`, for the
+  console's dropdown): each `litellm_provider` value with its model count,
+  plus a key prefix that names its entry's family (`vertex_ai/claude-…` is
+  listed under `vertex_ai-anthropic_models`, so `vertex_ai` counts too,
+  since the prefix is what matching uses). A prefix that isn't part of the
+  entry's family (LiteLLM's image-size keys such as `low/1024-x-1024/…`)
+  is not a family.
+- **Unset keeps today's behaviour and checksums**: it is left out of the
+  canonical form, as pricing is. Calls already priced keep their cost;
+  the backfill prices NULL-cost rows with the provider's current
+  `pricingProvider`, like new calls.
 
 ### Discount
 
@@ -212,9 +247,10 @@ added for them (the console asks for them once per page load).
 
 ### Provider pricing as a resource field
 
-`pricing`, `model_aliases` and `pricing_discount` are columns on
-`llm_providers` and fields of `LLMProviderSpec` (`pricing`, `modelAliases`,
-`discount` in YAML; `pricing`, `model_aliases`, `discount` over REST), so
+`pricing`, `model_aliases`, `pricing_discount` and `pricing_provider` are
+columns on `llm_providers` and fields of `LLMProviderSpec` (`pricing`,
+`modelAliases`, `discount`, `pricingProvider` in YAML; `pricing`,
+`model_aliases`, `discount`, `pricing_provider` over REST), so
 config apply, export, change history and restores carry them like any
 other field. Unset, they are left out of the canonical form: providers
 applied before pricing existed keep their checksum and show no change.
