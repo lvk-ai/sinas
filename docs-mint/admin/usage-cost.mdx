@@ -28,6 +28,8 @@ Prices come from two places. For each call, the first one that has the model win
 
 ### Deployment ratecard
 
+Sinas ships no prices and sets none of these by default: out-of-date prices would be worse than none. Until a ratecard (or provider pricing) is set, calls are recorded with their tokens but no cost, and the API counts them as unpriced. For most deployments, setting `MODEL_PRICES_URL` to LiteLLM's maintained file is all it takes (example below). It needs outbound HTTPS to `raw.githubusercontent.com`; without it, use `MODEL_PRICES_FILE` with a copy of the file instead.
+
 | Variable | Default | Description |
 |---|---|---|
 | `MODEL_PRICES_URL` | _(none)_ | An `https://` URL of a ratecard. The worker fetches it every `MODEL_PRICES_REFRESH_HOURS` and keeps the last good copy in the database, so a failed fetch never leaves calls unpriced. |
