@@ -1,9 +1,12 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
 import { apiClient } from '../lib/api';
-import { Brain, Plus, Trash2, Edit2 } from 'lucide-react';
+import { RATECARD_QUERY_KEY, useRatecard } from '../lib/ratecard';
+import { AlertTriangle, Brain, Plus, Trash2, Edit2 } from 'lucide-react';
 import { useState } from 'react';
-import type { LLMProvider, LLMProviderCreate, LLMProviderUpdate, ModelPricing } from '../types';
+import type { LLMProvider, LLMProviderCreate, LLMProviderUpdate, ModelPricing, Ratecard } from '../types';
 import { ErrorDisplay } from '../components/ErrorDisplay';
+import { RatecardSources } from '../components/Ratecard';
 
 function plural(n: number, one: string, many: string): string {
   return n ? `${n} ${n === 1 ? one : many}` : '';
@@ -14,13 +17,28 @@ interface PricingDraft {
   pricing: string;
   aliases: string;
   discount: string;
+  // The LiteLLM provider family to price as; '' = the provider type's own
+  pricingProvider: string;
+  // "Other…" chosen: the family is typed rather than picked
+  otherFamily: boolean;
 }
+
+type ProviderFamily = Ratecard['provider_families'][number];
+
+// The pricing field a fix from the overview opens the form at
+type PricingFocus = 'family' | 'alias';
+
+// A LiteLLM provider name, as the API validates it
+const FAMILY_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+const OTHER_FAMILY = '__other__';
 
 function pricingDraft(provider?: LLMProvider): PricingDraft {
   return {
     pricing: JSON.stringify(provider?.pricing || {}, null, 2),
     aliases: JSON.stringify(provider?.model_aliases || {}, null, 2),
     discount: provider?.discount != null ? String(provider.discount) : '',
+    pricingProvider: provider?.pricing_provider || '',
+    otherFamily: false,
   };
 }
 
@@ -43,10 +61,15 @@ function parsePricingDraft(draft: PricingDraft) {
   if (discount !== null && (Number.isNaN(discount) || discount < 0 || discount > 1)) {
     throw new Error('Discount must be a number between 0 and 1');
   }
+  const family = draft.pricingProvider.trim();
+  if (family && (family.length > 64 || !FAMILY_PATTERN.test(family))) {
+    throw new Error('"Price models as" must be a lowercase LiteLLM provider name, such as mistral or together_ai');
+  }
   return {
     pricing: parseObject(draft.pricing, 'Model prices') as Record<string, ModelPricing>,
     model_aliases: parseObject(draft.aliases, 'Model aliases') as Record<string, string>,
     discount,
+    pricing_provider: family || null,
   };
 }
 
@@ -54,11 +77,23 @@ function PricingFields({
   idPrefix,
   draft,
   onChange,
+  providerType,
+  families,
+  notice,
+  focus,
 }: {
   idPrefix: string;
   draft: PricingDraft;
   onChange: (draft: PricingDraft) => void;
+  providerType: string;
+  // The deployment ratecard's families; undefined when the ratecard can't be read
+  families?: ProviderFamily[];
+  notice?: string;
+  focus?: PricingFocus;
 }) {
+  const family = draft.pricingProvider.trim();
+  const known = !!families?.some((f) => f.family === family);
+  const selected = draft.otherFamily || (family && !known) ? OTHER_FAMILY : family;
   return (
     <div className="pt-4 border-t border-line-soft space-y-4">
       <div>
@@ -67,6 +102,55 @@ function PricingFields({
           For cost tracking (Admin › Usage). USD per token, in LiteLLM's field names. Models not priced here
           use the deployment ratecard.
         </p>
+      </div>
+      {notice && (
+        <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+          <p className="text-xs text-yellow-300">{notice}</p>
+        </div>
+      )}
+      <div>
+        <label htmlFor={`${idPrefix}_pricing_provider`} className="block text-sm font-medium text-gray-300 mb-2">
+          Price models as
+        </label>
+        <select
+          id={`${idPrefix}_pricing_provider`}
+          value={selected}
+          autoFocus={focus === 'family'}
+          onChange={(e) => {
+            const value = e.target.value;
+            if (value === OTHER_FAMILY) onChange({ ...draft, otherFamily: true, pricingProvider: family });
+            else onChange({ ...draft, otherFamily: false, pricingProvider: value });
+          }}
+          className="input"
+        >
+          <option value="">Same as provider type ({providerType || '—'})</option>
+          {families?.map((f) => (
+            <option key={f.family} value={f.family}>
+              {f.family} ({f.models.toLocaleString()} {f.models === 1 ? 'model' : 'models'})
+            </option>
+          ))}
+          <option value={OTHER_FAMILY}>Other…</option>
+        </select>
+        {selected === OTHER_FAMILY && (
+          <input
+            id={`${idPrefix}_pricing_provider_other`}
+            type="text"
+            value={draft.pricingProvider}
+            onChange={(e) => onChange({ ...draft, pricingProvider: e.target.value })}
+            placeholder="e.g. together_ai"
+            className="input mt-2 font-mono text-xs"
+          />
+        )}
+        <p className="text-xs text-gray-500 mt-1">
+          For an OpenAI-compatible API of another provider (Mistral, Groq, a LiteLLM proxy…): the LiteLLM provider
+          family its models are priced as.
+        </p>
+        {family && families && !known && (
+          <p className="text-xs text-yellow-400 mt-1">
+            The deployment ratecard has no models for <code>{family}</code> now: models are matched by their bare
+            names until it does.
+          </p>
+        )}
       </div>
       <div>
         <label htmlFor={`${idPrefix}_pricing`} className="block text-sm font-medium text-gray-300 mb-2">
@@ -93,6 +177,7 @@ function PricingFields({
         <textarea
           id={`${idPrefix}_aliases`}
           value={draft.aliases}
+          autoFocus={focus === 'alias'}
           onChange={(e) => onChange({ ...draft, aliases: e.target.value })}
           placeholder='{"my-azure-deployment": "gpt-4o"}'
           rows={3}
@@ -123,6 +208,137 @@ function PricingFields({
   );
 }
 
+// The ratecard as it applies to these providers: deployment sources, each
+// provider's own pricing, and the models in use that have no price.
+function PricingOverview({
+  ratecard,
+  editable,
+  onFix,
+}: {
+  ratecard: Ratecard;
+  // Providers whose form can be opened from here
+  editable: Set<string>;
+  onFix: (provider: string, model: string, how: 'family' | 'alias') => void;
+}) {
+  const families = new Set(ratecard.provider_families.map((f) => f.family));
+  const unpriced = new Map<string, Ratecard['unpriced_models']>();
+  for (const m of ratecard.unpriced_models) {
+    const key = m.provider || '';
+    unpriced.set(key, [...(unpriced.get(key) || []), m]);
+  }
+  return (
+    <div className="space-y-4">
+      <div className="card">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-100">Pricing</h3>
+            <p className="text-sm text-gray-400 mt-1">
+              Calls are priced from the provider's own prices first, then the deployment ratecard (
+              {ratecard.deployment_models.toLocaleString()} models).
+            </p>
+          </div>
+          <Link to="/usage" className="text-sm text-primary-400 hover:text-primary-300 flex-shrink-0">
+            Full price table in Admin › Usage →
+          </Link>
+        </div>
+        <RatecardSources sources={ratecard.sources} />
+      </div>
+
+      {ratecard.providers.length > 0 && (
+        <div className="bg-surface-1 rounded-lg border border-line-soft overflow-hidden">
+          <div className="px-6 py-4 border-b border-line-soft">
+            <h3 className="text-lg font-semibold text-gray-100">Provider pricing</h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-white/[0.06]">
+              <thead className="bg-surface-0">
+                <tr>
+                  {['Provider', 'Prices as', 'Own prices', 'Aliases', 'Discount'].map((h) => (
+                    <th key={h} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="bg-surface-1 divide-y divide-white/[0.06]">
+                {ratecard.providers.map((p) => (
+                  <tr key={p.name} className={p.is_active ? '' : 'opacity-60'}>
+                    <td className="px-6 py-3 text-sm text-gray-100">{p.name}</td>
+                    <td className="px-6 py-3 text-sm font-mono text-gray-300">
+                      {p.pricing_provider ? (
+                        <>
+                          {p.pricing_provider}
+                          {!families.has(p.pricing_provider) && (
+                            <span
+                              className="ml-2 inline-flex items-center text-xs font-sans text-yellow-400"
+                              title="The deployment ratecard has no models for this family: models are matched by their bare names"
+                            >
+                              <AlertTriangle className="w-3 h-3 mr-1" />
+                              not in the ratecard
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-gray-500">
+                          {p.priced_as_families.join(', ') || '—'}
+                          <span className="font-sans text-xs"> (provider type)</span>
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-6 py-3 text-sm text-gray-300">{Object.keys(p.pricing).length || '—'}</td>
+                    <td className="px-6 py-3 text-sm text-gray-300">{Object.keys(p.model_aliases).length || '—'}</td>
+                    <td className="px-6 py-3 text-sm text-gray-300">{p.discount ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-surface-1 rounded-lg border border-line-soft overflow-hidden">
+        <div className="px-6 py-4 border-b border-line-soft">
+          <h3 className="text-lg font-semibold text-gray-100">
+            Unpriced models{' '}
+            <span className="text-sm font-normal text-gray-500">(called in the last {ratecard.days} days)</span>
+          </h3>
+        </div>
+        {unpriced.size === 0 ? (
+          <p className="px-6 py-6 text-sm text-gray-500">Every model in use has a price.</p>
+        ) : (
+          <div className="divide-y divide-white/[0.06]">
+            {[...unpriced.entries()].map(([provider, models]) => (
+              <div key={provider} className="px-6 py-4">
+                <p className="text-sm font-medium text-gray-100 mb-2">{provider || '(no provider)'}</p>
+                <ul className="space-y-2">
+                  {models.map((m) => (
+                    <li key={m.model} className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                      <span className="font-mono text-gray-100">{m.model}</span>
+                      <span className="text-gray-500">
+                        {m.calls.toLocaleString()} {m.calls === 1 ? 'call' : 'calls'}
+                      </span>
+                      {editable.has(provider) && (
+                        <span className="flex items-center gap-3 text-xs">
+                          <button type="button" onClick={() => onFix(provider, m.model, 'family')} className="text-primary-400 hover:text-primary-300">
+                            Set “Price models as”
+                          </button>
+                          <button type="button" onClick={() => onFix(provider, m.model, 'alias')} className="text-primary-400 hover:text-primary-300">
+                            Add an alias
+                          </button>
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function LLMProviders() {
   const queryClient = useQueryClient();
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -140,6 +356,9 @@ export function LLMProviders() {
   const [createPricing, setCreatePricing] = useState<PricingDraft>(pricingDraft());
   const [editPricing, setEditPricing] = useState<PricingDraft>(pricingDraft());
   const [editError, setEditError] = useState('');
+  // Why the edit form was opened from the pricing overview, if it was
+  const [editNotice, setEditNotice] = useState('');
+  const [editFocus, setEditFocus] = useState<PricingFocus | undefined>();
 
   const { data: providers, isLoading } = useQuery({
     queryKey: ['llmProviders'],
@@ -147,10 +366,16 @@ export function LLMProviders() {
     retry: false,
   });
 
+  // Admins only (sinas.usage.read:all): without it the overview is left out
+  // and the form offers no families to pick from.
+  const ratecard = useRatecard();
+  const families = ratecard.data?.provider_families;
+
   const createMutation = useMutation({
     mutationFn: (data: LLMProviderCreate) => apiClient.createLLMProvider(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['llmProviders'] });
+      queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
       setShowCreateModal(false);
       resetCreateForm();
     },
@@ -161,6 +386,7 @@ export function LLMProviders() {
       apiClient.updateLLMProvider(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['llmProviders'] });
+      queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
       setShowEditModal(false);
       setSelectedProvider(null);
       setEditFormData({});
@@ -172,6 +398,7 @@ export function LLMProviders() {
     mutationFn: (providerId: string) => apiClient.deleteLLMProvider(providerId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['llmProviders'] });
+      queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
     },
   });
 
@@ -227,7 +454,7 @@ export function LLMProviders() {
     }
   };
 
-  const openEditModal = (provider: LLMProvider) => {
+  const openEditModal = (provider: LLMProvider, notice = '', focus?: PricingFocus) => {
     setSelectedProvider(provider);
     const configJson = JSON.stringify(provider.config || {}, null, 2);
     setEditConfigText(configJson);
@@ -242,7 +469,22 @@ export function LLMProviders() {
     });
     setEditPricing(pricingDraft(provider));
     setEditError('');
+    setEditNotice(notice);
+    setEditFocus(focus);
     setShowEditModal(true);
+  };
+
+  // A one-click fix from the overview: the provider's form, at the field.
+  const fixUnpriced = (providerName: string, model: string, how: 'family' | 'alias') => {
+    const provider = providers?.find((p) => p.name === providerName);
+    if (!provider) return;
+    openEditModal(
+      provider,
+      how === 'family'
+        ? `"${model}" has no price. If this provider calls another provider's OpenAI-compatible API, set "Price models as" to that provider's family.`
+        : `"${model}" has no price. Alias it to the ratecard model it is (e.g. {"${model}": "<ratecard model>"}), or give it a price below.`,
+      how
+    );
   };
 
   return (
@@ -302,7 +544,8 @@ export function LLMProviders() {
                     )}
                     {(Object.keys(provider.pricing || {}).length > 0 ||
                       Object.keys(provider.model_aliases || {}).length > 0 ||
-                      provider.discount != null) && (
+                      provider.discount != null ||
+                      !!provider.pricing_provider) && (
                       <p className="text-sm text-gray-400">
                         Pricing:{' '}
                         <span className="font-medium">
@@ -310,6 +553,7 @@ export function LLMProviders() {
                             plural(Object.keys(provider.pricing || {}).length, 'model priced', 'models priced'),
                             plural(Object.keys(provider.model_aliases || {}).length, 'alias', 'aliases'),
                             provider.discount != null ? `discount ${provider.discount}` : '',
+                            provider.pricing_provider ? `priced as ${provider.pricing_provider}` : '',
                           ]
                             .filter(Boolean)
                             .join(' · ')}
@@ -363,6 +607,14 @@ export function LLMProviders() {
             Add Provider
           </button>
         </div>
+      )}
+
+      {ratecard.data && (
+        <PricingOverview
+          ratecard={ratecard.data}
+          editable={new Set((providers || []).map((p) => p.name))}
+          onFix={fixUnpriced}
+        />
       )}
 
       {/* Create Modal */}
@@ -481,7 +733,13 @@ export function LLMProviders() {
                 </p>
               </div>
 
-              <PricingFields idPrefix="create" draft={createPricing} onChange={setCreatePricing} />
+              <PricingFields
+                idPrefix="create"
+                draft={createPricing}
+                onChange={setCreatePricing}
+                providerType={createFormData.provider_type}
+                families={families}
+              />
 
               <div className="flex items-center space-x-4">
                 <div className="flex items-center">
@@ -563,7 +821,7 @@ export function LLMProviders() {
                   placeholder="OpenAI GPT-4"
                   required
                   className="input"
-                  autoFocus
+                  autoFocus={!editFocus}
                 />
               </div>
 
@@ -660,7 +918,15 @@ export function LLMProviders() {
                 </p>
               </div>
 
-              <PricingFields idPrefix="edit" draft={editPricing} onChange={setEditPricing} />
+              <PricingFields
+                idPrefix="edit"
+                draft={editPricing}
+                onChange={setEditPricing}
+                providerType={editFormData.provider_type || ''}
+                families={families}
+                notice={editNotice}
+                focus={editFocus}
+              />
 
               <div className="flex items-center space-x-4">
                 <div className="flex items-center">

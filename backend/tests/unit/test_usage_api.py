@@ -240,6 +240,32 @@ class TestRatecard:
         assert [(m["model"], m["calls"]) for m in unpriced] == [(unknown, 2)]
         assert [e["model"] for e in body["deployment_entries"]] == ["gpt-4o"]
 
+    async def test_provider_families_and_what_each_provider_prices_as(self, client, db, admin_user, monkeypatch):
+        monkeypatch.setattr(settings, "model_prices_json", json.dumps({
+            "gpt-4o": {"input_cost_per_token": 2.5e-06, "output_cost_per_token": 1e-05, "litellm_provider": "openai"},
+            "mistral/mistral-large-latest": {
+                "input_cost_per_token": 2e-06, "output_cost_per_token": 6e-06, "litellm_provider": "mistral",
+            },
+            "mistral/mistral-small-latest": {
+                "input_cost_per_token": 1e-07, "output_cost_per_token": 3e-07, "litellm_provider": "mistral",
+            },
+        }))
+        compatible, plain = f"prov-{uuid.uuid4().hex[:8]}", f"prov-{uuid.uuid4().hex[:8]}"
+        db.add_all([
+            LLMProvider(name=compatible, provider_type="openai", pricing_provider="mistral"),
+            LLMProvider(name=plain, provider_type="azure_openai"),
+            _row(provider_name=compatible, model="mistral-large-latest"),
+        ])
+        await db.flush()
+
+        body = await _get(client, admin_user, "ratecard", {})
+        assert body["provider_families"] == [{"family": "mistral", "models": 2}, {"family": "openai", "models": 1}]
+        views = {p["name"]: p for p in body["providers"]}
+        assert (views[compatible]["pricing_provider"], views[compatible]["priced_as_families"]) == ("mistral", ["mistral"])
+        assert (views[plain]["pricing_provider"], views[plain]["priced_as_families"]) == (None, ["azure"])
+        used = next(m for m in body["models_in_use"] if m["provider"] == compatible)
+        assert used["matched_key"] == "mistral/mistral-large-latest"
+
     async def test_refresh_needs_a_url(self, client, admin_user):
         r = await client.post("/api/v1/usage/ratecard/refresh", headers=auth_headers(admin_user))
         assert r.status_code == 400

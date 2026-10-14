@@ -318,9 +318,10 @@ async def ratecard(
     db: AsyncSession, *, days: int, search: Optional[str], limit: int
 ) -> dict[str, Any]:
     """What prices apply now and where each comes from: the deployment
-    sources, every provider's own pricing, each model called in the last
-    `days` with the price it gets now (or none), and — with `search` — the
-    deployment entries whose name contains it."""
+    sources and the provider families they list (what a provider's
+    pricing_provider can name), every provider's own pricing, each model
+    called in the last `days` with the price it gets now (or none), and —
+    with `search` — the deployment entries whose name contains it."""
     from app.models.llm_provider import LLMProvider
     from app.models.ratecard_cache import RatecardCache
     from app.services import llm_pricing
@@ -358,7 +359,8 @@ async def ratecard(
     provider_views = []
     for row in (await db.execute(select(LLMProvider).order_by(LLMProvider.name))).scalars():
         pricing = llm_pricing.ProviderPricing.from_values(
-            row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount
+            row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount,
+            row.pricing_provider,
         )
         providers[row.name] = pricing
         provider_views.append({
@@ -368,6 +370,11 @@ async def ratecard(
             "pricing": {model: _price_view(p) for model, p in sorted(pricing.prices.items())},
             "model_aliases": dict(row.model_aliases or {}),
             "discount": row.pricing_discount,
+            "pricing_provider": pricing.pricing_provider,
+            # The families its models are looked up under, set or mapped
+            "priced_as_families": list(
+                llm_pricing.lookup_families(row.provider_type, pricing.pricing_provider)
+            ),
         })
 
     since = _now() - timedelta(days=days)
@@ -428,6 +435,10 @@ async def ratecard(
     return {
         "sources": sources,
         "deployment_models": len(deployment),
+        "provider_families": [
+            {"family": family, "models": count}
+            for family, count in llm_pricing.provider_families(deployment).items()
+        ],
         "providers": provider_views,
         "days": days,
         "models_in_use": in_use,

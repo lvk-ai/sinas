@@ -21,6 +21,9 @@ class LLMProviderCreate(BaseModel):
     pricing: Optional[dict[str, dict[str, Any]]] = None
     model_aliases: Optional[dict[str, str]] = None
     discount: Optional[float] = None
+    # The LiteLLM provider family to price models as (e.g. "mistral" for an
+    # OpenAI-compatible Mistral endpoint); unset: the provider type's own.
+    pricing_provider: Optional[str] = None
 
 
 class LLMProviderUpdate(BaseModel):
@@ -34,10 +37,12 @@ class LLMProviderUpdate(BaseModel):
     config: Optional[dict[str, Any]] = None
     is_default: Optional[bool] = None
     is_active: Optional[bool] = None
-    # Replaced as a whole; {} clears. discount: null clears it.
+    # Replaced as a whole; {} clears. discount and pricing_provider: null
+    # clears them.
     pricing: Optional[dict[str, dict[str, Any]]] = None
     model_aliases: Optional[dict[str, str]] = None
     discount: Optional[float] = None
+    pricing_provider: Optional[str] = None
 
 
 class LLMProviderResponse(BaseModel):
@@ -58,6 +63,7 @@ class LLMProviderResponse(BaseModel):
     discount: Optional[float] = Field(
         default=None, validation_alias=AliasChoices("discount", "pricing_discount")
     )
+    pricing_provider: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

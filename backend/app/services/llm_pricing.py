@@ -8,7 +8,10 @@ Prices come from two places; the first that has the model wins:
    worker cron and its last good copy kept in `ratecard_cache`.
 
 Both use LiteLLM's model_prices_and_context_window.json format, so operators
-can point at LiteLLM's maintained file. There are no bundled prices: a model
+can point at LiteLLM's maintained file. A model is looked up under its
+provider family's prefix first ("azure/gpt-4o"): the family provider_type
+maps to, or the provider's `pricing_provider` when set (an OpenAI-compatible
+API of another provider, such as Mistral or Groq behind the openai type). There are no bundled prices: a model
 nobody priced is recorded with cost NULL and counted as unpriced.
 
 A call is priced once, when its llm_usage row is written. A later price
@@ -174,17 +177,33 @@ def _names(model: str) -> list[str]:
     return [name, undated] if undated and undated != name else [name]
 
 
+def lookup_families(
+    provider_type: Optional[str], pricing_provider: Optional[str] = None
+) -> tuple[str, ...]:
+    """The provider families a model is looked up under: `pricing_provider`
+    when set, else the ones provider_type maps to."""
+    family = (pricing_provider or "").strip().lower()
+    if family:
+        return (family,)
+    kind = (provider_type or "").strip().lower()
+    return _LITELLM_PROVIDERS.get(kind, (kind,) if kind else ())
+
+
 def match(
-    card: dict[str, ModelPrice], model: str, provider_type: Optional[str]
+    card: dict[str, ModelPrice],
+    model: str,
+    provider_type: Optional[str],
+    pricing_provider: Optional[str] = None,
 ) -> Optional[tuple[str, ModelPrice]]:
-    """(key, price) for `model` called through a provider of `provider_type`.
+    """(key, price) for `model` called through a provider of `provider_type`
+    (priced as `pricing_provider`'s family when that is set).
 
     Per name (see _names): the provider-qualified key first ("azure/gpt-4o",
-    "gemini/gemini-2.0-flash"), then the bare name ("gpt-4o")."""
+    "gemini/gemini-2.0-flash", "mistral/mistral-large-latest"), then the bare
+    name ("gpt-4o")."""
     if not model or not card:
         return None
-    kind = (provider_type or "").strip().lower()
-    prefixes = _LITELLM_PROVIDERS.get(kind, (kind,) if kind else ())
+    prefixes = lookup_families(provider_type, pricing_provider)
     for name in _names(model):
         for prefix in prefixes:
             key = f"{prefix}/{name}"
@@ -193,6 +212,23 @@ def match(
         if name in card:
             return name, card[name]
     return None
+
+
+def provider_families(card: dict[str, ModelPrice]) -> dict[str, int]:
+    """The provider families in a ratecard, with how many models each has:
+    every `litellm_provider`, and a key prefix that names its entry's
+    provider ("vertex_ai/claude-..." listed under vertex_ai-anthropic_models
+    counts for vertex_ai too), since that prefix is what pricing_provider
+    is matched as."""
+    keys: dict[str, set[str]] = {}
+    for key, price in card.items():
+        if not price.provider:
+            continue
+        keys.setdefault(price.provider, set()).add(key)
+        prefix = key.split("/", 1)[0] if "/" in key else ""
+        if prefix and prefix != price.provider and price.provider.startswith(prefix):
+            keys.setdefault(prefix, set()).add(key)
+    return {family: len(names) for family, names in sorted(keys.items())}
 
 
 @dataclass(frozen=True)
@@ -204,6 +240,7 @@ class ProviderPricing:
     prices: dict[str, ModelPrice] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)  # lowercased keys
     discount: Optional[Decimal] = None
+    pricing_provider: Optional[str] = None  # the family models are priced as
 
     @classmethod
     def from_values(
@@ -213,6 +250,7 @@ class ProviderPricing:
         pricing: Optional[dict[str, Any]],
         model_aliases: Optional[dict[str, str]],
         discount: Optional[float],
+        pricing_provider: Optional[str] = None,
     ) -> "ProviderPricing":
         return cls(
             name=name,
@@ -224,6 +262,7 @@ class ProviderPricing:
                 if str(k).strip() and str(v).strip()
             },
             discount=_number(discount),
+            pricing_provider=(pricing_provider or "").strip().lower() or None,
         )
 
 
@@ -248,16 +287,18 @@ def resolve(
     alias (if any) replaces the name, then the provider's own pricing, then
     the deployment ratecard with the provider's discount applied. The
     discount is for list prices: a provider's own prices are taken as they
-    are."""
+    are. Both are looked up under the provider's pricing_provider family
+    when it has one."""
     if not model:
         return None
     priced_as = model
+    family = provider.pricing_provider if provider is not None else None
     if provider is not None:
         priced_as = provider.aliases.get(model.strip().lower(), model)
-        hit = match(provider.prices, priced_as, provider_type)
+        hit = match(provider.prices, priced_as, provider_type, family)
         if hit is not None:
             return Resolution(hit[1], hit[0], "provider", _ONE, priced_as)
-    hit = match(deployment, priced_as, provider_type)
+    hit = match(deployment, priced_as, provider_type, family)
     if hit is None:
         return None
     multiplier = provider.discount if provider is not None and provider.discount is not None else _ONE
@@ -505,13 +546,15 @@ async def provider_pricing(
                 LLMProvider.pricing,
                 LLMProvider.model_aliases,
                 LLMProvider.pricing_discount,
+                LLMProvider.pricing_provider,
             ).where(LLMProvider.name == name)
         )
     ).one_or_none()
     pricing = None
     if row is not None:
         pricing = ProviderPricing.from_values(
-            row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount
+            row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount,
+            row.pricing_provider,
         )
     _cache.providers[name] = (time.monotonic(), pricing)
     return pricing

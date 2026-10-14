@@ -29,6 +29,22 @@ LLM providers connect Sinas to language model APIs.
 | `pricing` | Per-model prices for this provider's calls, in LiteLLM's per-token fields (see [Usage & Cost](/admin/usage-cost)) |
 | `model_aliases` | Model name as called → the ratecard model it is priced as (e.g. an Azure deployment name → `gpt-4o`) |
 | `discount` | Multiplier (0–1) on deployment-ratecard prices, for negotiated rates |
+| `pricing_provider` | The LiteLLM provider family models are priced as (`pricingProvider` in YAML), for an OpenAI-compatible API of another provider. Unset: the provider type's own |
+
+**OpenAI-compatible providers:**
+
+Mistral, Groq, Together, DeepSeek or a LiteLLM proxy can be called through the `openai` type with their endpoint. For cost tracking, tell Sinas which provider's prices apply with `pricingProvider`; otherwise their models are priced as OpenAI's and mostly come out unpriced:
+
+```yaml
+llmProviders:
+  - name: la-plateforme
+    type: openai
+    endpoint: https://api.mistral.ai/v1
+    models: [mistral-large-latest]
+    pricingProvider: mistral   # priced as mistral/<model> in the ratecard
+```
+
+In the console this is **Price models as** in the provider form's Pricing section. See [Usage & Cost](/admin/usage-cost#openai-compatible-providers) for how models are matched.
 
 **Provider resolution for agents:**
 1. Agent's explicit `llm_provider_id` if set

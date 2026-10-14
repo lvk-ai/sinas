@@ -10,6 +10,7 @@ config. Nothing was in the change history, and a key must never be.
 import json
 import uuid
 
+import pytest
 import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -275,7 +276,9 @@ class TestPricing:
         """Unset pricing stays out of the canonical form: providers applied
         before pricing existed aren't re-stamped or shown as changed."""
         spec = LLMProviderSpec.model_validate(_yaml("p"))
-        assert not {"pricing", "model_aliases", "discount"} & set(spec.canonical())
+        assert not {"pricing", "model_aliases", "discount", "pricing_provider"} & set(spec.canonical())
+        assert spec.checksum() == LLMProviderSpec.model_validate(_yaml("p", pricingProvider="")).checksum()
+        assert spec.checksum() != LLMProviderSpec.model_validate(_yaml("p", pricingProvider="groq")).checksum()
 
     async def test_invalid_pricing_is_refused(self, client, db: AsyncSession, admin_user):
         name = _name()
@@ -285,6 +288,10 @@ class TestPricing:
             {"pricing": {"m": {"cache_read_input_token_cost": 1e-07}}},  # neither input nor output
             {"discount": 1.5},
             {"modelAliases": {"m": ""}},
+            {"pricingProvider": "Mistral"},
+            {"pricingProvider": "together ai"},
+            {"pricingProvider": "../openai"},
+            {"pricingProvider": "x" * 65},
         ]
         for extra in bad:
             result = await _apply(db, admin_user, llmProviders=[_yaml(name, **extra)])
@@ -315,3 +322,94 @@ class TestPricing:
         assert revisions[-1].changes == {
             "discount": {"from": 0.9, "to": None}, "model_aliases": {"from": {"dep": "gpt-4o"}, "to": None},
         }
+
+
+class TestPricingProvider:
+    """pricingProvider: the LiteLLM provider family an OpenAI-compatible API
+    of another provider is priced as. Same channels as pricing."""
+
+    RATECARD = {
+        "mistral/mistral-large-latest": {
+            "input_cost_per_token": 2e-06, "output_cost_per_token": 6e-06, "litellm_provider": "mistral",
+        },
+    }
+
+    @pytest.fixture(autouse=True)
+    def _ratecard(self, monkeypatch):
+        from app.core.config import settings
+        from app.services import llm_pricing
+
+        for setting in ("model_prices_file", "model_prices_url"):
+            monkeypatch.setattr(settings, setting, None)
+        monkeypatch.setattr(settings, "model_prices_json", json.dumps(self.RATECARD))
+        llm_pricing.reset_cache()
+        yield
+        llm_pricing.reset_cache()
+
+    async def test_config_apply_export_round_trip_and_history(self, db: AsyncSession, admin_user):
+        name = _name()
+        result = await _apply(db, admin_user, llmProviders=[_yaml(name, pricingProvider="mistral")])
+        assert result.success and not result.warnings, (result.errors, result.warnings)
+        assert (await _row(db, name)).pricing_provider == "mistral"
+
+        doc = yaml.safe_load(await ConfigExportService(db).export_config())["spec"]
+        exported = next(p for p in doc["llmProviders"] if p["name"] == name)
+        assert exported["pricingProvider"] == "mistral"
+        again = await _apply(db, admin_user, llmProviders=[exported])
+        assert again.success and not again.summary.updated, (again.errors, again.summary)
+
+        # Left out of the YAML: priced as the provider type again.
+        assert (await _apply(db, admin_user, llmProviders=[_yaml(name)])).success
+        assert (await _row(db, name)).pricing_provider is None
+        doc = yaml.safe_load(await ConfigExportService(db).export_config())["spec"]
+        assert "pricingProvider" not in next(p for p in doc["llmProviders"] if p["name"] == name)
+
+        revisions = await _revisions(db, name)
+        assert [r.action for r in revisions] == ["create", "update"]
+        assert revisions[0].spec["pricing_provider"] == "mistral"
+        assert revisions[1].changes == {"pricing_provider": {"from": "mistral", "to": None}}
+
+    async def test_a_provider_without_it_keeps_its_stored_checksum(self, db: AsyncSession, admin_user):
+        name = _name()
+        assert (await _apply(db, admin_user, llmProviders=[_yaml(name)])).success
+        row = await _row(db, name)
+        assert row.config_checksum == LLMProviderSpec.model_validate(_yaml(name)).checksum()
+        assert "pricing_provider" not in (await _revisions(db, name))[0].spec
+
+    async def test_a_family_the_ratecard_lacks_is_applied_with_a_warning(self, db: AsyncSession, admin_user, monkeypatch):
+        from app.core.config import settings
+        from app.services import llm_pricing
+
+        name = _name()
+        for dry_run in (True, False):
+            result = await _apply(db, admin_user, dry_run=dry_run, llmProviders=[_yaml(name, pricingProvider="groq")])
+            assert result.success, result.errors
+            assert len(result.warnings) == 1 and "'groq'" in result.warnings[0] and name in result.warnings[0]
+        assert (await _row(db, name)).pricing_provider == "groq"
+
+        monkeypatch.setattr(settings, "model_prices_json", None)
+        llm_pricing.reset_cache()
+        result = await _apply(db, admin_user, llmProviders=[_yaml(name, pricingProvider="mistral")])
+        assert result.success and "empty" in result.warnings[0]
+
+    async def test_rest_sets_and_clears_it(self, client, db: AsyncSession, admin_user):
+        name, h = _name(), auth_headers(admin_user)
+        r = await client.post("/api/v1/llm-providers", json={
+            "name": name, "provider_type": "openai", "pricing_provider": "mistral",
+        }, headers=h)
+        assert r.status_code == 201, r.text
+        assert r.json()["pricing_provider"] == "mistral"
+        provider_id = r.json()["id"]
+
+        r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"default_model": "m"}, headers=h)
+        assert r.json()["pricing_provider"] == "mistral"  # left out: kept
+        # Not checked against the ratecard: it changes.
+        r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"pricing_provider": "groq"}, headers=h)
+        assert r.status_code == 200 and r.json()["pricing_provider"] == "groq"
+        r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"pricing_provider": "Groq"}, headers=h)
+        assert r.status_code == 422
+        for cleared in (None, ""):
+            await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"pricing_provider": "groq"}, headers=h)
+            r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"pricing_provider": cleared}, headers=h)
+            assert r.status_code == 200 and r.json()["pricing_provider"] is None, cleared
+        assert (await _revisions(db, name))[-1].changes == {"pricing_provider": {"from": "groq", "to": None}}

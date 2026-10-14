@@ -43,10 +43,13 @@ class LLMProvider(Base):
     # the deployment ratecard. pricing: {model: {input_cost_per_token, ...}}
     # in LiteLLM's field names; model_aliases: {model as called: ratecard
     # model} (an Azure deployment name, say); pricing_discount: a multiplier
-    # on deployment-ratecard prices (0.8 = 20% off list).
+    # on deployment-ratecard prices (0.8 = 20% off list); pricing_provider:
+    # the LiteLLM provider family its models are priced as ("mistral" for
+    # Mistral's API behind the openai type), in place of the type's own.
     pricing: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     model_aliases: Mapped[Optional[dict[str, str]]] = mapped_column(JSON, nullable=True)
     pricing_discount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pricing_provider: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Default provider for new assistants
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

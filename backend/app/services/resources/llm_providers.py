@@ -3,19 +3,23 @@
 Admin-managed and owner-less. Deleting one through the API switches it off
 (agents point at it by id); config and packages keep that state unless they
 declare isActive. Packages never declare providers.
+
+A pricingProvider the deployment ratecard has no models for is applied (the
+ratecard changes) with a warning from config apply; the console shows the
+same from the ratecard view.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from sqlalchemy import select
 
 from app.core.encryption import encryption_service
 from app.models.llm_provider import LLMProvider
 from app.schemas.spec.llm_provider import LLMProviderSpec, ModelPricing
-from app.services.resources.base import ApplyContext, ResourceApplier
+from app.services.resources.base import ApplyContext, ApplyResult, ResourceApplier
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,7 @@ class LLMProviderApplier(ResourceApplier[LLMProviderSpec]):
             pricing={model: _stored_price(price) for model, price in (row.pricing or {}).items()},
             model_aliases=dict(row.model_aliases or {}),
             discount=row.pricing_discount,
+            pricing_provider=row.pricing_provider or None,
         )
 
     def new_row(self, spec: LLMProviderSpec, ctx: ApplyContext) -> LLMProvider:
@@ -106,6 +111,44 @@ class LLMProviderApplier(ResourceApplier[LLMProviderSpec]):
         } or None
         row.model_aliases = dict(spec.model_aliases) or None
         row.pricing_discount = spec.discount
+        row.pricing_provider = spec.pricing_provider
+
+    async def apply(
+        self,
+        spec: LLMProviderSpec,
+        ctx: ApplyContext,
+        *,
+        existing: Any = None,
+        must_create: bool = False,
+        keep: Iterable[str] = (),
+    ) -> ApplyResult:
+        result = await super().apply(
+            spec, ctx, existing=existing, must_create=must_create, keep=keep
+        )
+        if ctx.origin != "api" and spec.pricing_provider and result.action != "skipped":
+            note = await self._unknown_family(spec, ctx)
+            if note:
+                result.warning = f"{result.warning} {note}" if result.warning else note
+        return result
+
+    async def _unknown_family(self, spec: LLMProviderSpec, ctx: ApplyContext) -> Optional[str]:
+        """A warning when the deployment ratecard, as loaded now, lists no
+        model of the provider's pricingProvider family."""
+        from app.services import llm_pricing
+
+        try:
+            async with ctx.db.begin_nested():
+                card = await llm_pricing.deployment_ratecard(ctx.db)
+        except Exception as e:  # the apply doesn't depend on it
+            logger.warning("Could not check the pricingProvider of '%s': %s", spec.name, e)
+            return None
+        if spec.pricing_provider in llm_pricing.provider_families(card):
+            return None
+        return (
+            f"LLM provider '{spec.name}': the deployment ratecard "
+            f"{'lists no' if card else 'is empty, so it has no'} models for pricingProvider "
+            f"'{spec.pricing_provider}'; its models are matched by their bare names until it does."
+        )
 
     async def _unset_other_defaults(self, row: LLMProvider, ctx: ApplyContext) -> None:
         """One default provider; the previous one's change is recorded too."""

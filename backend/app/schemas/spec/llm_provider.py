@@ -7,10 +7,13 @@ Config writes `type`, `endpoint`, `apiKey`, `defaultModel` and a top-level
 
 Pricing (docs/design/usage-cost.md) is the same on every channel: `pricing`
 maps a model to LiteLLM's per-token fields, `modelAliases` (model_aliases)
-maps a model as called to the ratecard model it is priced as, and
-`discount` multiplies deployment-ratecard prices.
+maps a model as called to the ratecard model it is priced as,
+`discount` multiplies deployment-ratecard prices, and `pricingProvider`
+(pricing_provider) names the LiteLLM provider family the models are priced
+as, for an OpenAI-compatible API of another provider.
 """
 
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -36,6 +39,9 @@ class ModelPricing(BaseModel):
             raise ValueError("set input_cost_per_token and/or output_cost_per_token")
         return self
 
+# A LiteLLM provider family: "mistral", "together_ai", "vertex_ai-language-models".
+_FAMILY = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
 _CONFIG_NAMES = {
     "type": "provider_type",
     "endpoint": "api_endpoint",
@@ -59,6 +65,10 @@ class LLMProviderSpec(SpecModel):
     model_aliases: dict[str, str] = Field(default_factory=dict)
     # A multiplier on deployment-ratecard prices: 0.8 is 20% off list.
     discount: Optional[float] = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # The LiteLLM provider family to price models as, in place of the one
+    # provider_type maps to. Not checked against the ratecard (it changes);
+    # config apply warns when the ratecard has no models for it.
+    pricing_provider: Optional[str] = Field(default=None, max_length=64)
 
     @model_validator(mode="before")
     @classmethod
@@ -73,7 +83,7 @@ class LLMProviderSpec(SpecModel):
             data["config"] = {"models": data.pop("models"), **(data.get("config") or {})}
         return data
 
-    @field_validator("api_key", "api_endpoint", "default_model", mode="before")
+    @field_validator("api_key", "api_endpoint", "default_model", "pricing_provider", mode="before")
     @classmethod
     def _empty_is_none(cls, value: Any) -> Any:
         return None if value == "" else value
@@ -91,6 +101,16 @@ class LLMProviderSpec(SpecModel):
                 raise ValueError(f"invalid model name {model!r}")
             if isinstance(target, str) and (not target.strip() or len(target) > 255):
                 raise ValueError(f"invalid alias target for {model!r}: {target!r}")
+        return value
+
+    @field_validator("pricing_provider")
+    @classmethod
+    def _family(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _FAMILY.match(value):
+            raise ValueError(
+                f"invalid pricing provider {value!r}: a lowercase LiteLLM provider name, "
+                "such as 'mistral' or 'together_ai'"
+            )
         return value
 
     @property
@@ -118,6 +138,8 @@ class LLMProviderSpec(SpecModel):
             state.pop("model_aliases", None)
         if self.discount is None:
             state.pop("discount", None)
+        if self.pricing_provider is None:
+            state.pop("pricing_provider", None)
         return state
 
     def to_config(self) -> dict[str, Any]:
@@ -140,6 +162,8 @@ class LLMProviderSpec(SpecModel):
             out["modelAliases"] = dict(self.model_aliases)
         if self.discount is not None:
             out["discount"] = self.discount
+        if self.pricing_provider:
+            out["pricingProvider"] = self.pricing_provider
         out["isDefault"] = self.is_default
         out["isActive"] = self.is_active
         return out
