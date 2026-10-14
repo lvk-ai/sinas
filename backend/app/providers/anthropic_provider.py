@@ -4,10 +4,35 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, Optional
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from .base import BaseLLMProvider
-from .clients import secret_id, shared_client
+from .clients import guard_trace_context, secret_id, shared_client
+
+
+def anthropic_client(
+    *, api_key: Optional[str], base_url: Optional[str], http_client: Any = None, **options: Any
+) -> AsyncAnthropic:
+    """The SDK client an `AnthropicProvider` talks through.
+
+    It sends trace context only when the provider asks (`propagate_context`).
+    Since anthropic 1.14.0 the SDK sends its own: its call span's
+    `traceparent`, and the current `baggage` with it, on every request,
+    unless its `open_telemetry` option says `propagation: False`. That is set
+    here, keeping the rest of the option as the SDK resolved it (its spans,
+    and the `ANTHROPIC_OPEN_TELEMETRY*` variables). The HTTP client's guard
+    drops whatever an SDK sends unasked, whatever the SDK version.
+    """
+    client = AsyncAnthropic(
+        api_key=api_key,
+        base_url=base_url,
+        http_client=guard_trace_context(http_client or DefaultAsyncHttpxClient()),
+        **options,
+    )
+    telemetry = getattr(client, "open_telemetry", None)  # anthropic >= 1.14.0
+    if isinstance(telemetry, dict) and telemetry.get("propagation"):
+        client = client.with_options(open_telemetry={**telemetry, "propagation": False})
+    return client
 
 
 class UnsupportedOutputSchema(ValueError):
@@ -104,7 +129,7 @@ class AnthropicProvider(BaseLLMProvider):
         super().__init__(api_key, base_url)
         self.client = shared_client(
             ("anthropic", secret_id(api_key), base_url),
-            lambda: AsyncAnthropic(api_key=api_key, base_url=base_url),
+            lambda: anthropic_client(api_key=api_key, base_url=base_url),
         )
         self.enable_prompt_caching = enable_prompt_caching
         # output_config.effort, set per agent through provider_overrides
@@ -659,7 +684,7 @@ class AnthropicProvider(BaseLLMProvider):
                 {"custom_id": req["custom_id"], "params": self._build_batch_params(req)}
                 for req in requests
             ],
-            extra_headers=self._context_headers() or None,
+            extra_headers=self._sdk_context_headers() or None,
         )
         return batch.id
 
