@@ -50,6 +50,18 @@ class BaseLLMProvider(ABC):
 
         return inject_trace_context()
 
+    def _sdk_context_headers(self) -> dict[str, str]:
+        """`_context_headers`, for a call through an SDK client: marked, so
+        that the client's guard (`clients.guard_trace_context`) lets them
+        through. Without the mark it drops any trace context the SDK adds on
+        its own."""
+        headers = self._context_headers()
+        if not headers:
+            return {}
+        from .clients import CONTEXT_OPT_IN_HEADER
+
+        return {**headers, CONTEXT_OPT_IN_HEADER: "1"}
+
     def _add_context_headers(self, call_kwargs: dict[str, Any]) -> None:
         """Add the current trace context to an SDK call's `extra_headers`, in
         place, when enabled.
@@ -58,7 +70,7 @@ class BaseLLMProvider(ABC):
         a request body: the context travels as HTTP headers, and a body that
         is sent as data (a batch item) would carry it as an unknown field.
         """
-        headers = self._context_headers()
+        headers = self._sdk_context_headers()
         if headers:
             call_kwargs["extra_headers"] = {**(call_kwargs.get("extra_headers") or {}), **headers}
 

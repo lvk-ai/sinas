@@ -4,7 +4,8 @@ Pinned here: a request's `traceparent` and `baggage` become the current
 context while it is served, with members split over several `baggage` lines
 kept; every provider type configured with `propagate_context` sends both on
 with every call it makes for a request, batch submissions included, and one
-that is not sends nothing; a batch item's body never carries them; a queued
+that is not sends nothing, even when its SDK would send its own (as
+anthropic 1.14.0 does); a batch item's body never carries them; a queued
 job, a resumed one included, makes the context it was enqueued with current,
 baggage included.
 
@@ -37,6 +38,9 @@ from app.providers import (
     OpenAIProvider,
     ollama_provider,
 )
+from app.providers.anthropic_provider import anthropic_client
+from app.providers.clients import CONTEXT_OPT_IN_HEADER
+from app.providers.openai_provider import openai_client
 from app.queue import agent_jobs
 
 TRACE_ID = "4c79f60c11214eb38604f4ae0781bfb2"
@@ -108,9 +112,17 @@ class _Wire:
     canned response per path, or a 400 that ends the call. The Anthropic SDK
     sends through `httpx2`, the others through `httpx`."""
 
-    def __init__(self, answers: dict[str, dict] | None = None) -> None:
+    def __init__(self, answers: dict[str, dict] | None = None, *, sdk_injects: bool = False) -> None:
         self.sent: list = []
         self.answers = answers or {}
+        # Stands for an SDK (or an instrumentation of its HTTP client) that
+        # adds the current trace context to every request on its own, as
+        # anthropic 1.14.0 does: a request hook on the client it is given.
+        self.hooks = {"request": [self._inject]} if sdk_injects else {}
+
+    @staticmethod
+    async def _inject(request) -> None:
+        request.headers.update(inject_trace_context())
 
     def _answer(self, request, response_class):
         self.sent.append(request)
@@ -121,16 +133,19 @@ class _Wire:
 
     def client(self, **kwargs) -> httpx.AsyncClient:
         handle = lambda request: self._answer(request, httpx.Response)  # noqa: E731
-        return _HttpxClient(transport=httpx.MockTransport(handle), **kwargs)
+        return _HttpxClient(transport=httpx.MockTransport(handle), event_hooks=self.hooks, **kwargs)
 
     def client2(self) -> httpx2.AsyncClient:
         handle = lambda request: self._answer(request, httpx2.Response)  # noqa: E731
-        return httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+        return httpx2.AsyncClient(transport=httpx2.MockTransport(handle), event_hooks=self.hooks)
+
+
+# Each SDK client is built the way its provider builds it, on the wire.
 
 
 def _openai(wire: _Wire) -> OpenAIProvider:
     provider = OpenAIProvider(api_key="k", base_url="http://gateway.test/v1")
-    provider.client = openai.AsyncOpenAI(
+    provider.client = openai_client(
         api_key="k", base_url="http://gateway.test/v1", http_client=wire.client(), max_retries=0
     )
     return provider
@@ -138,7 +153,8 @@ def _openai(wire: _Wire) -> OpenAIProvider:
 
 def _azure(wire: _Wire) -> AzureOpenAIProvider:
     provider = AzureOpenAIProvider(api_key="k", azure_endpoint="http://gateway.test")
-    provider.client = openai.AsyncAzureOpenAI(
+    provider.client = openai_client(
+        openai.AsyncAzureOpenAI,
         api_key="k",
         api_version=provider.api_version,
         azure_endpoint="http://gateway.test",
@@ -150,7 +166,7 @@ def _azure(wire: _Wire) -> AzureOpenAIProvider:
 
 def _mistral(wire: _Wire) -> MistralProvider:
     provider = MistralProvider(api_key="k", base_url="http://gateway.test/v1")
-    provider.client = openai.AsyncOpenAI(
+    provider.client = openai_client(
         api_key="k", base_url="http://gateway.test/v1", http_client=wire.client(), max_retries=0
     )
     return provider
@@ -158,7 +174,7 @@ def _mistral(wire: _Wire) -> MistralProvider:
 
 def _anthropic(wire: _Wire) -> AnthropicProvider:
     provider = AnthropicProvider(api_key="k", base_url="http://gateway.test")
-    provider.client = anthropic.AsyncAnthropic(
+    provider.client = anthropic_client(
         api_key="k", base_url="http://gateway.test", http_client=wire.client2(), max_retries=0
     )
     return provider
@@ -224,6 +240,39 @@ def test_every_provider_sends_the_context_only_when_configured_to(kind, call, mo
     _call_inside_the_context(provider, call)
     assert wire.sent
     assert all(_carries_the_context(r) for r in wire.sent)
+    # The mark that lets it through stays in the process.
+    assert not any(CONTEXT_OPT_IN_HEADER in r.headers for r in wire.sent)
+
+
+SDK_PROVIDERS = {kind: PROVIDERS[kind] for kind in ("openai", "azure", "mistral", "anthropic")}
+
+
+@pytest.mark.parametrize("call", [_complete, _stream], ids=["complete", "stream"])
+@pytest.mark.parametrize("kind", SDK_PROVIDERS)
+def test_an_sdk_that_sends_the_context_on_its_own_is_overruled(kind, call, monkeypatch):
+    # Whatever an SDK version does, the provider's setting decides.
+    wire = _Wire(sdk_injects=True)
+    _call_inside_the_context(SDK_PROVIDERS[kind](wire, monkeypatch), call)
+    assert wire.sent
+    assert not any("baggage" in r.headers or "traceparent" in r.headers for r in wire.sent)
+
+    wire = _Wire(sdk_injects=True)
+    provider = SDK_PROVIDERS[kind](wire, monkeypatch)
+    provider.propagate_context = True
+    _call_inside_the_context(provider, call)
+    assert wire.sent
+    assert all(_carries_the_context(r) for r in wire.sent)
+    assert not any(CONTEXT_OPT_IN_HEADER in r.headers for r in wire.sent)
+
+
+def test_the_anthropic_sdk_is_told_not_to_send_its_own_context():
+    client = anthropic_client(api_key="k", base_url="http://gateway.test")
+    telemetry = getattr(client, "open_telemetry", None)
+    if telemetry is None:
+        pytest.skip(f"anthropic {anthropic.__version__} sends no trace context of its own")
+    assert telemetry["propagation"] is False
+    # The SDK's own spans are left as it resolved them.
+    assert telemetry["traces"] == anthropic.AsyncAnthropic(api_key="k").open_telemetry["traces"]
 
 
 def test_a_payload_never_carries_the_context():

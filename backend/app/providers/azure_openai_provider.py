@@ -5,7 +5,7 @@ from openai import AsyncAzureOpenAI
 
 from .base import BaseLLMProvider
 from .clients import secret_id, shared_client
-from .openai_provider import OpenAIProvider
+from .openai_provider import OpenAIProvider, openai_client
 
 # Azure requires an explicit API version; this is a recent stable default used
 # when one is not configured. See Azure OpenAI "API version lifecycle" docs.
@@ -79,7 +79,8 @@ class AzureOpenAIProvider(OpenAIProvider):
         self.extra_params = dict(extra_params or {})
         self.client = shared_client(
             ("azure", secret_id(api_key), azure_endpoint, self.api_version, azure_deployment),
-            lambda: AsyncAzureOpenAI(
+            lambda: openai_client(
+                AsyncAzureOpenAI,
                 api_key=api_key,
                 api_version=self.api_version,
                 azure_endpoint=azure_endpoint,

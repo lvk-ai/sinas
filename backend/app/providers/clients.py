@@ -22,6 +22,7 @@ from typing import Any, Optional, TypeVar
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+H = TypeVar("H")
 
 # Per loop. More than a deployment has providers; past it, the least
 # recently used client is dropped, and closed once any call still using it
@@ -89,3 +90,61 @@ async def _close(client: Any) -> None:
             await result
     except Exception as e:
         logger.debug(f"Closing an LLM client failed: {e}")
+
+
+# ── Trace context ───────────────────────────────────────────────────────────
+#
+# Whether a request to a model API carries the trace context (`traceparent`,
+# `baggage`, ...) is Sinas's decision alone: the provider's `propagate_context`
+# setting, off by default, because the baggage says whom a request is for.
+# An SDK may decide otherwise on its own: anthropic 1.14.0 started sending its
+# own call span's context, with the current baggage, on every request. So
+# every SDK client's HTTP client gets a last request hook that drops the trace
+# context from any request a provider did not mark as carrying it on purpose.
+# The mark is a private header that the hook takes off again, so it never
+# leaves the process either.
+
+#: Set (by `BaseLLMProvider._sdk_context_headers`) on a request that carries
+#: the trace context on purpose. Never sent.
+CONTEXT_OPT_IN_HEADER = "x-sinas-propagate-context"
+
+_W3C_CONTEXT_FIELDS = ("traceparent", "tracestate", "baggage")
+
+
+def _trace_context_fields() -> set[str]:
+    """The headers that carry a trace context: the W3C ones, and whatever the
+    registered propagator sets (`OTEL_PROPAGATORS` may add others, e.g. B3)."""
+    fields = set(_W3C_CONTEXT_FIELDS)
+    try:
+        from opentelemetry.propagate import get_global_textmap
+
+        fields.update(field.lower() for field in get_global_textmap().fields)
+    except Exception:
+        pass
+    return fields
+
+
+async def _drop_unrequested_trace_context(request: Any) -> None:
+    if CONTEXT_OPT_IN_HEADER in request.headers:
+        del request.headers[CONTEXT_OPT_IN_HEADER]
+        return
+    for field in _trace_context_fields():
+        if field in request.headers:
+            del request.headers[field]
+
+
+def guard_trace_context(http_client: H) -> H:
+    """`http_client` (an `httpx` or `httpx2` async client), made to send trace
+    context only on requests a provider marked with `CONTEXT_OPT_IN_HEADER`.
+
+    The hook goes last, after any the client already has, so that it sees the
+    request as it will be sent. Guarding a client twice adds it once.
+    """
+    hooks = http_client.event_hooks  # type: ignore[attr-defined]
+    request_hooks = list(hooks.get("request", []))
+    if _drop_unrequested_trace_context not in request_hooks:
+        http_client.event_hooks = {  # type: ignore[attr-defined]
+            **hooks,
+            "request": [*request_hooks, _drop_unrequested_trace_context],
+        }
+    return http_client
