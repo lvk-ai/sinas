@@ -36,6 +36,12 @@ from app.services import sso
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Per client IP and rate-limit window. Generous: a whole office signing in
+# at nine shares one address, and nothing here can be guessed (states and
+# codes are 256 random bits); this only bounds what one client parks in
+# Redis.
+SSO_IP_LIMIT = 300
+
 
 def _to_console(**params: str) -> RedirectResponse:
     """Back to the console's SSO route: the only place this flow redirects
@@ -71,7 +77,7 @@ async def discover_sso_provider(body: SsoDiscoverRequest, request: Request, db: 
     """The provider an email's domain must sign in with, if any (the console
     sends such a domain straight there). Decided by domain alone, so it
     reveals nothing about accounts."""
-    await rate_limit_by_ip(request, "sso_discover", settings.rate_limit_login_ip_max, settings.rate_limit_window_seconds)
+    await rate_limit_by_ip(request, "sso_discover", SSO_IP_LIMIT, settings.rate_limit_window_seconds)
     provider = await sso.enforcing_provider(db, body.email)
     if provider is None:
         return SsoDiscoverResponse()
@@ -81,6 +87,7 @@ async def discover_sso_provider(body: SsoDiscoverRequest, request: Request, db: 
 @router.get("/oidc/{name}/start", include_in_schema=False)
 async def start_sso(
     name: str,
+    request: Request,
     code_challenge: str = Query(default=""),
     return_to: str = Query(default="/"),
     db: AsyncSession = Depends(get_db),
@@ -88,6 +95,7 @@ async def start_sso(
     """Send the browser to the IdP. `code_challenge` (S256 of a verifier the
     console keeps) binds the one-time code to the console tab; `return_to`
     is a console path to continue on afterwards."""
+    await rate_limit_by_ip(request, "sso_start", SSO_IP_LIMIT, settings.rate_limit_window_seconds)
     if not sso.valid_challenge(code_challenge):
         return _failed("This sign-in link is incomplete. Start again from the login page.")
     provider = await _active(db, name)
@@ -196,14 +204,13 @@ async def sso_callback(
 
 
 @router.post("/oidc/exchange", response_model=SsoExchangeResponse)
-async def exchange_sso_code(body: SsoExchangeRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def exchange_sso_code(body: SsoExchangeRequest, db: AsyncSession = Depends(get_db)):
     """Trade the one-time code from the redirect for Sinas tokens. Single
     use, a minute to live, and only with the verifier of the challenge the
     console started with. The refresh token lasts the provider's
     session_hours at most."""
     from app.api.runtime.endpoints.authentication import _issue_tokens
 
-    await rate_limit_by_ip(request, "sso_exchange", settings.rate_limit_otp_ip_max, settings.rate_limit_window_seconds)
     payload = await sso.consume_code(body.code, body.code_verifier)
     if payload is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired sign-in code")

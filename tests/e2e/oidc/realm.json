@@ -1,0 +1,60 @@
+{
+  "realm": "sinas-e2e",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "groups": [
+    { "name": "sinas-admins" },
+    { "name": "sinas-readers" }
+  ],
+  "users": [
+    {
+      "username": "ann",
+      "email": "ann@acme.example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Ann",
+      "lastName": "Example",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "__USER_PASSWORD__", "temporary": false }
+      ],
+      "groups": ["/sinas-admins", "/sinas-readers"]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "sinas-console",
+      "name": "Sinas console",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "__CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["__REDIRECT_URI__"],
+      "webOrigins": ["+"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}
