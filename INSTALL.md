@@ -72,8 +72,8 @@ Tests use the dev database (via pgbouncer on localhost:5432) with transaction ro
 
 ```bash
 cd backend
-pip install -e ".[dev]"
-python -m pytest tests/ -v
+uv sync --extra dev          # locked deps + dev tools into backend/.venv
+uv run pytest tests/ -v
 ```
 
 ## Local Backend (without Docker)
@@ -82,9 +82,11 @@ For faster iteration on the backend without Docker:
 
 ```bash
 cd backend
-pip install -e ".[dev]"
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv sync --extra dev
+uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+Backend dependencies are locked in `backend/uv.lock`; see [CONTRIBUTING.md](CONTRIBUTING.md#backend-dependencies) for adding or upgrading one.
 
 Requires PostgreSQL, Redis, and ClickHouse running separately (e.g., via the dev compose with just infra services).
 
