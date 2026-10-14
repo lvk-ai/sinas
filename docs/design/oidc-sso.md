@@ -128,6 +128,11 @@ back signed in.
       says `email_verified: true`. Also refused when that user already has
       a different subject at this issuer, and for the superadmin (link the
       superadmin's identity explicitly through the users API if wanted).
+      The user row is locked from that check until the login commits, so
+      two first sign-ins with different subjects for one address can't both
+      link. (Not a unique index on (user, provider): identities linked by
+      token exchange or by hand may legitimately hold several subjects for
+      one provider name.)
    3. Else, with `autoProvision`, a new user with that email (and
       `defaultRole`). Not when the IdP says the email is unverified.
    4. Else refused: "no Sinas account".
@@ -170,13 +175,17 @@ back signed in.
    `users[].roles` is the full set for a config-managed user, so it may end
    IdP-granted memberships (they come back at the next SSO login).
 
-5. **Sessions.** The access token is the usual one. The refresh token of an
-   SSO login expires after `sessionHours` (never later than
+5. **Sessions.** An SSO session ends `sessionHours` after the login, to the
+   second. Its refresh token expires then (never later than
    `REFRESH_TOKEN_EXPIRE_DAYS`) and records the provider
-   (`refresh_tokens.identity_provider`). Then the console's refresh fails,
-   the user goes through the IdP again, and roles are synced again. A user
-   removed or deactivated at the IdP is out within `sessionHours`. Password
-   and OTP sessions are unchanged.
+   (`refresh_tokens.identity_provider`). Every access token minted for the
+   session, at the exchange or by a refresh, expires at the usual lifetime
+   or at the session's end, whichever comes first, so a refresh just before
+   the deadline doesn't stretch the session by a full access token. After
+   that the console's refresh fails, the user goes through the IdP again,
+   and roles are synced again. A user removed or deactivated at the IdP
+   keeps no access past the session's end. Password and OTP sessions are
+   unchanged.
 
 6. **The operator can't be locked out.**
    - Password and OTP login keep working; SSO is an addition.

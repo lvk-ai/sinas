@@ -5,7 +5,7 @@ import json
 import logging
 import secrets
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
@@ -68,8 +68,13 @@ _DUMMY_PASSWORD_HASH = hash_password("enumeration-resistant-dummy")
 
 async def _issue_tokens(db: AsyncSession, user: User, **refresh_options) -> tuple[str, str, AuthUserResponse]:
     """Mint an access + refresh token pair and build the user response.
-    `refresh_options` go to create_refresh_token (an SSO session's cap)."""
-    access_token = create_access_token(user_id=str(user.id), email=user.email)
+    `refresh_options` go to create_refresh_token (an SSO session's cap,
+    which the access token never outlives either)."""
+    cap = refresh_options.get("max_lifetime")
+    usual = timedelta(minutes=settings.access_token_expire_minutes)
+    access_token = create_access_token(
+        user_id=str(user.id), email=user.email, expires_delta=cap if cap is not None and cap < usual else None
+    )
     refresh_token_plain, _ = await create_refresh_token(db, str(user.id), **refresh_options)
 
     roles_result = await db.execute(
@@ -318,17 +323,19 @@ async def refresh_access_token(request: RefreshRequest, db: AsyncSession = Depen
     user_id, email = result
 
     # A password or code session ends once the user's domain must use SSO.
-    blocked = await sso_service.refresh_blocked(db, email, request.refresh_token)
+    session = await sso_service.refresh_session(db, request.refresh_token)
+    blocked = await sso_service.refresh_blocked(db, email, session)
     if blocked:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=blocked)
 
-    # Create new access token
-    access_token = create_access_token(user_id=user_id, email=email)
+    # Create new access token; an SSO session's never outlives the session.
+    lifetime = sso_service.access_token_lifetime(session)
+    access_token = create_access_token(user_id=user_id, email=email, expires_delta=lifetime)
 
     return RefreshResponse(
         access_token=access_token,
         token_type="bearer",
-        expires_in=settings.access_token_expire_minutes * 60,
+        expires_in=int(lifetime.total_seconds()) if lifetime else settings.access_token_expire_minutes * 60,
     )
 
 
