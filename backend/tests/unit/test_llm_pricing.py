@@ -5,6 +5,7 @@ call is priced from the provider's own pricing first, then the deployment
 ratecard (inline JSON over file over URL); the cost is frozen when the row
 is written, and only unpriced rows are ever backfilled.
 """
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 
 from app.core.config import settings
 from app.models import LLMUsage
@@ -482,3 +483,185 @@ async def test_provider_batch_results_are_recorded_as_batch_and_priced_so(db, ad
     assert (row.batch, row.source, row.model, row.price_source) == (True, "provider_batch", "claude-sonnet-4-5", "deployment")
     regular = call_cost(_card()["claude-sonnet-4-5"], prompt_tokens=1200, completion_tokens=100, cache_read_tokens=1000)
     assert row.cost_usd * 2 == regular
+
+
+class TestReviewFixes:
+    async def test_a_failing_pricing_query_never_loses_the_write(self, db, monkeypatch):
+        """A pricing read that errors aborts only its savepoint: the usage row
+        and anything else the caller has pending (the batch poller's messages)
+        still commit, unpriced."""
+        from app.providers import tracking
+
+        async def failing(session, name, **kwargs):
+            await session.execute(text("SELECT 1/0"))  # aborts the transaction, as a timeout would
+
+        monkeypatch.setattr(llm_pricing, "provider_pricing", failing)
+
+        class _Session:
+            async def __aenter__(self):
+                return db
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr("app.core.database.AsyncSessionLocal", lambda: _Session())
+        provider = await _provider(db)
+        chat_id = uuid.uuid4()
+        await tracking._insert_usage(_values(provider, "m-1", chat_id=chat_id))
+        row = (await db.execute(select(LLMUsage).where(LLMUsage.chat_id == chat_id))).scalar_one()
+        assert (row.cost_usd, row.price_source) == (None, None)
+
+        # The batch poller's shape: other writes pending in the same session.
+        other = LLMProvider(name=_name(), provider_type="openai")
+        db.add(other)
+        values = _values(provider, "m-1")
+        await price_usage(db, values)
+        db.add(LLMUsage(**values))
+        await db.commit()
+        assert (await db.execute(select(LLMProvider.id).where(LLMProvider.name == other.name))).scalar_one()
+
+    async def test_cached_pricing_makes_no_query(self, db, monkeypatch):
+        monkeypatch.setattr(settings, "model_prices_json", json.dumps(LITELLM))
+        provider = await _provider(db, provider_type="anthropic")
+        await price_usage(db, _values(provider, "claude-sonnet-4-5"))  # warms both caches
+
+        async def no_queries(*args, **kwargs):
+            raise AssertionError("queried the database")
+
+        monkeypatch.setattr(db, "execute", no_queries)
+        monkeypatch.setattr(db, "begin_nested", no_queries)
+        values = _values(provider, "claude-sonnet-4-5")
+        await price_usage(db, values)
+        assert values["price_source"] == "deployment"
+
+    async def test_concurrent_reloads_never_see_a_half_loaded_url_card(self, db, monkeypatch):
+        url = "https://prices.example/p.json"
+        monkeypatch.setattr(settings, "model_prices_url", url)
+        db.add(RatecardCache(
+            source="url", url=url, model_count=1, fetched_at=datetime.now(timezone.utc),
+            entries={"gpt-4o": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06}},
+        ))
+        await db.flush()
+        real_entries = llm_pricing._url_entries
+
+        async def slow_entries(session):
+            await asyncio.sleep(0.05)
+            return await real_entries(session)
+
+        monkeypatch.setattr(llm_pricing, "_url_entries", slow_entries)
+        cards = await asyncio.gather(
+            llm_pricing.deployment_ratecard(db, fresh=True), llm_pricing.deployment_ratecard(db, fresh=True)
+        )
+        assert all("gpt-4o" in card for card in cards)
+
+    async def test_a_failed_url_load_publishes_nothing_and_stays_due(self, db, monkeypatch):
+        url = "https://prices.example/p.json"
+        monkeypatch.setattr(settings, "model_prices_url", url)
+        db.add(RatecardCache(
+            source="url", url=url, model_count=1, fetched_at=datetime.now(timezone.utc),
+            entries={"gpt-4o": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06}},
+        ))
+        await db.flush()
+        real_entries = llm_pricing._url_entries
+        calls = []
+
+        async def flaky_entries(session):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("connection reset")
+            return await real_entries(session)
+
+        monkeypatch.setattr(llm_pricing, "_url_entries", flaky_entries)
+        with pytest.raises(RuntimeError):
+            await llm_pricing.deployment_ratecard(db)
+        assert llm_pricing.deployment_layers()["url"].key is None
+        # Not cached as loaded: the next call (no `fresh`) loads it.
+        assert "gpt-4o" in await llm_pricing.deployment_ratecard(db)
+
+    async def test_first_refreshes_at_once_dont_collide(self, monkeypatch):
+        """Two sessions create the cache row at the same time (an admin's
+        refresh and the cron's): both succeed."""
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.services import package_repositories
+        from tests.conftest import _test_db_url
+
+        monkeypatch.setattr(settings, "model_prices_url", "https://prices.example/race.json")
+
+        # Both fetches finish together, so both refreshes reach the row
+        # before either commits.
+        started, both = [], asyncio.Event()
+
+        async def fake_get(url, headers, **kwargs):
+            started.append(url)
+            if len(started) == 2:
+                both.set()
+            await asyncio.wait_for(both.wait(), timeout=5)
+            return json.dumps(LITELLM).encode()
+
+        monkeypatch.setattr(package_repositories, "_get", fake_get)
+        engine = create_async_engine(_test_db_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def clear():
+            async with sessions() as s:
+                await s.execute(delete(RatecardCache).where(RatecardCache.source == "url"))
+                await s.commit()
+
+        async def refresh():
+            async with sessions() as s:
+                stored = await llm_pricing.refresh_url_ratecard(s, force=True)
+                await s.commit()
+                return stored
+
+        await clear()
+        try:
+            assert await asyncio.gather(refresh(), refresh()) == [True, True]
+            async with sessions() as s:
+                assert (await s.get(RatecardCache, "url")).model_count == 5
+        finally:
+            await clear()
+            await engine.dispose()
+
+    async def test_backfill_counts_hold_while_calls_keep_arriving(self, db, monkeypatch):
+        provider = await _provider(db, pricing={"m-live": {"input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06}})
+        db.add(LLMUsage(created_at=datetime.now(timezone.utc) - timedelta(minutes=5), **_values(provider, "m-live")))
+        await db.flush()
+        real = llm_pricing.provider_pricing
+        late = LLMUsage(created_at=datetime.now(timezone.utc) + timedelta(seconds=1), **_values(provider, "m-live"))
+
+        async def call_arrives(session, name, **kwargs):
+            if late not in session:
+                session.add(late)  # recorded while the backfill runs
+                await session.flush()
+            return await real(session, name, **kwargs)
+
+        monkeypatch.setattr(llm_pricing, "provider_pricing", call_arrives)
+        result = await llm_pricing.backfill(db, start=datetime.now(timezone.utc) - timedelta(hours=1))
+        assert result["unpriced_calls"] >= 0
+        assert result["examined_calls"] == result["priced_calls"] + result["unpriced_calls"]
+        await db.refresh(late)
+        assert late.cost_usd is None  # after the range's end: left alone
+
+
+def test_concurrent_indexes_have_a_revision_of_their_own():
+    """A failed CONCURRENTLY build must not strand the columns migration:
+    it lives in a revision of its own, which drops leftovers first."""
+    import importlib.util
+    from pathlib import Path
+
+    versions = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+
+    def load(name):
+        spec = importlib.util.spec_from_file_location(name, versions / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    columns = load("c1o2s3t4u5s6_llm_usage_cost")
+    indexes = load("c2u3s4i5d6x7_llm_usage_cost_indexes")
+    assert indexes.down_revision == columns.revision
+    assert "CONCURRENTLY" not in (versions / "c1o2s3t4u5s6_llm_usage_cost.py").read_text().split("def upgrade")[1]
+    source = (versions / "c2u3s4i5d6x7_llm_usage_cost_indexes.py").read_text()
+    for index in ("idx_llm_usage_agent_created", "idx_llm_usage_provider_created"):
+        assert source.index(f"DROP INDEX CONCURRENTLY IF EXISTS {index}") < source.index(f"CREATE INDEX CONCURRENTLY {index}")
