@@ -17,6 +17,7 @@ rows that were never priced.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -29,6 +30,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -349,13 +351,20 @@ class _DeploymentCache:
     checked: float = 0.0
     layers: dict[str, _Layer] = field(default_factory=lambda: {n: _Layer() for n in DEPLOYMENT_LAYERS})
     merged: dict[str, ModelPrice] = field(default_factory=dict)
+    merged_keys: Optional[dict[str, Any]] = None  # the layer keys `merged` was built from
+    # One reload at a time: readers keep using `merged` meanwhile, and a
+    # reload publishes a layer only once it is fully loaded.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # provider name -> (loaded at, its pricing or None)
+    providers: dict[str, tuple[float, Optional["ProviderPricing"]]] = field(default_factory=dict)
 
 
 _cache = _DeploymentCache()
 
 
 def reset_cache() -> None:
-    """Forget the loaded ratecard (tests; settings changed in-process)."""
+    """Forget the loaded ratecard and provider pricing (tests; settings
+    changed in-process)."""
     global _cache
     _cache = _DeploymentCache()
 
@@ -364,14 +373,14 @@ def _load_json_layer(layer: _Layer) -> None:
     raw = settings.model_prices_json
     if layer.key == ("json", raw):
         return
-    layer.key, layer.card, layer.error = ("json", raw), {}, None
-    if not raw:
-        return
-    try:
-        layer.card = parse_ratecard(raw, "json")
-    except RatecardError as e:
-        layer.error = f"MODEL_PRICES_JSON: {e}"
-        logger.warning("Ignoring the deployment ratecard: %s", layer.error)
+    card, error = {}, None
+    if raw:
+        try:
+            card = parse_ratecard(raw, "json")
+        except RatecardError as e:
+            error = f"MODEL_PRICES_JSON: {e}"
+            logger.warning("Ignoring the deployment ratecard: %s", error)
+    layer.key, layer.card, layer.error = ("json", raw), card, error
 
 
 def _load_file_layer(layer: _Layer) -> None:
@@ -382,21 +391,32 @@ def _load_file_layer(layer: _Layer) -> None:
         mtime = None
     if layer.key == ("file", path, mtime):
         return
-    layer.key, layer.card, layer.error = ("file", path, mtime), {}, None
-    if not path:
-        return
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(settings.model_prices_max_bytes + 1)
-        if len(raw) > settings.model_prices_max_bytes:
-            raise RatecardError(f"larger than {settings.model_prices_max_bytes} bytes")
-        layer.card = parse_ratecard(raw, "file")
-    except (OSError, RatecardError) as e:
-        layer.error = f"MODEL_PRICES_FILE: {e}"
-        logger.warning("Ignoring the deployment ratecard: %s", layer.error)
+    card, error = {}, None
+    if path:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(settings.model_prices_max_bytes + 1)
+            if len(raw) > settings.model_prices_max_bytes:
+                raise RatecardError(f"larger than {settings.model_prices_max_bytes} bytes")
+            card = parse_ratecard(raw, "file")
+        except (OSError, RatecardError) as e:
+            error = f"MODEL_PRICES_FILE: {e}"
+            logger.warning("Ignoring the deployment ratecard: %s", error)
+    layer.key, layer.card, layer.error = ("file", path, mtime), card, error
+
+
+async def _url_entries(db: AsyncSession) -> Optional[dict[str, Any]]:
+    from app.models.ratecard_cache import RatecardCache
+
+    return (
+        await db.execute(select(RatecardCache.entries).where(RatecardCache.source == "url"))
+    ).scalar_one_or_none()
 
 
 async def _load_url_layer(db: AsyncSession, layer: _Layer) -> None:
+    """Loads into locals and publishes key and card together, only once both
+    queries succeeded: a failed load leaves the previous card (and key) in
+    place, so the next reload tries again."""
     from app.models.ratecard_cache import RatecardCache
 
     url = settings.model_prices_url
@@ -414,39 +434,43 @@ async def _load_url_layer(db: AsyncSession, layer: _Layer) -> None:
     # this ratecard.
     current = row is not None and row.url == url and row.fetched_at is not None
     key = ("url", url, row.fetched_at if current else None)
-    layer.error = row.last_error if row is not None else None
+    error = row.last_error if row is not None else None
     if layer.key == key:
+        layer.error = error
         return
-    layer.key, layer.card = key, {}
+    card: dict[str, ModelPrice] = {}
     if current:
-        entries = (
-            await db.execute(select(RatecardCache.entries).where(RatecardCache.source == "url"))
-        ).scalar_one_or_none()
         try:
-            layer.card = parse_ratecard(entries or {}, "url")
+            card = parse_ratecard(await _url_entries(db) or {}, "url")
         except RatecardError as e:  # pragma: no cover - stored entries were parsed once
-            layer.error = str(e)
+            error = str(e)
+    layer.key, layer.card, layer.error = key, card, error
 
 
 async def deployment_ratecard(db: AsyncSession, *, fresh: bool = False) -> dict[str, ModelPrice]:
     """The merged deployment ratecard. Re-checked at most once a minute per
     process (the file by mtime, the URL copy by its fetch time), unless
-    `fresh`."""
-    now = time.monotonic()
-    if not fresh and now - _cache.checked < _CACHE_SECONDS:
+    `fresh`. Reloads are serialised; a reload that fails raises and leaves
+    the previous ratecard in use (and due again)."""
+    if not fresh and time.monotonic() - _cache.checked < _CACHE_SECONDS:
         return _cache.merged
-    layers = _cache.layers
-    before = {name: layer.key for name, layer in layers.items()}
-    _load_json_layer(layers["json"])
-    _load_file_layer(layers["file"])
-    await _load_url_layer(db, layers["url"])
-    if {name: layer.key for name, layer in layers.items()} != before or not _cache.checked:
-        merged: dict[str, ModelPrice] = {}
-        for name in reversed(DEPLOYMENT_LAYERS):  # lowest precedence first
-            merged.update(layers[name].card)
-        _cache.merged = merged
-    _cache.checked = now
-    return _cache.merged
+    cache = _cache
+    async with cache.lock:
+        now = time.monotonic()
+        if not fresh and now - cache.checked < _CACHE_SECONDS:
+            return cache.merged  # reloaded while this call waited
+        layers = cache.layers
+        _load_json_layer(layers["json"])
+        _load_file_layer(layers["file"])
+        await _load_url_layer(db, layers["url"])
+        keys = {name: layer.key for name, layer in layers.items()}
+        if keys != cache.merged_keys or not cache.checked:
+            merged: dict[str, ModelPrice] = {}
+            for name in reversed(DEPLOYMENT_LAYERS):  # lowest precedence first
+                merged.update(layers[name].card)
+            cache.merged, cache.merged_keys = merged, keys
+        cache.checked = now
+        return cache.merged
 
 
 def deployment_layers() -> dict[str, _Layer]:
@@ -459,11 +483,18 @@ def deployment_layers() -> dict[str, _Layer]:
 # ---------------------------------------------------------------------------
 
 
-async def provider_pricing(db: AsyncSession, name: Optional[str]) -> Optional[ProviderPricing]:
+async def provider_pricing(
+    db: AsyncSession, name: Optional[str], *, fresh: bool = False
+) -> Optional[ProviderPricing]:
     """The pricing of the provider named `name` (switched off or not), or
-    None when there is no such provider."""
+    None when there is no such provider. Cached per process for a minute
+    like the deployment ratecard (so most calls price without a query),
+    unless `fresh`."""
     if not name:
         return None
+    cached = _cache.providers.get(name)
+    if not fresh and cached is not None and time.monotonic() - cached[0] < _CACHE_SECONDS:
+        return cached[1]
     from app.models.llm_provider import LLMProvider
 
     row = (
@@ -477,24 +508,49 @@ async def provider_pricing(db: AsyncSession, name: Optional[str]) -> Optional[Pr
             ).where(LLMProvider.name == name)
         )
     ).one_or_none()
-    if row is None:
-        return None
-    return ProviderPricing.from_values(
-        row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount
-    )
+    pricing = None
+    if row is not None:
+        pricing = ProviderPricing.from_values(
+            row.name, row.provider_type, row.pricing, row.model_aliases, row.pricing_discount
+        )
+    _cache.providers[name] = (time.monotonic(), pricing)
+    return pricing
+
+
+def _cached(provider_name: Optional[str]) -> bool:
+    """Whether pricing a call through this provider needs no query now."""
+    now = time.monotonic()
+    if now - _cache.checked >= _CACHE_SECONDS:
+        return False
+    if not provider_name:
+        return True
+    cached = _cache.providers.get(provider_name)
+    return cached is not None and now - cached[0] < _CACHE_SECONDS
 
 
 async def price_usage(db: AsyncSession, values: dict[str, Any]) -> None:
     """Set cost_usd and price_source on an llm_usage row's values, in place,
     when a price is known. Never raises: a failure leaves the row unpriced
-    (and backfillable)."""
+    (and backfillable).
+
+    The pricing reads (made only when a cache is due) run in a savepoint of
+    the caller's transaction: a query that fails or times out rolls back to
+    it, so the usage row — and whatever else the caller writes, the batch
+    poller's messages and executions — still commits."""
+    name = values.get("provider_name")
     try:
-        resolution = resolve(
-            values.get("model"),
-            values.get("provider_type"),
-            await provider_pricing(db, values.get("provider_name")),
-            await deployment_ratecard(db),
-        )
+        if _cached(name):  # the usual case: no query at all
+            provider = await provider_pricing(db, name)
+            deployment = await deployment_ratecard(db)
+        else:
+            async with db.begin_nested():
+                provider = await provider_pricing(db, name)
+                deployment = await deployment_ratecard(db)
+    except Exception as e:
+        logger.warning(f"Failed to price LLM usage: {e}")
+        return
+    try:
+        resolution = resolve(values.get("model"), values.get("provider_type"), provider, deployment)
         if resolution is None:
             return
         cost = call_cost(
@@ -519,14 +575,18 @@ async def backfill(
     """Price the rows in [start, end) that have no cost, with the prices that
     apply now; they get price_source "backfill". Rows already priced are
     never touched. One UPDATE per (provider, model, batch) group, committed
-    as it goes, so a long range doesn't hold one big transaction."""
+    as it goes, so a long range doesn't hold one big transaction.
+
+    Without an `end`, the range ends when the backfill starts: calls
+    recorded while it runs are left alone. The counts are what was priced
+    and what is still unpriced in the range afterwards (examined is their
+    sum), so they can't disagree whatever is written meanwhile."""
     from app.models.llm_usage import LLMUsage
 
-    window = [LLMUsage.cost_usd.is_(None)]
+    end = end or _now()
+    window = [LLMUsage.cost_usd.is_(None), LLMUsage.created_at < end]
     if start is not None:
         window.append(LLMUsage.created_at >= start)
-    if end is not None:
-        window.append(LLMUsage.created_at < end)
 
     groups = (
         await db.execute(
@@ -544,11 +604,10 @@ async def backfill(
 
     deployment = await deployment_ratecard(db, fresh=True)
     providers: dict[Optional[str], Optional[ProviderPricing]] = {}
-    examined = priced = 0
-    for provider_name, provider_type, model, batch, count in groups:
-        examined += count
+    priced = 0
+    for provider_name, provider_type, model, batch, _count in groups:
         if provider_name not in providers:
-            providers[provider_name] = await provider_pricing(db, provider_name)
+            providers[provider_name] = await provider_pricing(db, provider_name, fresh=True)
         resolution = resolve(model, provider_type, providers[provider_name], deployment)
         if resolution is None:
             continue
@@ -585,7 +644,8 @@ async def backfill(
         )
         priced += result.rowcount or 0
         await db.commit()
-    return {"examined_calls": examined, "priced_calls": priced, "unpriced_calls": examined - priced}
+    unpriced = (await db.execute(select(func.count()).select_from(LLMUsage).where(*window))).scalar_one()
+    return {"examined_calls": priced + unpriced, "priced_calls": priced, "unpriced_calls": unpriced}
 
 
 # ---------------------------------------------------------------------------
@@ -643,10 +703,15 @@ async def refresh_url_ratecard(db: AsyncSession, *, force: bool = False) -> bool
         error = str(e)
         logger.warning("Model price ratecard %s: %s", _safe(url), error)
 
+    # The first refresh creates the row. Two refreshes at once (an admin's
+    # and the cron's) both insert-or-skip, then take turns on the row lock:
+    # never a duplicate key.
+    await db.execute(
+        pg_insert(RatecardCache)
+        .values(source="url", model_count=0)
+        .on_conflict_do_nothing(index_elements=["source"])
+    )
     row = await db.get(RatecardCache, "url", with_for_update=True, populate_existing=True)
-    if row is None:
-        row = RatecardCache(source="url", model_count=0)
-        db.add(row)
     row.checked_at = _now()
     if card is None:
         row.last_error = error

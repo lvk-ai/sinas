@@ -10,10 +10,9 @@ MODEL_PRICES_URL.
 Existing rows stay unpriced (POST /usage/backfill prices them); rows the
 batch poller wrote are marked batch.
 
-The usage API filters a time range by agent or provider: both get an index
-led by that column, built CONCURRENTLY like ix_messages_created_at so the
-inserts every LLM call makes are not blocked while they build. A build that
-fails leaves an INVALID index behind, so each is dropped first if present.
+All in one transaction, so a failure leaves nothing behind. The indexes the
+usage API needs are built CONCURRENTLY (outside a transaction) by the next
+revision, c2u3s4i5d6x7: kept apart so a failed build can simply be rerun.
 
 Revision ID: c1o2s3t4u5s6
 Revises: o1i2d3c4s5s6
@@ -51,23 +50,8 @@ def upgrade() -> None:
         sa.Column("last_error", sa.Text(), nullable=True),
     )
 
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_llm_usage_agent_created")
-        op.execute(
-            "CREATE INDEX CONCURRENTLY idx_llm_usage_agent_created "
-            "ON llm_usage (agent, created_at)"
-        )
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_llm_usage_provider_created")
-        op.execute(
-            "CREATE INDEX CONCURRENTLY idx_llm_usage_provider_created "
-            "ON llm_usage (provider_name, created_at)"
-        )
-
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_llm_usage_provider_created")
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_llm_usage_agent_created")
     op.drop_table("ratecard_cache")
     op.drop_column("llm_providers", "pricing_discount")
     op.drop_column("llm_providers", "model_aliases")

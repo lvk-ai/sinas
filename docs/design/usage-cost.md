@@ -8,7 +8,7 @@
   - `backend/app/services/usage_reports.py`, `backend/app/api/v1/endpoints/usage.py`: `/api/v1/usage/*`
   - `backend/app/providers/tracking.py`, `backend/app/scheduler/jobs/poll_provider_batches.py`: where rows are priced
   - `backend/app/schemas/spec/llm_provider.py`, `backend/app/services/resources/llm_providers.py`: provider pricing
-  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migration `c1o2s3t4u5s6`
+  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migrations `c1o2s3t4u5s6` (columns, table) and `c2u3s4i5d6x7` (indexes)
 - **Related docs:** `docs-mint/admin/usage-cost.mdx`
 
 ## 1. Context
@@ -75,10 +75,19 @@ that app can stop reading the table.
   explicit bounds): https on every redirect hop, a size cap
   (`MODEL_PRICES_MAX_BYTES`, 16 MB — LiteLLM's file is a few MB), and a
   timeout. Plain http is refused outright, with no development override.
-- **Each process caches the merged ratecard for a minute.** The file layer
-  is re-read when its mtime changes, the URL layer when the stored copy's
-  `fetched_at` changes. Provider pricing is read fresh per call (one indexed
-  lookup by name), so an edit applies to the next call.
+- **Each process caches the merged ratecard and each provider's pricing
+  for a minute.** The file layer is re-read when its mtime changes, the URL
+  layer when the stored copy's `fetched_at` changes. A provider pricing edit
+  applies to new calls within a minute. So the insert of a usage row
+  usually makes no pricing query at all; when a cache is due, its reads run
+  in a savepoint of the insert's transaction, so a failed or timed-out read
+  leaves that row (and the batch poller's other writes) committed, unpriced.
+- **Reloads are serialised** (one asyncio lock per process) and publish a
+  layer only once it is fully read: concurrent calls keep pricing against
+  the previous ratecard, never a half-loaded one, and a failed reload stays
+  due.
+- **The cache row is upserted** (`INSERT … ON CONFLICT DO NOTHING`, then a
+  row lock), so the first refresh by an admin and by the cron can overlap.
 
 ### Matching
 
@@ -147,6 +156,9 @@ reader can tell they weren't priced at call time. It runs one `UPDATE` per
 (provider, provider type, model, batch) group with the cost formula in SQL,
 committing per group, so it never loads rows and never holds one long
 transaction. A deleted provider's rows fall back to the deployment ratecard.
+Without a `to`, the range ends when the backfill starts, and the counts it
+returns are the rows it priced and the rows still unpriced in the range
+afterwards, so calls recorded meanwhile can't skew them.
 
 ### API
 
@@ -178,7 +190,10 @@ transaction. A deleted provider's rows fall back to the deployment ratecard.
 
 `llm_usage` already had `(user_id, created_at)`, `(created_at)` and
 `(chat_id)`. Added `(agent, created_at)` and `(provider_name, created_at)`,
-built `CONCURRENTLY` so the per-call inserts aren't blocked. On 2M rows
+built `CONCURRENTLY` so the per-call inserts aren't blocked, in a revision
+of their own: a failed concurrent build then never strands the columns
+migration half-applied, and rerunning it drops any INVALID leftover
+first. On 2M rows
 spread over 180 days (≈11k/day), EXPLAIN ANALYZE showed:
 
 | Query (30-day window unless noted) | Plan | Time |
