@@ -1,0 +1,155 @@
+---
+title: "Single Sign-On"
+description: "Sign in with your identity provider (OpenID Connect), with roles from its groups"
+---
+
+
+People can sign in to the console with your organization's identity provider instead of an emailed code or a password. Sinas speaks **OpenID Connect** (Authorization Code flow with PKCE), so any compliant provider works: Keycloak, Auth0, WorkOS, Microsoft Entra ID, Okta, Google, and so on. A SAML-only directory can be put behind one of these (Keycloak, Auth0, WorkOS and Okta all broker SAML).
+
+What a user may do in Sinas can follow the groups they hold at the provider: **role mappings** grant Sinas roles for groups (or email domains), and are re-applied at every sign-in.
+
+Password and code sign-in keep working next to SSO. The superadmin (`SUPERADMIN_EMAIL`) can always use them, so you can't lock yourself out.
+
+## How it works
+
+1. The login page shows **Sign in with &lt;provider&gt;** for every active provider.
+2. The browser goes to the provider, the user signs in there, and the provider sends the browser back to Sinas's **redirect URI**.
+3. Sinas verifies the provider's ID token, finds or creates the user, syncs their roles, and hands the console a one-time code that it trades for the usual Sinas tokens. Tokens never appear in a URL.
+
+**Finding the user.** Sinas links a user to the provider by the provider's subject (`sub`). The first time someone signs in:
+
+- if a Sinas user with that email exists, they're linked only when the provider says the email is verified (`email_verified: true`). Otherwise sign-in is refused, since linking on an unverified address would let anyone with that address on an IdP account take over the Sinas one. An administrator can link the identity by hand instead (`POST /api/v1/users/{id}/identities` with the issuer URL as `provider` and the subject).
+- if no user has that email, one is created when **Create unknown users** (`autoProvision`) is on, with the **default role** if one is set. Otherwise sign-in is refused.
+
+The superadmin account is never linked by email.
+
+**Sessions.** An SSO session lasts **Session length** hours (default 12). After that the console sends the user through the provider again, which also re-syncs their roles. Someone removed at the provider is out of Sinas within that time.
+
+## Setting up a provider
+
+In the console: **Admin → Single Sign-On → Add provider**.
+
+| Field | |
+|---|---|
+| Name | Short id, lowercase. It's part of the redirect URI, so it can't be changed later. |
+| Button label | "Sign in with …" |
+| Issuer URL | The provider's issuer. Sinas reads `<issuer>/.well-known/openid-configuration`. Must be `https://` (or `http://localhost`). |
+| Client ID | From the client/application you register at the provider. |
+| Client secret | A shared [Secret](/build-resources/secrets) holding the client secret. Leave empty for a public client. |
+| Scopes | Default `openid email profile`. |
+| Email claim | Where the email is, default `email`. |
+| Groups claim | Where the groups are, default `groups`. A path: `realm_access.roles` looks inside `realm_access`; a namespaced claim like `https://example.com/roles` is found as one key. |
+| Role mappings | Rules: **Group is** `<value>` or **Email domain is** `<domain>` → Sinas roles. |
+| Allowed email domains | Only these domains may sign in with this provider. Empty: any. |
+| Required for domains | These domains must use this provider (see [Requiring SSO](#requiring-sso)). |
+| Create unknown users / Default role | See above. The default role is given once, when the user is created. |
+| Session length | Hours. |
+
+The console shows the **redirect URI** to register at the provider:
+
+```
+https://<your sinas domain>/auth/oidc/<name>/callback
+```
+
+It is built from `DOMAIN`. After signing in, the browser lands on the console at `CONSOLE_URL` (default `https://<domain>/ui`); make sure both are set correctly.
+
+### Role sync
+
+At every SSO sign-in, Sinas adds the roles the user's groups map to, and removes roles **this provider** granted earlier that no longer map. Roles an administrator gave by hand, roles from config, and roles from another provider are never touched, even when a mapping names the same role. A membership granted by a provider carries its source (`"source": "idp:<name>"` in `GET /api/v1/roles/{name}/members`). An administrator who re-adds a membership by hand makes it a manual one, which sync then leaves alone.
+
+## Requiring SSO
+
+**Required for domains** turns off password and code sign-in for those email domains: such users get "Accounts at example.com sign in with &lt;provider&gt;", and existing password or code sessions stop at their next refresh. On the login page, typing an email at such a domain switches the form to **Continue with &lt;provider&gt;**.
+
+The superadmin is always exempt.
+
+## Provider examples
+
+### Keycloak
+
+1. In your realm: **Clients → Create client**, type OpenID Connect, client ID e.g. `sinas`. Turn **Client authentication** on and keep **Standard flow**.
+2. **Valid redirect URIs**: the redirect URI from the Sinas console.
+3. **Credentials** tab: copy the client secret into a shared Secret in Sinas.
+4. Groups: **Client scopes → sinas-dedicated → Add mapper → By configuration → Group Membership**, token claim name `groups`, **Full group path** off, **Add to ID token** on.
+
+   Or use realm roles: they are in `realm_access.roles`; on the **roles** client scope's *realm roles* mapper, turn on **Add to ID token** (or **Add to userinfo**).
+
+```yaml
+identityProviders:
+  - name: keycloak
+    displayName: Keycloak
+    issuer: https://sso.example.com/realms/acme
+    clientId: sinas
+    clientSecret: KEYCLOAK_CLIENT_SECRET   # a shared Secret's name
+    groupsClaim: groups                    # or realm_access.roles
+    roleMappings:
+      - group: sinas-admins
+        roles: [Admins]
+      - group: staff
+        roles: [Users]
+    autoProvision: true
+```
+
+### Auth0
+
+1. **Applications → Create Application → Regular Web Application**.
+2. **Allowed Callback URLs**: the redirect URI from the Sinas console.
+3. Copy the client ID, and the client secret into a shared Secret.
+4. The issuer is your tenant domain with a trailing slash, e.g. `https://acme.eu.auth0.com/`.
+5. Auth0 puts no roles in tokens by default. Add a **Post Login** Action:
+
+```js
+exports.onExecutePostLogin = async (event, api) => {
+  api.idToken.setCustomClaim("https://example.com/roles", event.authorization?.roles || []);
+};
+```
+
+```yaml
+identityProviders:
+  - name: auth0
+    displayName: Auth0
+    issuer: https://acme.eu.auth0.com/
+    clientId: <client id>
+    clientSecret: AUTH0_CLIENT_SECRET
+    groupsClaim: https://example.com/roles
+    roleMappings:
+      - group: sinas-admin
+        roles: [Admins]
+```
+
+### WorkOS
+
+Use AuthKit as the OpenID Connect provider:
+
+1. In the WorkOS dashboard, create an OAuth application for Sinas and add the redirect URI from the Sinas console.
+2. The issuer is your AuthKit domain (e.g. `https://acme.authkit.app`); check that `<issuer>/.well-known/openid-configuration` answers.
+3. Copy the client ID, and the client secret into a shared Secret.
+4. WorkOS sends organization roles as role slugs. Set **Groups claim** to the claim that holds them in your environment (commonly `roles`); if they're only in the userinfo response, Sinas reads them from there.
+
+Connections to customer directories (SAML, Google Workspace, Entra ID) are then managed in WorkOS; Sinas only ever sees OpenID Connect.
+
+### Entra ID, Okta, Google
+
+Register a web application with the redirect URI from the console and use its issuer:
+
+- **Entra ID**: `https://login.microsoftonline.com/<tenant id>/v2.0`. Group claims hold group object ids; enable them under *Token configuration*. Entra doesn't send `email_verified`, so existing Sinas users can't be linked by email: create them through SSO, or link their identity by hand.
+- **Okta**: `https://<your org>.okta.com` (or an authorization server's issuer); add a `groups` claim to the ID token.
+- **Google**: `https://accounts.google.com`. No groups; use **Email domain is** rules.
+
+## Declarative config and API
+
+Identity providers are a resource kind like the others: declare them under `identityProviders` in a config (see the examples above), export them, and find every change in **Change History**. Packages can't declare identity providers.
+
+```
+GET    /api/v1/identity-providers          # list (admin)
+POST   /api/v1/identity-providers          # create
+GET    /api/v1/identity-providers/{name}
+PUT    /api/v1/identity-providers/{name}   # partial update; "" clears client_secret / default_role
+DELETE /api/v1/identity-providers/{name}
+```
+
+The login flow itself is public: `GET /auth/oidc/providers`, `POST /auth/oidc/discover`, `GET /auth/oidc/{name}/start`, `GET /auth/oidc/{name}/callback`, `POST /auth/oidc/exchange`.
+
+<Note>
+Signing out of the console ends the Sinas session, not the session at the identity provider: "Sign in with …" may then sign you straight back in. Provisioning and deprovisioning pushed by the provider (SCIM) and provider-initiated sign-in are not supported yet.
+</Note>

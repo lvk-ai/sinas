@@ -7,6 +7,8 @@ import { APIErrorHandler } from './components/APIErrorHandler';
 import { Layout } from './components/Layout';
 import { Login } from './pages/Login';
 import { ResetPassword } from './pages/ResetPassword';
+import { SsoCallback } from './pages/SsoCallback';
+import { IdentityProviders } from './pages/IdentityProviders';
 import { Dashboard } from './pages/Dashboard';
 import { Chats } from './pages/Chats';
 import { ChatDetail } from './pages/ChatDetail';
@@ -124,6 +126,8 @@ function App() {
                 </PublicRoute>
               }
             />
+            {/* Not a PublicRoute: a signed-in tab finishing SSO still trades its code. */}
+            <Route path="/sso/callback" element={<SsoCallback />} />
             <Route
               path="/shared/:token"
               element={
@@ -182,6 +186,7 @@ function App() {
               <Route path="logs" element={<RequestLogs />} />
               <Route path="system" element={<System />} />
               <Route path="users" element={<Users />} />
+              <Route path="identity-providers" element={<IdentityProviders />} />
               <Route path="permissions" element={<Permissions />} />
               <Route path="api-keys" element={<APIKeys />} />
             </Route>

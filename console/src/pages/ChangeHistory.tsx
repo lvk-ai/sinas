@@ -25,6 +25,7 @@ const KINDS: { value: string; label: string }[] = [
   { value: 'manifests', label: 'Manifests' },
   { value: 'roles', label: 'Roles' },
   { value: 'secrets', label: 'Secrets' },
+  { value: 'identityProviders', label: 'Identity providers' },
   { value: 'llmProviders', label: 'LLM providers' },
   { value: 'databaseConnections', label: 'Database connections' },
   { value: 'dependencies', label: 'Dependencies' },

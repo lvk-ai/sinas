@@ -1,9 +1,12 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Logo } from '../components/Logo';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { returnPath } from '../lib/returnPath';
 import { useAuth } from '../lib/auth-context';
-import { Mail, Lock, Loader2, KeyRound } from 'lucide-react';
+import { apiClient } from '../lib/api';
+import { startSso } from '../lib/sso';
+import type { SsoProvider } from '../types';
+import { Mail, Lock, Loader2, KeyRound, LogIn } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 
 export function Login() {
@@ -17,9 +20,41 @@ export function Login() {
   const [sessionId, setSessionId] = useState('');
   const [step, setStep] = useState<'credentials' | 'otp'>('credentials');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  // An SSO sign-in that came back refused lands here with its reason.
+  const [error, setError] = useState<string>(() => (location.state as { ssoError?: string } | null)?.ssoError || '');
+  const [ssoProviders, setSsoProviders] = useState<SsoProvider[]>([]);
+  const [redirectingTo, setRedirectingTo] = useState<string | null>(null);
+  // The provider the typed email's domain must sign in with, once looked up.
+  const [enforced, setEnforced] = useState<SsoProvider | null>(null);
+  const emailRef = useRef(email);
+  emailRef.current = email;
 
   const requiresPassword = authMode === 'password' || authMode === 'password+otp';
+
+  useEffect(() => {
+    apiClient.listSsoProviders()
+      .then(setSsoProviders)
+      .catch(() => setSsoProviders([]));  // an older backend: no SSO
+  }, []);
+
+  const lookUpEnforced = async () => {
+    if (ssoProviders.length === 0 || !email.includes('@')) return;
+    const asked = email;
+    const found = await apiClient.discoverSsoProvider(asked).catch(() => null);
+    // Only for the address still in the box (it may have changed meanwhile).
+    if (emailRef.current === asked) setEnforced(found);
+  };
+
+  const signInWith = async (provider: SsoProvider) => {
+    setError('');
+    setRedirectingTo(provider.display_name);
+    try {
+      await startSso(provider.name, returnPath(location.state));
+    } catch (err: any) {
+      setRedirectingTo(null);
+      setError(err.message || 'Single sign-on could not start');
+    }
+  };
 
   const handleCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -27,6 +62,12 @@ export function Login() {
     setLoading(true);
 
     try {
+      // A domain that must use single sign-on goes straight to its provider.
+      const sso = enforced ?? (ssoProviders.length > 0 ? await apiClient.discoverSsoProvider(email).catch(() => null) : null);
+      if (sso) {
+        await signInWith(sso);
+        return;
+      }
       const newSessionId = await login(email, requiresPassword ? password : undefined);
       if (newSessionId) {
         // OTP step follows
@@ -59,6 +100,7 @@ export function Login() {
   };
 
   const credentialsCta = (() => {
+    if (enforced) return `Continue with ${enforced.display_name}`;
     if (loading) return 'Signing in...';
     if (authMode === 'otp') return 'Continue with email';
     if (authMode === 'password') return 'Sign in';
@@ -95,6 +137,32 @@ export function Login() {
                 <p className="text-gray-400">{credentialsHelp}</p>
               </div>
 
+              {ssoProviders.length > 0 && (
+                <div className="space-y-2 mb-6">
+                  {ssoProviders.map((provider) => (
+                    <button
+                      key={provider.name}
+                      type="button"
+                      onClick={() => signInWith(provider)}
+                      disabled={redirectingTo !== null}
+                      className="w-full btn btn-secondary py-3 rounded-lg flex items-center justify-center disabled:opacity-50"
+                    >
+                      {redirectingTo === provider.display_name ? (
+                        <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                      ) : (
+                        <LogIn className="w-5 h-5 mr-2" />
+                      )}
+                      Sign in with {provider.display_name}
+                    </button>
+                  ))}
+                  <div className="flex items-center gap-3 pt-2 text-xs text-gray-500">
+                    <div className="flex-1 border-t border-line-soft" />
+                    or
+                    <div className="flex-1 border-t border-line-soft" />
+                  </div>
+                </div>
+              )}
+
               <form onSubmit={handleCredentialsSubmit} className="space-y-4">
                 <div>
                   <label htmlFor="email" className="block text-sm font-medium text-gray-300 mb-2">
@@ -106,7 +174,11 @@ export function Login() {
                       id="email"
                       type="email"
                       value={email}
-                      onChange={(e) => setEmail(e.target.value)}
+                      onChange={(e) => {
+                        setEmail(e.target.value);
+                        setEnforced(null);
+                      }}
+                      onBlur={lookUpEnforced}
                       placeholder="you@example.com"
                       autoComplete="email"
                       required
@@ -115,7 +187,13 @@ export function Login() {
                   </div>
                 </div>
 
-                {requiresPassword && (
+                {enforced && (
+                  <p className="text-sm text-gray-400">
+                    Accounts at {email.split('@')[1]} sign in with {enforced.display_name}.
+                  </p>
+                )}
+
+                {requiresPassword && !enforced && (
                   <div>
                     <label htmlFor="password" className="block text-sm font-medium text-gray-300 mb-2">
                       Password
@@ -142,9 +220,13 @@ export function Login() {
                   </div>
                 )}
 
+                {redirectingTo && (
+                  <p className="text-sm text-gray-400">Taking you to {redirectingTo}...</p>
+                )}
+
                 <button
                   type="submit"
-                  disabled={loading || !email || (requiresPassword && !password)}
+                  disabled={loading || redirectingTo !== null || !email || (requiresPassword && !enforced && !password)}
                   className="w-full btn btn-primary py-3 rounded-lg flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {loading ? (

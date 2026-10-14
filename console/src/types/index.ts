@@ -1,3 +1,5 @@
+import type { AuthUser } from '@sinas/sdk';
+
 /**
  * Per-agent provider behaviour overrides. Absent key = inherit the provider's
  * setting. The backend validates keys and values (providers/factory.py
@@ -761,6 +763,75 @@ export interface PackageRepositoryUpdate {
   description?: string;
   auth?: PackageRepositoryAuth;
   is_active?: boolean;
+}
+
+// Identity providers (SSO via OpenID Connect)
+
+/** One rule: exactly one matcher (group or email_domain), the roles it grants. */
+export interface RoleMapping {
+  group?: string | null;
+  email_domain?: string | null;
+  roles: string[];
+}
+
+export interface IdentityProvider {
+  id: string;
+  name: string;
+  display_name: string;
+  issuer: string;
+  client_id: string;
+  client_secret: string | null;  // name of a shared Secret
+  scopes: string[];
+  email_claim: string;
+  groups_claim: string;
+  role_mappings: RoleMapping[];
+  allowed_domains: string[];
+  auto_provision: boolean;
+  default_role: string | null;
+  enforce_for_domains: string[];
+  session_hours: number;
+  is_active: boolean;
+  managed_by: string | null;
+  redirect_uri: string;  // to register at the IdP
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface IdentityProviderCreate {
+  name: string;
+  display_name: string;
+  issuer: string;
+  client_id: string;
+  client_secret?: string | null;
+  scopes?: string[];
+  email_claim?: string;
+  groups_claim?: string;
+  role_mappings?: RoleMapping[];
+  allowed_domains?: string[];
+  auto_provision?: boolean;
+  default_role?: string | null;
+  enforce_for_domains?: string[];
+  session_hours?: number;
+  is_active?: boolean;
+}
+
+/** Providers can't be renamed: the name is in the redirect URI. "" clears
+ * client_secret or default_role. */
+export type IdentityProviderUpdate = Partial<Omit<IdentityProviderCreate, 'name'>>;
+
+/** What the login page sees of a provider. */
+export interface SsoProvider {
+  name: string;
+  display_name: string;
+}
+
+export interface SsoExchangeResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number;
+  user: AuthUser;
+  return_to: string;  // a console path to continue on
 }
 
 export interface PackageCatalogInstall {

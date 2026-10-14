@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { API_BASE_URL } from './api';
+import { API_BASE_URL, apiClient } from './api';
 import { SinasClient } from '@sinas/sdk';
 import type { AuthUser, InfoResponse, SinasConfig } from '@sinas/sdk';
 import type { AuthMode, InstanceInfo } from '../types';
@@ -21,6 +21,9 @@ interface AuthContextType {
   /** Returns session_id when an OTP step follows; undefined for password-only mode. */
   login: (email: string, password?: string) => Promise<string | undefined>;
   verifyOTP: (sessionId: string, otpCode: string) => Promise<void>;
+  /** Finish an SSO sign-in: trade the one-time code for tokens. Returns the
+   * console path to continue on. */
+  completeSso: (code: string, codeVerifier: string) => Promise<string>;
   logout: () => Promise<void>;
 }
 
@@ -207,6 +210,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     persistSession(response.access_token, response.refresh_token, response.user);
   };
 
+  const completeSso = async (code: string, codeVerifier: string): Promise<string> => {
+    const response = await apiClient.exchangeSsoCode(code, codeVerifier);
+    persistSession(response.access_token, response.refresh_token, response.user);
+    return response.return_to || '/';
+  };
+
   const logout = async () => {
     const refreshToken = localStorage.getItem('refresh_token');
 
@@ -236,7 +245,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, logout }}
+      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, completeSso, logout }}
     >
       {children}
     </AuthContext.Provider>
