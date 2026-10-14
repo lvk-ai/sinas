@@ -441,6 +441,11 @@ class Settings(BaseSettings):
     # Role assigned to users auto-provisioned via POST /auth/token/exchange
     token_exchange_default_role: str = "GuestUsers"
 
+    # SSO (identity providers, docs/design/oidc-sso.md): allow http:// issuers
+    # other than localhost. For a lab IdP only: over plain http the code and
+    # tokens cross the network readable.
+    oidc_allow_http: bool = False
+
     @field_validator("content_filter_timeout_seconds")
     @classmethod
     def _validate_content_filter_timeout(cls, v: int) -> int:

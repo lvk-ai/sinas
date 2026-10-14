@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Roles are deliberately NOT here: a package may DEFINE roles (its own
 # least-privilege permission surface) but never BIND them — assignment to
 # users stays an operator act, and emailDomain (auto-membership) is rejected.
-PACKAGE_SKIP_TYPES = {"users", "llmProviders", "databaseConnections", "packageRepositories"}
+PACKAGE_SKIP_TYPES = {"users", "llmProviders", "databaseConnections", "packageRepositories", "identityProviders"}
 
 # Permission keys shaped sinas.<resource>/<namespace>/... — anything else
 # (non-namespaced or non-sinas keys) counts as broad for package roles.

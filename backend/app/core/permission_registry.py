@@ -174,6 +174,12 @@ PERMISSION_REGISTRY: list[dict[str, Any]] = [
         "adminOnly": True,
     },
     {
+        "resource": "identity_providers",
+        "description": "SSO identity providers (OpenID Connect) and their role mappings",
+        "actions": ["create", "read", "update", "delete"],
+        "adminOnly": True,
+    },
+    {
         "resource": "config",
         "description": "Declarative YAML configuration",
         "actions": ["validate", "apply", "read"],

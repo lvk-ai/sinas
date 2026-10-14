@@ -624,6 +624,39 @@ class PackageRepositoryConfig(BaseModel):
     isActive: Optional[bool] = None
 
 
+class RoleMappingConfig(BaseModel):
+    """An identity provider's role mapping: one matcher, the roles it grants"""
+
+    model_config = {"extra": "forbid"}
+
+    group: Optional[str] = None
+    emailDomain: Optional[str] = None
+    roles: list[str]
+
+
+class IdentityProviderConfig(BaseModel):
+    """OpenID Connect identity provider (see docs/design/oidc-sso.md)"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str
+    displayName: str
+    issuer: str
+    clientId: str
+    clientSecret: Optional[str] = None  # the name of a shared Secret
+    scopes: Optional[list[str]] = None
+    emailClaim: Optional[str] = None
+    groupsClaim: Optional[str] = None
+    roleMappings: list[RoleMappingConfig] = Field(default_factory=list)
+    allowedDomains: list[str] = Field(default_factory=list)
+    autoProvision: bool = False
+    defaultRole: Optional[str] = None
+    enforceForDomains: list[str] = Field(default_factory=list)
+    sessionHours: Optional[int] = None
+    # Unset: a new provider is active, an existing one keeps its state.
+    isActive: Optional[bool] = None
+
+
 class PipelineConfig(BaseModel):
     """Pipeline configuration (see ADR 2026-07-28-pipelines-triggers-and-linear-steps).
 
@@ -720,6 +753,7 @@ class ConfigSpec(BaseModel):
     connectors: list[ConnectorConfig] = Field(default_factory=list)
     mcpServers: list[McpServerConfig] = Field(default_factory=list)
     packageRepositories: list[PackageRepositoryConfig] = Field(default_factory=list)
+    identityProviders: list[IdentityProviderConfig] = Field(default_factory=list)
 
     skills: list[SkillConfig] = Field(default_factory=list)
     components: list[ComponentConfig] = Field(default_factory=list)

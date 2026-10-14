@@ -1,7 +1,7 @@
 """Runtime API - Data Plane for execution, authentication, and runtime state."""
 from fastapi import APIRouter
 
-from app.api.runtime.endpoints import batches, manifests, authentication, chats, components, discovery, executions, files, functions, info, oidc, pipelines, queries, stores, templates, watch, webhooks, workbench
+from app.api.runtime.endpoints import batches, manifests, authentication, chats, components, discovery, executions, files, functions, info, oidc, pipelines, queries, sso, stores, templates, watch, webhooks, workbench
 
 runtime_router = APIRouter()
 
@@ -11,6 +11,9 @@ runtime_router.include_router(info.router, tags=["runtime-info"])
 
 # Auth - OTP, tokens, API keys
 runtime_router.include_router(authentication.router, prefix="/auth", tags=["runtime-auth"])
+
+# SSO - OpenID Connect login (identity providers)
+runtime_router.include_router(sso.router, prefix="/auth", tags=["runtime-auth"])
 
 # OIDC-compatible verification - JWKS (root-level .well-known) + userinfo
 runtime_router.include_router(oidc.router, tags=["runtime-oidc"])

@@ -136,6 +136,11 @@ class UserRole(Base):
     added_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
     removed_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     removed_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
+    # Who granted it, when not by hand: "idp:<provider>" for a membership an
+    # identity provider's role mapping grants (and so may end again at a
+    # later SSO login). NULL: an admin, config or provisioning; no sync ever
+    # touches those.
+    source: Mapped[Optional[str]] = mapped_column(String(255))
 
     # Relationships
     role: Mapped["Role"] = relationship("Role", back_populates="members")
@@ -237,6 +242,10 @@ class RefreshToken(Base):
     last_used_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[created_at]
     revoked_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
+    # The identity provider whose SSO login issued it (NULL: password, OTP
+    # or token exchange). Its lifetime is capped at that provider's
+    # session_hours.
+    identity_provider: Mapped[Optional[str]] = mapped_column(String(100))
 
     # Relationships
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])

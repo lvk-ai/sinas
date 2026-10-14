@@ -23,6 +23,7 @@ def redact_path(path: str) -> str:
 
 _SENSITIVE_KEYS = frozenset({
     "password", "api_key", "secret", "token", "refresh_token", "access_token", "otp",
+    "code_verifier",
 })
 # Whole mappings whose values are credentials (an MCP server's or a
 # connector's request headers), and strings that may carry one in their

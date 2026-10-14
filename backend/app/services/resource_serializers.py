@@ -155,6 +155,14 @@ def serialize_mcp_server(server) -> dict:
 
 
 
+def serialize_identity_provider(provider) -> dict:
+    """Config form of an identity provider — delegated to its spec. The
+    client secret is a Secret's name, so nothing here is secret."""
+    from app.services.resources.identity_providers import IdentityProviderApplier
+
+    return IdentityProviderApplier().spec_from_row(provider).to_config()
+
+
 def serialize_package_repository(repository) -> dict:
     """Config form of a package repository — delegated to its spec. The
     cached index and refresh state are runtime, not config."""

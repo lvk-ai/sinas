@@ -184,6 +184,9 @@ class ConfigApplyService:
                 item.name: True for item in config.spec.llmProviders
             }
         self._pending_references["secrets"] = {name: True for name in self.supplied_secrets}
+        # Identity providers grant roles by name; roles apply first.
+        if "roles" not in self.skip_resource_types:
+            self._pending_references["roles"] = {item.name: True for item in config.spec.roles}
         if not dry_run:
             # Promotions to "the default" serialize on a lock taken before any
             # row lock this apply takes (lock order: see lock_singleton).
