@@ -5,7 +5,9 @@ import { AlertTriangle, CircleDollarSign, Coins, Hash, RefreshCw, TrendingUp, XC
 import { apiClient } from '../lib/api';
 import { useToast } from '../lib/toast-context';
 import { ErrorDisplay } from '../components/ErrorDisplay';
-import type { ModelPricing, UsageDimension, UsageFilters } from '../types';
+import { ModelTable, RatecardSources } from '../components/Ratecard';
+import { RATECARD_QUERY_KEY, useRatecard } from '../lib/ratecard';
+import type { UsageDimension, UsageFilters } from '../types';
 
 const RANGES = [
   { label: 'Last 24 hours', hours: 24 },
@@ -43,12 +45,6 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return `${n}`;
-}
-
-// A per-token price as USD per million tokens
-function perMillion(value: number | undefined): string {
-  if (value == null) return '—';
-  return `$${Number((value * 1_000_000).toPrecision(4))}`;
 }
 
 // datetime-local value (local time) -> ISO
@@ -127,16 +123,12 @@ export function Usage() {
   }).data === true;
 
   // Admins only (sinas.usage.read:all): the section hides itself otherwise.
-  const ratecard = useQuery({
-    queryKey: ['usage-ratecard'],
-    queryFn: () => apiClient.getRatecard({ days: 30 }),
-    retry: false,
-  });
+  const ratecard = useRatecard();
 
   const invalidateUsage = () => {
     queryClient.invalidateQueries({ queryKey: ['usage-summary'] });
     queryClient.invalidateQueries({ queryKey: ['usage-timeseries'] });
-    queryClient.invalidateQueries({ queryKey: ['usage-ratecard'] });
+    queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
   };
 
   const refreshMutation = useMutation({
@@ -489,27 +481,7 @@ export function Usage() {
                 )}
               </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {ratecard.data.sources.map((s) => (
-                <div key={s.source} className="rounded-md border border-line-soft p-3">
-                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    MODEL_PRICES_{s.source.toUpperCase()}
-                  </p>
-                  {s.configured ? (
-                    <>
-                      <p className="text-sm text-gray-100 mt-1">{s.models.toLocaleString()} models</p>
-                      {(s.url || s.path) && <p className="text-xs text-gray-500 truncate" title={s.url || s.path || ''}>{s.url || s.path}</p>}
-                      {s.fetched_at && (
-                        <p className="text-xs text-gray-500">Fetched {new Date(s.fetched_at).toLocaleString()}</p>
-                      )}
-                      {s.error && <p className="text-xs text-red-400 mt-1">{s.error}</p>}
-                    </>
-                  ) : (
-                    <p className="text-sm text-gray-500 mt-1">Not set</p>
-                  )}
-                </div>
-              ))}
-            </div>
+            <RatecardSources sources={ratecard.data.sources} />
           </div>
 
           <div className="bg-surface-1 rounded-lg border border-line-soft overflow-hidden">
@@ -519,8 +491,9 @@ export function Usage() {
                 <span className="text-sm font-normal text-gray-500">(called in the last {ratecard.data.days} days)</span>
               </h3>
               <p className="text-sm text-gray-400 mt-1">
-                Give these a price on the LLM provider (or an alias to a priced model), or add them to the deployment
-                ratecard. Then price the calls already made with "Price unpriced calls".
+                Give these a price on the LLM provider (or an alias to a priced model, or "Price models as" for an
+                OpenAI-compatible API of another provider), or add them to the deployment ratecard. Then price the
+                calls already made with "Price unpriced calls".
               </p>
             </div>
             {ratecard.data.unpriced_models.length === 0 ? (
@@ -539,80 +512,6 @@ export function Usage() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function ModelTable({
-  rows,
-  showPrice,
-}: {
-  rows: Array<{
-    provider: string | null;
-    model: string;
-    calls: number;
-    last_used: string | null;
-    priced_as: string | null;
-    matched_key: string | null;
-    source: string | null;
-    origin: string | null;
-    discount: number | null;
-    price: ModelPricing | null;
-  }>;
-  showPrice: boolean;
-}) {
-  const headers = showPrice
-    ? ['Provider', 'Model', 'Priced as', 'From', 'Input', 'Cached input', 'Output', 'Calls']
-    : ['Provider', 'Model', 'Calls', 'Last used'];
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full divide-y divide-white/[0.06]">
-        <thead className="bg-surface-0">
-          <tr>
-            {headers.map((h) => (
-              <th key={h} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="bg-surface-1 divide-y divide-white/[0.06]">
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={headers.length} className="px-6 py-6 text-sm text-gray-500">
-                No priced calls yet.
-              </td>
-            </tr>
-          ) : (
-            rows.map((m) => (
-              <tr key={`${m.provider}/${m.model}`}>
-                <td className="px-6 py-3 text-sm text-gray-300">{m.provider || '—'}</td>
-                <td className="px-6 py-3 text-sm font-mono text-gray-100">{m.model}</td>
-                {showPrice ? (
-                  <>
-                    <td className="px-6 py-3 text-sm font-mono text-gray-400">{m.matched_key}</td>
-                    <td className="px-6 py-3 text-sm text-gray-400">
-                      {m.source === 'provider' ? 'provider' : `ratecard (${m.origin})`}
-                      {m.discount != null && <span className="text-xs text-gray-500"> × {m.discount}</span>}
-                    </td>
-                    <td className="px-6 py-3 text-sm text-gray-300">{perMillion(m.price?.input_cost_per_token)}</td>
-                    <td className="px-6 py-3 text-sm text-gray-300">{perMillion(m.price?.cache_read_input_token_cost)}</td>
-                    <td className="px-6 py-3 text-sm text-gray-300">{perMillion(m.price?.output_cost_per_token)}</td>
-                    <td className="px-6 py-3 text-sm text-gray-300">{m.calls.toLocaleString()}</td>
-                  </>
-                ) : (
-                  <>
-                    <td className="px-6 py-3 text-sm text-gray-300">{m.calls.toLocaleString()}</td>
-                    <td className="px-6 py-3 text-sm text-gray-400">
-                      {m.last_used ? new Date(m.last_used).toLocaleString() : '—'}
-                    </td>
-                  </>
-                )}
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
     </div>
   );
 }

@@ -877,6 +877,8 @@ export interface LLMProvider {
   pricing: Record<string, ModelPricing>;
   model_aliases: Record<string, string>;
   discount: number | null;
+  // The LiteLLM provider family models are priced as; null: the provider type's
+  pricing_provider: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -893,6 +895,7 @@ export interface LLMProviderCreate {
   pricing?: Record<string, ModelPricing>;
   model_aliases?: Record<string, string>;
   discount?: number | null;
+  pricing_provider?: string | null;
 }
 
 export interface LLMProviderUpdate {
@@ -906,8 +909,9 @@ export interface LLMProviderUpdate {
   is_active?: boolean;
   pricing?: Record<string, ModelPricing>;
   model_aliases?: Record<string, string>;
-  // null clears it
+  // null clears these
   discount?: number | null;
+  pricing_provider?: string | null;
 }
 
 // LLM usage and cost (/api/v1/usage)
@@ -978,17 +982,24 @@ export interface RatecardModelInUse {
   price: ModelPricing | null;
 }
 
+export interface RatecardProvider {
+  name: string;
+  provider_type: string;
+  is_active: boolean;
+  pricing: Record<string, ModelPricing>;
+  model_aliases: Record<string, string>;
+  discount: number | null;
+  pricing_provider: string | null;
+  // The families its models are looked up under (pricing_provider, or the type's)
+  priced_as_families: string[];
+}
+
 export interface Ratecard {
   sources: RatecardSource[];
   deployment_models: number;
-  providers: Array<{
-    name: string;
-    provider_type: string;
-    is_active: boolean;
-    pricing: Record<string, ModelPricing>;
-    model_aliases: Record<string, string>;
-    discount: number | null;
-  }>;
+  // The litellm_provider families of the deployment ratecard
+  provider_families: Array<{ family: string; models: number }>;
+  providers: RatecardProvider[];
   days: number;
   models_in_use: RatecardModelInUse[];
   unpriced_models: RatecardModelInUse[];
