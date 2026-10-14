@@ -5,9 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_permission
+from app.core.config import settings
 from app.core.database import get_db
 from app.schemas.container import ScaleRequest
 from app.services.container_pool import container_pool
+from app.services.executor_status import sandbox_stats
 
 router = APIRouter(prefix="/containers", tags=["containers"])
 
@@ -16,9 +18,9 @@ router = APIRouter(prefix="/containers", tags=["containers"])
 async def get_container_stats(
     user_id: str = Depends(require_permission("sinas.system.read:all")),
 ) -> dict[str, Any]:
-    """Get sandbox container stats. Admin only."""
+    """Get sandbox container stats for the configured sandbox executor. Admin only."""
 
-    return container_pool.get_stats()
+    return await sandbox_stats()
 
 
 @router.post("/reload")
@@ -34,8 +36,6 @@ async def reload_pool_packages(
       per-execution, so there is nothing to reload).
     Admin only.
     """
-    from app.core.config import settings
-
     if settings.sandbox_executor == "docker_ephemeral":
         from app.services.sandbox_image import build_sandbox_image
 
@@ -53,6 +53,13 @@ async def scale_pool(
     db: AsyncSession = Depends(get_db),
 ):
     """Scale the sandbox containers to a target size. Admin only."""
+
+    if settings.sandbox_executor != "docker_pool":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only the docker_pool sandbox can be scaled; this deployment uses "
+            f"{settings.sandbox_executor}.",
+        )
 
     if body.target < 0:
         raise HTTPException(status_code=400, detail="Target must be non-negative")
