@@ -2,8 +2,126 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
 import { Brain, Plus, Trash2, Edit2 } from 'lucide-react';
 import { useState } from 'react';
-import type { LLMProvider, LLMProviderCreate, LLMProviderUpdate } from '../types';
+import type { LLMProvider, LLMProviderCreate, LLMProviderUpdate, ModelPricing } from '../types';
 import { ErrorDisplay } from '../components/ErrorDisplay';
+
+function plural(n: number, one: string, many: string): string {
+  return n ? `${n} ${n === 1 ? one : many}` : '';
+}
+
+// The pricing form, as typed (JSON text and a number), until submit.
+interface PricingDraft {
+  pricing: string;
+  aliases: string;
+  discount: string;
+}
+
+function pricingDraft(provider?: LLMProvider): PricingDraft {
+  return {
+    pricing: JSON.stringify(provider?.pricing || {}, null, 2),
+    aliases: JSON.stringify(provider?.model_aliases || {}, null, 2),
+    discount: provider?.discount != null ? String(provider.discount) : '',
+  };
+}
+
+function parseObject(text: string, what: string): Record<string, unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text.trim() || '{}');
+  } catch {
+    throw new Error(`${what} is not valid JSON`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${what} must be a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+// The API fields of a pricing draft; throws with a message on bad input.
+function parsePricingDraft(draft: PricingDraft) {
+  const discount = draft.discount.trim() === '' ? null : Number(draft.discount);
+  if (discount !== null && (Number.isNaN(discount) || discount < 0 || discount > 1)) {
+    throw new Error('Discount must be a number between 0 and 1');
+  }
+  return {
+    pricing: parseObject(draft.pricing, 'Model prices') as Record<string, ModelPricing>,
+    model_aliases: parseObject(draft.aliases, 'Model aliases') as Record<string, string>,
+    discount,
+  };
+}
+
+function PricingFields({
+  idPrefix,
+  draft,
+  onChange,
+}: {
+  idPrefix: string;
+  draft: PricingDraft;
+  onChange: (draft: PricingDraft) => void;
+}) {
+  return (
+    <div className="pt-4 border-t border-line-soft space-y-4">
+      <div>
+        <p className="text-sm font-medium text-gray-300">Pricing</p>
+        <p className="text-xs text-gray-500 mt-1">
+          For cost tracking (Admin › Usage). USD per token, in LiteLLM's field names. Models not priced here
+          use the deployment ratecard.
+        </p>
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}_pricing`} className="block text-sm font-medium text-gray-300 mb-2">
+          Model prices (JSON)
+        </label>
+        <textarea
+          id={`${idPrefix}_pricing`}
+          value={draft.pricing}
+          onChange={(e) => onChange({ ...draft, pricing: e.target.value })}
+          placeholder='{"gpt-4o": {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 1e-5}}'
+          rows={5}
+          className="input resize-none font-mono text-xs"
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Per model: <code>input_cost_per_token</code>, <code>output_cost_per_token</code>,{' '}
+          <code>cache_read_input_token_cost</code>, <code>cache_creation_input_token_cost</code>, and the{' '}
+          <code>_batches</code> variants.
+        </p>
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}_aliases`} className="block text-sm font-medium text-gray-300 mb-2">
+          Model aliases (JSON)
+        </label>
+        <textarea
+          id={`${idPrefix}_aliases`}
+          value={draft.aliases}
+          onChange={(e) => onChange({ ...draft, aliases: e.target.value })}
+          placeholder='{"my-azure-deployment": "gpt-4o"}'
+          rows={3}
+          className="input resize-none font-mono text-xs"
+        />
+        <p className="text-xs text-gray-500 mt-1">A model name as called → the model it is priced as.</p>
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}_discount`} className="block text-sm font-medium text-gray-300 mb-2">
+          Discount
+        </label>
+        <input
+          id={`${idPrefix}_discount`}
+          type="number"
+          step="any"
+          min="0"
+          max="1"
+          value={draft.discount}
+          onChange={(e) => onChange({ ...draft, discount: e.target.value })}
+          placeholder="None"
+          className="input"
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Multiplier on deployment-ratecard prices for negotiated rates: 0.85 is 15% off.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 export function LLMProviders() {
   const queryClient = useQueryClient();
@@ -19,6 +137,9 @@ export function LLMProviders() {
   const [editFormData, setEditFormData] = useState<LLMProviderUpdate>({});
   const [editConfigText, setEditConfigText] = useState('{}');
   const [createConfigText, setCreateConfigText] = useState('{}');
+  const [createPricing, setCreatePricing] = useState<PricingDraft>(pricingDraft());
+  const [editPricing, setEditPricing] = useState<PricingDraft>(pricingDraft());
+  const [editError, setEditError] = useState('');
 
   const { data: providers, isLoading } = useQuery({
     queryKey: ['llmProviders'],
@@ -62,6 +183,7 @@ export function LLMProviders() {
       is_default: false,
     });
     setCreateConfigText('{}');
+    setCreatePricing(pricingDraft());
   };
 
   const [createError, setCreateError] = useState('');
@@ -77,15 +199,30 @@ export function LLMProviders() {
       setCreateError('Provider type is required');
       return;
     }
-    createMutation.mutate(createFormData);
+    let pricing;
+    try {
+      pricing = parsePricingDraft(createPricing);
+    } catch (err) {
+      setCreateError((err as Error).message);
+      return;
+    }
+    createMutation.mutate({ ...createFormData, ...pricing });
   };
 
   const handleEdit = (e: React.FormEvent) => {
     e.preventDefault();
+    setEditError('');
     if (selectedProvider && editFormData.name?.trim()) {
+      let pricing;
+      try {
+        pricing = parsePricingDraft(editPricing);
+      } catch (err) {
+        setEditError((err as Error).message);
+        return;
+      }
       updateMutation.mutate({
         id: selectedProvider.id,
-        data: editFormData,
+        data: { ...editFormData, ...pricing },
       });
     }
   };
@@ -103,6 +240,8 @@ export function LLMProviders() {
       is_default: provider.is_default,
       is_active: provider.is_active,
     });
+    setEditPricing(pricingDraft(provider));
+    setEditError('');
     setShowEditModal(true);
   };
 
@@ -159,6 +298,22 @@ export function LLMProviders() {
                     {provider.default_model && (
                       <p className="text-sm text-gray-400">
                         Default Model: <span className="font-medium">{provider.default_model}</span>
+                      </p>
+                    )}
+                    {(Object.keys(provider.pricing || {}).length > 0 ||
+                      Object.keys(provider.model_aliases || {}).length > 0 ||
+                      provider.discount != null) && (
+                      <p className="text-sm text-gray-400">
+                        Pricing:{' '}
+                        <span className="font-medium">
+                          {[
+                            plural(Object.keys(provider.pricing || {}).length, 'model priced', 'models priced'),
+                            plural(Object.keys(provider.model_aliases || {}).length, 'alias', 'aliases'),
+                            provider.discount != null ? `discount ${provider.discount}` : '',
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
                       </p>
                     )}
                     <p className="text-xs text-gray-500 mt-1">
@@ -325,6 +480,8 @@ export function LLMProviders() {
                   <code>{'"drop_params": ["temperature"]'}</code>.
                 </p>
               </div>
+
+              <PricingFields idPrefix="create" draft={createPricing} onChange={setCreatePricing} />
 
               <div className="flex items-center space-x-4">
                 <div className="flex items-center">
@@ -503,6 +660,8 @@ export function LLMProviders() {
                 </p>
               </div>
 
+              <PricingFields idPrefix="edit" draft={editPricing} onChange={setEditPricing} />
+
               <div className="flex items-center space-x-4">
                 <div className="flex items-center">
                   <input
@@ -531,6 +690,11 @@ export function LLMProviders() {
                 </div>
               </div>
 
+              {editError && (
+                <div className="p-3 bg-red-900/20 border border-red-800 rounded-lg">
+                  <p className="text-sm text-red-400">{editError}</p>
+                </div>
+              )}
               {updateMutation.isError && (
                 <ErrorDisplay error={updateMutation.error} title="Failed to update provider" />
               )}
