@@ -307,6 +307,25 @@ class TestKubernetesHealth:
         assert body["services"] == []
         assert body["services_unavailable_reason"]
 
+    async def test_no_release_name_lists_nothing(self, client, admin_user, k8s_mode, monkeypatch):
+        """Kubernetes mode via the k8s executors but no K8S_RELEASE_NAME: an
+        unfiltered list would show every app in the namespace, so refuse."""
+        monkeypatch.setattr(settings, "k8s_release_name", "")
+        k8s_mode.core.pods = RELEASE_PODS + [_pod("someone-elses-app", "web")]
+
+        body = await _health(client, admin_user)
+        assert body["deployment"] == "kubernetes"
+        assert body["services"] == []
+        assert "K8S_RELEASE_NAME" in body["services_unavailable_reason"]
+        assert not any("someone-elses-app" in w["message"] for w in body["warnings"])
+
+        h = auth_headers(admin_user)
+        stats = (await client.get("/api/v1/containers/stats", headers=h)).json()
+        count = (await client.get("/api/v1/workers/count", headers=h)).json()
+        assert stats["total"] == 0 and "K8S_RELEASE_NAME" in stats["unavailable_reason"]
+        assert count["count"] == 0 and "K8S_RELEASE_NAME" in count["unavailable_reason"]
+        assert k8s_mode.core.calls == [] and k8s_mode.custom.calls == []
+
     async def test_restart_rejected_clearly(self, client, admin_user, k8s_mode):
         resp = await client.post(
             "/api/v1/system/containers/backend-abc/restart", headers=auth_headers(admin_user)
@@ -370,6 +389,23 @@ class TestKubernetesExecutorCards:
         assert resp.status_code == 200
         body = resp.json()
         assert body["total"] == 0 and "may not list pods" in body["unavailable_reason"]
+
+    async def test_finished_sandbox_pods_not_counted_busy(self, client, admin_user, k8s_mode):
+        """A pod stopped by activeDeadlineSeconds lingers as Failed; a leaked
+        one as Succeeded. Neither is an execution in flight."""
+        k8s_mode.core.pods = RELEASE_PODS + [
+            _pod("sinas-sbx-done", sinas_type="sandbox-executor", phase="Succeeded", ready=False),
+            _pod("sinas-sbx-deadline", sinas_type="sandbox-executor", phase="Failed", ready=False),
+        ]
+        h = auth_headers(admin_user)
+        body = (await client.get("/api/v1/containers/stats", headers=h)).json()
+        assert body["in_use"] == body["total"] == 1
+        assert [c["name"] for c in body["in_use_containers"]] == ["sinas-sbx-123"]
+        assert body["finished"] == 2
+        assert "2 finished sandbox pods" in body["note"]
+
+        stats = (await client.get("/api/v1/queue/stats", headers=h)).json()
+        assert stats["pool"] == {"idle": 0, "in_use": 1, "total": 1}
 
     async def test_shared_card_lists_trusted_pods(self, client, admin_user, k8s_mode):
         h = auth_headers(admin_user)

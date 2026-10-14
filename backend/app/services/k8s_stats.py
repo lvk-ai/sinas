@@ -92,11 +92,17 @@ def _apis() -> tuple[Any, Any]:
 
 
 def _selector(*extra: str) -> str:
-    parts = []
-    if settings.k8s_release_name:
-        parts.append(f"app.kubernetes.io/instance={settings.k8s_release_name}")
-    parts.extend(extra)
-    return ",".join(parts)
+    """Label selector scoped to this release.
+
+    Without a release name there is no way to tell this deployment's pods
+    from anything else in the namespace, so refuse rather than list them all.
+    """
+    if not settings.k8s_release_name:
+        raise K8sUnavailableError(
+            "K8S_RELEASE_NAME is not set, so this deployment's pods can't be told "
+            "apart from others in the namespace (the Helm chart sets it)."
+        )
+    return ",".join([f"app.kubernetes.io/instance={settings.k8s_release_name}", *extra])
 
 
 def _api_reason(e: Exception, what: str, namespace: str) -> str:
@@ -293,8 +299,8 @@ async def list_services(
     the Docker shared containers.
     """
     namespace = release_namespace()
-    selector = _selector()
     try:
+        selector = _selector()
         pods = await asyncio.to_thread(_list_pods_blocking, namespace, selector)
     except K8sUnavailableError as e:
         logger.warning("System health: %s", e)
@@ -322,9 +328,8 @@ async def list_services(
 
 async def list_executor_pods(pod_type: str) -> list[dict[str, Any]]:
     """Executor pods of one kind (sandbox / trusted). Raises K8sUnavailableError."""
+    selector = _selector(f"sinas.type={pod_type}")
     namespace = executor_namespace()
-    pods = await asyncio.to_thread(
-        _list_pods_blocking, namespace, _selector(f"sinas.type={pod_type}")
-    )
+    pods = await asyncio.to_thread(_list_pods_blocking, namespace, selector)
     now = datetime.now(timezone.utc)
     return sorted((pod_info(p, now) for p in pods), key=lambda i: i["name"])

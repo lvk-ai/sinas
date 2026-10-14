@@ -235,9 +235,10 @@ export function System() {
   ];
 
   // Only the Docker pool / Docker shared workers can be scaled from here;
-  // an older backend doesn't send `scalable`, so missing means scalable.
-  const poolScalable = poolStats?.scalable !== false;
-  const sharedScalable = sharedPoolCount?.scalable !== false;
+  // hidden until a response has loaded. An older backend doesn't send
+  // `scalable`, so on a loaded response a missing flag means scalable.
+  const poolScalable = poolStats != null && poolStats.scalable !== false;
+  const sharedScalable = sharedPoolCount != null && sharedPoolCount.scalable !== false;
 
   const poolUtilPct = poolMax ? Math.round((poolTotal / poolMax) * 100) : 0;
   const poolBusyPct = poolTotal > 0 ? Math.round((poolInUse / poolTotal) * 100) : 0;

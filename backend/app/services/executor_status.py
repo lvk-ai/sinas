@@ -27,6 +27,9 @@ from app.services.k8s_stats import (
 
 logger = logging.getLogger(__name__)
 
+# k8s_stats status words for pods in phase Pending or Running.
+_ACTIVE_POD_STATUSES = {"pending", "running", "restarting"}
+
 _CODE_EXECUTION_OFF = "Code execution is disabled (CODE_EXECUTION_ENABLED=false)."
 
 
@@ -85,6 +88,12 @@ async def sandbox_stats() -> dict[str, Any]:
             pods = await list_executor_pods(SANDBOX_POD_TYPE)
         except K8sUnavailableError as e:
             return {**_empty_pool(), **meta, "unavailable_reason": str(e)}
+        # Only Pending/Running pods are executions in flight. A pod stopped by
+        # activeDeadlineSeconds (or whose deleter died) lingers as
+        # completed/failed until someone deletes it; count it (and pods
+        # already terminating) separately.
+        active = [p for p in pods if p["status"] in _ACTIVE_POD_STATUSES]
+        finished = len(pods) - len(active)
         in_use = [
             {
                 "name": p["name"],
@@ -92,12 +101,18 @@ async def sandbox_stats() -> dict[str, Any]:
                 "executions": None,
                 "age_seconds": p["age_seconds"],
             }
-            for p in pods
+            for p in active
         ]
+        if finished:
+            meta["note"] += (
+                f" {finished} finished sandbox pod{'s' if finished != 1 else ''} not yet "
+                "cleaned up (not counted)."
+            )
         return {
             **_empty_pool(),
             "in_use": len(in_use),
             "total": len(in_use),
+            "finished": finished,
             "max_executions": 1,
             "in_use_containers": in_use,
             **meta,
