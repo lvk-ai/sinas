@@ -91,9 +91,12 @@ async def sandbox_stats() -> dict[str, Any]:
         # Only Pending/Running pods are executions in flight. A pod stopped by
         # activeDeadlineSeconds (or whose deleter died) lingers as
         # completed/failed until someone deletes it; count it (and pods
-        # already terminating) separately.
+        # already terminating) separately. Phase Unknown (its node stopped
+        # reporting) is neither: the execution may still be running, so the
+        # pod stays listed and is counted on its own.
         active = [p for p in pods if p["status"] in _ACTIVE_POD_STATUSES]
-        finished = len(pods) - len(active)
+        unknown = [p for p in pods if p["status"] == "unknown"]
+        finished = len(pods) - len(active) - len(unknown)
         in_use = [
             {
                 "name": p["name"],
@@ -101,8 +104,13 @@ async def sandbox_stats() -> dict[str, Any]:
                 "executions": None,
                 "age_seconds": p["age_seconds"],
             }
-            for p in active
+            for p in active + unknown
         ]
+        if unknown:
+            meta["note"] += (
+                f" {len(unknown)} sandbox pod{'s' if len(unknown) != 1 else ''} in an unknown "
+                "state (its node is not reporting): listed, not counted."
+            )
         if finished:
             meta["note"] += (
                 f" {finished} finished sandbox pod{'s' if finished != 1 else ''} not yet "
@@ -110,9 +118,10 @@ async def sandbox_stats() -> dict[str, Any]:
             )
         return {
             **_empty_pool(),
-            "in_use": len(in_use),
-            "total": len(in_use),
+            "in_use": len(active),
+            "total": len(active),
             "finished": finished,
+            "unknown": len(unknown),
             "max_executions": 1,
             "in_use_containers": in_use,
             **meta,

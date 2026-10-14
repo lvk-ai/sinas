@@ -407,6 +407,20 @@ class TestKubernetesExecutorCards:
         stats = (await client.get("/api/v1/queue/stats", headers=h)).json()
         assert stats["pool"] == {"idle": 0, "in_use": 1, "total": 1}
 
+    async def test_unknown_sandbox_pods_stay_listed_not_finished(self, client, admin_user, k8s_mode):
+        """Phase Unknown (node not reporting) hasn't been confirmed stopped:
+        the pod stays visible, counted apart from both busy and finished."""
+        k8s_mode.core.pods = RELEASE_PODS + [
+            _pod("sinas-sbx-lost", sinas_type="sandbox-executor", phase="Unknown", ready=False),
+            _pod("sinas-sbx-done", sinas_type="sandbox-executor", phase="Succeeded", ready=False),
+        ]
+        body = (await client.get("/api/v1/containers/stats", headers=auth_headers(admin_user))).json()
+        assert body["in_use"] == body["total"] == 1
+        assert body["unknown"] == 1 and body["finished"] == 1
+        names = {c["name"]: c["status"] for c in body["in_use_containers"]}
+        assert names == {"sinas-sbx-123": "pending", "sinas-sbx-lost": "unknown"}
+        assert "unknown state" in body["note"] and "1 finished sandbox pod " in body["note"]
+
     async def test_shared_card_lists_trusted_pods(self, client, admin_user, k8s_mode):
         h = auth_headers(admin_user)
         workers = (await client.get("/api/v1/workers", headers=h)).json()
