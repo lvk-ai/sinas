@@ -30,6 +30,9 @@ export function Login() {
   emailRef.current = email;
 
   const requiresPassword = authMode === 'password' || authMode === 'password+otp';
+  // With identity providers configured the email can be submitted on its
+  // own first, so an enforced domain reaches SSO without a password.
+  const emailFirst = ssoProviders.length > 0;
 
   useEffect(() => {
     apiClient.listSsoProviders()
@@ -66,6 +69,13 @@ export function Login() {
       const sso = enforced ?? (ssoProviders.length > 0 ? await apiClient.discoverSsoProvider(email).catch(() => null) : null);
       if (sso) {
         await signInWith(sso);
+        return;
+      }
+      if (requiresPassword && !password) {
+        // Submitted with the email alone (Enter in the email box): not an
+        // SSO domain, so the password comes next.
+        setError('Enter your password.');
+        document.getElementById('password')?.focus();
         return;
       }
       const newSessionId = await login(email, requiresPassword ? password : undefined);
@@ -207,7 +217,9 @@ export function Login() {
                         onChange={(e) => setPassword(e.target.value)}
                         placeholder="••••••••"
                         autoComplete="current-password"
-                        required
+                        // With SSO configured, an email alone may be submitted
+                        // first: its domain may have to sign in elsewhere.
+                        required={!emailFirst}
                         className="w-full pl-10 pr-4 py-3 bg-surface-input border border-line rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                       />
                     </div>
@@ -226,7 +238,7 @@ export function Login() {
 
                 <button
                   type="submit"
-                  disabled={loading || redirectingTo !== null || !email || (requiresPassword && !enforced && !password)}
+                  disabled={loading || redirectingTo !== null || !email || (requiresPassword && !emailFirst && !password)}
                   className="w-full btn btn-primary py-3 rounded-lg flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {loading ? (

@@ -252,8 +252,8 @@ function ProviderModal({
         scopes: splitList(form.scopes),
         email_claim: form.email_claim.trim() || 'email',
         groups_claim: form.groups_claim.trim() || 'groups',
+        // Every rule is complete by now (ruleProblems blocks saving otherwise).
         role_mappings: rules
-          .filter((r) => r.value.trim() && r.roles.length > 0)
           .map((r) => (r.kind === 'group' ? { group: r.value.trim(), roles: r.roles } : { email_domain: r.value.trim(), roles: r.roles })),
         allowed_domains: splitList(form.allowed_domains),
         enforce_for_domains: splitList(form.enforce_for_domains),
@@ -275,7 +275,15 @@ function ProviderModal({
 
   const nameValid = NAME_PATTERN.test(form.name);
   const hours = Number(form.session_hours);
+  // A rule left half-filled is pointed out, never dropped on save.
+  const ruleProblems = rules.map((r) => {
+    if (!r.value.trim()) return r.kind === 'group' ? 'Enter the group.' : 'Enter the email domain.';
+    if (r.roles.length === 0) return 'Pick at least one role.';
+    return null;
+  });
+  const rulesComplete = ruleProblems.every((p) => p === null);
   const canSubmit =
+    rulesComplete &&
     nameValid && form.display_name.trim() !== '' && form.issuer.trim() !== '' && form.client_id.trim() !== '' &&
     Number.isInteger(hours) && hours >= 1 && !save.isPending;
   const redirectUri = provider?.redirect_uri ?? `${API_BASE_URL}/auth/oidc/${form.name || '<name>'}/callback`;
@@ -462,6 +470,7 @@ function ProviderModal({
                       </select>
                     </div>
                   </div>
+                  {ruleProblems[i] && <p className="text-xs text-red-400">{ruleProblems[i]}</p>}
                 </div>
               ))}
             </div>
@@ -528,6 +537,10 @@ function ProviderModal({
               Enabled
             </label>
           </div>
+
+          {!rulesComplete && (
+            <p className="text-sm text-red-400">Complete or remove the role rules marked above to save.</p>
+          )}
 
           {save.isError && (
             <div className="p-3 bg-red-900/20 border border-red-900/30 rounded text-sm text-red-400 whitespace-pre-wrap">

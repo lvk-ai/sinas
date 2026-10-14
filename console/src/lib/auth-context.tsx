@@ -45,6 +45,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [instanceInfo, setInstanceInfo] = useState<InstanceInfo | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
   const tokenRef = useRef<string | null>(null);
+  // Bumped whenever a session starts or ends here. A request started for an
+  // earlier session (the startup check of a stored one) may not change a
+  // newer one: e.g. an SSO sign-in finishing while the old check is in flight.
+  const sessionGeneration = useRef(0);
 
   // Single SinasClient configured for standalone (browser) use. Token getters
   // read from localStorage so every request — including those issued from the
@@ -132,12 +136,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setupRefreshTimer();
 
       // Verify token is still valid
+      const generation = sessionGeneration.current;
       client.auth.getMe()
         .then((u) => {
+          if (sessionGeneration.current !== generation) return;  // a newer session took over
           setUser(u);
           localStorage.setItem('user', JSON.stringify(u));
         })
         .catch((error) => {
+          if (sessionGeneration.current !== generation) return;  // not this session's tokens anymore
           // Token invalid, clear
           console.error('Token verification failed on refresh:', error);
           localStorage.removeItem('auth_token');
@@ -183,6 +190,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const persistSession = (access: string, refresh: string, u: AuthUser) => {
     setToken(access);
+    sessionGeneration.current += 1;
     setUser(u);
     localStorage.setItem('auth_token', access);
     localStorage.setItem('refresh_token', refresh);
@@ -228,6 +236,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    sessionGeneration.current += 1;
     setToken(null);
     setUser(null);
     window.__SINAS_AUTH_TOKEN__ = null;
