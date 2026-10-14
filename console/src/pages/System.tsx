@@ -230,7 +230,11 @@ export function System() {
   const poolMax = poolStats?.max_size;
 
   const allSandboxContainers = [
-    ...(poolStats?.in_use_containers || []).map((c: any) => ({ ...c, state: 'in_use' as const })),
+    // A k8s sandbox pod whose node stopped reporting is listed but not busy.
+    ...(poolStats?.in_use_containers || []).map((c: any) => ({
+      ...c,
+      state: c.status === 'unknown' ? ('unknown' as const) : ('in_use' as const),
+    })),
     ...(poolStats?.idle_containers || []).map((c: any) => ({ ...c, state: 'idle' as const })),
   ];
 
@@ -615,9 +619,13 @@ export function System() {
                       <td className="py-2 pr-4 font-mono text-xs text-gray-300">{c.name}</td>
                       <td className="py-2 pr-4">
                         <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                          c.state === 'in_use' ? 'bg-blue-900/30 text-blue-300' : 'bg-green-900/30 text-green-300'
+                          c.state === 'in_use'
+                            ? 'bg-blue-900/30 text-blue-300'
+                            : c.state === 'unknown'
+                              ? 'bg-yellow-900/30 text-yellow-300'
+                              : 'bg-green-900/30 text-green-300'
                         }`}>
-                          {c.state === 'in_use' ? 'busy' : 'idle'}
+                          {c.state === 'in_use' ? 'busy' : c.state === 'unknown' ? 'unknown' : 'idle'}
                         </span>
                       </td>
                       <td className="py-2 pr-4 text-gray-400">
