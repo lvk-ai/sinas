@@ -49,6 +49,7 @@ from .user import (
 from .chat_wakeup import ChatWakeup
 from .mcp_task import McpTask
 from .package_repository import PackageRepository
+from .identity_provider import IdentityProvider
 from .webhook import Webhook
 
 __all__ = [
@@ -59,6 +60,7 @@ __all__ = [
     "ChatWakeup",
     "McpTask",
     "PackageRepository",
+    "IdentityProvider",
     "ConfigRevision",
     "ScheduledJob",
     "Execution",

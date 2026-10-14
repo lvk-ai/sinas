@@ -46,6 +46,9 @@ class UserRoleResponse(BaseModel):
     user_email: str
     active: bool
     added_at: datetime
+    # "idp:<provider>" when an identity provider's role mapping granted it
+    # (its SSO logins keep it in sync); None when granted by hand or config.
+    source: Optional[str] = None
 
     class Config:
         from_attributes = True

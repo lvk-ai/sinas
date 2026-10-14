@@ -53,6 +53,7 @@ from app.schemas.auth import (
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
+from app.services import sso as sso_service
 from app.services.user_identity import (
     IdentityConflictError,
     get_user_by_identity,
@@ -65,10 +66,11 @@ from app.services.user_identity import (
 _DUMMY_PASSWORD_HASH = hash_password("enumeration-resistant-dummy")
 
 
-async def _issue_tokens(db: AsyncSession, user: User) -> tuple[str, str, AuthUserResponse]:
-    """Mint an access + refresh token pair and build the user response."""
+async def _issue_tokens(db: AsyncSession, user: User, **refresh_options) -> tuple[str, str, AuthUserResponse]:
+    """Mint an access + refresh token pair and build the user response.
+    `refresh_options` go to create_refresh_token (an SSO session's cap)."""
     access_token = create_access_token(user_id=str(user.id), email=user.email)
-    refresh_token_plain, _ = await create_refresh_token(db, str(user.id))
+    refresh_token_plain, _ = await create_refresh_token(db, str(user.id), **refresh_options)
 
     roles_result = await db.execute(
         select(Role.name)
@@ -99,6 +101,16 @@ async def login(request: LoginRequest, http_request: Request, db: AsyncSession =
     """
     await rate_limit_by_ip(http_request, "login", settings.rate_limit_login_ip_max, settings.rate_limit_window_seconds)
     await rate_limit_by_value(request.email, "login:email", settings.rate_limit_login_email_max, settings.rate_limit_window_seconds)
+
+    # A domain an identity provider enforces signs in there (never the
+    # superadmin). By domain, so it says nothing about whether the account
+    # exists.
+    sso = await sso_service.enforcing_provider(db, request.email)
+    if sso is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=sso_service.enforced_message(sso, request.email),
+        )
 
     auth_mode = settings.auth_mode
     requires_password = "password" in auth_mode
@@ -181,6 +193,14 @@ async def verify_otp(request: OTPVerifyRequest, http_request: Request, db: Async
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User not found. Contact your administrator.",
+        )
+
+    # SSO enforced since the code was sent.
+    sso = await sso_service.enforcing_provider(db, user.email)
+    if sso is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=sso_service.enforced_message(sso, user.email),
         )
 
     access_token, refresh_token, user_resp = await _issue_tokens(db, user)
@@ -296,6 +316,11 @@ async def refresh_access_token(request: RefreshRequest, db: AsyncSession = Depen
         )
 
     user_id, email = result
+
+    # A password or code session ends once the user's domain must use SSO.
+    blocked = await sso_service.refresh_blocked(db, email, request.refresh_token)
+    if blocked:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=blocked)
 
     # Create new access token
     access_token = create_access_token(user_id=user_id, email=email)

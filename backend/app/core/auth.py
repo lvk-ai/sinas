@@ -388,7 +388,13 @@ def get_execution_depth_from_request(request) -> Optional[int]:
         return None
 
 
-async def create_refresh_token(db: AsyncSession, user_id: str) -> tuple[str, "RefreshToken"]:
+async def create_refresh_token(
+    db: AsyncSession,
+    user_id: str,
+    *,
+    max_lifetime: Optional[timedelta] = None,
+    identity_provider: Optional[str] = None,
+) -> tuple[str, "RefreshToken"]:
     """
     Create a refresh token and store it in the database.
 
@@ -397,6 +403,9 @@ async def create_refresh_token(db: AsyncSession, user_id: str) -> tuple[str, "Re
     Args:
         db: Database session
         user_id: User UUID
+        max_lifetime: Cap below refresh_token_expire_days (an SSO login's
+            session_hours: the user goes back through the IdP after it)
+        identity_provider: The provider whose SSO login this is
 
     Returns:
         Tuple of (plain_token, refresh_token_model)
@@ -409,7 +418,10 @@ async def create_refresh_token(db: AsyncSession, user_id: str) -> tuple[str, "Re
     token_prefix = plain_token[:8]
 
     # Calculate expiration
-    expires_at = datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days)
+    lifetime = timedelta(days=settings.refresh_token_expire_days)
+    if max_lifetime is not None:
+        lifetime = min(lifetime, max_lifetime)
+    expires_at = datetime.now(UTC) + lifetime
 
     # Create refresh token record
     refresh_token = RefreshToken(
@@ -418,6 +430,7 @@ async def create_refresh_token(db: AsyncSession, user_id: str) -> tuple[str, "Re
         token_prefix=token_prefix,
         is_revoked=False,
         expires_at=expires_at,
+        identity_provider=identity_provider,
     )
 
     db.add(refresh_token)

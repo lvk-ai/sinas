@@ -200,6 +200,7 @@ async def apply_user_roles(
         if held:  # ended before: reactivate the most recent row
             latest = max(held, key=lambda m: m.added_at or now)
             latest.active, latest.removed_at, latest.removed_by = True, None, None
+            latest.source = None  # the config's now: no SSO sync ends it
         else:
             db.add(UserRole(user_id=user_id, role_id=role_id, active=True))
     for membership in memberships:

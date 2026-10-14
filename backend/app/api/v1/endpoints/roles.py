@@ -271,6 +271,7 @@ async def list_role_members(
                 user_email=email,
                 active=member.active,
                 added_at=member.added_at,
+                source=member.source,
             )
         )
 
@@ -316,9 +317,11 @@ async def add_role_member(
     if existing:
         if existing.active:
             raise HTTPException(status_code=400, detail="User is already a member of this role")
-        # Reactivate membership
+        # Reactivate membership: granted by hand now, so no identity
+        # provider's sync takes it away again.
         existing.active = True
         existing.added_by = uuid.UUID(user_id)
+        existing.source = None
         await db.flush()
         await db.refresh(existing)
 
