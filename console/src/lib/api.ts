@@ -1510,6 +1510,12 @@ class APIClient {
     return response.data;
   }
 
+  /** Whether the caller holds every one of these permissions. */
+  async hasPermissions(permissions: string[]): Promise<boolean> {
+    const response = await this.runtimeClient.post('/auth/check-permissions', { permissions, logic: 'AND' });
+    return !!response.data?.result;
+  }
+
   // Admins only: a 403 is how the page learns to leave the ratecard out.
   async getRatecard(params: { days?: number; search?: string } = {}): Promise<Ratecard> {
     const response = await this.configClient.get('/usage/ratecard', { params, quietStatuses: [403] } as QuietRequestConfig);

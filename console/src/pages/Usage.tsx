@@ -92,6 +92,9 @@ export function Usage() {
   // Pricing past calls rewrites stored costs: only for a range the user set
   // in full, never for a guessed one.
   const rangeComplete = rangeHours !== 'custom' || (!!customFrom && !!customTo);
+  // Backfill prices every unpriced call in the window; with an agent,
+  // provider or model filter on, that would include calls the report hides.
+  const narrowed = !!(agent || provider || model);
 
   const spanHours =
     filters.from && filters.to ? (Date.parse(filters.to) - Date.parse(filters.from)) / 3600_000 : 24 * 30;
@@ -114,6 +117,14 @@ export function Usage() {
     queryFn: () => apiClient.getUsageTimeseries(filters, interval),
     retry: false,
   });
+
+  // Fetching the URL and pricing past calls need sinas.usage.update:all; a
+  // reader without it gets no buttons that would only answer 403.
+  const canUpdate = useQuery({
+    queryKey: ['usage-can-update'],
+    queryFn: () => apiClient.hasPermissions(['sinas.usage.update:all']),
+    retry: false,
+  }).data === true;
 
   // Admins only (sinas.usage.read:all): the section hides itself otherwise.
   const ratecard = useQuery({
@@ -449,7 +460,7 @@ export function Usage() {
                 </p>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
-                {urlSource?.configured && (
+                {canUpdate && urlSource?.configured && (
                   <button
                     onClick={() => refreshMutation.mutate()}
                     disabled={refreshMutation.isPending}
@@ -458,20 +469,24 @@ export function Usage() {
                     {refreshMutation.isPending ? 'Fetching…' : 'Fetch URL now'}
                   </button>
                 )}
-                <button
-                  onClick={() => {
-                    if (confirm('Price the unpriced calls in this range at the current prices?')) backfillMutation.mutate();
-                  }}
-                  disabled={backfillMutation.isPending || !totals?.unpriced_calls || !rangeComplete}
-                  className="btn btn-secondary btn-sm"
-                  title={
-                    rangeComplete
-                      ? "Price calls recorded without a cost, in the selected range, at today's prices"
-                      : 'Set both dates of the custom range first'
-                  }
-                >
-                  {backfillMutation.isPending ? 'Pricing…' : 'Price unpriced calls'}
-                </button>
+                {canUpdate && (
+                  <button
+                    onClick={() => {
+                      if (confirm('Price the unpriced calls in this range at the current prices?')) backfillMutation.mutate();
+                    }}
+                    disabled={backfillMutation.isPending || !totals?.unpriced_calls || !rangeComplete || narrowed}
+                    className="btn btn-secondary btn-sm"
+                    title={
+                      !rangeComplete
+                        ? 'Set both dates of the custom range first'
+                        : narrowed
+                          ? 'Clear the agent, provider and model filters first: pricing covers every call in the range'
+                          : "Price calls recorded without a cost, in the selected range, at today's prices"
+                    }
+                  >
+                    {backfillMutation.isPending ? 'Pricing…' : 'Price unpriced calls'}
+                  </button>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
