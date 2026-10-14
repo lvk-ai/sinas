@@ -107,7 +107,7 @@ function PricingFields({
         <input
           id={`${idPrefix}_discount`}
           type="number"
-          step="0.01"
+          step="any"
           min="0"
           max="1"
           value={draft.discount}
