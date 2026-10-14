@@ -71,11 +71,15 @@ export function Usage() {
   const [groupBy, setGroupBy] = useState<UsageDimension>('agent');
   const [chartMetric, setChartMetric] = useState<ChartMetric>('cost_usd');
 
+  // The window, resolved once: every query and the backfill send exactly
+  // these bounds. A blank custom date falls back the way the API would
+  // (to: now, from: 30 days before to).
   const filters: UsageFilters = useMemo(() => {
     const f: UsageFilters = {};
     if (rangeHours === 'custom') {
-      f.from = localToIso(customFrom);
-      f.to = localToIso(customTo);
+      const to = customTo ? new Date(customTo).getTime() : anchor;
+      f.to = new Date(to).toISOString();
+      f.from = customFrom ? localToIso(customFrom) : new Date(to - 30 * 24 * 3600_000).toISOString();
     } else {
       f.to = new Date(anchor).toISOString();
       f.from = new Date(anchor - rangeHours * 3600_000).toISOString();
@@ -85,12 +89,12 @@ export function Usage() {
     if (model) f.model = [model];
     return f;
   }, [rangeHours, customFrom, customTo, anchor, agent, provider, model]);
+  // Pricing past calls rewrites stored costs: only for a range the user set
+  // in full, never for a guessed one.
+  const rangeComplete = rangeHours !== 'custom' || (!!customFrom && !!customTo);
 
-  const spanHours = useMemo(() => {
-    const from = filters.from ? new Date(filters.from).getTime() : anchor - 30 * 24 * 3600_000;
-    const to = filters.to ? new Date(filters.to).getTime() : anchor;
-    return (to - from) / 3600_000;
-  }, [filters, anchor]);
+  const spanHours =
+    filters.from && filters.to ? (Date.parse(filters.to) - Date.parse(filters.from)) / 3600_000 : 24 * 30;
   const interval: 'hour' | 'day' = spanHours <= 48 ? 'hour' : 'day';
 
   const { data: agents } = useQuery({
@@ -172,7 +176,7 @@ export function Usage() {
     ...p,
     label:
       interval === 'hour'
-        ? new Date(p.bucket).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit' })
+        ? new Date(p.bucket).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', timeZone: 'UTC' })
         : new Date(p.bucket).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }),
   }));
   const hasChartData = chartData.some((p) => p.calls > 0);
@@ -458,9 +462,13 @@ export function Usage() {
                   onClick={() => {
                     if (confirm('Price the unpriced calls in this range at the current prices?')) backfillMutation.mutate();
                   }}
-                  disabled={backfillMutation.isPending || !totals?.unpriced_calls}
+                  disabled={backfillMutation.isPending || !totals?.unpriced_calls || !rangeComplete}
                   className="btn btn-secondary btn-sm"
-                  title="Price calls recorded without a cost, in the selected range, at today's prices"
+                  title={
+                    rangeComplete
+                      ? "Price calls recorded without a cost, in the selected range, at today's prices"
+                      : 'Set both dates of the custom range first'
+                  }
                 >
                   {backfillMutation.isPending ? 'Pricing…' : 'Price unpriced calls'}
                 </button>
