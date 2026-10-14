@@ -802,11 +802,13 @@ function EditUserRolesModal({ user, allRoles, onClose }: { user: any; allRoles: 
     <>
       <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50" onClick={onClose} />
       <div className="fixed inset-0 flex items-center justify-center z-50 p-4 pointer-events-none">
-        <div className="bg-surface-1 rounded-lg max-w-md w-full p-6 pointer-events-auto">
+        {/* Capped to the viewport (minus the wrapper's p-4): the header and
+            Done button stay put and only the role list scrolls. */}
+        <div className="bg-surface-1 rounded-lg max-w-md w-full max-h-[calc(100dvh-2rem)] flex flex-col p-6 pointer-events-auto">
           <h2 className="text-xl font-semibold text-gray-100 mb-1">Edit Roles</h2>
-          <p className="text-sm text-gray-400 mb-4">{user.email}</p>
+          <p className="text-sm text-gray-400 mb-4 wrap-anywhere">{user.email}</p>
 
-          <div className="space-y-2">
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-2">
             {allRoles.map((role: any) => {
               const isAssigned = roleNames.has(role.name);
               return (
@@ -821,9 +823,9 @@ function EditUserRolesModal({ user, allRoles, onClose }: { user: any; allRoles: 
                     disabled={isPending}
                     className="rounded border-line text-primary-600 focus:ring-primary-500"
                   />
-                  <div className="flex-1">
+                  <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-gray-100">{role.name}</span>
+                      <span className="text-sm font-medium text-gray-100 wrap-anywhere">{role.name}</span>
                       {role.name.toLowerCase() === 'admins' && (
                         <span className="px-1.5 py-0.5 bg-red-900/30 text-red-300 text-[10px] font-medium rounded">Admin</span>
                       )}
@@ -837,7 +839,7 @@ function EditUserRolesModal({ user, allRoles, onClose }: { user: any; allRoles: 
             })}
           </div>
 
-          <div className="flex justify-end mt-6 pt-4 border-t border-line-soft">
+          <div className="flex justify-end mt-6 pt-4 border-t border-line-soft shrink-0">
             <button onClick={onClose} className="btn btn-secondary">Done</button>
           </div>
         </div>
