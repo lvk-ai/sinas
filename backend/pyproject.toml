@@ -18,7 +18,7 @@ dependencies = [
     # stopped installing it by default, so the unbounded pin resolved to
     # 2.1.1 with no greenlet and every fresh image crashed at import.
     # Capped at the tested 2.0 line: a new minor is a deliberate upgrade,
-    # not something a rebuild should pick up (same lesson as anthropic 1.0).
+    # not something a lock refresh should pick up (same lesson as anthropic 1.0).
     "sqlalchemy[asyncio]>=2.0.0,<2.1",
     "alembic>=1.12.0",
     "psycopg2-binary>=2.9.0",
@@ -35,10 +35,11 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "bcrypt (>=4.1.0)",
     "openai>=1.3.0",
-    # Bounded to the major we code against: the image build installs from
-    # this file (not the lock), and 1.0.0 removed the sampling kwargs
-    # (temperature/top_p/top_k) — an unbounded range let images resolve a
-    # breaking major ahead of the code (every agent invoke 500'd).
+    # Bounded to the major we code against: 1.0.0 removed the sampling
+    # kwargs (temperature/top_p/top_k) — back when images installed from
+    # these ranges, an unbounded one let a build resolve a breaking major
+    # ahead of the code (every agent invoke 500'd). Images and CI now install
+    # from uv.lock; the bound keeps `uv lock --upgrade` and Dependabot honest.
     "anthropic>=1.0.0,<2",
     "sse-starlette>=1.8.0",
     "websockets>=12.0",
@@ -59,6 +60,10 @@ dependencies = [
     # so an unbounded range would let an image resolve a breaking major.
     "mcp>=2.2.0,<3",
 ]
+
+# Exact versions + hashes for everything (transitive included) live in
+# uv.lock: edit the ranges here, then run `uv lock` and commit both files.
+# See CONTRIBUTING.md > "Backend dependencies".
 
 [project.optional-dependencies]
 dev = [

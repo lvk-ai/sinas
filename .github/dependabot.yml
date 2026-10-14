@@ -1,0 +1,61 @@
+# Dependabot: weekly grouped version-update PRs against dev (git-flow
+# integration branch). See CONTRIBUTING.md > "Dependency updates".
+#
+# Each ecosystem gets ONE grouped PR per week. Each group sets
+# `applies-to: version-updates`, so security updates are never folded into
+# it: they arrive as their own per-advisory PRs. Security updates always
+# target the default branch (main), not `target-branch`, and only once
+# "Dependabot security updates" is switched on in the repo settings.
+version: 2
+updates:
+  # Backend Python deps: uv.lock (exact versions + hashes). lockfile-only
+  # keeps pyproject.toml's ranges as the compatibility statement: Dependabot
+  # bumps whatever the ranges already allow and skips anything that would
+  # need a range change (e.g. a new anthropic major), which stays a
+  # deliberate, human edit.
+  - package-ecosystem: uv
+    directory: /backend
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+    versioning-strategy: lockfile-only
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      backend-python:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # Console npm deps (package.json + package-lock.json).
+  - package-ecosystem: npm
+    directory: /console
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      # A file: link to the sibling sinas-js checkout; CI and the console
+      # Dockerfile swap it for the published package (see ci.yml).
+      - dependency-name: "@sinas/sdk"
+    groups:
+      console-npm:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # Actions used by .github/workflows (SHA pins are bumped with their
+  # version comment).
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]

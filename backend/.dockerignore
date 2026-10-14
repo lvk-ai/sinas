@@ -1,0 +1,8 @@
+# Keep host-side environments and caches out of the build context (a local
+# `uv sync` creates .venv here; COPY . /app/ would otherwise ship it).
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
