@@ -95,6 +95,11 @@ import type {
   PackageRepository,
   PackageRepositoryCreate,
   PackageRepositoryUpdate,
+  IdentityProvider,
+  IdentityProviderCreate,
+  IdentityProviderUpdate,
+  SsoProvider,
+  SsoExchangeResponse,
   PackageCatalogEntry,
 } from '../types';
 
@@ -950,6 +955,52 @@ class APIClient {
 
   async refreshPackageRepository(name: string): Promise<PackageRepository> {
     const response = await this.configClient.post(`/package-repositories/${encodeURIComponent(name)}/refresh`);
+    return response.data;
+  }
+
+  // Identity providers (admin only)
+  async listIdentityProviders(): Promise<IdentityProvider[]> {
+    const response = await this.configClient.get('/identity-providers', { quietStatuses: [403] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  async createIdentityProvider(data: IdentityProviderCreate): Promise<IdentityProvider> {
+    const response = await this.configClient.post('/identity-providers', data);
+    return response.data;
+  }
+
+  async updateIdentityProvider(name: string, data: IdentityProviderUpdate): Promise<IdentityProvider> {
+    const response = await this.configClient.put(`/identity-providers/${encodeURIComponent(name)}`, data);
+    return response.data;
+  }
+
+  async deleteIdentityProvider(name: string): Promise<void> {
+    await this.configClient.delete(`/identity-providers/${encodeURIComponent(name)}`);
+  }
+
+  // SSO login (public; the login page explains failures in place)
+  async listSsoProviders(): Promise<SsoProvider[]> {
+    const response = await this.runtimeClient.get('/auth/oidc/providers', { quietStatuses: [404] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  /** The provider this email's domain must sign in with, if any. */
+  async discoverSsoProvider(email: string): Promise<SsoProvider | null> {
+    const response = await this.runtimeClient.post(
+      '/auth/oidc/discover',
+      { email },
+      { quietStatuses: [404, 422, 429] } as QuietRequestConfig,
+    );
+    return response.data.provider ?? null;
+  }
+
+  /** Trade the one-time code from the SSO redirect for tokens. */
+  async exchangeSsoCode(code: string, codeVerifier: string): Promise<SsoExchangeResponse> {
+    const response = await this.runtimeClient.post(
+      '/auth/oidc/exchange',
+      { code, code_verifier: codeVerifier },
+      { quietStatuses: [400, 403, 422] } as QuietRequestConfig,
+    );
     return response.data;
   }
 

@@ -34,6 +34,7 @@ import {
   KeyRound,
   Plug,
   Workflow,
+  Fingerprint,
 } from 'lucide-react';
 import { useState } from 'react';
 
@@ -87,6 +88,7 @@ const navigationSections = [
       { name: 'Packages', href: '/packages', icon: Package },
       { name: 'Manifests', href: '/manifests', icon: AppWindow },
       { name: 'Access Control', href: '/users', icon: Users },
+      { name: 'Single Sign-On', href: '/identity-providers', icon: Fingerprint },
       { name: 'API Keys', href: '/api-keys', icon: Key },
       { name: 'Logs', href: '/logs', icon: Activity },
       { name: 'System', href: '/system', icon: Server },

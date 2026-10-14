@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { API_BASE_URL } from './api';
+import { API_BASE_URL, apiClient } from './api';
 import { SinasClient } from '@sinas/sdk';
 import type { AuthUser, InfoResponse, SinasConfig } from '@sinas/sdk';
 import type { AuthMode, InstanceInfo } from '../types';
@@ -21,6 +21,9 @@ interface AuthContextType {
   /** Returns session_id when an OTP step follows; undefined for password-only mode. */
   login: (email: string, password?: string) => Promise<string | undefined>;
   verifyOTP: (sessionId: string, otpCode: string) => Promise<void>;
+  /** Finish an SSO sign-in: trade the one-time code for tokens. Returns the
+   * console path to continue on. */
+  completeSso: (code: string, codeVerifier: string) => Promise<string>;
   logout: () => Promise<void>;
 }
 
@@ -42,6 +45,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [instanceInfo, setInstanceInfo] = useState<InstanceInfo | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
   const tokenRef = useRef<string | null>(null);
+  // Bumped whenever a session starts or ends here. A request started for an
+  // earlier session (the startup check of a stored one) may not change a
+  // newer one: e.g. an SSO sign-in finishing while the old check is in flight.
+  const sessionGeneration = useRef(0);
 
   // Single SinasClient configured for standalone (browser) use. Token getters
   // read from localStorage so every request — including those issued from the
@@ -129,12 +136,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setupRefreshTimer();
 
       // Verify token is still valid
+      const generation = sessionGeneration.current;
       client.auth.getMe()
         .then((u) => {
+          if (sessionGeneration.current !== generation) return;  // a newer session took over
           setUser(u);
           localStorage.setItem('user', JSON.stringify(u));
         })
         .catch((error) => {
+          if (sessionGeneration.current !== generation) return;  // not this session's tokens anymore
           // Token invalid, clear
           console.error('Token verification failed on refresh:', error);
           localStorage.removeItem('auth_token');
@@ -180,6 +190,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const persistSession = (access: string, refresh: string, u: AuthUser) => {
     setToken(access);
+    sessionGeneration.current += 1;
     setUser(u);
     localStorage.setItem('auth_token', access);
     localStorage.setItem('refresh_token', refresh);
@@ -207,6 +218,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     persistSession(response.access_token, response.refresh_token, response.user);
   };
 
+  const completeSso = async (code: string, codeVerifier: string): Promise<string> => {
+    const response = await apiClient.exchangeSsoCode(code, codeVerifier);
+    persistSession(response.access_token, response.refresh_token, response.user);
+    return response.return_to || '/';
+  };
+
   const logout = async () => {
     const refreshToken = localStorage.getItem('refresh_token');
 
@@ -219,6 +236,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    sessionGeneration.current += 1;
     setToken(null);
     setUser(null);
     window.__SINAS_AUTH_TOKEN__ = null;
@@ -236,7 +254,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, logout }}
+      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, completeSso, logout }}
     >
       {children}
     </AuthContext.Provider>

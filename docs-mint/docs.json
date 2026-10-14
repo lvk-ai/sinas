@@ -78,6 +78,7 @@
               "admin/packages",
               "admin/manifests",
               "admin/users-roles",
+              "admin/sso",
               "admin/permissions",
               "admin/system",
               "admin/config-manager",
