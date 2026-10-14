@@ -1,9 +1,10 @@
 """Per-call LLM token usage records."""
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, GUID
@@ -47,6 +48,16 @@ class LLMUsage(Base):
     # Set when the call raised; token counts may then be 0/partial
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Cost in USD, priced when the row is written and never recomputed
+    # (app/services/llm_pricing.py). NULL: no price was known for the model.
+    cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    # Where the price came from: "provider" (the LLM provider's own pricing),
+    # "deployment" (the MODEL_PRICES_* ratecard) or "backfill" (priced later
+    # by POST /usage/backfill). NULL when unpriced.
+    price_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # A provider batch-API call (usually discounted)
+    batch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -54,4 +65,6 @@ class LLMUsage(Base):
     __table_args__ = (
         Index("idx_llm_usage_user_created", "user_id", "created_at"),
         Index("idx_llm_usage_created", "created_at"),
+        Index("idx_llm_usage_agent_created", "agent", "created_at"),
+        Index("idx_llm_usage_provider_created", "provider_name", "created_at"),
     )

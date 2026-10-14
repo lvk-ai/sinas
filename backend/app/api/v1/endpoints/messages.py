@@ -225,10 +225,13 @@ async def get_message_stats(
         func.coalesce(func.sum(LLMUsage.cache_read_tokens), 0),
         func.coalesce(func.sum(LLMUsage.cache_write_tokens), 0),
         func.count(),
+        func.coalesce(func.sum(LLMUsage.cost_usd), 0),
+        func.count().filter(LLMUsage.cost_usd.is_(None)),
     ).where(usage_filter)
-    u_prompt, u_completion, u_total, u_cache_read, u_cache_write, u_calls = (
-        await db.execute(usage_q)
-    ).one()
+    (
+        u_prompt, u_completion, u_total, u_cache_read, u_cache_write, u_calls,
+        u_cost, u_unpriced,
+    ) = (await db.execute(usage_q)).one()
 
     return {
         "total_messages": total,
@@ -242,5 +245,8 @@ async def get_message_stats(
         "llm_cache_read_tokens": int(u_cache_read),
         "llm_cache_write_tokens": int(u_cache_write),
         "llm_calls": u_calls,
+        # Cost of the priced calls; llm_unpriced_calls had no known price
+        "llm_cost_usd": float(u_cost),
+        "llm_unpriced_calls": u_unpriced,
         "days": days,
     }

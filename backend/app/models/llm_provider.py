@@ -1,6 +1,6 @@
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Boolean, String, Text, select
+from sqlalchemy import JSON, Boolean, Float, String, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,6 +38,15 @@ class LLMProvider(Base):
     #    "max_tokens_param": "max_completion_tokens",  # token-limit param name
     #    "drop_params": ["temperature"],     # strip per-deployment (reasoning models)
     #    "extra_params": {"reasoning_effort": "medium"}}  # merged into requests
+
+    # Pricing for this provider's calls (docs/design/usage-cost.md), ahead of
+    # the deployment ratecard. pricing: {model: {input_cost_per_token, ...}}
+    # in LiteLLM's field names; model_aliases: {model as called: ratecard
+    # model} (an Azure deployment name, say); pricing_discount: a multiplier
+    # on deployment-ratecard prices (0.8 = 20% off list).
+    pricing: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    model_aliases: Mapped[Optional[dict[str, str]]] = mapped_column(JSON, nullable=True)
+    pricing_discount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # Default provider for new assistants
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

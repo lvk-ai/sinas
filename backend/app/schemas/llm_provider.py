@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class LLMProviderCreate(BaseModel):
@@ -16,6 +16,11 @@ class LLMProviderCreate(BaseModel):
     default_model: Optional[str] = None
     config: Optional[dict[str, Any]] = None
     is_default: Optional[bool] = False
+    # Pricing (docs/design/usage-cost.md): {model: {input_cost_per_token,
+    # output_cost_per_token, cache_read_input_token_cost, ...}}
+    pricing: Optional[dict[str, dict[str, Any]]] = None
+    model_aliases: Optional[dict[str, str]] = None
+    discount: Optional[float] = None
 
 
 class LLMProviderUpdate(BaseModel):
@@ -29,6 +34,10 @@ class LLMProviderUpdate(BaseModel):
     config: Optional[dict[str, Any]] = None
     is_default: Optional[bool] = None
     is_active: Optional[bool] = None
+    # Replaced as a whole; {} clears. discount: null clears it.
+    pricing: Optional[dict[str, dict[str, Any]]] = None
+    model_aliases: Optional[dict[str, str]] = None
+    discount: Optional[float] = None
 
 
 class LLMProviderResponse(BaseModel):
@@ -44,5 +53,15 @@ class LLMProviderResponse(BaseModel):
     config: dict[str, Any]
     is_default: bool
     is_active: bool
+    pricing: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    model_aliases: dict[str, str] = Field(default_factory=dict)
+    discount: Optional[float] = Field(
+        default=None, validation_alias=AliasChoices("discount", "pricing_discount")
+    )
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("pricing", "model_aliases", mode="before")
+    @classmethod
+    def _none_is_empty(cls, value: Any) -> Any:
+        return {} if value is None else value

@@ -100,6 +100,19 @@ Default off. When enabled, every operation (function execution, code execution, 
 
 Meter integrity: sandbox and shared executor containers/pods receive no Redis/database credentials, so code they run cannot alter the count. `TRUSTED_EXECUTOR=inprocess` breaks that guarantee (client code runs inside a credential-bearing process) — enabling metering in that mode logs a warning. Metered instances should use `docker_shared` (Docker) or `k8s_shared` (Kubernetes), or `disabled` if shared-pool functions aren't needed.
 
+## LLM Cost (Optional)
+
+The deployment ratecard calls are priced from, in LiteLLM's `model_prices_and_context_window.json` format. Unset (and no per-provider pricing), calls are recorded unpriced. See [Usage & Cost](/admin/usage-cost).
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PRICES_URL` | _(none)_ | `https://` URL of a ratecard, e.g. LiteLLM's file on raw.githubusercontent.com. Fetched by the worker; the last good copy is kept in the database. |
+| `MODEL_PRICES_FILE` | _(none)_ | Path to a ratecard file. Wins over the URL. |
+| `MODEL_PRICES_JSON` | _(none)_ | A ratecard inline. Wins over the file and the URL. |
+| `MODEL_PRICES_REFRESH_HOURS` | `24` | Age at which the URL copy is fetched again. |
+| `MODEL_PRICES_TIMEOUT_SECONDS` | `30` | URL fetch timeout. |
+| `MODEL_PRICES_MAX_BYTES` | `16777216` | Largest ratecard accepted. |
+
 ## Executors
 
 How Sinas runs user code. `SANDBOX_EXECUTOR` handles untrusted code

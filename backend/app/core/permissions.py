@@ -363,6 +363,8 @@ DEFAULT_ROLE_PERMISSIONS = {
         "sinas.templates/*/*.send:own": True,  # Send with specific templates
         # Request Logs (non-namespaced)
         "sinas.logs.read:own": True,
+        # LLM usage and cost of the user's own calls
+        "sinas.usage.read:own": True,
     },
     # For CI/CD API keys that validate, preview and apply config and install
     # packages (e.g. the Sinas CLI in a pipeline). No members by default: link
@@ -398,6 +400,9 @@ DEFAULT_ROLE_PERMISSIONS = {
         # Executions (admin-only)
         # "sinas.executions.read:all"
         # "sinas.executions.update:all"
+        # LLM usage and cost (admin-only beyond one's own calls)
+        # "sinas.usage.read:all" - every user's usage, and the ratecard
+        # "sinas.usage.update:all" - refresh the ratecard, backfill costs
         # System (admin-only - queues, workers, containers)
         # "sinas.system.read:all"
         # "sinas.system.update:all"

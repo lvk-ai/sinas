@@ -2,10 +2,11 @@
 
 Every provider returned by ``create_provider()`` is wrapped in
 :class:`UsageTrackingProvider`, which records one ``llm_usage`` row per
-LLM call (token counts, latency, attribution). Recording is fire-and-forget
-on a dedicated DB session: a failed insert never blocks or fails the call,
-and it is isolated from whatever transaction state the caller's session
-is in.
+LLM call (token counts, latency, attribution, and the cost at the prices
+that apply at that moment — see app/services/llm_pricing.py). Recording is
+fire-and-forget on a dedicated DB session: a failed insert never blocks or
+fails the call, and it is isolated from whatever transaction state the
+caller's session is in.
 """
 import asyncio
 import logging
@@ -26,8 +27,10 @@ async def _insert_usage(values: dict[str, Any]) -> None:
     try:
         from app.core.database import AsyncSessionLocal
         from app.models import LLMUsage
+        from app.services.llm_pricing import price_usage
 
         async with AsyncSessionLocal() as session:
+            await price_usage(session, values)
             session.add(LLMUsage(**values))
             await session.commit()
     except Exception as e:

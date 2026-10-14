@@ -90,6 +90,12 @@ class LLMProviderConfig(BaseModel):
     # max_tokens_param, drop_params, extra_params.
     config: dict[str, Any] = Field(default_factory=dict)
     isActive: Optional[bool] = None
+    # Pricing (docs/design/usage-cost.md): {model: LiteLLM per-token fields},
+    # {model as called: ratecard model}, and a multiplier on deployment
+    # ratecard prices.
+    pricing: Optional[dict[str, dict[str, Any]]] = None
+    modelAliases: Optional[dict[str, str]] = None
+    discount: Optional[float] = None
 
 
 class DatabaseAnnotationConfig(BaseModel):

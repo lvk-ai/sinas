@@ -14,10 +14,18 @@ from sqlalchemy import select
 
 from app.core.encryption import encryption_service
 from app.models.llm_provider import LLMProvider
-from app.schemas.spec.llm_provider import LLMProviderSpec
+from app.schemas.spec.llm_provider import LLMProviderSpec, ModelPricing
 from app.services.resources.base import ApplyContext, ResourceApplier
 
 logger = logging.getLogger(__name__)
+
+
+def _stored_price(price: dict[str, Any]) -> ModelPricing:
+    """A stored model price as written (validated then), numbers as floats."""
+    try:
+        return ModelPricing.model_validate(price)
+    except ValueError:  # edited in the database by hand: shown as it is
+        return ModelPricing.model_construct(**price)
 
 
 class LLMProviderApplier(ResourceApplier[LLMProviderSpec]):
@@ -68,6 +76,9 @@ class LLMProviderApplier(ResourceApplier[LLMProviderSpec]):
             config=dict(row.config or {}),
             is_default=bool(row.is_default),
             is_active=row.is_active is not False,
+            pricing={model: _stored_price(price) for model, price in (row.pricing or {}).items()},
+            model_aliases=dict(row.model_aliases or {}),
+            discount=row.pricing_discount,
         )
 
     def new_row(self, spec: LLMProviderSpec, ctx: ApplyContext) -> LLMProvider:
@@ -89,6 +100,12 @@ class LLMProviderApplier(ResourceApplier[LLMProviderSpec]):
         row.config = dict(spec.config)
         row.is_default = spec.is_default
         row.is_active = spec.is_active
+        row.pricing = {
+            model: price.model_dump(mode="json", exclude_none=True)
+            for model, price in spec.pricing.items()
+        } or None
+        row.model_aliases = dict(spec.model_aliases) or None
+        row.pricing_discount = spec.discount
 
     async def _unset_other_defaults(self, row: LLMProvider, ctx: ApplyContext) -> None:
         """One default provider; the previous one's change is recorded too."""

@@ -81,6 +81,7 @@
               "admin/sso",
               "admin/permissions",
               "admin/system",
+              "admin/usage-cost",
               "admin/config-manager",
               "admin/icons"
             ]

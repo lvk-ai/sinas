@@ -3,8 +3,9 @@
 Runs as a scheduler interval job. For each unfinished provider-mode batch:
 check the provider's batch status; once ended, write each result back as an
 assistant message on its chat, mark the child Execution terminal, record
-llm_usage, and hand off to batch_service.on_execution_terminated for the
-aggregate status + batch callback.
+llm_usage (marked batch, priced at batch rates), and hand off to
+batch_service.on_execution_terminated for the aggregate status + batch
+callback.
 
 Processing is idempotent: already-terminal executions are skipped, so a
 crash mid-processing is repaired on the next tick.
@@ -20,6 +21,7 @@ from app.models import LLMProvider, LLMUsage
 from app.models.batch import Batch
 from app.models.chat import Message
 from app.models.execution import Execution, ExecutionStatus
+from app.services.llm_pricing import price_usage
 
 logger = logging.getLogger(__name__)
 
@@ -118,21 +120,25 @@ async def _poll_one(batch_id: uuid_lib.UUID) -> None:
                     ))
                     execution.output_data = {"final_message": content}
                     usage = result.get("usage") or {}
-                    db.add(LLMUsage(
-                        user_id=batch.user_id,
-                        chat_id=execution.chat_id,
-                        agent=f"{batch.target_namespace}/{batch.target_name}",
-                        source="provider_batch",
-                        provider_name=provider_row.name,
-                        provider_type=provider_row.provider_type,
-                        model=model,
-                        prompt_tokens=usage.get("prompt_tokens", 0) or 0,
-                        completion_tokens=usage.get("completion_tokens", 0) or 0,
-                        total_tokens=usage.get("total_tokens", 0) or 0,
-                        cache_read_tokens=usage.get("cache_read_tokens", 0) or 0,
-                        cache_write_tokens=usage.get("cache_write_tokens", 0) or 0,
-                        streamed=False,
-                    ))
+                    values = {
+                        "user_id": batch.user_id,
+                        "chat_id": execution.chat_id,
+                        "agent": f"{batch.target_namespace}/{batch.target_name}",
+                        "source": "provider_batch",
+                        "provider_name": provider_row.name,
+                        "provider_type": provider_row.provider_type,
+                        "model": model,
+                        "prompt_tokens": usage.get("prompt_tokens", 0) or 0,
+                        "completion_tokens": usage.get("completion_tokens", 0) or 0,
+                        "total_tokens": usage.get("total_tokens", 0) or 0,
+                        "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
+                        "cache_write_tokens": usage.get("cache_write_tokens", 0) or 0,
+                        "streamed": False,
+                        # Priced at the provider's batch rates
+                        "batch": True,
+                    }
+                    await price_usage(db, values)
+                    db.add(LLMUsage(**values))
                 else:
                     execution.error = result.get("error") or result["status"]
 

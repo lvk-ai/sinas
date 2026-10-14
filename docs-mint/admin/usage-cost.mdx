@@ -1,0 +1,146 @@
+---
+title: "Usage & Cost"
+description: "What every LLM call cost, by agent, provider, model and user"
+---
+
+
+Sinas records one row per LLM call: who made it, through which agent, provider and model, the tokens it used (cache reads and writes included), and what it cost. The cost is worked out from a **ratecard** when the call is recorded and never changes afterwards, so a price change applies to new calls only.
+
+There are no built-in prices. Until you configure a ratecard, calls are recorded with their tokens and counted as **unpriced**.
+
+## Ratecards
+
+Prices use [LiteLLM's](https://github.com/BerriAI/litellm) `model_prices_and_context_window.json` format, so you can point Sinas at LiteLLM's maintained file instead of keeping prices yourself. Sinas reads these fields of each model and ignores the rest:
+
+| Field | Meaning |
+|---|---|
+| `input_cost_per_token` | USD per uncached input token |
+| `output_cost_per_token` | USD per output token |
+| `cache_read_input_token_cost` | USD per input token read from the prompt cache |
+| `cache_creation_input_token_cost` | USD per input token written to the prompt cache |
+| `input_cost_per_token_batches`, `output_cost_per_token_batches` | Batch API prices |
+| `litellm_provider` | The provider the entry belongs to |
+
+Prices come from two places. For each call, the first one that has the model wins:
+
+1. **The LLM provider's own pricing** (`pricing` on the provider, below).
+2. **The deployment ratecard**, from environment variables.
+
+### Deployment ratecard
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_PRICES_URL` | _(none)_ | An `https://` URL of a ratecard. The worker fetches it every `MODEL_PRICES_REFRESH_HOURS` and keeps the last good copy in the database, so a failed fetch never leaves calls unpriced. |
+| `MODEL_PRICES_FILE` | _(none)_ | Path to a ratecard file (for example a mounted ConfigMap). Re-read when it changes. |
+| `MODEL_PRICES_JSON` | _(none)_ | A ratecard inline, as JSON. |
+| `MODEL_PRICES_REFRESH_HOURS` | `24` | How old the fetched URL copy may get before it is fetched again. |
+| `MODEL_PRICES_TIMEOUT_SECONDS` | `30` | Timeout of the URL fetch. |
+| `MODEL_PRICES_MAX_BYTES` | `16777216` | Largest ratecard accepted (16 MB). |
+
+When more than one is set they are merged: an entry in `MODEL_PRICES_JSON` wins over the same model in `MODEL_PRICES_FILE`, and that over `MODEL_PRICES_URL`. A common setup is LiteLLM's file plus a few overrides:
+
+```bash
+MODEL_PRICES_URL=https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+MODEL_PRICES_JSON='{"my-finetune": {"input_cost_per_token": 3e-06, "output_cost_per_token": 1.2e-05}}'
+```
+
+The URL must be `https`, on every redirect too. The first fetch happens within ten minutes of the worker starting; an admin can fetch it at once with `POST /api/v1/usage/ratecard/refresh`.
+
+### Per-provider pricing
+
+An LLM provider can carry its own prices, model aliases and a discount, in YAML and through the API like any other provider field (and in the provider's change history):
+
+```yaml
+llmProviders:
+  - name: azure-prod
+    type: azure
+    endpoint: https://my-resource.openai.azure.com/
+    models: [prod-gpt4o, prod-mini]
+    # Azure deployment names, priced as the ratecard model they run
+    modelAliases:
+      prod-gpt4o: gpt-4o
+    # Prices of its own, ahead of the deployment ratecard
+    pricing:
+      prod-mini:
+        input_cost_per_token: 1.5e-07
+        output_cost_per_token: 6.0e-07
+        cache_read_input_token_cost: 7.5e-08
+    # Negotiated rate: 85% of the deployment ratecard's list prices
+    discount: 0.85
+```
+
+- `modelAliases` maps a model name as it is called to the name it is priced as. The alias replaces the name before any lookup.
+- `pricing` maps a model to the per-token fields above. A model needs `input_cost_per_token` and/or `output_cost_per_token`; unknown fields are refused.
+- `discount` (between 0 and 1) multiplies prices taken from the deployment ratecard for this provider's calls. It does not apply to the provider's own `pricing`, which is taken as the actual price.
+
+### How a model is matched
+
+For a call to model `M` through a provider of type `T`:
+
+1. `T/M` (for example `azure/gpt-4o` or `gemini/gemini-2.0-flash`), then the bare `M` (`gpt-4o`).
+2. Only if neither exists: `M` without a trailing release date (`-2024-08-06`, `-20241022` or `@20241022`), again provider-qualified first. So `gpt-4o-2024-11-20` is priced as `gpt-4o` when the ratecard doesn't list that snapshot.
+
+Names are matched case-insensitively. No other guessing is done: a model that doesn't match is unpriced, and `GET /api/v1/usage/ratecard` lists it so you can add a price or an alias.
+
+## How cost is calculated
+
+Every provider reports prompt tokens **including** the tokens read from and written to the prompt cache. Sinas charges the rest at the input price, and the cache portions at their own prices:
+
+```
+cost = (prompt − cache_read − cache_write) × input
+     + cache_read × cache_read_price
+     + cache_write × cache_write_price
+     + completion × output
+```
+
+- A model without a cache price is charged the input price for its cache tokens.
+- Calls through a provider's batch API (`source: provider_batch`, `batch: true`) use the batch prices where the ratecard has them, and their cache tokens get the same discount as their input tokens. Without batch prices, the regular prices apply.
+- If a call used a kind of token the model has no price for, the call is unpriced rather than guessed.
+- Long-context tiers (`*_above_200k_tokens`) and the one-hour cache-write price are not used.
+
+## API
+
+All under the management API. Times are UTC. `from` is inclusive, `to` exclusive; without `from`, the last 30 days are covered, except when filtering by `chat_id`, where the chats' calls are found whenever they were made.
+
+Common filters: `from`, `to`, `agent`, `provider`, `model`, `user_id`, `source` and `chat_id`. Each can be repeated.
+
+```
+GET  /api/v1/usage/summary?group_by=agent,model     # totals, and per group
+GET  /api/v1/usage/timeseries?interval=day          # per hour or day
+GET  /api/v1/usage/calls?limit=100&offset=0         # individual calls, newest first
+GET  /api/v1/usage/ratecard                         # effective prices and unpriced models
+POST /api/v1/usage/ratecard/refresh                 # fetch MODEL_PRICES_URL now
+POST /api/v1/usage/backfill                         # price calls recorded without a cost
+```
+
+`group_by` takes any of `agent`, `provider`, `model`, `user`, `source`, `chat`, `batch`, and `day` or `hour`. Every total and group has `calls`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `unpriced_calls` and `errors`. `cost_usd` adds up the priced calls only.
+
+The cost of a set of chats, for example to enforce a budget per run:
+
+```bash
+curl -H "Authorization: Bearer $KEY" \
+  "$SINAS/api/v1/usage/summary?chat_id=$CHAT_1&chat_id=$CHAT_2"
+```
+
+### Backfill
+
+Calls recorded before a price was known keep `cost_usd: null`. Once you've added the price, an admin can price them at the prices that apply **now**:
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"from": "2026-10-01T00:00:00Z", "to": "2026-10-14T00:00:00Z"}' \
+  "$SINAS/api/v1/usage/backfill"
+```
+
+Backfilled calls get `price_source: "backfill"`. Calls that already have a cost are never changed.
+
+## Permissions
+
+| Permission | Grants |
+|---|---|
+| `sinas.usage.read:own` | Usage and cost of the caller's own calls (every query is limited to them, whatever the filters). Part of the default **Users** role. |
+| `sinas.usage.read:all` | Everyone's usage, and the ratecard. |
+| `sinas.usage.update:all` | Refreshing the URL ratecard and backfilling. |
+
+Admins have all three through `sinas.*:all`.
+

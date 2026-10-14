@@ -104,6 +104,8 @@ async def update_llm_provider(
     patch = {f: v for f, v in request.model_dump(exclude_unset=True).items() if v is not None}
     if not patch.get("api_key"):
         patch.pop("api_key", None)  # "" keeps the stored key, like null
+    if "discount" in request.model_fields_set and request.discount is None:
+        patch["discount"] = None  # the one field null clears: no discount
     try:
         await rest.write(_applier, ctx, rest.patch_spec(_applier, provider, patch), existing=provider)
     except HTTPException as e:

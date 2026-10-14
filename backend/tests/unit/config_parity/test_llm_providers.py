@@ -233,3 +233,85 @@ async def test_every_promotion_takes_the_lock_before_row_locks(client, db: Async
     assert r.status_code == 200, r.text
     assert events[0] == ("singleton", "default-llm-provider")
     assert ("row", "llmProviders") in events
+
+
+class TestPricing:
+    """Pricing (docs/design/usage-cost.md) is part of the provider: config,
+    REST and export carry it, history records it."""
+
+    PRICING = {
+        "gpt-4o": {"input_cost_per_token": 2.5e-06, "output_cost_per_token": 1e-05,
+                   "cache_read_input_token_cost": 1.25e-06},
+    }
+
+    async def test_config_apply_export_round_trip_and_history(self, db: AsyncSession, admin_user):
+        name = _name()
+        spec = _yaml(name, pricing=self.PRICING, modelAliases={"prod-4o": "gpt-4o"}, discount=0.85)
+        assert (await _apply(db, admin_user, llmProviders=[spec])).success
+        row = await _row(db, name)
+        assert (row.pricing, row.model_aliases, row.pricing_discount) == (self.PRICING, {"prod-4o": "gpt-4o"}, 0.85)
+
+        doc = yaml.safe_load(await ConfigExportService(db).export_config())["spec"]
+        exported = next(p for p in doc["llmProviders"] if p["name"] == name)
+        assert (exported["pricing"], exported["modelAliases"], exported["discount"]) == (
+            self.PRICING, {"prod-4o": "gpt-4o"}, 0.85,
+        )
+        again = await _apply(db, admin_user, llmProviders=[exported])
+        assert again.success and not again.summary.updated, (again.errors, again.summary)
+
+        cheaper = {"gpt-4o": {**self.PRICING["gpt-4o"], "output_cost_per_token": 8e-06}}
+        assert (await _apply(db, admin_user, llmProviders=[{**spec, "pricing": cheaper}])).success
+        revisions = await _revisions(db, name)
+        assert [r.action for r in revisions] == ["create", "update"]
+        assert revisions[0].spec["pricing"] == self.PRICING
+        assert revisions[1].changes == {"pricing": {"from": self.PRICING, "to": cheaper}}
+
+        # Left out of the YAML: the provider has no pricing any more.
+        assert (await _apply(db, admin_user, llmProviders=[_yaml(name)])).success
+        row = await _row(db, name)
+        assert (row.pricing, row.model_aliases, row.pricing_discount) == (None, None, None)
+
+    def test_a_provider_without_pricing_keeps_its_checksum(self):
+        """Unset pricing stays out of the canonical form: providers applied
+        before pricing existed aren't re-stamped or shown as changed."""
+        spec = LLMProviderSpec.model_validate(_yaml("p"))
+        assert not {"pricing", "model_aliases", "discount"} & set(spec.canonical())
+
+    async def test_invalid_pricing_is_refused(self, client, db: AsyncSession, admin_user):
+        name = _name()
+        bad = [
+            {"pricing": {"m": {"input_cost_per_tokens": 1e-06}}},  # typo
+            {"pricing": {"m": {"input_cost_per_token": -1}}},
+            {"pricing": {"m": {"cache_read_input_token_cost": 1e-07}}},  # neither input nor output
+            {"discount": 1.5},
+            {"modelAliases": {"m": ""}},
+        ]
+        for extra in bad:
+            result = await _apply(db, admin_user, llmProviders=[_yaml(name, **extra)])
+            assert not result.success, extra
+        r = await client.post("/api/v1/llm-providers", json={
+            "name": name, "provider_type": "openai", "pricing": {"m": {"input_cost_per_token": "x"}},
+        }, headers=auth_headers(admin_user))
+        assert r.status_code == 422
+
+    async def test_rest_sets_patches_and_clears_pricing(self, client, db: AsyncSession, admin_user):
+        name, h = _name(), auth_headers(admin_user)
+        r = await client.post("/api/v1/llm-providers", json={
+            "name": name, "provider_type": "azure", "pricing": self.PRICING,
+            "model_aliases": {"dep": "gpt-4o"}, "discount": 0.9,
+        }, headers=h)
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert (body["pricing"], body["model_aliases"], body["discount"]) == (self.PRICING, {"dep": "gpt-4o"}, 0.9)
+        provider_id = body["id"]
+
+        # Left out: kept. discount null and {}: cleared.
+        r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"default_model": "gpt-4o"}, headers=h)
+        assert r.json()["pricing"] == self.PRICING and r.json()["discount"] == 0.9
+        r = await client.patch(f"/api/v1/llm-providers/{provider_id}", json={"discount": None, "model_aliases": {}}, headers=h)
+        assert r.status_code == 200, r.text
+        assert (r.json()["discount"], r.json()["model_aliases"], r.json()["pricing"]) == (None, {}, self.PRICING)
+        revisions = await _revisions(db, name)
+        assert revisions[-1].changes == {
+            "discount": {"from": 0.9, "to": None}, "model_aliases": {"from": {"dep": "gpt-4o"}, "to": None},
+        }

@@ -86,7 +86,8 @@ async def test_stats_fold_one_pass_into_the_same_response(client, db):
     assert set(stats) == {
         "total_messages", "tool_calls", "activity_by_day", "agent_usage", "role_distribution",
         "llm_prompt_tokens", "llm_completion_tokens", "llm_total_tokens",
-        "llm_cache_read_tokens", "llm_cache_write_tokens", "llm_calls", "days",
+        "llm_cache_read_tokens", "llm_cache_write_tokens", "llm_calls",
+        "llm_cost_usd", "llm_unpriced_calls", "days",
     }
 
 
