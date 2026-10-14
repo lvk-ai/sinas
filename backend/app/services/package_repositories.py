@@ -130,24 +130,36 @@ async def _auth_headers(db: AsyncSession, repository: PackageRepository) -> dict
 _MAX_REDIRECTS = 5
 
 
-def _check_scheme(url: str) -> None:
+def _check_scheme(url: str, allow_http: bool) -> None:
     scheme = urlsplit(url).scheme
-    if scheme != "https" and not (scheme == "http" and settings.package_repositories_allow_http):
+    if scheme != "https" and not (scheme == "http" and allow_http):
         raise RepositoryError(f"{_safe(url)}: refusing a non-https URL")
 
 
-async def _get(url: str, headers: dict[str, str]) -> bytes:
+async def _get(
+    url: str,
+    headers: dict[str, str],
+    *,
+    max_bytes: Optional[int] = None,
+    timeout: Optional[float] = None,
+    allow_http: Optional[bool] = None,
+) -> bytes:
     """GET with redirects followed by hand: every hop must be https, and the
     repository's credentials go only to the host they were configured for —
-    a redirect to another host is followed without them."""
-    limit = settings.package_repository_max_bytes
+    a redirect to another host is followed without them. The bounds default
+    to the package repository settings; other fetchers (the model price
+    ratecard) pass their own."""
+    limit = settings.package_repository_max_bytes if max_bytes is None else max_bytes
+    if allow_http is None:
+        allow_http = settings.package_repositories_allow_http
     origin = (urlsplit(url).hostname or "").lower()
     try:
         async with httpx.AsyncClient(
-            timeout=settings.package_repository_timeout_seconds, follow_redirects=False,
+            timeout=settings.package_repository_timeout_seconds if timeout is None else timeout,
+            follow_redirects=False,
         ) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
-                _check_scheme(url)
+                _check_scheme(url, allow_http)
                 same_host = (urlsplit(url).hostname or "").lower() == origin
                 async with client.stream("GET", url, headers=headers if same_host else {}) as response:
                     if response.is_redirect:

@@ -33,6 +33,7 @@ from .endpoints import (
     skills,
     stores,
     templates,
+    usage,
     users,
     webhooks,
     workers,
@@ -73,6 +74,7 @@ router.include_router(database_triggers.router)
 # Observability routes
 router.include_router(messages.router)
 router.include_router(request_logs.router)
+router.include_router(usage.router)
 
 # System routes
 router.include_router(containers.router)

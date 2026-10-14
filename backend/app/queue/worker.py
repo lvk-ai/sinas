@@ -563,6 +563,13 @@ async def refresh_package_repositories_job(ctx: dict) -> int:
     return await refresh_due()
 
 
+async def refresh_model_prices_job(ctx: dict) -> bool:
+    """Refresh the MODEL_PRICES_URL ratecard when it is due."""
+    from app.services.llm_pricing import refresh_url_ratecard_due
+
+    return await refresh_url_ratecard_due()
+
+
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
@@ -583,6 +590,10 @@ class AgentWorkerSettings:
         # Hourly; each repository is refreshed when its index is older than
         # package_repository_refresh_hours.
         cron(refresh_package_repositories_job, minute=17, second=10, unique=True),
+        # Every 10 minutes; fetches only when never fetched, the URL changed
+        # or the copy is older than model_prices_refresh_hours (so a failing
+        # URL is retried every 10 minutes, the last good copy kept meanwhile).
+        cron(refresh_model_prices_job, minute=set(range(3, 60, 10)), second=40, unique=True),
     ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown

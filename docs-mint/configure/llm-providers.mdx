@@ -26,6 +26,9 @@ LLM providers connect Sinas to language model APIs.
 | `default_model` | Model used when agents don't specify one |
 | `config` | Additional settings (e.g., `max_tokens`, `organization_id`) |
 | `is_default` | Whether this is the system-wide default provider |
+| `pricing` | Per-model prices for this provider's calls, in LiteLLM's per-token fields (see [Usage & Cost](/admin/usage-cost)) |
+| `model_aliases` | Model name as called → the ratecard model it is priced as (e.g. an Azure deployment name → `gpt-4o`) |
+| `discount` | Multiplier (0–1) on deployment-ratecard prices, for negotiated rates |
 
 **Provider resolution for agents:**
 1. Agent's explicit `llm_provider_id` if set

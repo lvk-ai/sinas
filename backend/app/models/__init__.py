@@ -14,6 +14,7 @@ from .file import Collection, ContentFilterEvaluation, File, FileVersion
 from .function import Function, FunctionVersion
 from .llm_provider import LLMProvider
 from .llm_usage import LLMUsage
+from .ratecard_cache import RatecardCache
 from .mcp_server import McpServer
 
 from .dependency import Dependency
@@ -90,6 +91,7 @@ __all__ = [
     "McpServer",
     "LLMProvider",
     "LLMUsage",
+    "RatecardCache",
     "DatabaseConnection",
     "DatabaseTrigger",
     "Query",

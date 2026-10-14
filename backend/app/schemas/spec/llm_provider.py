@@ -4,13 +4,37 @@ Config writes `type`, `endpoint`, `apiKey`, `defaultModel` and a top-level
 `models` list; the REST API and the database use `provider_type`,
 `api_endpoint`, `api_key`, `default_model`, and keep the models inside
 `config`. The spec takes both and holds the database shape.
+
+Pricing (docs/design/usage-cost.md) is the same on every channel: `pricing`
+maps a model to LiteLLM's per-token fields, `modelAliases` (model_aliases)
+maps a model as called to the ratecard model it is priced as, and
+`discount` multiplies deployment-ratecard prices.
 """
 
 from typing import Any, Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.spec.base import SpecModel
+
+
+class ModelPricing(BaseModel):
+    """One model's per-token USD prices, in LiteLLM's field names."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_cost_per_token: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    output_cost_per_token: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    cache_read_input_token_cost: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    cache_creation_input_token_cost: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    input_cost_per_token_batches: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+    output_cost_per_token_batches: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _priced(self) -> "ModelPricing":
+        if self.input_cost_per_token is None and self.output_cost_per_token is None:
+            raise ValueError("set input_cost_per_token and/or output_cost_per_token")
+        return self
 
 _CONFIG_NAMES = {
     "type": "provider_type",
@@ -31,6 +55,10 @@ class LLMProviderSpec(SpecModel):
     config: dict[str, Any] = Field(default_factory=dict)
     is_default: bool = False
     is_active: bool = True
+    pricing: dict[str, ModelPricing] = Field(default_factory=dict)
+    model_aliases: dict[str, str] = Field(default_factory=dict)
+    # A multiplier on deployment-ratecard prices: 0.8 is 20% off list.
+    discount: Optional[float] = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
     @model_validator(mode="before")
     @classmethod
@@ -50,10 +78,20 @@ class LLMProviderSpec(SpecModel):
     def _empty_is_none(cls, value: Any) -> Any:
         return None if value == "" else value
 
-    @field_validator("config", mode="before")
+    @field_validator("config", "pricing", "model_aliases", mode="before")
     @classmethod
     def _none_is_empty(cls, value: Any) -> Any:
         return {} if value is None else value
+
+    @field_validator("pricing", "model_aliases")
+    @classmethod
+    def _model_names(cls, value: dict[str, Any]) -> dict[str, Any]:
+        for model, target in value.items():
+            if not model.strip() or len(model) > 255:
+                raise ValueError(f"invalid model name {model!r}")
+            if isinstance(target, str) and (not target.strip() or len(target) > 255):
+                raise ValueError(f"invalid alias target for {model!r}: {target!r}")
+        return value
 
     @property
     def key(self) -> str:
@@ -67,6 +105,19 @@ class LLMProviderSpec(SpecModel):
         state = super().canonical()
         if self.api_key is not None:
             state["api_key"] = redact(self.api_key)
+        # Left out while unset, so providers that never had pricing keep the
+        # checksum and history they had before it existed.
+        if self.pricing:
+            state["pricing"] = {
+                model: price.model_dump(mode="json", exclude_none=True)
+                for model, price in sorted(self.pricing.items())
+            }
+        else:
+            state.pop("pricing", None)
+        if not self.model_aliases:
+            state.pop("model_aliases", None)
+        if self.discount is None:
+            state.pop("discount", None)
         return state
 
     def to_config(self) -> dict[str, Any]:
@@ -80,6 +131,15 @@ class LLMProviderSpec(SpecModel):
             out["defaultModel"] = self.default_model
         if config:
             out["config"] = config
+        if self.pricing:
+            out["pricing"] = {
+                model: price.model_dump(mode="json", exclude_none=True)
+                for model, price in self.pricing.items()
+            }
+        if self.model_aliases:
+            out["modelAliases"] = dict(self.model_aliases)
+        if self.discount is not None:
+            out["discount"] = self.discount
         out["isDefault"] = self.is_default
         out["isActive"] = self.is_active
         return out

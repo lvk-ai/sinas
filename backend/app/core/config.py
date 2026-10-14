@@ -425,6 +425,19 @@ class Settings(BaseSettings):
     package_repository_max_bytes: int = 2 * 1024 * 1024
     package_repositories_allow_http: bool = False
 
+    # LLM cost (docs/design/usage-cost.md): the deployment ratecard, in
+    # LiteLLM's model_prices_and_context_window.json format. Any of a file
+    # path, inline JSON, or an https URL refreshed from the worker cron (the
+    # last good copy kept in the database). Where several are set, inline
+    # JSON wins over the file, the file over the URL. None set and no
+    # provider pricing: calls are recorded unpriced.
+    model_prices_file: Optional[str] = None
+    model_prices_json: Optional[str] = None
+    model_prices_url: Optional[str] = None
+    model_prices_refresh_hours: int = 24
+    model_prices_timeout_seconds: int = 30
+    model_prices_max_bytes: int = 16 * 1024 * 1024
+
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
 
