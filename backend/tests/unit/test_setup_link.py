@@ -398,3 +398,21 @@ class TestRequestLogRedaction:
         assert redact_url_query("/agents?page=2&tokens=5&q=a%20b") == "/agents?page=2&tokens=5&q=a%20b"
         assert redact_url_query("/login?next=/ui/?token=s3cret") == "/login?next=/ui/?token=***REDACTED***"
         assert redact_query_params("next=/ui/?tok%65n=s3cret") == {"next": "/ui/?tok%65n=***REDACTED***"}
+
+
+def test_deeply_nested_urls_are_masked_without_recursing_forever():
+    """A few hundred nested `?next=` values must not stop the request with a
+    RecursionError; past the nesting cap the rest is masked whole."""
+    from app.middleware.request_logger import redact_query_params, redact_url_query
+
+    deep = "/ui/?token=s3cr3t"
+    for _ in range(500):
+        deep = f"/a?next={deep}"
+    out = redact_url_query(deep)
+    assert "s3cr3t" not in out
+    assert "s3cr3t" not in str(redact_query_params(deep.split("?", 1)[1]))
+
+    shallow = "/a?next=/b?next=/ui/?tok%65n=s3cr3t&x=1"
+    masked = redact_url_query(shallow)
+    assert "s3cr3t" not in masked and masked.endswith("&x=1")
+    assert "/b?next=/ui/?tok%65n=***REDACTED***" in masked

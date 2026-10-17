@@ -59,14 +59,23 @@ def _is_sensitive_param(raw_name: str) -> bool:
     return unquote_plus(raw_name).casefold() in _SENSITIVE_KEYS
 
 
-def _redact_query_string(query: str) -> str:
+# How deep URLs nested in query values (`?next=/a?next=/b?token=...`) are
+# followed. Past it the rest of the value is masked whole: fail closed, and
+# never recurse without bound on attacker-supplied input.
+_MAX_NESTED_URLS = 8
+
+
+def _redact_query_string(query: str, depth: int = 0) -> str:
     pairs = []
     for pair in query.split("&"):
         name, sep, value = pair.partition("=")
         if sep and _is_sensitive_param(name):
             pairs.append(f"{name}={_REDACTED}")
         elif "?" in value:  # a URL inside a value (`?next=/ui/?token=...`)
-            pairs.append(f"{name}{sep}{redact_url_query(value)}")
+            if depth >= _MAX_NESTED_URLS:
+                pairs.append(f"{name}{sep}{_REDACTED}")
+            else:
+                pairs.append(f"{name}{sep}{redact_url_query(value, depth + 1)}")
         else:
             pairs.append(pair)
     return "&".join(pairs)
@@ -91,11 +100,11 @@ def redact_query_params(query_string: str) -> dict[str, str]:
 _QUERY_IN_TEXT = re.compile(r"\?([^#\s\"]*)")
 
 
-def redact_url_query(text: str) -> str:
+def redact_url_query(text: str, depth: int = 0) -> str:
     """A URL, path-with-query or log line with credential-bearing query
     values masked: `/ui/?token=abc` (or `?tok%65n=abc`) ->
     `/ui/?token=***REDACTED***`."""
-    return _QUERY_IN_TEXT.sub(lambda m: "?" + _redact_query_string(m.group(1)), text)
+    return _QUERY_IN_TEXT.sub(lambda m: "?" + _redact_query_string(m.group(1), depth), text)
 
 
 class RedactQueryTokensFilter:
