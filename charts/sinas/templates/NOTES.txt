@@ -21,11 +21,12 @@ Untrusted code runs in ephemeral hardened Pods created in this namespace
 {{- $setupLink := and .Values.superadminEmail (not .Values.superadminPassword) (or (contains "password" $mode) (and (not $mode) (not .Values.smtp.host))) }}
 {{- if $setupLink }}
 
-First login: password auth with no superadminPassword, so the backend prints a
-one-time setup link for {{ .Values.superadminEmail }} in its logs on boot
-(valid 24h; restart the backend for a fresh one):
+First login: password auth with no superadminPassword. Once the backend is
+up, mint a one-time setup link for {{ .Values.superadminEmail }}
+and open it to choose a password and sign in. Single use, valid 24h;
+running it again replaces the previous link:
 
-  kubectl logs -n {{ .Release.Namespace }} deploy/backend | grep -A6 'SUPERADMIN SETUP'
+  kubectl exec -n {{ .Release.Namespace }} deploy/backend -c backend -- python -m app.cli setup-link
 {{- end }}
 
 Check rollout:

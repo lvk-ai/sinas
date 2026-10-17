@@ -39,13 +39,40 @@ For local development, see [INSTALL.md](https://github.com/sinas-platform/sinas/
 
 ## Log in
 
-1. Open the console at `https://yourdomain.com:51245`
+1. Open the console at `https://yourdomain.com:51245/ui/`
 2. Enter your `SUPERADMIN_EMAIL` address
 3. Then, depending on your `AUTH_MODE`:
    - `otp` — check your inbox for the 6-digit code
-   - `password` — enter your `SUPERADMIN_PASSWORD`
+   - `password` — enter your password (see [First admin access](#first-admin-access-with-a-setup-link) if you don't have one yet)
    - `password+otp` — enter your password, then the emailed code
 4. You're in. See [Authentication](/platform/authentication) for the full reference.
+
+## First admin access with a setup link
+
+With a password mode and no `SUPERADMIN_PASSWORD` (what the installer does when you leave the password empty), the superadmin starts without a password and chooses one through a one-time **setup link**: `https://yourdomain.com:51245/ui?token=…`.
+
+The installer prints the link once at the end of a fresh install. To get one yourself (the link is never written to the logs; the backend logs only this command):
+
+```bash
+# docker compose (run in /opt/sinas)
+docker compose exec backend python -m app.cli setup-link
+
+# all-in-one compose profile
+docker compose -f docker-compose.lite.yml exec sinas python -m app.cli setup-link
+
+# Kubernetes (Helm)
+kubectl exec -n sinas deploy/backend -c backend -- python -m app.cli setup-link
+```
+
+It defaults to `SUPERADMIN_EMAIL`; `--email someone@example.com` mints one for any active user. The URL goes to stdout on its own line, so a script can capture it.
+
+Opening the link spends it and shows **Set your password**; saving signs you in and lands on the dashboard (with `password+otp`, the emailed code is asked first). Expiry and reuse:
+
+- A link is valid for 24 hours (`PASSWORD_RESET_TOKEN_TTL_HOURS`) and works **once**. After it is opened there are 30 minutes to save the password.
+- Minting a new link for a user invalidates the previous one, and so does setting the password.
+- A used, expired or replaced link shows "This link is invalid or has expired" with a way to the login page; run the command again for a fresh one.
+
+See [Setup links](/platform/authentication#setup-links) for the details.
 
 ## Configure an LLM provider
 

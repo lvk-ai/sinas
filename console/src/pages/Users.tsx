@@ -348,8 +348,9 @@ function ConfirmResetLinkModal({
           </button>
         </div>
         <p className="text-sm text-gray-400 mb-4">
-          A one-time token will be generated. You'll need to deliver it to the user yourself
-          (Slack, in person, etc.) — Sinas does not send it for you. The token expires in 24 hours.
+          A one-time link will be generated. You'll need to deliver it to the user yourself
+          (Slack, in person, etc.) — Sinas does not send it for you. Opening it lets them set a
+          password and sign in. Any earlier link for this user stops working.
         </p>
         {error && (
           <div className="p-3 bg-red-900/20 border border-red-800/30 rounded-lg text-sm text-red-400 mb-4">
@@ -377,7 +378,9 @@ function ResetLinkResultModal({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState<'token' | 'url' | null>(null);
-  const resetUrl = `${window.location.origin}${import.meta.env.BASE_URL}reset-password?token=${encodeURIComponent(result.reset_token)}`;
+  // The setup-link form (`<console>/ui/?token=...`): spent on opening, then
+  // a "set your password" page that signs them in (pages/SetupLink).
+  const resetUrl = `${window.location.origin}${import.meta.env.BASE_URL}?token=${encodeURIComponent(result.reset_token)}`;
 
   const copy = async (value: string, kind: 'token' | 'url') => {
     try {

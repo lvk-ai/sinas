@@ -112,10 +112,13 @@ echo -e "${BLUE}  Configuration${NC}"
 echo -e "${BLUE}═══════════════════════════════════════${NC}"
 echo ""
 
+FRESH_INSTALL=false
+SERVICES_STARTED=false
 if [ -f .env ]; then
     echo -e "${GREEN}✓ Existing .env file found — using current configuration${NC}"
     echo -e "${YELLOW}  (Delete .env and re-run to reconfigure)${NC}"
 else
+    FRESH_INSTALL=true
     # Generate secure keys
     echo -e "${YELLOW}Generating secure keys...${NC}"
     SECRET_KEY=$(openssl rand -hex 32)
@@ -178,17 +181,19 @@ else
     esac
     echo -e "${GREEN}✓ Auth mode: $AUTH_MODE${NC}"
 
-    # Password prompt (when auth mode includes password)
+    # Password prompt (when auth mode includes password). Empty (recommended):
+    # no password in .env; the end of the install prints a one-time setup link
+    # with which the superadmin chooses their own.
     SUPERADMIN_PASSWORD=""
-    PASSWORD_GENERATED=false
     if [[ "$AUTH_MODE" == *"password"* ]]; then
         echo ""
-        read -s -p "Superadmin password (or press enter to auto-generate): " SUPERADMIN_PASSWORD
+        echo "  Leave empty (recommended) to get a one-time setup link at the end of the"
+        echo "  install. A password set here is pinned: changes made in the console"
+        echo "  revert to it on every restart."
+        read -s -p "Superadmin password [empty = setup link]: " SUPERADMIN_PASSWORD
         echo ""
         if [ -z "$SUPERADMIN_PASSWORD" ]; then
-            SUPERADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
-            PASSWORD_GENERATED=true
-            echo -e "${GREEN}✓ Password auto-generated (shown at end of install)${NC}"
+            echo -e "${GREEN}✓ Setup link will be printed at the end of the install${NC}"
         else
             while [ ${#SUPERADMIN_PASSWORD} -lt 8 ]; do
                 echo -e "${RED}Password must be at least 8 characters${NC}"
@@ -332,9 +337,29 @@ if [[ "$START_SERVICES" =~ ^[Yy]$ ]]; then
 
     if docker ps | grep -q sinas; then
         echo -e "${GREEN}✓ Services started successfully${NC}"
+        SERVICES_STARTED=true
     else
         echo -e "${RED}⚠ Services may have failed. Check: docker compose logs${NC}"
     fi
+fi
+
+# First admin access: a fresh password-mode install without SUPERADMIN_PASSWORD
+# gets a one-time setup link, minted once the backend has created the
+# superadmin (it retries while the backend migrates and boots). Printed to
+# this terminal only; nothing is written to disk or logs.
+SETUP_LINK=""
+SETUP_LINK_CMD="docker compose exec backend python -m app.cli setup-link"
+WANTS_SETUP_LINK=false
+if [ "$FRESH_INSTALL" = true ] && [[ "$AUTH_MODE" == *"password"* ]] && [ -z "$SUPERADMIN_PASSWORD" ]; then
+    WANTS_SETUP_LINK=true
+fi
+if [ "$WANTS_SETUP_LINK" = true ] && [ "$SERVICES_STARTED" = true ]; then
+    echo -e "${YELLOW}Creating the superadmin's one-time setup link...${NC}"
+    for _ in $(seq 1 36); do
+        SETUP_LINK=$(docker compose exec -T backend python -m app.cli setup-link 2>/dev/null | tail -n 1) && [ -n "$SETUP_LINK" ] && break
+        SETUP_LINK=""
+        sleep 5
+    done
 fi
 
 # Done
@@ -356,13 +381,23 @@ echo "3. Verify:"
 echo "   curl https://${DOMAIN}/health"
 echo ""
 echo "4. Login:"
-echo "   https://${DOMAIN}/docs → POST /auth/login"
+echo "   Console:    https://${DOMAIN}:51245/ui/"
 echo "   Superadmin: ${SUPERADMIN_EMAIL}"
 echo "   Auth mode:  ${AUTH_MODE}"
-if [ "$PASSWORD_GENERATED" = true ] && [ -n "$SUPERADMIN_PASSWORD" ]; then
+if [ -n "$SETUP_LINK" ]; then
     echo ""
-    echo -e "   ${YELLOW}Generated superadmin password: ${SUPERADMIN_PASSWORD}${NC}"
-    echo -e "   ${YELLOW}Save this now — also stored in ${INSTALL_DIR}/.env (chmod 600)${NC}"
+    echo -e "   ${YELLOW}Open this one-time link to set the superadmin's password and sign in"
+    echo -e "   (single use, valid 24h; shown only here):${NC}"
+    echo ""
+    echo "   ${SETUP_LINK}"
+    echo ""
+    echo "   Lost or expired? Get a new one (the old one stops working):"
+    echo "   cd ${INSTALL_DIR} && ${SETUP_LINK_CMD}"
+elif [ "$WANTS_SETUP_LINK" = true ]; then
+    echo ""
+    echo -e "   ${YELLOW}Set the superadmin's password with a one-time setup link. Once the"
+    echo -e "   backend is up, run:${NC}"
+    echo "   cd ${INSTALL_DIR} && ${SETUP_LINK_CMD}"
 fi
 echo ""
 echo "5. Update:"

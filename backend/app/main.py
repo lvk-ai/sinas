@@ -16,13 +16,18 @@ from app.core.auth import initialize_default_roles, initialize_superadmin, warn_
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.templates import initialize_default_templates
 from app.core.config import settings
-from app.middleware.request_logger import RequestLoggerMiddleware
+from app.middleware.request_logger import RedactQueryTokensFilter, RequestLoggerMiddleware
 from app.middleware.trace_context import TraceContextMiddleware
 from app.services.clickhouse_logger import clickhouse_logger
 from app.services.openapi_generator import generate_runtime_openapi
 
 
 logger = logging.getLogger(__name__)
+
+# uvicorn's access log prints each request's path with its query string; a
+# setup link (`/ui/?token=...`, the console being served here in the lite
+# profile) must not land there usable.
+logging.getLogger("uvicorn.access").addFilter(RedactQueryTokensFilter())
 
 
 @asynccontextmanager

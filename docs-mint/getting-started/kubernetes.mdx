@@ -63,6 +63,16 @@ helm install sinas ./charts/sinas \
 </details>
 
 The backend runs database migrations on startup; first boot takes a minute.
+
+Without SMTP or a `superadminPassword`, the chart selects `password` auth and
+the superadmin has no password yet. Once the backend is up, mint a one-time
+setup link and open it to choose one (single use, valid 24h; see
+[First admin access](/getting-started/deployment#first-admin-access-with-a-setup-link)):
+
+```bash
+kubectl exec -n sinas deploy/backend -c backend -- python -m app.cli setup-link
+```
+
 Watch sandbox pods appear during executions:
 
 ```bash

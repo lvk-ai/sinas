@@ -1,5 +1,6 @@
 """FastAPI middleware for comprehensive request logging to ClickHouse."""
 import json
+import re
 import time
 import uuid
 
@@ -23,7 +24,8 @@ def redact_path(path: str) -> str:
 
 _SENSITIVE_KEYS = frozenset({
     "password", "api_key", "secret", "token", "refresh_token", "access_token", "otp",
-    "code_verifier",
+    "code_verifier", "reset_token", "setup_token", "new_password", "current_password",
+    "otp_code",
 })
 # Whole mappings whose values are credentials (an MCP server's or a
 # connector's request headers), and strings that may carry one in their
@@ -46,6 +48,43 @@ def _safe_url(value: str) -> str:
     if host != parts.netloc:
         host = "***@" + host
     return urlunsplit((parts.scheme, host, parts.path, "***" if parts.query else "", ""))
+
+
+def redact_query_params(query_string: str) -> dict[str, str]:
+    """Query parameters as they may be stored, credential-bearing ones
+    (`?token=`, `?api_key=`...) masked."""
+    params: dict[str, str] = {}
+    for pair in query_string.split("&") if query_string else ():
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        params[k] = _REDACTED if k.lower() in _SENSITIVE_KEYS else v
+    return params
+
+
+_TOKEN_IN_QUERY = re.compile(
+    r"([?&](?:" + "|".join(sorted(_SENSITIVE_KEYS)) + r")=)[^&#\s\"]*", re.IGNORECASE
+)
+
+
+def redact_url_query(url: str) -> str:
+    """A path-with-query (an access-log line's) with credential-bearing
+    query values masked: `/ui/?token=abc` -> `/ui/?token=***REDACTED***`."""
+    return _TOKEN_IN_QUERY.sub(lambda m: m.group(1) + _REDACTED, url)
+
+
+class RedactQueryTokensFilter:
+    """logging filter for uvicorn's access log: the console (served by this
+    process in the lite profile) is opened as `/ui/?token=<setup link>`, and
+    that line must not land in the logs with a usable token."""
+
+    def filter(self, record) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and args:
+            record.args = tuple(redact_url_query(a) if isinstance(a, str) else a for a in args)
+        elif isinstance(record.msg, str):
+            record.msg = redact_url_query(record.msg)
+        return True
 
 
 def redact_body(body):
@@ -93,7 +132,7 @@ class RequestLoggerMiddleware:
 
         # Decode headers
         user_agent = headers_dict.get(b"user-agent", b"").decode("latin1")
-        referer = headers_dict.get(b"referer", b"").decode("latin1")
+        referer = redact_url_query(headers_dict.get(b"referer", b"").decode("latin1"))
         content_type = headers_dict.get(b"content-type", b"").decode("latin1")
 
         application = headers_dict.get(b"x-application", b"").decode("latin1")
@@ -104,12 +143,7 @@ class RequestLoggerMiddleware:
 
         # Get query params
         query_string = scope.get("query_string", b"").decode("latin1")
-        query_params = {}
-        if query_string:
-            for pair in query_string.split("&"):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    query_params[k] = v
+        query_params = redact_query_params(query_string)
 
         # Cache body for logging
         body_parts = []
@@ -143,7 +177,8 @@ class RequestLoggerMiddleware:
         # After request is processed, parse the cached body
         # Skip logging request bodies for auth endpoints (security best practice)
         is_auth_endpoint = (
-            path.startswith("/api/auth/")
+            path.startswith("/auth/")
+            or path.startswith("/api/auth/")
             or "/login" in path
             or "/verify-otp" in path
             or "/refresh" in path

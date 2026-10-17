@@ -1,4 +1,5 @@
 """User management endpoints."""
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Optional
@@ -28,6 +29,7 @@ from app.services.user_identity import (
 )
 
 router = APIRouter(prefix="/users", tags=["users"])
+logger = logging.getLogger(__name__)
 
 
 async def _user_with_roles_response(db: AsyncSession, user: User) -> UserWithRolesResponse:
@@ -364,8 +366,10 @@ async def admin_create_password_reset(
     Admin generates a one-time password reset token for a user.
 
     The plaintext token is returned exactly once and should be delivered to the
-    user out-of-band (Slack, in person, etc). The user redeems it via
-    POST /auth/password-reset.
+    user out-of-band (Slack, in person, etc), usually as the console link
+    `<console>/ui/?token=...` (see POST /auth/setup-link/exchange); it also
+    redeems directly via POST /auth/password-reset. Any earlier unused link
+    for the user stops working.
 
     Only available when AUTH_MODE includes password.
     """
@@ -391,6 +395,7 @@ async def admin_create_password_reset(
     plain_token, record = await create_password_reset_token(
         db, str(user.id), created_by=current_user_id
     )
+    logger.warning("Password reset link minted for user %s by %s", user.id, current_user_id)
     return AdminCreateResetLinkResponse(
         user_id=user.id,
         reset_token=plain_token,

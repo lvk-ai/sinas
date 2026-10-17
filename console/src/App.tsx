@@ -8,6 +8,8 @@ import { Layout } from './components/Layout';
 import { Login } from './pages/Login';
 import { ResetPassword } from './pages/ResetPassword';
 import { SsoCallback } from './pages/SsoCallback';
+import { SetupLink } from './pages/SetupLink';
+import { SETUP_ROUTE } from './lib/setupLink';
 import { IdentityProviders } from './pages/IdentityProviders';
 import { Dashboard } from './pages/Dashboard';
 import { Chats } from './pages/Chats';
@@ -127,6 +129,10 @@ function App() {
                 </PublicRoute>
               }
             />
+            {/* A setup link (`/ui/?token=...`, moved here by lib/setupLink before
+                render). Not a PublicRoute: the link is spent on arrival, and a
+                browser signed in as someone else must still be able to use it. */}
+            <Route path={SETUP_ROUTE} element={<SetupLink />} />
             {/* Not a PublicRoute: a signed-in tab finishing SSO still trades its code. */}
             <Route path="/sso/callback" element={<SsoCallback />} />
             <Route

@@ -1,11 +1,22 @@
 """Authentication schemas."""
 import uuid
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, EmailStr, Field
 
 from app.schemas.user import UserIdentityInput
+
+
+def _bcrypt_fits(value: str) -> str:
+    # bcrypt only uses the first 72 bytes and bcrypt>=5 refuses longer input.
+    if len(value.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 bytes.")
+    return value
+
+
+# The password policy for every place a new password is chosen.
+NewPassword = Annotated[str, Field(min_length=8), AfterValidator(_bcrypt_fits)]
 
 
 class LoginRequest(BaseModel):
@@ -66,7 +77,7 @@ class ChangePasswordRequest(BaseModel):
     """User changes their own password."""
 
     current_password: str
-    new_password: str = Field(min_length=8)
+    new_password: NewPassword
 
 
 class AdminCreateResetLinkResponse(BaseModel):
@@ -81,7 +92,28 @@ class ResetPasswordRequest(BaseModel):
     """User redeems a reset token to set a new password."""
 
     reset_token: str
-    new_password: str = Field(min_length=8)
+    new_password: NewPassword
+
+
+class SetupLinkExchangeRequest(BaseModel):
+    """The token from a setup link (`<console>/ui/?token=...`)."""
+
+    token: str = Field(min_length=1, max_length=512)
+
+
+class SetupLinkExchangeResponse(BaseModel):
+    """The link is spent; `setup_token` lets the holder set a password until
+    `expires_at`. Keep it out of URLs."""
+
+    setup_token: str
+    email: str
+    has_password: bool
+    expires_at: datetime
+
+
+class SetupLinkCompleteRequest(BaseModel):
+    setup_token: str = Field(min_length=1, max_length=512)
+    new_password: NewPassword
 
 
 class AuthUserResponse(BaseModel):

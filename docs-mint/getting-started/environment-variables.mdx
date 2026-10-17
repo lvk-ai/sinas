@@ -19,7 +19,8 @@ description: "All configuration options"
 | Variable | Default | Description |
 |---|---|---|
 | `AUTH_MODE` | `otp` | One of `otp`, `password`, `password+otp`. See [Authentication](/platform/authentication) for the differences. |
-| `SUPERADMIN_PASSWORD` | _(none)_ | Seed password for the superadmin. Only used when `AUTH_MODE` includes `password`. Setting this and restarting acts as a password-reset escape hatch. |
+| `SUPERADMIN_PASSWORD` | _(none)_ | Pinned password for the superadmin. Only used when `AUTH_MODE` includes `password`. While set it is authoritative (a password changed in the console reverts on restart); setting it and restarting acts as a password-reset escape hatch. Leave it unset to give the superadmin a [setup link](/platform/authentication#setup-links) instead. |
+| `PASSWORD_RESET_TOKEN_TTL_HOURS` | `24` | How long a setup or password-reset link stays valid. Links are single use either way. |
 | `TOKEN_EXCHANGE_DEFAULT_ROLE` | `GuestUsers` | Role assigned to users auto-provisioned via `POST /auth/token/exchange`. See [Token Exchange](/platform/authentication#token-exchange-bring-your-own-auth). |
 | `OAUTH_BIND_BROWSER_SESSION` | `true` | Bind connector OAuth (authorization-code) flows to the browser that started them via an HttpOnly nonce cookie — prevents account-linking CSRF. Set `false` only for split-origin local dev (console and API on different ports); keep `true` in production. |
 | `JWT_ALGORITHM` | `HS256` | Access-token signing. `RS256` signs with an RSA keypair and publishes it at `/.well-known/jwks.json` so external services can verify tokens offline. See [Verifying Sinas Tokens](/platform/verifying-tokens). |
@@ -58,6 +59,7 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `RATE_LIMIT_LOGIN_IP_MAX` | `10` | Max login requests per IP per window |
 | `RATE_LIMIT_LOGIN_EMAIL_MAX` | `5` | Max login requests per email per window |
 | `RATE_LIMIT_OTP_IP_MAX` | `10` | Max OTP verify requests per IP per window |
+| `RATE_LIMIT_SETUP_LINK_IP_MAX` | `10` | Max setup-link exchange (and, separately, complete) requests per IP per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `900` | Rate limit window (15 minutes) |
 
 ## Function Execution

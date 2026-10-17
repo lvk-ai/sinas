@@ -40,8 +40,6 @@ from app.models import (
     UserRole,
 )
 
-PASSWORD_RESET_TOKEN_EXPIRY_HOURS = 24
-
 security = HTTPBearer()
 
 
@@ -68,22 +66,41 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def hash_reset_token(plain_token: str) -> str:
+    """At-rest form of a password reset/setup token (SHA-256: the token is
+    256 random bits, so a slow hash adds nothing)."""
+    return hashlib.sha256(plain_token.encode()).hexdigest()
+
+
 async def create_password_reset_token(
-    db: AsyncSession, user_id: str, created_by: Optional[str] = None
+    db: AsyncSession,
+    user_id: str,
+    created_by: Optional[str] = None,
+    ttl: Optional[timedelta] = None,
 ) -> tuple[str, PasswordResetToken]:
     """
-    Create a one-time password reset token. Plaintext is returned to the caller
-    (the admin) once; only the hash is stored.
-    """
-    plain_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
-    expires_at = datetime.now(UTC) + timedelta(hours=PASSWORD_RESET_TOKEN_EXPIRY_HOURS)
+    Create a one-time password reset/setup token. Plaintext is returned to the
+    caller once; only the hash is stored.
 
+    Newest link wins: every earlier unused token for the user is revoked in the
+    same transaction, so re-issuing a link (an admin clicking "reset link"
+    again, the operator re-running `setup-link`) kills the one sent before.
+    """
+    now = datetime.now(UTC)
+    plain_token = secrets.token_urlsafe(32)
+    expires_at = now + (ttl or timedelta(hours=settings.password_reset_token_ttl_hours))
+    uid = uuid_lib.UUID(str(user_id))
+
+    await db.execute(
+        update(PasswordResetToken)
+        .where(PasswordResetToken.user_id == uid, PasswordResetToken.used_at.is_(None))
+        .values(used_at=now)
+    )
     record = PasswordResetToken(
-        user_id=uuid_lib.UUID(user_id),
-        token_hash=token_hash,
+        user_id=uid,
+        token_hash=hash_reset_token(plain_token),
         expires_at=expires_at,
-        created_by=uuid_lib.UUID(created_by) if created_by else None,
+        created_by=uuid_lib.UUID(str(created_by)) if created_by else None,
     )
     db.add(record)
     await db.commit()
@@ -97,31 +114,34 @@ async def consume_password_reset_token(
     """
     Validate and consume a password reset token. Returns the record on success
     (with used_at set) or None if the token is invalid, expired, or already used.
+
+    One conditional UPDATE: two concurrent redemptions of the same token cannot
+    both succeed (the loser matches no row).
     """
-    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
-
+    if not plain_token:
+        return None
+    now = datetime.now(UTC)
     result = await db.execute(
-        select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash)
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.token_hash == hash_reset_token(plain_token),
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at > now,
+        )
+        .values(used_at=now)
+        .returning(PasswordResetToken.id)
     )
-    record = result.scalar_one_or_none()
-
-    if not record or record.used_at is not None:
-        return None
-    if record.expires_at < datetime.now(UTC):
-        return None
-
-    record.used_at = datetime.now(UTC)
+    token_id = result.scalar_one_or_none()
     await db.commit()
-    return record
+    if token_id is None:
+        return None
+    return await db.get(PasswordResetToken, token_id, populate_existing=True)
 
 
 async def revoke_outstanding_password_reset_tokens(db: AsyncSession, user_id) -> int:
     """Mark every unused reset token for a user as used. Called once a token is
-    redeemed: any sibling link (two admins issuing one each, or the boot-time
-    setup link minted by more than one replica) must not stay redeemable for
-    up to 24h after the account already has its password."""
-    from sqlalchemy import update
-
+    redeemed (or the password changed): any sibling link must not stay
+    redeemable after the account already has its password."""
     result = await db.execute(
         update(PasswordResetToken)
         .where(PasswordResetToken.user_id == user_id, PasswordResetToken.used_at.is_(None))
@@ -156,7 +176,8 @@ async def warn_if_users_lack_passwords(db: AsyncSession) -> None:
     suffix = f" (showing first 5: {sample})" if count > 5 else f" ({sample})"
     logger.warning(
         f"AUTH_MODE={settings.auth_mode} but {count} user(s) have no password set "
-        f"and cannot sign in until an admin issues a reset link{suffix}"
+        f"and cannot sign in until they get a setup link (an admin's reset link, or "
+        f"`python -m app.cli setup-link --email <email>`){suffix}"
     )
 
 
@@ -1136,11 +1157,11 @@ async def initialize_superadmin(db: AsyncSession):
       UI reverts on restart while the var is set. This doubles as the "admin lost
       their password" escape hatch: change SUPERADMIN_PASSWORD and restart.
     - SUPERADMIN_PASSWORD unset: the superadmin owns their password. Nothing is
-      touched once one is set. Until then, every boot issues a one-time setup link
-      (a standard password-reset token) and logs it — the operator opens it from
-      the pod/container logs. Anyone who can read those logs can claim a fresh
-      instance, which is the same trust boundary as Jenkins' initial admin
-      password; it beats the alternative of an unauthenticated "set password"
+      touched once one is set. Until then, every boot logs one line telling the
+      operator how to mint a one-time setup link (`python -m app.cli
+      setup-link`, run inside the backend container). The link itself is never
+      logged: minting takes a shell in the container, a stronger boundary than
+      read access to logs, and it beats an unauthenticated "set password"
       endpoint that the first scanner to find the host could use.
     """
     import logging
@@ -1218,43 +1239,8 @@ async def initialize_superadmin(db: AsyncSession):
     if user.password_hash:
         return  # self-managed; never touch an existing password
 
-    await _issue_superadmin_setup_link(db, user, logger)
+    from app.services.setup_link import log_setup_hint
 
-
-# Sibling uvicorn workers run the lifespan concurrently. A token this young and
-# still unused was minted by one of them a moment ago — don't issue another.
-_SETUP_LINK_DEDUP_WINDOW = timedelta(seconds=60)
-
-
-async def _issue_superadmin_setup_link(db: AsyncSession, user: User, logger) -> None:
-    """Mint a one-time password-reset token for a password-less superadmin and
-    log the link. Only ever called when the account has NO password; an account
-    that has one is never re-issued a link this way (that would be a takeover
-    vector for anyone with log access)."""
-    now = datetime.now(UTC)
-    recent = await db.execute(
-        select(PasswordResetToken.id).where(
-            PasswordResetToken.user_id == user.id,
-            PasswordResetToken.used_at.is_(None),
-            PasswordResetToken.expires_at > now,
-            PasswordResetToken.created_at > now - _SETUP_LINK_DEDUP_WINDOW,
-        )
-    )
-    if recent.first():
-        return
-
-    plain_token, _ = await create_password_reset_token(db, str(user.id))
-    url = f"{settings.public_console_url}/reset-password?token={plain_token}"
-    logger.warning(
-        "\n"
-        "==================== SUPERADMIN SETUP ====================\n"
-        f"  {user.email} has no password yet. Set one via this one-time link\n"
-        f"  (valid {PASSWORD_RESET_TOKEN_EXPIRY_HOURS}h; restart to get a fresh one):\n"
-        "\n"
-        f"    {url}\n"
-        "\n"
-        "  If the console is served from another origin, open\n"
-        f"  <console-origin>/ui/reset-password?token={plain_token}\n"
-        "  To pin the password from config instead, set SUPERADMIN_PASSWORD.\n"
-        "==========================================================="
-    )
+    # The how, never a token: anyone who can read logs must not be able to
+    # claim the instance.
+    await log_setup_hint(email, logger)

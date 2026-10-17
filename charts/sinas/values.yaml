@@ -39,11 +39,11 @@ secrets:
 ##   superadminPassword set     -> "password" (+otp with SMTP). The value is
 ##                                 authoritative: a password changed in the
 ##                                 UI reverts to it on every restart.
-##   neither                    -> "password"; the backend prints a one-time
-##                                 setup link in its logs on boot. The
-##                                 superadmin then owns their password.
-##                                 (kubectl logs deploy/backend
-##                                  | grep -A6 'SUPERADMIN SETUP')
+##   neither                    -> "password"; mint a one-time setup link
+##                                 and the superadmin chooses (and then
+##                                 owns) their password:
+##                                 kubectl exec deploy/backend -c backend
+##                                   -- python -m app.cli setup-link
 ## Override the auto-selection with auth.mode.
 superadminEmail: ""
 superadminPassword: ""

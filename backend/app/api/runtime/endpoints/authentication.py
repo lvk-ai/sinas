@@ -50,9 +50,13 @@ from app.schemas.auth import (
     RefreshRequest,
     RefreshResponse,
     ResetPasswordRequest,
+    SetupLinkCompleteRequest,
+    SetupLinkExchangeRequest,
+    SetupLinkExchangeResponse,
     TokenExchangeRequest,
     TokenExchangeResponse,
 )
+from app.services import setup_link as setup_link_service
 from app.services import sso as sso_service
 from app.services.user_identity import (
     IdentityConflictError,
@@ -426,6 +430,137 @@ async def redeem_password_reset(
     await revoke_outstanding_password_reset_tokens(db, user.id)
     await revoke_all_refresh_tokens(db, str(user.id))
     return None
+
+
+_SETUP_LINK_OTP_ONLY = (
+    "Setup links aren't used on this instance: sign in with the code emailed to you."
+)
+
+
+def _attribute(http_request: Request, user: User) -> None:
+    """Credit the request log (the audit trail) to the user the link was for;
+    these calls carry no bearer token to do it."""
+    http_request.state.user_id = str(user.id)
+    http_request.state.user_email = user.email
+
+
+def _setup_link_refused(detail: str = setup_link_service.INVALID_LINK_MESSAGE) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+@router.post("/setup-link/exchange", response_model=SetupLinkExchangeResponse)
+async def exchange_setup_link(
+    request: SetupLinkExchangeRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trade the token from a setup link (`<console>/ui/?token=...`) for a
+    short-lived setup session. The link is spent by this call, so it can't be
+    replayed from browser history or a log; the setup session token returned
+    here lets the holder choose a password via POST /auth/setup-link/complete.
+
+    Never signs anyone in. Every unusable link (unknown, expired, used,
+    superseded, or for a deactivated account) gets the same 400. Only
+    available when AUTH_MODE includes password.
+    """
+    if not setup_link_service.password_auth_enabled():
+        raise _setup_link_refused(_SETUP_LINK_OTP_ONLY)
+
+    await rate_limit_by_ip(
+        http_request,
+        "setup_link",
+        settings.rate_limit_setup_link_ip_max,
+        settings.rate_limit_window_seconds,
+    )
+
+    exchanged = await setup_link_service.exchange_setup_link(db, request.token)
+    if exchanged is None:
+        raise _setup_link_refused()
+    session_token, session, user = exchanged
+    _attribute(http_request, user)
+
+    # A domain that must use SSO never signs in with a password.
+    sso = await sso_service.enforcing_provider(db, user.email)
+    if sso is not None:
+        await revoke_outstanding_password_reset_tokens(db, user.id)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=sso_service.enforced_message(sso, user.email),
+        )
+
+    return SetupLinkExchangeResponse(
+        setup_token=session_token,
+        email=user.email,
+        has_password=bool(user.password_hash),
+        expires_at=session.expires_at,
+    )
+
+
+@router.post("/setup-link/complete", response_model=LoginResponse)
+async def complete_setup_link(
+    request: SetupLinkCompleteRequest,
+    http_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Set a password with a setup session from POST /auth/setup-link/exchange,
+    then sign in the way a correct password does in this AUTH_MODE:
+
+    - password:     tokens are returned immediately
+    - password+otp: a code is emailed and `session_id` returned; finish with
+                    POST /auth/verify-otp (the link never skips the second factor)
+
+    The setup session is single use. Every other outstanding link for the
+    account and all of its refresh tokens are revoked.
+    """
+    if not setup_link_service.password_auth_enabled():
+        raise _setup_link_refused(_SETUP_LINK_OTP_ONLY)
+
+    await rate_limit_by_ip(
+        http_request,
+        "setup_link_complete",
+        settings.rate_limit_setup_link_ip_max,
+        settings.rate_limit_window_seconds,
+    )
+
+    user = await setup_link_service.redeem_setup_session(db, request.setup_token)
+    if user is None:
+        raise _setup_link_refused()
+    _attribute(http_request, user)
+
+    sso = await sso_service.enforcing_provider(db, user.email)
+    if sso is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=sso_service.enforced_message(sso, user.email),
+        )
+
+    user.password_hash = hash_password(request.new_password)
+    await db.commit()
+    await revoke_outstanding_password_reset_tokens(db, user.id)
+    await revoke_all_refresh_tokens(db, str(user.id))
+    logger.warning("Password set via setup link for user %s", user.id)
+
+    if "otp" in settings.auth_mode:
+        try:
+            otp_session = await create_otp_session(db, user.email)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Your password is set, but the sign-in code could not be sent: {e}",
+            )
+        return LoginResponse(message="OTP sent to your email", session_id=otp_session.id)
+
+    access_token, refresh_token, user_resp = await _issue_tokens(db, user)
+    return LoginResponse(
+        message="Password set",
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        user=user_resp,
+    )
 
 
 @router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)

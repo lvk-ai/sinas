@@ -4,11 +4,12 @@ Two modes when AUTH_MODE includes password:
 
 - SUPERADMIN_PASSWORD set   -> env var is authoritative, synced on every boot.
 - SUPERADMIN_PASSWORD unset -> the superadmin owns their password. While they
-  have none, each boot mints a one-time reset token and logs the setup link.
+  have none, each boot logs how to mint a setup link (the CLI command) - never
+  a link or token: log access must not be enough to claim the instance.
 
-The negative cases are the important ones: a setup link must never be issued
-for an account that already has a password (anyone with log access could take
-it over), nor when the env var pins the password, nor in OTP-only mode.
+The negative cases are the important ones: no hint for an account that already
+has a password, nor when the env var pins the password, nor in OTP-only mode;
+and boot itself never mints a token.
 """
 
 import logging
@@ -20,7 +21,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import (
-    consume_password_reset_token,
     create_password_reset_token,
     hash_password,
     initialize_default_roles,
@@ -64,36 +64,48 @@ async def _tokens(db: AsyncSession, user: User) -> list[PasswordResetToken]:
 
 
 def _setup_links(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if "SUPERADMIN SETUP" in r.getMessage()]
+    """The boot-time setup hints logged."""
+    return [r.getMessage() for r in caplog.records if "setup-link" in r.getMessage()]
 
 
 class TestSetupLinkMode:
     """No SUPERADMIN_PASSWORD, no password yet."""
 
-    async def test_first_boot_issues_a_working_setup_link(self, db: AsyncSession, caplog):
-        with caplog.at_level(logging.WARNING, logger="app.core.auth"):
+    async def test_first_boot_logs_how_to_get_a_link_but_no_token(self, db: AsyncSession, caplog):
+        with caplog.at_level(logging.DEBUG):
             await initialize_superadmin(db)
 
         user = await _superadmin(db)
         assert user.password_hash is None
-        tokens = await _tokens(db, user)
-        assert len(tokens) == 1
+        # Boot mints nothing: the operator does, with the CLI
+        assert await _tokens(db, user) == []
 
         links = _setup_links(caplog)
         assert len(links) == 1
-        assert "/ui/reset-password?token=" in links[0]
-        plain = links[0].split("?token=")[1].split()[0]
-        # The logged token is the real one: it redeems through the normal path
-        consumed = await consume_password_reset_token(db, plain)
-        assert consumed is not None and consumed.user_id == user.id
+        assert "python -m app.cli setup-link" in links[0]
+        assert settings.superadmin_email in links[0]
+        assert all("token=" not in r.getMessage() for r in caplog.records)
 
-    async def test_sibling_workers_do_not_stack_links(self, db: AsyncSession, caplog):
-        """uvicorn workers run the lifespan concurrently; one link per boot."""
+    async def test_hint_never_contains_a_live_token(self, db: AsyncSession, caplog):
+        """Even with a link outstanding, nothing logged at boot carries it."""
+        await initialize_superadmin(db)
+        user = await _superadmin(db)
+        plain, _ = await create_password_reset_token(db, str(user.id))
+        from app.core.redis import get_redis
+
+        await (await get_redis()).delete("sinas:setup-link-hint")
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            await initialize_superadmin(db)
+        assert len(_setup_links(caplog)) == 1
+        assert all(plain not in r.getMessage() for r in caplog.records)
+
+    async def test_sibling_workers_log_the_hint_once(self, db: AsyncSession, caplog):
+        """uvicorn workers run the lifespan concurrently; one line per boot."""
         with caplog.at_level(logging.WARNING, logger="app.core.auth"):
             await initialize_superadmin(db)
             await initialize_superadmin(db)
             await initialize_superadmin(db)
-        assert len(await _tokens(db, await _superadmin(db))) == 1
         assert len(_setup_links(caplog)) == 1
 
     async def test_existing_password_is_never_touched_and_no_link_issued(
@@ -103,11 +115,10 @@ class TestSetupLinkMode:
         user = await _superadmin(db)
         user.password_hash = hash_password("chosen-in-the-ui")
         await db.flush()
-        # Pretend the first-boot token was already consumed
-        for t in await _tokens(db, user):
-            await db.delete(t)
-        await db.flush()
-        caplog.clear()  # drop the legitimate first-boot link
+        from app.core.redis import get_redis
+
+        await (await get_redis()).delete("sinas:setup-link-hint")
+        caplog.clear()  # drop the legitimate first-boot hint
 
         with caplog.at_level(logging.WARNING, logger="app.core.auth"):
             await initialize_superadmin(db)
@@ -160,22 +171,22 @@ class TestEnvPinnedMode:
 
 
 class TestRedeemKillsSiblings:
-    async def test_redeeming_one_link_invalidates_the_others(self, db: AsyncSession, client):
-        """Two replicas racing the dedup window can each log a link. Once the
-        operator uses one, the other must not stay redeemable for 24h."""
+    async def test_newest_link_wins_and_redeeming_kills_the_rest(self, db: AsyncSession, client):
+        """Minting a link revokes the one before it; redeeming one leaves no
+        other link for the account usable."""
         await initialize_superadmin(db)
         user = await _superadmin(db)
         first, _ = await create_password_reset_token(db, str(user.id))
         second, _ = await create_password_reset_token(db, str(user.id))
 
         r = await client.post(
-            "/auth/password-reset", json={"reset_token": first, "new_password": "operator-chosen"}
-        )
-        assert r.status_code == 204, r.text
-        r = await client.post(
-            "/auth/password-reset", json={"reset_token": second, "new_password": "attacker-chosen"}
+            "/auth/password-reset", json={"reset_token": first, "new_password": "attacker-chosen"}
         )
         assert r.status_code == 400
+        r = await client.post(
+            "/auth/password-reset", json={"reset_token": second, "new_password": "operator-chosen"}
+        )
+        assert r.status_code == 204, r.text
         assert verify_password("operator-chosen", (await _superadmin(db)).password_hash)
         assert all(t.used_at is not None for t in await _tokens(db, user))
 

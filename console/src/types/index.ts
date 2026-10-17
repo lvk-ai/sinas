@@ -80,6 +80,27 @@ export interface AdminCreateResetLinkResponse {
   expires_at: string;
 }
 
+/** POST /auth/setup-link/exchange: the link is spent; `setup_token` sets a
+ * password until `expires_at`. */
+export interface SetupLinkExchangeResponse {
+  setup_token: string;
+  email: string;
+  has_password: boolean;
+  expires_at: string;
+}
+
+/** POST /auth/setup-link/complete: tokens (password mode) or an OTP
+ * session_id (password+otp). */
+export interface SetupLinkCompleteResponse {
+  message: string;
+  session_id?: string;
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  user?: AuthUser;
+}
+
 // API Keys
 export interface APIKeyRoleRef {
   id: string;

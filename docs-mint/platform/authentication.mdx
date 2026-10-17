@@ -55,15 +55,35 @@ GET    /auth/me                   # Get current user info
 The first admin user is seeded from environment variables on backend startup:
 
 - `SUPERADMIN_EMAIL` — email of the user to create / promote to Admins
-- `SUPERADMIN_PASSWORD` — only used when `AUTH_MODE` is `password` or `password+otp`. Setting this on a running deployment and restarting the backend will reset the password — the escape hatch for "admin lost their password."
+- `SUPERADMIN_PASSWORD` — only used when `AUTH_MODE` is `password` or `password+otp`. While set it is authoritative: it is applied on every boot, so setting it on a running deployment and restarting the backend resets the password (the escape hatch for "admin lost their password"), and a password changed in the console reverts. Leave it unset to let the superadmin choose their own with a [setup link](#setup-links); until they have, the backend logs on every boot how to mint one (never the link itself).
+
+## Setup Links
+
+A setup link is a one-time console URL, `<console>/ui?token=…`, with which someone sets their password and signs in. The first admin gets one from the operator; any user can get one from an admin.
+
+**Minting**
+
+- **Operator (CLI)**, inside the backend container: `python -m app.cli setup-link [--email …]` (default: `SUPERADMIN_EMAIL`). For example `docker compose exec backend python -m app.cli setup-link`, or `kubectl exec deploy/backend -c backend -- python -m app.cli setup-link`. Prints the full URL, built from the configured console URL (`CONSOLE_URL`, else `https://$DOMAIN/ui`).
+- **Admin (console)** — the key icon on the Users page ("Generate password reset link") produces the same kind of link. API: `POST /api/v1/users/{id}/password-reset` (`sinas.users.update:all`).
+- The installer runs the CLI at the end of a fresh install without `SUPERADMIN_PASSWORD` and prints the link once.
+
+**Token rules.** 256 random bits, stored only as a SHA-256 hash, single use, valid for `PASSWORD_RESET_TOKEN_TTL_HOURS` (default 24). Minting a new link for a user revokes their earlier ones; setting or changing the password revokes all of them. Unknown, expired, used, replaced links and links for deactivated accounts all get the same response.
+
+**The flow.** The console takes the token out of the address bar (`history.replaceState`) before it renders or fetches anything, and immediately trades it via `POST /auth/setup-link/exchange` for a short-lived setup session (30 minutes, kept in the tab). That spends the link: a copy in browser history or a log is useless once the person it was meant for has opened it. It also means a chat app that only fetches the page for a preview doesn't use it up; one that runs the page's JavaScript would. The page then shows **Set your password** (current password policy: 8 characters minimum, 72 bytes maximum). `POST /auth/setup-link/complete` sets it and signs in the way a correct password does in the current mode: tokens straight away for `password`, an emailed code first for `password+otp`. The link never skips the second factor.
+
+**Accounts that already have a password.** A link is never a sign-in link on its own. Opened for an account that already has a password, it says so and offers **Sign in** normally; the person can instead choose a new password with it, which is what an admin's reset link has always been for. Only after a new password is saved does it sign them in.
+
+**OTP-only mode** (`AUTH_MODE=otp`). Setup links aren't used: people sign in with the emailed code, and there is no password to set. The CLI and the admin endpoint refuse to mint one, and an older link shows "sign in with the code emailed to you". We deliberately don't let a link sign in directly here: that would make a 24-hour bearer URL a way in that skips proving control of the mailbox.
+
+**Security.** The exchange and complete endpoints are rate limited per IP (`RATE_LIMIT_SETUP_LINK_IP_MAX` per `RATE_LIMIT_WINDOW_SECONDS`). Opening a link and setting a password are logged with the user id, never the token. Request logs mask `token`-style query parameters and Referers, request bodies of `/auth/*` are not logged, and the console's nginx access log drops query strings.
 
 ## Password Reset
 
 For modes that include passwords:
 
 - **User-initiated** — not implemented when `AUTH_MODE=password` (no email channel guaranteed). Use admin reset.
-- **Admin-initiated** — an admin generates a one-time reset link from the user management page in the console and delivers it out-of-band (Slack, in person).
-- **Lost-superadmin escape hatch** — set `SUPERADMIN_PASSWORD` in the env and restart the backend.
+- **Admin-initiated** — an admin generates a one-time [setup link](#setup-links) from the user management page in the console and delivers it out-of-band (Slack, in person). The user chooses a new password with it.
+- **Lost-superadmin escape hatch** — mint a setup link with the CLI (`python -m app.cli setup-link`), or set `SUPERADMIN_PASSWORD` in the env and restart the backend.
 
 ## API Keys
 
