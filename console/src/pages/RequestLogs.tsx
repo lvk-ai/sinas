@@ -18,17 +18,30 @@ import {
 } from 'lucide-react';
 import { Messages } from './Messages';
 import { useAuth } from '../lib/auth-context';
-import { isClickHouseEnabled, requestLogsState, unavailableDetail } from '../lib/clickhouse';
-import { ClickHouseDisabledState, ClickHouseUnavailableState } from '../components/ClickHouseNotice';
+import {
+  clickHouseFeature,
+  isUnavailableError,
+  requestLogsState,
+  unavailableDetail,
+  unavailableRefetchInterval,
+} from '../lib/clickhouse';
+import {
+  ClickHouseDisabledState,
+  ClickHouseUnavailableNote,
+  ClickHouseUnavailableState,
+} from '../components/ClickHouseNotice';
 
 type Tab = 'requests' | 'messages' | 'executions';
 
 export function RequestLogs() {
   const { instanceInfo } = useAuth();
-  const clickhouseEnabled = isClickHouseEnabled(instanceInfo?.features);
-  // Without ClickHouse there are no request logs: open on the message logs,
-  // keeping the Request Logs tab reachable to explain why it's empty.
-  const [activeTab, setActiveTab] = useState<Tab>(clickhouseEnabled ? 'requests' : 'messages');
+  const clickhouse = clickHouseFeature(instanceInfo);
+  // The tab the user picked; until then the default, which waits for /info:
+  // without ClickHouse there are no request logs, so open on the message
+  // logs, keeping the Request Logs tab reachable to explain why it's empty.
+  const [chosenTab, setActiveTab] = useState<Tab | null>(null);
+  const activeTab: Tab | null =
+    chosenTab ?? (clickhouse === 'pending' ? null : clickhouse === 'disabled' ? 'messages' : 'requests');
   const [treeChatId, setTreeChatId] = useState<string | null>(null);
 
   const viewTree = (chatId: string) => {
@@ -56,7 +69,7 @@ export function RequestLogs() {
           >
             <Activity className="w-5 h-5 inline mr-2" />
             Request Logs
-            {!clickhouseEnabled && (
+            {clickhouse === 'disabled' && (
               <span
                 className="ml-2 px-1.5 py-0.5 text-xs font-medium rounded bg-surface-1 border border-line-soft text-gray-500"
                 title="ClickHouse is disabled on this deployment"
@@ -92,6 +105,7 @@ export function RequestLogs() {
 
       {/* Tab Content */}
       <div>
+        {activeTab === null && <div className="text-center py-8 text-gray-500">Loading...</div>}
         {activeTab === 'requests' && <RequestLogsTab />}
         {activeTab === 'messages' && <Messages onViewTree={viewTree} />}
         {activeTab === 'executions' && <ExecutionsTab initialTreeChatId={treeChatId} onClearTree={() => setTreeChatId(null)} />}
@@ -102,7 +116,8 @@ export function RequestLogs() {
 
 function RequestLogsTab() {
   const { instanceInfo } = useAuth();
-  const clickhouseEnabled = isClickHouseEnabled(instanceInfo?.features);
+  // Only query once /info has settled and doesn't say ClickHouse is off.
+  const clickhouseEnabled = clickHouseFeature(instanceInfo) === 'enabled';
   const [filters, setFilters] = useState({
     user_id: '',
     start_time: '',
@@ -116,9 +131,18 @@ function RequestLogsTab() {
   const [showFilters, setShowFilters] = useState(false);
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
 
-  const { data: logs, isLoading, error: logsError } = useQuery({
+  // retry: false, but while ClickHouse is unavailable (503) both queries
+  // re-check slowly, and "Try again" refetches them at once.
+  const {
+    data: logs,
+    isLoading,
+    error: logsError,
+    refetch: refetchLogs,
+    isFetching: logsFetching,
+  } = useQuery({
     queryKey: ['requestLogs', filters],
     enabled: clickhouseEnabled,
+    refetchInterval: (query) => unavailableRefetchInterval(query.state.error),
     queryFn: () => {
       const params: any = { ...filters };
       Object.keys(params).forEach(key => {
@@ -130,9 +154,15 @@ function RequestLogsTab() {
     retry: false,
   });
 
-  const { data: stats } = useQuery({
+  const {
+    data: stats,
+    error: statsError,
+    refetch: refetchStats,
+    isFetching: statsFetching,
+  } = useQuery({
     queryKey: ['requestLogStats', filters.user_id, filters.start_time, filters.end_time],
     enabled: clickhouseEnabled,
+    refetchInterval: (query) => unavailableRefetchInterval(query.state.error),
     queryFn: () => {
       const params: any = {};
       if (filters.user_id) params.user_id = filters.user_id;
@@ -193,12 +223,31 @@ function RequestLogsTab() {
     a.click();
   };
 
-  const state = requestLogsState(instanceInfo?.features, logsError);
+  const retryBoth = () => {
+    refetchLogs();
+    refetchStats();
+  };
+  const retrying = logsFetching || statsFetching;
+
+  const state = requestLogsState(instanceInfo, logsError);
+  if (state === 'pending') return <div className="text-center py-8 text-gray-500">Loading...</div>;
   if (state === 'disabled') return <ClickHouseDisabledState />;
-  if (state === 'unavailable') return <ClickHouseUnavailableState detail={unavailableDetail(logsError)} />;
+  // The list failed with a 503: one notice for the whole view (stats too).
+  if (state === 'unavailable') {
+    return <ClickHouseUnavailableState detail={unavailableDetail(logsError)} onRetry={retryBoth} retrying={retrying} />;
+  }
 
   return (
     <div className="space-y-6">
+      {/* Stats failed while the list loaded: say so where the stats go. */}
+      {isUnavailableError(statsError) && (
+        <ClickHouseUnavailableNote
+          detail={`Request statistics could not be loaded. ${unavailableDetail(statsError)}`}
+          onRetry={() => refetchStats()}
+          retrying={statsFetching}
+        />
+      )}
+
       {/* Actions */}
       <div className="flex justify-end gap-2">
         <button
