@@ -8,9 +8,11 @@ import { useAuth } from '../lib/auth-context';
 import {
   clearPendingCode,
   clearSetupSession,
+  completeFailure,
   resumeSetup,
   savePendingCode,
   saveSetupSession,
+  signInAction,
   takeSetupLinkToken,
   type SetupSession,
 } from '../lib/setupLink';
@@ -35,6 +37,8 @@ function refusal(err: unknown): string {
   const status = statusOf(err);
   if (status === 429) return 'Too many attempts. Wait a few minutes and open the link again.';
   if (status === 400 || status === 403) return getApiErrorMessage(err, INVALID);
+  // No answer or a server error: the link may well be unspent.
+  if (status === undefined || status >= 500) return "Couldn't check your link just now. Open it again in a moment.";
   return INVALID;
 }
 
@@ -43,7 +47,7 @@ function refusal(err: unknown): string {
  * then sets a password and is signed in. A link never signs anyone in on its
  * own: with a password already on the account, it can only replace it. */
 export function SetupLink() {
-  const { completeSetup, verifyOTP } = useAuth();
+  const { completeSetup, verifyOTP, user, logout } = useAuth();
   const navigate = useNavigate();
   const started = useRef(false);  // once: StrictMode runs effects twice
   const [view, setView] = useState<View>({ kind: 'checking' });
@@ -73,7 +77,10 @@ export function SetupLink() {
       }
       return;
     }
-    clearPendingCode();  // a new link starts over
+    // A new link starts over: nothing of an earlier link (another account,
+    // maybe) may resume if this one fails.
+    clearPendingCode();
+    clearSetupSession();
     apiClient.exchangeSetupLink(token)
       .then((session) => {
         saveSetupSession(session);
@@ -82,11 +89,34 @@ export function SetupLink() {
       .catch((err) => setView({ kind: 'refused', message: refusal(err) }));
   }, []);
 
-  const toLogin = () => {
+  /** Leave for the login page (or, signed in as the link's own account, the
+   * dashboard). Signed in as someone else: sign out first, or /login would
+   * bounce straight back to their dashboard. */
+  const toLogin = async (linkFor?: string) => {
+    const action = signInAction(user?.email, linkFor);
     clearSetupSession();
     clearPendingCode();
+    if (action.toDashboard) {
+      navigate('/', { replace: true });
+      return;
+    }
+    if (action.signOut) await logout();
     navigate('/login', { replace: true });
   };
+
+  /** Which account this browser is signed in as, when it is: the buttons
+   * below say what they do to it. */
+  const signedInNote = user ? (
+    <p className="text-sm text-gray-400">
+      This browser is signed in as <span className="text-gray-200">{user.email}</span>.
+    </p>
+  ) : null;
+
+  const signInButton = (linkFor?: string) => (
+    <button type="button" onClick={() => toLogin(linkFor)} className="w-full btn btn-primary py-3 rounded-lg">
+      {signInAction(user?.email, linkFor).label}
+    </button>
+  );
 
   const submitPassword = async (e: React.FormEvent, session: SetupSession) => {
     e.preventDefault();
@@ -115,15 +145,24 @@ export function SetupLink() {
         navigate('/', { replace: true });
       }
     } catch (err) {
-      if (statusOf(err) === 422) {
+      const status = statusOf(err);
+      const failure = completeFailure(status);
+      if (failure === 'fix') {
         setError(getApiErrorMessage(err, 'Choose a different password.'));
+      } else if (failure === 'retry') {
+        // Nothing was spent: keep the session and the form.
+        setError(
+          status === 429
+            ? 'Too many attempts. Wait a few minutes, then try again.'
+            : "Couldn't save your password just now. Try again in a moment.",
+        );
       } else {
         // The setup session is spent or gone (or, on 503, the password is
         // set and only the emailed code failed): this page can't go on.
         clearSetupSession();
         setView({
           kind: 'refused',
-          message: statusOf(err) === 503 ? getApiErrorMessage(err, INVALID) : refusal(err),
+          message: status === 503 ? getApiErrorMessage(err, INVALID) : refusal(err),
         });
       }
     } finally {
@@ -183,9 +222,8 @@ export function SetupLink() {
           {view.kind === 'refused' && (
             <div className="space-y-6">
               <p className="text-sm text-gray-300">{view.message}</p>
-              <button type="button" onClick={toLogin} className="w-full btn btn-primary py-3 rounded-lg">
-                Go to sign in
-              </button>
+              {signedInNote}
+              {signInButton()}
             </div>
           )}
 
@@ -196,9 +234,8 @@ export function SetupLink() {
                 <span className="font-medium text-gray-100">{view.session.email}</span> already has one.
                 Sign in with it as usual.
               </p>
-              <button type="button" onClick={toLogin} className="w-full btn btn-primary py-3 rounded-lg">
-                Sign in
-              </button>
+              {signedInNote}
+              {signInButton(view.session.email)}
               <button
                 type="button"
                 onClick={() => setView({ kind: 'form', session: view.session })}
@@ -309,8 +346,15 @@ export function SetupLink() {
               </button>
               {/* The code expired or was mistyped too often: the password is
                   saved, so a normal sign-in (with a fresh code) finishes it. */}
-              <button type="button" onClick={toLogin} className="w-full text-sm text-gray-400 hover:text-gray-200">
-                Code expired? Sign in with your new password
+              {signedInNote}
+              <button
+                type="button"
+                onClick={() => toLogin(view.email)}
+                className="w-full text-sm text-gray-400 hover:text-gray-200"
+              >
+                {signInAction(user?.email, view.email).signOut
+                  ? `Code expired? Sign out and sign in as ${view.email} with your new password`
+                  : 'Code expired? Sign in with your new password'}
               </button>
             </form>
           )}

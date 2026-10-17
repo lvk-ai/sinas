@@ -50,27 +50,52 @@ def _safe_url(value: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path, "***" if parts.query else "", ""))
 
 
+def _is_sensitive_param(raw_name: str) -> bool:
+    """Whether a raw query parameter name names a credential, read the way
+    the browser does (URLSearchParams: percent-decoded, `+` as a space),
+    case-insensitively: `tok%65n`, `%74oken` and `TOKEN` all name `token`."""
+    from urllib.parse import unquote_plus
+
+    return unquote_plus(raw_name).casefold() in _SENSITIVE_KEYS
+
+
+def _redact_query_string(query: str) -> str:
+    pairs = []
+    for pair in query.split("&"):
+        name, sep, value = pair.partition("=")
+        if sep and _is_sensitive_param(name):
+            pairs.append(f"{name}={_REDACTED}")
+        elif "?" in value:  # a URL inside a value (`?next=/ui/?token=...`)
+            pairs.append(f"{name}{sep}{redact_url_query(value)}")
+        else:
+            pairs.append(pair)
+    return "&".join(pairs)
+
+
 def redact_query_params(query_string: str) -> dict[str, str]:
     """Query parameters as they may be stored, credential-bearing ones
-    (`?token=`, `?api_key=`...) masked."""
+    (`?token=`, `?api_key=`..., however their names are encoded) masked."""
     params: dict[str, str] = {}
     for pair in query_string.split("&") if query_string else ():
         if "=" not in pair:
             continue
         k, v = pair.split("=", 1)
-        params[k] = _REDACTED if k.lower() in _SENSITIVE_KEYS else v
+        if _is_sensitive_param(k):
+            params[k] = _REDACTED
+        else:
+            params[k] = redact_url_query(v) if "?" in v else v
     return params
 
 
-_TOKEN_IN_QUERY = re.compile(
-    r"([?&](?:" + "|".join(sorted(_SENSITIVE_KEYS)) + r")=)[^&#\s\"]*", re.IGNORECASE
-)
+# A query string inside a URL, a path or a whole log line.
+_QUERY_IN_TEXT = re.compile(r"\?([^#\s\"]*)")
 
 
-def redact_url_query(url: str) -> str:
-    """A path-with-query (an access-log line's) with credential-bearing
-    query values masked: `/ui/?token=abc` -> `/ui/?token=***REDACTED***`."""
-    return _TOKEN_IN_QUERY.sub(lambda m: m.group(1) + _REDACTED, url)
+def redact_url_query(text: str) -> str:
+    """A URL, path-with-query or log line with credential-bearing query
+    values masked: `/ui/?token=abc` (or `?tok%65n=abc`) ->
+    `/ui/?token=***REDACTED***`."""
+    return _QUERY_IN_TEXT.sub(lambda m: "?" + _redact_query_string(m.group(1)), text)
 
 
 class RedactQueryTokensFilter:

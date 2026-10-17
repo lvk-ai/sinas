@@ -75,7 +75,7 @@ A setup link is a one-time console URL, `<console>/ui?token=…`, with which som
 
 **OTP-only mode** (`AUTH_MODE=otp`). Setup links aren't used: people sign in with the emailed code, and there is no password to set. The CLI and the admin endpoint refuse to mint one, and an older link shows "sign in with the code emailed to you". We deliberately don't let a link sign in directly here: that would make a 24-hour bearer URL a way in that skips proving control of the mailbox.
 
-**Security.** The exchange and complete endpoints are rate limited per IP (`RATE_LIMIT_SETUP_LINK_IP_MAX` per `RATE_LIMIT_WINDOW_SECONDS`). Opening a link and setting a password are logged with the user id, never the token. Request logs mask `token`-style query parameters and Referers, request bodies of `/auth/*` are not logged, and the console's nginx access log drops query strings.
+**Security.** The exchange and complete endpoints are rate limited per IP (`RATE_LIMIT_SETUP_LINK_IP_MAX` per `RATE_LIMIT_WINDOW_SECONDS`). Opening a link and setting a password are logged with the user id, never the token. Request logs mask `token`-style query parameters and Referers (names read as the browser reads them: percent-decoded, any case), request bodies of `/auth/*` are not logged, and the console's nginx access log drops query strings.
 
 ## Password Reset
 

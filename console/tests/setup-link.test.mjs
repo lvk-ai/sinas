@@ -74,3 +74,24 @@ test('garbage in storage resumes nothing', () => {
   store.set('sinas_setup_session', '{"email":"x"}');
   assert.equal(m.resumeSetup(), null);
 });
+
+test('a failed save keeps the setup session unless the server spent or refused it', () => {
+  assert.equal(m.completeFailure(422), 'fix');
+  // Nothing spent: rate limited, no response, a server error
+  for (const status of [429, undefined, 500, 502, 504]) assert.equal(m.completeFailure(status), 'retry', String(status));
+  // Spent or invalid: the generic 400, SSO 403, password saved but code failed (503)
+  for (const status of [400, 403, 503]) assert.equal(m.completeFailure(status), 'spent', String(status));
+});
+
+test('the way to the login page signs another account out, and says so', () => {
+  assert.deepEqual(m.signInAction(null, 'a@example.com'), { label: 'Sign in', signOut: false, toDashboard: false });
+  assert.deepEqual(m.signInAction(undefined), { label: 'Go to sign in', signOut: false, toDashboard: false });
+  assert.deepEqual(m.signInAction('b@example.com', 'a@example.com'), {
+    label: 'Sign out and sign in as a@example.com', signOut: true, toDashboard: false,
+  });
+  assert.deepEqual(m.signInAction('b@example.com'), { label: 'Sign out and go to sign in', signOut: true, toDashboard: false });
+  // Already signed in as the link's own account: nothing to switch
+  assert.deepEqual(m.signInAction('A@example.com', 'a@example.com'), {
+    label: 'Continue as A@example.com', signOut: false, toDashboard: true,
+  });
+});

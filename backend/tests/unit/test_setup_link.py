@@ -354,3 +354,47 @@ class TestRequestLogRedaction:
         )
         assert RedactQueryTokensFilter().filter(record)
         assert "abc" not in record.getMessage() and "token=***REDACTED***" in record.getMessage()
+
+    # Names the browser (URLSearchParams) reads as `token`: percent-encoded,
+    # partly encoded, any case. Review round: these slipped past.
+    ENCODED_NAMES = ["tok%65n", "%74oken", "%74%6F%6B%65%6E", "TOKEN", "ToKeN", "TOK%45N", "setup%5Ftoken", "api%5fkey"]
+
+    @pytest.mark.parametrize("name", ENCODED_NAMES)
+    def test_encoded_and_mixed_case_names_in_query_params(self, name):
+        from app.middleware.request_logger import redact_query_params
+
+        assert redact_query_params(f"page=2&{name}=s3cret") == {"page": "2", name: "***REDACTED***"}
+
+    @pytest.mark.parametrize("name", ENCODED_NAMES)
+    def test_encoded_and_mixed_case_names_in_urls(self, name):
+        from app.middleware.request_logger import redact_url_query
+
+        for url in (f"/ui/?{name}=s3cret", f"https://h:51245/ui?x=1&{name}=s3cret#f"):
+            assert "s3cret" not in redact_url_query(url), url
+
+    @pytest.mark.parametrize("name", ENCODED_NAMES)
+    def test_encoded_and_mixed_case_names_in_the_access_log(self, name):
+        from app.middleware.request_logger import RedactQueryTokensFilter
+
+        record = logging.LogRecord(
+            "uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:5000", "GET", f"/ui/?{name}=s3cret", "1.1", 200), None,
+        )
+        RedactQueryTokensFilter().filter(record)
+        assert "s3cret" not in record.getMessage()
+
+    def test_the_names_redacted_are_the_ones_the_browser_reads(self):
+        """Cross-check against the decoding URLSearchParams does (urllib's
+        parse_qsl decodes names the same way: percent-escapes, `+`)."""
+        from urllib.parse import parse_qsl
+
+        for name in self.ENCODED_NAMES:
+            decoded = parse_qsl(f"{name}=v")[0][0]
+            assert decoded.lower() in {"token", "setup_token", "api_key"}
+
+    def test_non_credentials_untouched_and_nested_urls_masked(self):
+        from app.middleware.request_logger import redact_query_params, redact_url_query
+
+        assert redact_url_query("/agents?page=2&tokens=5&q=a%20b") == "/agents?page=2&tokens=5&q=a%20b"
+        assert redact_url_query("/login?next=/ui/?token=s3cret") == "/login?next=/ui/?token=***REDACTED***"
+        assert redact_query_params("next=/ui/?tok%65n=s3cret") == {"next": "/ui/?tok%65n=***REDACTED***"}

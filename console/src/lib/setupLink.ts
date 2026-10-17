@@ -121,6 +121,40 @@ export function loadPendingCode(): PendingCode | null {
   }
 }
 
+/** What a failed "save password" (POST /auth/setup-link/complete) means for
+ * the setup session kept in this tab:
+ * - 'fix': the password was refused (422); fix it and resubmit.
+ * - 'retry': nothing was spent (429 rate limit, no response, a 5xx other
+ *   than 503); keep the session and the form, try again in a moment.
+ * - 'spent': the session is invalid or used (the generic 400, 403 SSO), or
+ *   the password is saved and only the emailed code failed (503); this
+ *   page can't go on. */
+export function completeFailure(status: number | undefined): 'fix' | 'retry' | 'spent' {
+  if (status === 422) return 'fix';
+  if (status === undefined || status === 429 || (status >= 500 && status !== 503)) return 'retry';
+  return 'spent';
+}
+
+/** The way out to the login page, given who (if anyone) this browser is
+ * signed in as and which account the link was for. A signed-in browser
+ * can't reach the login form (it bounces to the dashboard), so switching
+ * accounts means signing out first, said out loud. */
+export function signInAction(
+  signedInAs: string | null | undefined,
+  linkFor?: string,
+): { label: string; signOut: boolean; toDashboard: boolean } {
+  const same = !!signedInAs && !!linkFor && signedInAs.toLowerCase() === linkFor.toLowerCase();
+  if (same) return { label: `Continue as ${signedInAs}`, signOut: false, toDashboard: true };
+  if (signedInAs) {
+    return {
+      label: linkFor ? `Sign out and sign in as ${linkFor}` : 'Sign out and go to sign in',
+      signOut: true,
+      toDashboard: false,
+    };
+  }
+  return { label: linkFor ? 'Sign in' : 'Go to sign in', signOut: false, toDashboard: false };
+}
+
 /** Where a reload of the setup page (no token in the URL) picks up: the code
  * step if the password is already saved, else the setup session, else
  * nothing (the link is spent or was never valid). */
