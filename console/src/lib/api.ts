@@ -609,7 +609,9 @@ class APIClient {
     limit?: number;
     offset?: number;
   }): Promise<any[]> {
-    const response = await this.configClient.get('/request-logs', { params });
+    // 503 = ClickHouse disabled or unreachable: the Logs page explains that
+    // in place, so no error toast.
+    const response = await this.configClient.get('/request-logs', { params, quietStatuses: [503] } as QuietRequestConfig);
     return response.data;
   }
 
@@ -618,7 +620,7 @@ class APIClient {
     start_time?: string;
     end_time?: string;
   }): Promise<any> {
-    const response = await this.configClient.get('/request-logs/stats', { params });
+    const response = await this.configClient.get('/request-logs/stats', { params, quietStatuses: [503] } as QuietRequestConfig);
     return response.data;
   }
 
