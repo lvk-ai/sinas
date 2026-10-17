@@ -10,6 +10,8 @@ import type {
   OTPVerifyRequest,
   OTPVerifyResponse,
   ResetPasswordRequest,
+  SetupLinkCompleteResponse,
+  SetupLinkExchangeResponse,
   User,
   UserCreate,
   APIKey,
@@ -351,6 +353,26 @@ class APIClient {
 
   async redeemPasswordReset(data: ResetPasswordRequest): Promise<void> {
     await this.runtimeClient.post('/auth/password-reset', data);
+  }
+
+  /** Spend a setup link's token for a short-lived setup session. */
+  async exchangeSetupLink(token: string): Promise<SetupLinkExchangeResponse> {
+    const response = await this.runtimeClient.post(
+      '/auth/setup-link/exchange',
+      { token },
+      { quietStatuses: [400, 403, 422, 429] } as QuietRequestConfig,
+    );
+    return response.data;
+  }
+
+  /** Set the password with a setup session, then sign in per AUTH_MODE. */
+  async completeSetupLink(setupToken: string, newPassword: string): Promise<SetupLinkCompleteResponse> {
+    const response = await this.runtimeClient.post(
+      '/auth/setup-link/complete',
+      { setup_token: setupToken, new_password: newPassword },
+      { quietStatuses: [400, 403, 422, 429, 503] } as QuietRequestConfig,
+    );
+    return response.data;
   }
 
   async adminCreatePasswordResetLink(userId: string): Promise<AdminCreateResetLinkResponse> {

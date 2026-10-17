@@ -24,6 +24,10 @@ interface AuthContextType {
   /** Finish an SSO sign-in: trade the one-time code for tokens. Returns the
    * console path to continue on. */
   completeSso: (code: string, codeVerifier: string) => Promise<string>;
+  /** Set a password with a setup-link session and sign in. Returns
+   * session_id when an OTP step follows (password+otp); undefined once
+   * signed in. */
+  completeSetup: (setupToken: string, newPassword: string) => Promise<string | undefined>;
   logout: () => Promise<void>;
 }
 
@@ -224,6 +228,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return response.return_to || '/';
   };
 
+  const completeSetup = async (setupToken: string, newPassword: string): Promise<string | undefined> => {
+    const response = await apiClient.completeSetupLink(setupToken, newPassword);
+    if (response.access_token && response.refresh_token && response.user) {
+      persistSession(response.access_token, response.refresh_token, response.user);
+      return undefined;
+    }
+    if (!response.session_id) throw new Error('Signing in failed. Sign in with your new password.');
+    return response.session_id;
+  };
+
   const logout = async () => {
     const refreshToken = localStorage.getItem('refresh_token');
 
@@ -254,7 +268,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, completeSso, logout }}
+      value={{ user, token, loading, authMode, instanceInfo, login, verifyOTP, completeSso, completeSetup, logout }}
     >
       {children}
     </AuthContext.Provider>

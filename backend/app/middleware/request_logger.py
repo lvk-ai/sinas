@@ -1,5 +1,6 @@
 """FastAPI middleware for comprehensive request logging to ClickHouse."""
 import json
+import re
 import time
 import uuid
 
@@ -23,7 +24,8 @@ def redact_path(path: str) -> str:
 
 _SENSITIVE_KEYS = frozenset({
     "password", "api_key", "secret", "token", "refresh_token", "access_token", "otp",
-    "code_verifier",
+    "code_verifier", "reset_token", "setup_token", "new_password", "current_password",
+    "otp_code",
 })
 # Whole mappings whose values are credentials (an MCP server's or a
 # connector's request headers), and strings that may carry one in their
@@ -46,6 +48,77 @@ def _safe_url(value: str) -> str:
     if host != parts.netloc:
         host = "***@" + host
     return urlunsplit((parts.scheme, host, parts.path, "***" if parts.query else "", ""))
+
+
+def _is_sensitive_param(raw_name: str) -> bool:
+    """Whether a raw query parameter name names a credential, read the way
+    the browser does (URLSearchParams: percent-decoded, `+` as a space),
+    case-insensitively: `tok%65n`, `%74oken` and `TOKEN` all name `token`."""
+    from urllib.parse import unquote_plus
+
+    return unquote_plus(raw_name).casefold() in _SENSITIVE_KEYS
+
+
+# How deep URLs nested in query values (`?next=/a?next=/b?token=...`) are
+# followed. Past it the rest of the value is masked whole: fail closed, and
+# never recurse without bound on attacker-supplied input.
+_MAX_NESTED_URLS = 8
+
+
+def _redact_query_string(query: str, depth: int = 0) -> str:
+    pairs = []
+    for pair in query.split("&"):
+        name, sep, value = pair.partition("=")
+        if sep and _is_sensitive_param(name):
+            pairs.append(f"{name}={_REDACTED}")
+        elif "?" in value:  # a URL inside a value (`?next=/ui/?token=...`)
+            if depth >= _MAX_NESTED_URLS:
+                pairs.append(f"{name}{sep}{_REDACTED}")
+            else:
+                pairs.append(f"{name}{sep}{redact_url_query(value, depth + 1)}")
+        else:
+            pairs.append(pair)
+    return "&".join(pairs)
+
+
+def redact_query_params(query_string: str) -> dict[str, str]:
+    """Query parameters as they may be stored, credential-bearing ones
+    (`?token=`, `?api_key=`..., however their names are encoded) masked."""
+    params: dict[str, str] = {}
+    for pair in query_string.split("&") if query_string else ():
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        if _is_sensitive_param(k):
+            params[k] = _REDACTED
+        else:
+            params[k] = redact_url_query(v) if "?" in v else v
+    return params
+
+
+# A query string inside a URL, a path or a whole log line.
+_QUERY_IN_TEXT = re.compile(r"\?([^#\s\"]*)")
+
+
+def redact_url_query(text: str, depth: int = 0) -> str:
+    """A URL, path-with-query or log line with credential-bearing query
+    values masked: `/ui/?token=abc` (or `?tok%65n=abc`) ->
+    `/ui/?token=***REDACTED***`."""
+    return _QUERY_IN_TEXT.sub(lambda m: "?" + _redact_query_string(m.group(1), depth), text)
+
+
+class RedactQueryTokensFilter:
+    """logging filter for uvicorn's access log: the console (served by this
+    process in the lite profile) is opened as `/ui/?token=<setup link>`, and
+    that line must not land in the logs with a usable token."""
+
+    def filter(self, record) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and args:
+            record.args = tuple(redact_url_query(a) if isinstance(a, str) else a for a in args)
+        elif isinstance(record.msg, str):
+            record.msg = redact_url_query(record.msg)
+        return True
 
 
 def redact_body(body):
@@ -93,7 +166,7 @@ class RequestLoggerMiddleware:
 
         # Decode headers
         user_agent = headers_dict.get(b"user-agent", b"").decode("latin1")
-        referer = headers_dict.get(b"referer", b"").decode("latin1")
+        referer = redact_url_query(headers_dict.get(b"referer", b"").decode("latin1"))
         content_type = headers_dict.get(b"content-type", b"").decode("latin1")
 
         application = headers_dict.get(b"x-application", b"").decode("latin1")
@@ -104,12 +177,7 @@ class RequestLoggerMiddleware:
 
         # Get query params
         query_string = scope.get("query_string", b"").decode("latin1")
-        query_params = {}
-        if query_string:
-            for pair in query_string.split("&"):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    query_params[k] = v
+        query_params = redact_query_params(query_string)
 
         # Cache body for logging
         body_parts = []
@@ -143,7 +211,8 @@ class RequestLoggerMiddleware:
         # After request is processed, parse the cached body
         # Skip logging request bodies for auth endpoints (security best practice)
         is_auth_endpoint = (
-            path.startswith("/api/auth/")
+            path.startswith("/auth/")
+            or path.startswith("/api/auth/")
             or "/login" in path
             or "/verify-otp" in path
             or "/refresh" in path

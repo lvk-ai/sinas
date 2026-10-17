@@ -2,6 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- Origin only, even same-origin: a setup link (/ui/?token=...) must not
+         ride along in the Referer of what the page loads before it strips it. -->
+    <meta name="referrer" content="strict-origin" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="alternate icon" type="image/png" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

@@ -269,5 +269,10 @@ class PasswordResetToken(Base):
     used_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[created_at]
     created_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
+    # "link": what an admin or the setup-link CLI hands out (redeemable via
+    # /auth/password-reset or /auth/setup-link/exchange). "setup_session":
+    # what exchanging a link returns, redeemable only via
+    # /auth/setup-link/complete. Never interchangeable.
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False, server_default="link")
 
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])

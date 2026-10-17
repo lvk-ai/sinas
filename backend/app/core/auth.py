@@ -40,8 +40,6 @@ from app.models import (
     UserRole,
 )
 
-PASSWORD_RESET_TOKEN_EXPIRY_HOURS = 24
-
 security = HTTPBearer()
 
 
@@ -68,67 +66,169 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-async def create_password_reset_token(
-    db: AsyncSession, user_id: str, created_by: Optional[str] = None
-) -> tuple[str, PasswordResetToken]:
-    """
-    Create a one-time password reset token. Plaintext is returned to the caller
-    (the admin) once; only the hash is stored.
-    """
-    plain_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
-    expires_at = datetime.now(UTC) + timedelta(hours=PASSWORD_RESET_TOKEN_EXPIRY_HOURS)
+def hash_reset_token(plain_token: str) -> str:
+    """At-rest form of a password reset/setup token (SHA-256: the token is
+    256 random bits, so a slow hash adds nothing)."""
+    return hashlib.sha256(plain_token.encode()).hexdigest()
 
+
+# PasswordResetToken.purpose values.
+RESET_LINK = "link"  # handed out by an admin / the setup-link CLI
+SETUP_SESSION = "setup_session"  # what exchanging a link returns; never a link
+
+
+# Every change to a user's password or reset tokens runs in one transaction
+# holding this lock: minting, redeeming, exchanging a link for a setup
+# session, completing setup, and every password change. Serialised per user,
+# a password change can never miss a token minted concurrently with it, and
+# two concurrent mints can't both leave a usable link.
+async def lock_user_for_credentials(db: AsyncSession, user_id) -> None:
+    """SELECT ... FOR UPDATE on the user row, held until the caller's
+    transaction ends (commit or rollback)."""
+    await db.execute(
+        select(User.id).where(User.id == uuid_lib.UUID(str(user_id))).with_for_update()
+    )
+
+
+async def revoke_tokens_locked(db: AsyncSession, user_id) -> int:
+    """Every unused token of the user, links and setup sessions alike. Caller
+    holds the user lock and commits."""
+    result = await db.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == uuid_lib.UUID(str(user_id)),
+            PasswordResetToken.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(UTC))
+    )
+    return result.rowcount or 0
+
+
+async def issue_reset_token_locked(
+    db: AsyncSession,
+    user_id,
+    purpose: str = RESET_LINK,
+    created_by: Optional[str] = None,
+    ttl: Optional[timedelta] = None,
+) -> tuple[str, PasswordResetToken]:
+    """Revoke the user's outstanding tokens and insert a new one, without
+    committing. Caller holds the user lock."""
+    now = datetime.now(UTC)
+    plain_token = secrets.token_urlsafe(32)
+    await revoke_tokens_locked(db, user_id)
     record = PasswordResetToken(
-        user_id=uuid_lib.UUID(user_id),
-        token_hash=token_hash,
-        expires_at=expires_at,
-        created_by=uuid_lib.UUID(created_by) if created_by else None,
+        user_id=uuid_lib.UUID(str(user_id)),
+        token_hash=hash_reset_token(plain_token),
+        expires_at=now + (ttl or timedelta(hours=settings.password_reset_token_ttl_hours)),
+        created_by=uuid_lib.UUID(str(created_by)) if created_by else None,
+        purpose=purpose,
     )
     db.add(record)
+    await db.flush()
+    return plain_token, record
+
+
+async def create_password_reset_token(
+    db: AsyncSession,
+    user_id: str,
+    created_by: Optional[str] = None,
+    ttl: Optional[timedelta] = None,
+) -> tuple[str, PasswordResetToken]:
+    """
+    Create a one-time password reset link. Plaintext is returned to the caller
+    once; only the hash is stored.
+
+    Newest link wins: every earlier unused token for the user (links and
+    setup sessions) is revoked in the same transaction, under the user lock,
+    so re-issuing a link kills the one sent before, even concurrently.
+    """
+    await lock_user_for_credentials(db, user_id)
+    plain_token, record = await issue_reset_token_locked(
+        db, user_id, RESET_LINK, created_by=created_by, ttl=ttl
+    )
     await db.commit()
     await db.refresh(record)
     return plain_token, record
 
 
-async def consume_password_reset_token(
-    db: AsyncSession, plain_token: str
+async def take_reset_token(
+    db: AsyncSession, plain_token: str, purpose: str = RESET_LINK
 ) -> Optional[PasswordResetToken]:
     """
-    Validate and consume a password reset token. Returns the record on success
-    (with used_at set) or None if the token is invalid, expired, or already used.
+    Lock the token's user and consume the token if it is unused, unexpired and
+    of `purpose`. Does NOT commit: the caller finishes its work (set a
+    password, mint a setup session) in the same transaction, under the lock,
+    then commits. None (and nothing locked) for an unusable token.
+
+    The consume is re-checked under the lock: a token revoked by a password
+    change that committed first no longer matches.
     """
-    token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
-
-    result = await db.execute(
-        select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash)
-    )
-    record = result.scalar_one_or_none()
-
-    if not record or record.used_at is not None:
+    if not plain_token:
         return None
-    if record.expires_at < datetime.now(UTC):
+    token_hash = hash_reset_token(plain_token)
+    user_id = (
+        await db.execute(
+            select(PasswordResetToken.user_id).where(PasswordResetToken.token_hash == token_hash)
+        )
+    ).scalar_one_or_none()
+    if user_id is None:
         return None
+    await lock_user_for_credentials(db, user_id)
+    now = datetime.now(UTC)
+    token_id = (
+        await db.execute(
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.token_hash == token_hash,
+                PasswordResetToken.purpose == purpose,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            )
+            .values(used_at=now)
+            .returning(PasswordResetToken.id)
+        )
+    ).scalar_one_or_none()
+    if token_id is None:
+        # Nothing changed; end the transaction to release the lock. (commit,
+        # not rollback: a caller's session may be nested in an outer
+        # transaction it must not roll back.)
+        await db.commit()
+        return None
+    return await db.get(PasswordResetToken, token_id, populate_existing=True)
 
-    record.used_at = datetime.now(UTC)
-    await db.commit()
+
+async def consume_password_reset_token(
+    db: AsyncSession, plain_token: str, purpose: str = RESET_LINK
+) -> Optional[PasswordResetToken]:
+    """
+    Validate and consume a password reset token of `purpose` (default: a
+    link). Returns the record (used_at set) or None if the token is invalid,
+    expired, already used, revoked, or of another purpose. Commits.
+    """
+    record = await take_reset_token(db, plain_token, purpose)
+    if record is not None:
+        await db.commit()
     return record
 
 
 async def revoke_outstanding_password_reset_tokens(db: AsyncSession, user_id) -> int:
-    """Mark every unused reset token for a user as used. Called once a token is
-    redeemed: any sibling link (two admins issuing one each, or the boot-time
-    setup link minted by more than one replica) must not stay redeemable for
-    up to 24h after the account already has its password."""
-    from sqlalchemy import update
-
-    result = await db.execute(
-        update(PasswordResetToken)
-        .where(PasswordResetToken.user_id == user_id, PasswordResetToken.used_at.is_(None))
-        .values(used_at=datetime.now(UTC))
-    )
+    """Mark every unused reset token (links and setup sessions) of a user as
+    used, under the user lock. Commits."""
+    await lock_user_for_credentials(db, user_id)
+    count = await revoke_tokens_locked(db, user_id)
     await db.commit()
-    return result.rowcount or 0
+    return count
+
+
+async def apply_new_password(db: AsyncSession, user: User, password_hash: str) -> None:
+    """Set a user's password: under the user lock, with every outstanding
+    reset link and setup session revoked in the same transaction. Commits.
+    Hash the password (slow) before calling, not under the lock. Every path
+    that changes a password goes through here (or holds the lock itself)."""
+    await lock_user_for_credentials(db, user.id)
+    user.password_hash = password_hash
+    await revoke_tokens_locked(db, user.id)
+    await db.commit()
 
 
 async def warn_if_users_lack_passwords(db: AsyncSession) -> None:
@@ -156,7 +256,8 @@ async def warn_if_users_lack_passwords(db: AsyncSession) -> None:
     suffix = f" (showing first 5: {sample})" if count > 5 else f" ({sample})"
     logger.warning(
         f"AUTH_MODE={settings.auth_mode} but {count} user(s) have no password set "
-        f"and cannot sign in until an admin issues a reset link{suffix}"
+        f"and cannot sign in until they get a setup link (an admin's reset link, or "
+        f"`python -m app.cli setup-link --email <email>`){suffix}"
     )
 
 
@@ -1136,11 +1237,11 @@ async def initialize_superadmin(db: AsyncSession):
       UI reverts on restart while the var is set. This doubles as the "admin lost
       their password" escape hatch: change SUPERADMIN_PASSWORD and restart.
     - SUPERADMIN_PASSWORD unset: the superadmin owns their password. Nothing is
-      touched once one is set. Until then, every boot issues a one-time setup link
-      (a standard password-reset token) and logs it — the operator opens it from
-      the pod/container logs. Anyone who can read those logs can claim a fresh
-      instance, which is the same trust boundary as Jenkins' initial admin
-      password; it beats the alternative of an unauthenticated "set password"
+      touched once one is set. Until then, every boot logs one line telling the
+      operator how to mint a one-time setup link (`python -m app.cli
+      setup-link`, run inside the backend container). The link itself is never
+      logged: minting takes a shell in the container, a stronger boundary than
+      read access to logs, and it beats an unauthenticated "set password"
       endpoint that the first scanner to find the host could use.
     """
     import logging
@@ -1201,8 +1302,8 @@ async def initialize_superadmin(db: AsyncSession):
         )
         if needs_update:
             reverted = bool(user.password_hash)
-            user.password_hash = hash_password(settings.superadmin_password)
-            await db.commit()
+            # Under the user lock, outstanding links/sessions revoked with it.
+            await apply_new_password(db, user, hash_password(settings.superadmin_password))
             if reverted:
                 logger.warning(
                     f"Superadmin password for {email} differed from SUPERADMIN_PASSWORD "
@@ -1218,43 +1319,8 @@ async def initialize_superadmin(db: AsyncSession):
     if user.password_hash:
         return  # self-managed; never touch an existing password
 
-    await _issue_superadmin_setup_link(db, user, logger)
+    from app.services.setup_link import log_setup_hint
 
-
-# Sibling uvicorn workers run the lifespan concurrently. A token this young and
-# still unused was minted by one of them a moment ago — don't issue another.
-_SETUP_LINK_DEDUP_WINDOW = timedelta(seconds=60)
-
-
-async def _issue_superadmin_setup_link(db: AsyncSession, user: User, logger) -> None:
-    """Mint a one-time password-reset token for a password-less superadmin and
-    log the link. Only ever called when the account has NO password; an account
-    that has one is never re-issued a link this way (that would be a takeover
-    vector for anyone with log access)."""
-    now = datetime.now(UTC)
-    recent = await db.execute(
-        select(PasswordResetToken.id).where(
-            PasswordResetToken.user_id == user.id,
-            PasswordResetToken.used_at.is_(None),
-            PasswordResetToken.expires_at > now,
-            PasswordResetToken.created_at > now - _SETUP_LINK_DEDUP_WINDOW,
-        )
-    )
-    if recent.first():
-        return
-
-    plain_token, _ = await create_password_reset_token(db, str(user.id))
-    url = f"{settings.public_console_url}/reset-password?token={plain_token}"
-    logger.warning(
-        "\n"
-        "==================== SUPERADMIN SETUP ====================\n"
-        f"  {user.email} has no password yet. Set one via this one-time link\n"
-        f"  (valid {PASSWORD_RESET_TOKEN_EXPIRY_HOURS}h; restart to get a fresh one):\n"
-        "\n"
-        f"    {url}\n"
-        "\n"
-        "  If the console is served from another origin, open\n"
-        f"  <console-origin>/ui/reset-password?token={plain_token}\n"
-        "  To pin the password from config instead, set SUPERADMIN_PASSWORD.\n"
-        "==========================================================="
-    )
+    # The how, never a token: anyone who can read logs must not be able to
+    # claim the instance.
+    await log_setup_hint(email, logger)

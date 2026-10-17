@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     rate_limit_login_ip_max: int = 10  # Max login requests per IP per window
     rate_limit_login_email_max: int = 5  # Max login requests per email per window
     rate_limit_otp_ip_max: int = 10  # Max OTP verify requests per IP per window
+    rate_limit_setup_link_ip_max: int = 10  # Max setup-link exchange/complete requests per IP per window
     rate_limit_window_seconds: int = 900  # Rate limit window (15 minutes)
 
     # SMTP Configuration (for sending emails)
@@ -445,6 +446,11 @@ class Settings(BaseSettings):
     superadmin_email: Optional[str] = None  # Email for superadmin user
     superadmin_password: Optional[str] = None  # Seed password for superadmin (used when auth_mode includes password)
 
+    # How long a password setup/reset link stays valid (hours). One setting
+    # for both: an admin's "reset link" and the operator's `setup-link` CLI
+    # mint the same single-use token.
+    password_reset_token_ttl_hours: int = 24
+
     # Authentication mode: "otp", "password", or "password+otp"
     # otp: email OTP only (default, requires SMTP)
     # password: password only (works airgapped, no SMTP needed)
@@ -458,6 +464,13 @@ class Settings(BaseSettings):
     # other than localhost. For a lab IdP only: over plain http the code and
     # tokens cross the network readable.
     oidc_allow_http: bool = False
+
+    @field_validator("password_reset_token_ttl_hours")
+    @classmethod
+    def _validate_reset_ttl(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"PASSWORD_RESET_TOKEN_TTL_HOURS must be positive, got {v}")
+        return v
 
     @field_validator("content_filter_timeout_seconds")
     @classmethod

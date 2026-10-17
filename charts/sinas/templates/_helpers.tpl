@@ -185,8 +185,8 @@ Backend environment — shared by backend, all workers, scheduler, cdc-worker
 {{- end }}
 {{/*
 Auto auth mode. OTP needs SMTP (codes arrive by email); without SMTP the
-only way in is a password. With no superadminPassword either, the backend
-issues a one-time setup link in its logs on boot (see NOTES.txt).
+only way in is a password. With no superadminPassword either, the operator
+mints a one-time setup link with `python -m app.cli setup-link` (see NOTES.txt).
 */}}
 {{- $hasSmtp := ne (.Values.smtp.host | default "") "" }}
 {{- $auto := "otp" }}
