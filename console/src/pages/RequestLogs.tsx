@@ -17,11 +17,18 @@ import {
   Workflow,
 } from 'lucide-react';
 import { Messages } from './Messages';
+import { useAuth } from '../lib/auth-context';
+import { isClickHouseEnabled, requestLogsState, unavailableDetail } from '../lib/clickhouse';
+import { ClickHouseDisabledState, ClickHouseUnavailableState } from '../components/ClickHouseNotice';
 
 type Tab = 'requests' | 'messages' | 'executions';
 
 export function RequestLogs() {
-  const [activeTab, setActiveTab] = useState<Tab>('requests');
+  const { instanceInfo } = useAuth();
+  const clickhouseEnabled = isClickHouseEnabled(instanceInfo?.features);
+  // Without ClickHouse there are no request logs: open on the message logs,
+  // keeping the Request Logs tab reachable to explain why it's empty.
+  const [activeTab, setActiveTab] = useState<Tab>(clickhouseEnabled ? 'requests' : 'messages');
   const [treeChatId, setTreeChatId] = useState<string | null>(null);
 
   const viewTree = (chatId: string) => {
@@ -49,6 +56,14 @@ export function RequestLogs() {
           >
             <Activity className="w-5 h-5 inline mr-2" />
             Request Logs
+            {!clickhouseEnabled && (
+              <span
+                className="ml-2 px-1.5 py-0.5 text-xs font-medium rounded bg-surface-1 border border-line-soft text-gray-500"
+                title="ClickHouse is disabled on this deployment"
+              >
+                off
+              </span>
+            )}
           </button>
           <button
             onClick={() => setActiveTab('messages')}
@@ -86,6 +101,8 @@ export function RequestLogs() {
 }
 
 function RequestLogsTab() {
+  const { instanceInfo } = useAuth();
+  const clickhouseEnabled = isClickHouseEnabled(instanceInfo?.features);
   const [filters, setFilters] = useState({
     user_id: '',
     start_time: '',
@@ -99,8 +116,9 @@ function RequestLogsTab() {
   const [showFilters, setShowFilters] = useState(false);
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
 
-  const { data: logs, isLoading } = useQuery({
+  const { data: logs, isLoading, error: logsError } = useQuery({
     queryKey: ['requestLogs', filters],
+    enabled: clickhouseEnabled,
     queryFn: () => {
       const params: any = { ...filters };
       Object.keys(params).forEach(key => {
@@ -114,6 +132,7 @@ function RequestLogsTab() {
 
   const { data: stats } = useQuery({
     queryKey: ['requestLogStats', filters.user_id, filters.start_time, filters.end_time],
+    enabled: clickhouseEnabled,
     queryFn: () => {
       const params: any = {};
       if (filters.user_id) params.user_id = filters.user_id;
@@ -173,6 +192,10 @@ function RequestLogsTab() {
     a.download = `request-logs-${new Date().toISOString()}.csv`;
     a.click();
   };
+
+  const state = requestLogsState(instanceInfo?.features, logsError);
+  if (state === 'disabled') return <ClickHouseDisabledState />;
+  if (state === 'unavailable') return <ClickHouseUnavailableState detail={unavailableDetail(logsError)} />;
 
   return (
     <div className="space-y-6">
@@ -366,6 +389,8 @@ function RequestLogsTab() {
 
         {isLoading ? (
           <div className="text-center py-8 text-gray-500">Loading logs...</div>
+        ) : state === 'error' ? (
+          <div className="text-center py-8 text-gray-500">Could not load request logs.</div>
         ) : !logs || logs.length === 0 ? (
           <div className="text-center py-8 text-gray-500">No logs found</div>
         ) : (
