@@ -6,8 +6,10 @@ import ThemeToggle from '../components/ThemeToggle';
 import { apiClient, getApiErrorMessage } from '../lib/api';
 import { useAuth } from '../lib/auth-context';
 import {
+  clearPendingCode,
   clearSetupSession,
-  loadSetupSession,
+  resumeSetup,
+  savePendingCode,
   saveSetupSession,
   takeSetupLinkToken,
   type SetupSession,
@@ -59,12 +61,19 @@ export function SetupLink() {
       setView(session.has_password ? { kind: 'has-password', session } : { kind: 'form', session });
 
     if (!token) {
-      // A reload of this page: the session the link was traded for, if any.
-      const stored = loadSetupSession();
-      if (stored) show(stored);
-      else setView({ kind: 'refused', message: INVALID });
+      // A reload of this page: the code step (password already saved), or
+      // the session the link was traded for, if any.
+      const resumed = resumeSetup();
+      if (resumed?.step === 'code') {
+        setView({ kind: 'otp', sessionId: resumed.pending.session_id, email: resumed.pending.email });
+      } else if (resumed?.step === 'password') {
+        show(resumed.session);
+      } else {
+        setView({ kind: 'refused', message: INVALID });
+      }
       return;
     }
+    clearPendingCode();  // a new link starts over
     apiClient.exchangeSetupLink(token)
       .then((session) => {
         saveSetupSession(session);
@@ -75,6 +84,7 @@ export function SetupLink() {
 
   const toLogin = () => {
     clearSetupSession();
+    clearPendingCode();
     navigate('/login', { replace: true });
   };
 
@@ -98,6 +108,8 @@ export function SetupLink() {
       const otpSession = await completeSetup(session.setup_token, password);
       clearSetupSession();
       if (otpSession) {
+        // Kept for a reload: the password is saved, only the code is left.
+        savePendingCode({ session_id: otpSession, email: session.email });
         setView({ kind: 'otp', sessionId: otpSession, email: session.email });
       } else {
         navigate('/', { replace: true });
@@ -125,6 +137,7 @@ export function SetupLink() {
     setBusy(true);
     try {
       await verifyOTP(sessionId, otpCode);
+      clearPendingCode();
       navigate('/', { replace: true });
     } catch (err) {
       setError(getApiErrorMessage(err, 'Invalid code'));
@@ -293,6 +306,11 @@ export function SetupLink() {
                 className="w-full btn btn-primary py-3 rounded-lg flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Verify and continue'}
+              </button>
+              {/* The code expired or was mistyped too often: the password is
+                  saved, so a normal sign-in (with a fresh code) finishes it. */}
+              <button type="button" onClick={toLogin} className="w-full text-sm text-gray-400 hover:text-gray-200">
+                Code expired? Sign in with your new password
               </button>
             </form>
           )}

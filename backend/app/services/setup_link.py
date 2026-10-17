@@ -23,9 +23,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import (
-    consume_password_reset_token,
+    RESET_LINK,
+    SETUP_SESSION,
     create_password_reset_token,
     get_user_by_email,
+    issue_reset_token_locked,
+    revoke_tokens_locked,
+    take_reset_token,
 )
 from app.core.config import settings
 from app.models import PasswordResetToken, User
@@ -81,32 +85,59 @@ async def mint_setup_link(
     return setup_link_url(plain_token), record, user
 
 
+async def _active_user(db: AsyncSession, user_id) -> User | None:
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    return user if user is not None and user.is_active else None
+
+
 async def exchange_setup_link(
     db: AsyncSession, plain_token: str
 ) -> tuple[str, PasswordResetToken, User] | None:
-    """Burn a link token and hand back a setup session token (never put in a
-    URL) for the same user. None for any unusable link or account."""
-    record = await consume_password_reset_token(db, plain_token)
+    """Spend a link and hand back a setup session token (never put in a URL)
+    for the same user. One transaction under the user lock: the link is
+    consumed and the session created together, so a password change can't
+    slip in between and miss the session. Only a *link* is accepted here: a
+    setup session can never mint another one. None for any unusable link or
+    account."""
+    record = await take_reset_token(db, plain_token, RESET_LINK)
     if record is None:
         return None
-    user = (await db.execute(select(User).where(User.id == record.user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
+    user = await _active_user(db, record.user_id)
+    if user is None:
+        await db.commit()  # the link stays spent
         return None
     ttl = min(SETUP_SESSION_TTL, timedelta(hours=settings.password_reset_token_ttl_hours))
-    session_token, session = await create_password_reset_token(db, str(user.id), ttl=ttl)
+    session_token, session = await issue_reset_token_locked(db, user.id, SETUP_SESSION, ttl=ttl)
+    await db.commit()
+    await db.refresh(session)
     logger.warning("Setup link opened for user %s", user.id)
     return session_token, session, user
 
 
 async def redeem_setup_session(db: AsyncSession, session_token: str) -> User | None:
-    """Consume a setup session token. None for any unusable token or account."""
-    record = await consume_password_reset_token(db, session_token)
+    """Consume a setup session (only a session: never a link) and return its
+    user, leaving the transaction open with the user lock held so the caller
+    sets the password in it (finish_setup). The session's validity is
+    checked under the lock, so one revoked by a password change that
+    committed first is refused. None (transaction ended) for any unusable
+    session or account."""
+    record = await take_reset_token(db, session_token, SETUP_SESSION)
     if record is None:
         return None
-    user = (await db.execute(select(User).where(User.id == record.user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
+    user = await _active_user(db, record.user_id)
+    if user is None:
+        await db.commit()
         return None
     return user
+
+
+async def finish_setup(db: AsyncSession, user: User, password_hash: str) -> None:
+    """Set the password redeem_setup_session's caller chose, revoke every
+    other outstanding link/session, commit (releasing the lock)."""
+    user.password_hash = password_hash
+    await revoke_tokens_locked(db, user.id)
+    await db.commit()
+    logger.warning("Password set via setup link for user %s", user.id)
 
 
 async def log_setup_hint(email: str, log: logging.Logger) -> None:

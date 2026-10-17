@@ -91,3 +91,52 @@ export function clearSetupSession(): void {
     // ignore
   }
 }
+
+/** password+otp: the password is saved and a code was emailed; what the code
+ * step needs to survive a reload. The OTP session id is no credential on its
+ * own (the emailed code is), the same as the login page's code step. */
+export interface PendingCode {
+  session_id: string;
+  email: string;
+}
+
+const PENDING_CODE_KEY = 'sinas_setup_pending_code';
+
+export function savePendingCode(pending: PendingCode): void {
+  try {
+    sessionStorage.setItem(PENDING_CODE_KEY, JSON.stringify(pending));
+  } catch {
+    // storage unavailable: the code step works until a reload
+  }
+}
+
+export function loadPendingCode(): PendingCode | null {
+  try {
+    const raw = sessionStorage.getItem(PENDING_CODE_KEY);
+    if (!raw) return null;
+    const pending = JSON.parse(raw) as PendingCode;
+    return pending.session_id && pending.email ? pending : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where a reload of the setup page (no token in the URL) picks up: the code
+ * step if the password is already saved, else the setup session, else
+ * nothing (the link is spent or was never valid). */
+export function resumeSetup(
+  now: number = Date.now(),
+): { step: 'code'; pending: PendingCode } | { step: 'password'; session: SetupSession } | null {
+  const pending = loadPendingCode();
+  if (pending) return { step: 'code', pending };
+  const session = loadSetupSession(now);
+  return session ? { step: 'password', session } : null;
+}
+
+export function clearPendingCode(): void {
+  try {
+    sessionStorage.removeItem(PENDING_CODE_KEY);
+  } catch {
+    // ignore
+  }
+}

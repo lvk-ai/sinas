@@ -13,7 +13,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import (
-    consume_password_reset_token,
+    RESET_LINK,
+    apply_new_password,
     create_access_token,
     create_otp_session,
     create_refresh_token,
@@ -25,7 +26,9 @@ from app.core.auth import (
     revoke_all_refresh_tokens,
     revoke_outstanding_password_reset_tokens,
     revoke_refresh_token,
+    revoke_tokens_locked,
     set_permission_used,
+    take_reset_token,
     validate_refresh_token,
     verify_otp_code,
     verify_password,
@@ -411,23 +414,27 @@ async def redeem_password_reset(
         settings.rate_limit_window_seconds,
     )
 
-    record = await consume_password_reset_token(db, request.reset_token)
+    invalid = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid, expired, or already-used reset token.",
+    )
+    password_hash = hash_password(request.new_password)  # slow: not under the lock
+    # Consume the link (links only, never a setup session) and set the
+    # password in one transaction under the user lock, every other
+    # outstanding link/session revoked with it.
+    record = await take_reset_token(db, request.reset_token, RESET_LINK)
     if not record:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid, expired, or already-used reset token.",
-        )
+        raise invalid
 
     result = await db.execute(select(User).where(User.id == record.user_id))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        await db.commit()  # the link stays spent
+        raise invalid
 
-    user.password_hash = hash_password(request.new_password)
+    user.password_hash = password_hash
+    await revoke_tokens_locked(db, user.id)
     await db.commit()
-
-    # Any other outstanding link for this account dies with this one.
-    await revoke_outstanding_password_reset_tokens(db, user.id)
     await revoke_all_refresh_tokens(db, str(user.id))
     return None
 
@@ -524,6 +531,10 @@ async def complete_setup_link(
         settings.rate_limit_window_seconds,
     )
 
+    password_hash = hash_password(request.new_password)  # slow: not under the lock
+    # Consumes the session (sessions only, never a link) under the user lock
+    # and keeps the transaction open: the password is set in it, so nothing
+    # can change the password or revoke the session in between.
     user = await setup_link_service.redeem_setup_session(db, request.setup_token)
     if user is None:
         raise _setup_link_refused()
@@ -531,16 +542,14 @@ async def complete_setup_link(
 
     sso = await sso_service.enforcing_provider(db, user.email)
     if sso is not None:
+        await db.commit()  # the session stays spent
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=sso_service.enforced_message(sso, user.email),
         )
 
-    user.password_hash = hash_password(request.new_password)
-    await db.commit()
-    await revoke_outstanding_password_reset_tokens(db, user.id)
+    await setup_link_service.finish_setup(db, user, password_hash)
     await revoke_all_refresh_tokens(db, str(user.id))
-    logger.warning("Password set via setup link for user %s", user.id)
 
     if "otp" in settings.auth_mode:
         try:
@@ -595,11 +604,8 @@ async def change_password(
             detail="Current password is incorrect.",
         )
 
-    user.password_hash = hash_password(request.new_password)
-    await db.commit()
-
-    # Any other outstanding link for this account dies with this one.
-    await revoke_outstanding_password_reset_tokens(db, user.id)
+    # Under the user lock; any outstanding link/setup session dies with it.
+    await apply_new_password(db, user, hash_password(request.new_password))
     await revoke_all_refresh_tokens(db, str(user.id))
     return None
 

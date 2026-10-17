@@ -36,3 +36,41 @@ test('not a setup link: other pages, no token, an empty token, outside the conso
   assert.equal(m.parseSetupLink('/uix', '?token=abc', '', '/ui/'), null);
   assert.equal(m.parseSetupLink('/', '?token=abc', '', '/ui/'), null);
 });
+
+// A minimal sessionStorage for the resume tests (node has none).
+function stubSessionStorage() {
+  const store = new Map();
+  globalThis.sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  return store;
+}
+
+const session = { setup_token: 's', email: 'a@example.com', has_password: false, expires_at: '2100-01-01T00:00:00Z' };
+
+test('a reload during the code step resumes the code step, not "invalid link"', () => {
+  stubSessionStorage();
+  // password+otp: the password is saved, the setup session cleared, a code sent
+  m.saveSetupSession(session);
+  m.clearSetupSession();
+  m.savePendingCode({ session_id: 'otp-1', email: 'a@example.com' });
+  assert.deepEqual(m.resumeSetup(), { step: 'code', pending: { session_id: 'otp-1', email: 'a@example.com' } });
+  m.clearPendingCode();
+  assert.equal(m.resumeSetup(), null);
+});
+
+test('a reload before saving resumes the password step until the session expires', () => {
+  stubSessionStorage();
+  m.saveSetupSession(session);
+  assert.deepEqual(m.resumeSetup(Date.parse('2099-01-01T00:00:00Z')), { step: 'password', session });
+  assert.equal(m.resumeSetup(Date.parse('2100-01-02T00:00:00Z')), null);
+});
+
+test('garbage in storage resumes nothing', () => {
+  const store = stubSessionStorage();
+  store.set('sinas_setup_pending_code', '{not json');
+  store.set('sinas_setup_session', '{"email":"x"}');
+  assert.equal(m.resumeSetup(), null);
+});
