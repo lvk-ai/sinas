@@ -644,6 +644,12 @@ class PackageService:
                     "requires_input": dep_needs,
                     "preview": dep_result.model_dump(mode="json"),
                 })
+            elif entry.status == deps.INVALID and entry.yaml:
+                # Its variables may be what made it invalid (a value that
+                # isn't a usable instance name): list them, so the values
+                # can be corrected and previewed again.
+                declarations = self._extract_variable_declarations(entry.yaml)
+                item.update({"variables": declarations, "requires_input": bool(declarations)})
             planned.append(item)
 
         result, variable_declarations, requires_input, install_info, config = await self._preview_one(

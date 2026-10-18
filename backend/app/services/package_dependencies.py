@@ -537,6 +537,9 @@ async def resolve_plan(
             entry.message = (
                 f"{name} {entry.version} from {repository.name} can't be installed as '{target}': {e}"
             )
+            # Kept (never installed): the preview still lists its variables,
+            # so a value that made it invalid can be corrected.
+            entry.yaml = text
             return entry, []
         entry.status, entry.yaml = INSTALL, text
         if waiting:
