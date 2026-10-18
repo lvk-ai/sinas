@@ -1067,21 +1067,39 @@ def encode_chat_cursor(updated_at: datetime, chat_id: uuid.UUID) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
+def _parse_chat_cursor(cursor: str) -> Optional[tuple[datetime, uuid.UUID]]:
+    """(updated_at, id) from a cursor, or None unless it has exactly the
+    shape encode_chat_cursor writes: {"u": aware ISO datetime, "i": UUID}."""
+    if len(cursor) > _CURSOR_MAX_LEN:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii") + b"=" * (-len(cursor) % 4))
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:  # non-ASCII, bad base64, not UTF-8, not JSON
+        return None
+    if not isinstance(data, dict) or set(data) != {"u", "i"}:
+        return None
+    u, i = data["u"], data["i"]
+    if not isinstance(u, str) or not isinstance(i, str):
+        return None
+    try:
+        updated_at = datetime.fromisoformat(u)
+        chat_id = uuid.UUID(i)
+        if updated_at.tzinfo is None:  # ambiguous against timestamptz
+            return None
+        # In UTC, as the driver sends it; out of range (year 1 at +14:00) fails here.
+        updated_at = updated_at.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    return updated_at, chat_id
+
+
 def decode_chat_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
     """Inverse of encode_chat_cursor; anything malformed is a 400."""
-    try:
-        if len(cursor) > _CURSOR_MAX_LEN:
-            raise ValueError("cursor too long")
-        data = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-        updated_at = datetime.fromisoformat(data["u"])
-        chat_id = uuid.UUID(data["i"])
-        if updated_at.tzinfo is None:
-            raise ValueError("cursor timestamp has no timezone")
-    except (ValueError, KeyError, TypeError):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor"
-        ) from None
-    return updated_at, chat_id
+    parsed = _parse_chat_cursor(cursor)
+    if parsed is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor")
+    return parsed
 
 
 @router.get("/chats", response_model=list[ChatResponse])
