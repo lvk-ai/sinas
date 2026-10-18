@@ -109,6 +109,8 @@ test('the confirmation calls the counts eligible and states the run limits', () 
 test('skip reasons and sizes read as words', () => {
   assert.equal(m.skipLabel('pending_approval'), 'tool approval pending');
   assert.equal(m.skipLabel('something_new'), 'something new');
+  assert.equal(m.skipLabel('too_large'), 'too large to archive safely');
+  assert.equal(m.skipLabel('not_eligible'), 'active again or retention changed');
   assert.equal(m.formatBytes(512), '512 B');
   assert.equal(m.formatBytes(1536), '1.5 KB');
   assert.equal(m.formatBytes(50 * 1024 * 1024), '50 MB');

@@ -1792,7 +1792,7 @@ export interface RetentionRunCounts {
 export interface RetentionRun {
   id: string;
   trigger: 'schedule' | 'api' | 'cli';
-  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'refused';
+  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'refused' | 'interrupted';
   actor_email: string | null;
   created_at: string | null;
   started_at: string | null;

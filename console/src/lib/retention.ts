@@ -62,6 +62,8 @@ export const SKIP_REASONS: Record<string, string> = {
   locked: 'row locked at delete time',
   changed: 'written to while archiving',
   gone: 'deleted meanwhile',
+  not_eligible: 'active again or retention changed',
+  too_large: 'too large to archive safely',
 };
 
 export function skipLabel(reason: string): string {

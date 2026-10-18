@@ -30,6 +30,7 @@ const STATUS_STYLE: Record<RetentionRun['status'], string> = {
   partial: 'text-yellow-400',
   failed: 'text-red-400',
   refused: 'text-red-400',
+  interrupted: 'text-yellow-400',
 };
 
 function RunLine({ run }: { run: RetentionRun }) {
@@ -57,7 +58,7 @@ function RunLine({ run }: { run: RetentionRun }) {
       )}
       {run.counts && Object.keys(run.counts.failed).length > 0 && (
         <p className="text-xs text-red-400">
-          Failed (kept, retried next run): {Object.entries(run.counts.failed).map(([stage, n]) => `${n} at ${stage}`).join(', ')}
+          Failed (kept, retried on a later run): {Object.entries(run.counts.failed).map(([stage, n]) => `${n} at ${stage}`).join(', ')}
         </p>
       )}
       {run.error && <p className="text-xs text-red-400">{run.error}</p>}
