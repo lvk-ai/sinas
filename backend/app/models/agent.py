@@ -25,7 +25,7 @@ class Agent(Base, PermissionMixin):
     __table_args__ = (
         UniqueConstraint("namespace", "name", name="uix_agent_namespace_name"),
         CheckConstraint(
-            "retention_days IS NULL OR retention_days >= 0", name="ck_agents_retention_days_non_negative"
+            "retention_days IS NULL OR retention_days BETWEEN 0 AND 36500", name="ck_agents_retention_days_non_negative"
         ),
     )
 

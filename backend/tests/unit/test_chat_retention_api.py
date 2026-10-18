@@ -124,6 +124,11 @@ class TestAgentField:
         assert r.json()["retention_days"] is None
         r = await client.put(path, json={"retention_days": -1}, headers=auth_headers(admin_user))
         assert r.status_code == 422
+        # The same cap as the console's input: 100 years.
+        r = await client.put(path, json={"retention_days": 36501}, headers=auth_headers(admin_user))
+        assert r.status_code == 422
+        r = await client.put(path, json={"retention_days": 36500}, headers=auth_headers(admin_user))
+        assert r.status_code == 200 and r.json()["retention_days"] == 36500
 
     async def test_changes_are_in_the_history(self, client, db, admin_user):
         r = await client.post("/api/v1/agents", json=_agent_payload(), headers=auth_headers(admin_user))
