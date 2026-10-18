@@ -214,7 +214,8 @@ def _breaks(install_name: str, declared_name: Optional[str], version: Optional[s
     yet: the preview asks for the value, and the install refuses without it."""
     from app.services.package_dependencies import broken_dependents
 
-    if not declared_name or not version or "${{" in version:
+    # An empty version is judged like any other: it satisfies no range.
+    if not declared_name or version is None or "${{" in version:
         return []
     return broken_dependents(install_name, declared_name, version, installed)
 
@@ -381,7 +382,9 @@ class PackageService:
             root_repository=source[0] if source else (existing.source_repository if existing else None),
             dependency_variables=dependency_variables,
         )
-        if plan.blocking:
+        # errors(), not just blocking entries: a resolve that didn't settle
+        # reports a problem without any one entry being blocked.
+        if plan.errors():
             raise ValueError(
                 "Package not installed: its requirements can't be met. " + "; ".join(plan.errors())
             )
