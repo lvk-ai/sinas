@@ -7,6 +7,14 @@ import type { AgentUpdate, EffortLevel } from '../types';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { ApiUsage } from '../components/ApiUsage';
 import { useAuth } from '../lib/auth-context';
+import {
+  MAX_RETENTION_DAYS,
+  defaultOptionLabel,
+  retentionInputError,
+  retentionDaysFor,
+  retentionMode,
+  type RetentionMode,
+} from '../lib/retention';
 
 export function AgentDetail() {
   const { namespace, name } = useParams<{ namespace: string; name: string }>();
@@ -100,6 +108,14 @@ export function AgentDetail() {
   // Raw text of an MCP tool-pattern input while it is being edited; split
   // into patterns on blur (splitting on every keystroke ate the separators).
   const [mcpPatternDrafts, setMcpPatternDrafts] = useState<Record<string, string>>({});
+  // Chat retention: the select and, for "Delete after", the days as typed
+  // (formData.retention_days holds the last valid value).
+  const [retentionChoice, setRetentionChoice] = useState<RetentionMode>('default');
+  const [retentionText, setRetentionText] = useState('');
+  // Only what the user changes is validated: a stored value goes back as is.
+  const [retentionTouched, setRetentionTouched] = useState(false);
+  const retentionError = retentionInputError(retentionChoice, retentionText, retentionTouched);
+  const retentionInvalid = retentionError !== null;
   // A server may be bound more than once (REST and config allow it; the
   // allowed tools are the union). The editor shows that union and writes
   // it back as one binding, so editing never drops a sibling's patterns.
@@ -155,10 +171,32 @@ export function AgentDetail() {
         icon: agent.icon || undefined,
         default_job_timeout: agent.default_job_timeout ?? undefined,
         default_keep_alive: agent.default_keep_alive,
+        retention_days: agent.retention_days ?? null,
         system_tools: agent.system_tools || [],
       });
+      setRetentionChoice(retentionMode(agent.retention_days));
+      setRetentionText(agent.retention_days ? String(agent.retention_days) : '');
+      setRetentionTouched(false);
     }
   }, [agent]);
+
+  // The deployment's default, for the "Use default (N days)" label. Admins
+  // only (sinas.retention.read:all); others see "Use default".
+  const { data: retentionStatus } = useQuery({
+    queryKey: ['retention-status'],
+    queryFn: () => apiClient.getRetentionStatus(),
+    retry: false,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
+
+  const chooseRetention = (mode: RetentionMode, text: string) => {
+    setRetentionChoice(mode);
+    setRetentionText(text);
+    setRetentionTouched(true);
+    const days = retentionDaysFor(mode, text);
+    if (days !== undefined) setFormData((prev) => ({ ...prev, retention_days: days }));
+  };
 
   const updateMutation = useMutation({
     mutationFn: (data: AgentUpdate) => apiClient.updateAgent(namespace!, name!, data),
@@ -182,6 +220,7 @@ export function AgentDetail() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (retentionInvalid) return;
     // Enter can submit before an MCP pattern field blurs: fold any typed
     // drafts into the submitted bindings so nothing the user typed is lost.
     let submitted = formData;
@@ -556,6 +595,49 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 onChange={(e) => setFormData({ ...formData, default_job_timeout: e.target.value ? parseInt(e.target.value) : undefined })}
                 className="input w-48"
               />
+            </div>
+            <div>
+              <label htmlFor="retention_mode" className="block text-sm font-medium text-gray-300 mb-2">
+                Chat Retention
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  id="retention_mode"
+                  value={retentionChoice}
+                  onChange={(e) => chooseRetention(e.target.value as RetentionMode, retentionText)}
+                  className="input max-w-72"
+                >
+                  <option value="default">
+                    {defaultOptionLabel(retentionStatus?.policy.default_days, !!retentionStatus)}
+                  </option>
+                  <option value="never">Keep forever</option>
+                  <option value="days">Delete after a number of days</option>
+                </select>
+                {retentionChoice === 'days' && (
+                  <>
+                    <input
+                      id="retention_days"
+                      type="number"
+                      min={1}
+                      max={MAX_RETENTION_DAYS}
+                      placeholder="90"
+                      aria-label="Retention in days"
+                      aria-invalid={retentionInvalid}
+                      value={retentionText}
+                      onChange={(e) => chooseRetention('days', e.target.value)}
+                      className="input max-w-28"
+                    />
+                    <span className="text-sm text-gray-400">days after the last activity</span>
+                  </>
+                )}
+              </div>
+              {retentionError && <p className="text-xs text-red-400 mt-1">{retentionError}</p>}
+              <p className="text-xs text-gray-500 mt-1">
+                How long chats with this agent are kept after their last activity before they are archived and
+                deleted. Changing it takes the chat retention admin permission.
+                {retentionStatus && !retentionStatus.policy.enabled &&
+                  ' Chat retention is switched off on this deployment, so nothing is deleted yet.'}
+              </p>
             </div>
           </div>
         </div>
@@ -2269,7 +2351,9 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
 
         {updateMutation.isError && (
           <div className="p-3 bg-red-900/20 border border-red-800/30 rounded-lg text-sm text-red-400">
-            Failed to update agent. Please try again.
+            {typeof (updateMutation.error as any)?.response?.data?.detail === 'string'
+              ? `Failed to update agent: ${(updateMutation.error as any).response.data.detail}`
+              : 'Failed to update agent. Please try again.'}
           </div>
         )}
       </form>

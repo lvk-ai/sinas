@@ -2,6 +2,8 @@ import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { chatListParams, type ChatListFilter, type ChatListPage } from './chatPages';
 import type {
   AdminCreateResetLinkResponse,
+  RetentionPreview,
+  RetentionStatus,
   ConfigRestoreResult,
   ConfigRevision,
   ChangePasswordRequest,
@@ -1370,6 +1372,26 @@ class APIClient {
 
   async getQueueWorkers(): Promise<any[]> {
     const response = await this.configClient.get('/queue/workers');
+    return response.data;
+  }
+
+  // Chat retention (admin)
+  async getRetentionStatus(): Promise<RetentionStatus> {
+    // 403 is expected for everyone but admins (the agent form and the System
+    // page ask anyway, to show the default): no error toast for it.
+    const response = await this.configClient.get('/retention/status', { quietStatuses: [403] } as QuietRequestConfig);
+    return response.data;
+  }
+
+  /** What a run would archive and delete now; changes nothing. */
+  async previewRetention(): Promise<RetentionPreview> {
+    const response = await this.configClient.post('/retention/run', null, { params: { dry_run: true } });
+    return response.data;
+  }
+
+  /** Queue a real run (202); follow it through getRetentionStatus. */
+  async runRetention(): Promise<{ run_id: string; status: string }> {
+    const response = await this.configClient.post('/retention/run', null, { params: { dry_run: false } });
     return response.data;
   }
 
