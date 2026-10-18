@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Archive, Eye, Loader2, Play, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 import { apiClient } from '../lib/api';
@@ -146,6 +146,20 @@ export function RetentionPanel() {
     },
   });
 
+  // "Run queued" is about the run this panel started, and only until it
+  // shows up as the last run (or a newer one does): then the line above
+  // reports it and the stale success is cleared.
+  const queuedRunId = runMutation.isSuccess ? runMutation.data.run_id : null;
+  const lastRun = status?.last_run;
+  const queuedRunVisible =
+    !!queuedRunId &&
+    !!lastRun &&
+    (lastRun.id === queuedRunId ||
+      (!!lastRun.created_at && Date.parse(lastRun.created_at) >= runMutation.submittedAt));
+  useEffect(() => {
+    if (queuedRunVisible) runMutation.reset();
+  }, [queuedRunVisible, runMutation]);
+
   if ((error as any)?.response?.status === 403) return null; // not an admin
   if (isLoading) {
     return (
@@ -275,7 +289,7 @@ export function RetentionPanel() {
         </div>
       </div>
 
-      {runMutation.isSuccess && status.last_run?.id !== runMutation.data.run_id && (
+      {queuedRunId && !queuedRunVisible && (
         <p className="mt-3 text-sm text-green-400 flex items-center gap-1.5">
           <CheckCircle2 className="w-4 h-4" /> Run queued. It shows here once a worker picks it up.
         </p>
