@@ -318,7 +318,128 @@ class TestPlan:
         result, _, _, info = await PackageService(db).preview(
             package_yaml(a, requires=[{"name": b}, {"name": c}]), str(admin_user.id)
         )
-        assert not result.success and _deps(info)[d]["status"] == "incompatible"
+        entry = _deps(info)[d]
+        # No version meets both: refused, naming both constraints and who set them.
+        assert not result.success and entry["status"] == "missing"
+        assert f"'{b}' requires {d} >=1" in entry["message"] and f"'{c}' requires {d} >=2" in entry["message"]
+
+    async def test_a_shared_dependency_meets_every_constraint(self, db, admin_user, fake_repos):
+        """The first constraint seen doesn't lock the version: every
+        constraint is collected first (Greptile's two cases), whatever the
+        order the requirements are listed in."""
+        tag = _uid()
+        b, c, d = f"b{tag}", f"c{tag}", f"d{tag}"
+        preferred = await fake_repos.add(db, admin_user, f"a{tag}", [package_yaml(d, "1.5.0")])
+        other = await fake_repos.add(db, admin_user, f"z{tag}", [
+            package_yaml(d, "2.5.0"),
+            # b looks in the preferred repository first.
+            package_yaml(b, requires=[{"name": d, "version": ">=1", "repository": preferred.name}]),
+            package_yaml(c, requires=[{"name": d, "version": ">=2"}]),
+        ])
+        service = PackageService(db)
+
+        async def plan(order):
+            result, _, _, info = await service.preview(
+                package_yaml(f"root{tag}", requires=[{"name": n} for n in order]), str(admin_user.id)
+            )
+            return result, {e["install_name"]: (e["status"], e["version"], e["repository"]) for e in info["dependencies"]}
+
+        result, first = await plan([b, c])
+        assert result.success, result.errors
+        assert first[d] == ("install", "2.5.0", other.name)   # >=1 alone would have taken 1.5.0
+        _result, second = await plan([c, b])
+        assert second == first
+
+    async def test_a_later_upper_bound_picks_a_lower_version(self, db, admin_user, fake_repos):
+        tag = _uid()
+        b, c, d = f"b{tag}", f"c{tag}", f"d{tag}"
+        newest = await fake_repos.add(db, admin_user, f"a{tag}", [package_yaml(d, "3.0.0")])
+        older = await fake_repos.add(db, admin_user, f"z{tag}", [
+            package_yaml(d, "1.5.0"),
+            package_yaml(b, requires=[{"name": d, "version": ">=1", "repository": newest.name}]),
+            package_yaml(c, requires=[{"name": d, "version": "<2"}]),
+        ])
+        for order in ([b, c], [c, b]):
+            result, _, _, info = await PackageService(db).preview(
+                package_yaml(f"root{tag}", requires=[{"name": n} for n in order]), str(admin_user.id)
+            )
+            assert result.success, result.errors
+            assert (_deps(info)[d]["version"], _deps(info)[d]["repository"]) == ("1.5.0", older.name)
+
+    async def test_an_installed_dependency_must_meet_every_constraint(self, db, admin_user, fake_repos):
+        tag = _uid()
+        b, c, d = f"b{tag}", f"c{tag}", f"d{tag}"
+        await PackageService(db).install(package_yaml(d, "1.5.0"), str(admin_user.id))
+        await fake_repos.add(db, admin_user, f"r{tag}", [
+            package_yaml(d, "2.5.0"),   # available, but an installed one is never upgraded
+            package_yaml(b, requires=[{"name": d, "version": ">=1"}]),
+            package_yaml(c, requires=[{"name": d, "version": ">=2"}]),
+        ])
+        result, _, _, info = await PackageService(db).preview(
+            package_yaml(f"root{tag}", requires=[{"name": b}, {"name": c}]), str(admin_user.id)
+        )
+        entry = _deps(info)[d]
+        assert not result.success and entry["status"] == "incompatible"
+        assert f"'{c}' requires {d} >=2" in entry["message"] and f"'{b}'" not in entry["message"]
+
+    async def test_a_nested_requirement_waiting_for_a_variable(self, db, admin_user, fake_repos):
+        """a requires b (to install); b requires mail under an instance its
+        own variable names. First preview: b asks for MAILBOX; with it, mail
+        is resolved and installed under that name."""
+        tag = _uid()
+        a, b, mail = f"a{tag}", f"b{tag}", f"mail{tag}"
+        await fake_repos.add(db, admin_user, f"r{tag}", [
+            package_yaml(mail, multi=True),
+            package_yaml(b, requires=[{"name": mail, "instance": "${{ vars.MAILBOX }}"}], variable="MAILBOX"),
+        ])
+        root_yaml = package_yaml(a, requires=[{"name": b}])
+        service = PackageService(db)
+
+        result, _, _, info = await service.preview(root_yaml, str(admin_user.id))
+        entry = _deps(info)[b]
+        assert (entry["status"], entry["needs_input"], entry["requires_input"]) == ("install", True, True)
+        assert [v["name"] for v in entry["variables"]] == ["MAILBOX"] and entry["requires"] == []
+        assert not result.success and any("MAILBOX" in e for e in result.errors)
+        savepoint = await db.begin_nested()
+        with pytest.raises(ValueError, match="MAILBOX"):
+            await service.install(root_yaml, str(admin_user.id))
+        await savepoint.rollback()
+
+        values = {b: {"MAILBOX": f"{mail}-support"}}
+        result, _, _, info = await service.preview(root_yaml, str(admin_user.id), dependency_variables=values)
+        assert result.success, result.errors
+        assert [d["install_name"] for d in info["dependencies"]] == [f"{mail}-support", b]
+        assert not _deps(info)[b]["needs_input"] and _deps(info)[b]["requires"] == [f"{mail}-support"]
+
+        await service.install(root_yaml, str(admin_user.id), dependency_variables=values)
+        assert (await _installed(db, f"{mail}-support")).package_name == mail
+
+        # A value that still doesn't make a valid requirement: invalid.
+        bad = {b: {"MAILBOX": "Not A Name"}}
+        other_root = package_yaml(f"other{tag}", requires=[{"name": f"b2{tag}"}])
+        await fake_repos.add(db, admin_user, f"s{tag}", [
+            package_yaml(f"b2{tag}", requires=[{"name": mail, "instance": "${{ vars.MAILBOX }}"}], variable="MAILBOX"),
+        ])
+        _, _, _, info = await service.preview(
+            other_root, str(admin_user.id), dependency_variables={f"b2{tag}": bad[b]}
+        )
+        assert _deps(info)[f"b2{tag}"]["status"] == "invalid"
+
+    async def test_a_cycle_through_installed_packages_is_refused(self, db, admin_user, fake_repos):
+        """Upgrading a to require installed b, while b requires a: both would
+        block each other's uninstall."""
+        a, b = f"a{_uid()}", f"b{_uid()}"
+        service = PackageService(db)
+        await service.install(package_yaml(a, "1.0.0"), str(admin_user.id))
+        await service.install(package_yaml(b, requires=[{"name": a}]), str(admin_user.id))
+        upgrade = package_yaml(a, "2.0.0", requires=[{"name": b}])
+
+        result, _, _, info = await service.preview(upgrade, str(admin_user.id))
+        assert not result.success and _deps(info)[b]["status"] == "cycle"
+        assert f"{a} → {b} → {a}" in _deps(info)[b]["message"]
+        with pytest.raises(ValueError, match=f"{a} → {b} → {a}"):
+            await service.install(upgrade, str(admin_user.id))
+        assert (await _installed(db, a)).version == "1.0.0"
 
     async def test_cycles_fail_clearly(self, db, admin_user, fake_repos):
         a, b, c = f"a{_uid()}", f"b{_uid()}", f"c{_uid()}"
@@ -440,6 +561,25 @@ class TestUninstallAndUpgrade:
         _package, forced = await service.install(new, str(admin_user.id), allow_breaking_dependents=True)
         assert any("allowBreakingDependents" in w for w in forced.warnings)
         assert (await _installed(db, dep)).version == "2.0.0"
+
+    async def test_preview_and_install_check_the_substituted_version(self, db, admin_user, fake_repos):
+        """version: ${{ vars.VERSION }}: dependents are checked against the
+        version it is installed as, in the preview and the install alike."""
+        dep, root = f"gmail{_uid()}", f"triage{_uid()}"
+        service = PackageService(db)
+        templated = package_yaml(dep, "${{ vars.VERSION }}", variable="VERSION")
+        await service.install(templated, str(admin_user.id), variables={"VERSION": "1.0.0"})
+        await service.install(package_yaml(root, requires=[{"name": dep, "version": "<2"}]), str(admin_user.id))
+
+        result, _, _, info = await service.preview(templated, str(admin_user.id), variables={"VERSION": "2.0.0"})
+        assert not result.success and [b["dependent"] for b in info["breaks"]] == [root]
+        with pytest.raises(ValueError, match="would break"):
+            await service.install(templated, str(admin_user.id), variables={"VERSION": "2.0.0"})
+
+        result, _, _, info = await service.preview(templated, str(admin_user.id), variables={"VERSION": "1.5.0"})
+        assert result.success and info["breaks"] == [], result.errors
+        await service.install(templated, str(admin_user.id), variables={"VERSION": "1.5.0"})
+        assert (await _installed(db, dep)).version == "1.5.0"
 
     async def test_an_upgrade_rechecks_its_own_requirements(self, db, admin_user, fake_repos):
         dep, root = f"gmail{_uid()}", f"triage{_uid()}"
