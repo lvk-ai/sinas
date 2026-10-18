@@ -85,6 +85,16 @@ test('a package waiting for values to resolve its own requirements is still one 
   assert.deepEqual(m.dependencyPayload({ b: { MAILBOX: 'mail-support' } }, [waiting]), { b: { MAILBOX: 'mail-support' } });
 });
 
+test('a package a bad value made invalid keeps its fields and sends the corrected value', () => {
+  const vars = [{ name: 'MAILBOX', type: 'text' }];
+  const invalid = plan('b', 'invalid', { variables: vars, message: "can't be installed as 'b'" });
+  const entries = [invalid, plan('c', 'invalid'), plan('d', 'missing', { variables: vars }), plan('e', 'install', { variables: vars })];
+  assert.deepEqual(m.configurableEntries(entries).map((e) => e.install_name), ['b', 'e']);
+  // The value entered stays and goes out with the next preview, corrected or not.
+  assert.deepEqual(m.dependencyPayload({ b: { MAILBOX: 'mail-support' } }, entries), { b: { MAILBOX: 'mail-support' } });
+  assert.deepEqual(m.configurableEntries(undefined), []);
+});
+
 test('defaults pre-fill a form; absent and null defaults do not', () => {
   assert.deepEqual(
     m.variableDefaults([{ name: 'A', default: 'x' }, { name: 'B' }, { name: 'C', default: null }, { name: 'D', default: false }]),

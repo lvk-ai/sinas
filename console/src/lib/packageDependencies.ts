@@ -97,15 +97,24 @@ export function sentValues(
   return Object.keys(sent).length > 0 ? sent : undefined;
 }
 
+/** The required packages whose variables the dialog asks for: those it
+ * installs, and one made invalid that has variables (a value of its own may
+ * be what made it invalid, so its fields stay, to be corrected). */
+export function configurableEntries(entries: DependencyPlanEntry[] | undefined): DependencyPlanEntry[] {
+  return (entries ?? []).filter(
+    (e) => (e.status === 'install' || e.status === 'invalid') && (e.variables?.length ?? 0) > 0,
+  );
+}
+
 /** dependencyVariables for a preview or install: the values entered for each
- * package the plan installs, keyed by its install name. Values for packages
- * no longer in the plan are left out. */
+ * package the dialog asks values for (configurableEntries), keyed by its
+ * install name. Values for packages no longer in the plan are left out. */
 export function dependencyPayload(
   values: Record<string, Record<string, any>>,
   entries: DependencyPlanEntry[] | undefined,
 ): Record<string, Record<string, any>> | undefined {
   const out: Record<string, Record<string, any>> = {};
-  for (const entry of planSummary(entries).toInstall) {
+  for (const entry of configurableEntries(entries)) {
     const sent = sentValues(values[entry.install_name], entry.variables);
     if (sent) out[entry.install_name] = sent;
   }

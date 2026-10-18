@@ -4,6 +4,7 @@ import { AlertTriangle, Check, Eye, GitBranch, Package as PackageIcon, RefreshCw
 import { apiClient } from '../../lib/api';
 import {
   BLOCKED_LABEL,
+  configurableEntries,
   dependencyPayload,
   installWarnings,
   planSummary,
@@ -126,7 +127,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
         setVariableValues(prev => ({ ...defaults, ...prev }));
       }
       // The same for each package the install would install first.
-      const toInstall = planSummary(data.dependencies).toInstall.filter((d) => d.variables?.length);
+      const toInstall = configurableEntries(data.dependencies);
       if (toInstall.length) {
         setDependencyValues((prev) => {
           const next = { ...prev };
@@ -540,10 +541,9 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               </div>
             )}
 
-            {/* Configuration of each package the install installs first */}
-            {plan.toInstall
-              .filter((d) => d.variables && d.variables.length > 0)
-              .map((d) => (
+            {/* Configuration of each package the install installs first; one
+                a value made invalid keeps its fields, to correct the value */}
+            {configurableEntries(previewResult.dependencies).map((d) => (
                 <div key={d.install_name} className="p-3 bg-surface-2 border border-line-soft rounded">
                   <h3 className="text-sm font-medium text-gray-200 mb-1">
                     Configuration: <span className="font-mono">{d.install_name}</span>
@@ -551,6 +551,9 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                   <p className="text-xs text-gray-500 mb-3">
                     Required package, installed first ({d.package_name} {d.version}).
                   </p>
+                  {d.status === 'invalid' && d.message && (
+                    <p className="text-xs text-red-400/90 mb-3">{d.message}. Correct the values and preview again.</p>
+                  )}
                   <VariableFields
                     declarations={d.variables!}
                     values={dependencyValues[d.install_name] ?? {}}
