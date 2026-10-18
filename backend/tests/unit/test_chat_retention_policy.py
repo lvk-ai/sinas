@@ -41,12 +41,12 @@ class TestPolicyResolution:
 
     @pytest.mark.parametrize(
         "given,stored",
-        [(None, None), (0, 0), ("never", 0), ("NEVER", 0), (30, 30), ("30", 30), (30.0, 30)],
+        [(None, None), (0, 0), ("never", 0), ("NEVER", 0), (30, 30), ("30", 30), (30.0, 30), (36500, 36500)],
     )
     def test_normalize(self, given, stored):
         assert normalize_retention_days(given) == stored
 
-    @pytest.mark.parametrize("bad", [-1, "-3", "soon", 1.5, True, [], {}])
+    @pytest.mark.parametrize("bad", [-1, "-3", "soon", 1.5, True, [], {}, 36501, "99999"])
     def test_normalize_rejects(self, bad):
         with pytest.raises(ValueError):
             normalize_retention_days(bad)

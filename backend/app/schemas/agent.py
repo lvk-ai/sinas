@@ -138,9 +138,10 @@ class AgentCreate(BaseModel):
     retention_days: Optional[int] = Field(
         None,
         ge=0,
+        le=36500,
         description=(
             "Chat retention override, in days since a chat's last activity: null = the "
-            "deployment default (CHAT_RETENTION_DAYS), 0 = keep forever. Setting it takes "
+            "deployment default (CHAT_RETENTION_DAYS), 0 = keep forever, at most 36500. Setting it takes "
             "sinas.retention.update:all."
         ),
     )
@@ -237,7 +238,7 @@ class AgentUpdate(BaseModel):
     # Unlike the other fields, an explicit null here means "back to the
     # deployment default" (left out = unchanged). Changing it takes
     # sinas.retention.update:all.
-    retention_days: Optional[int] = Field(None, ge=0)
+    retention_days: Optional[int] = Field(None, ge=0, le=36500)
     system_tools: Optional[list[Union[str, SystemToolConfig]]] = None
     tool_approvals: Optional[dict[str, Any]] = None
 

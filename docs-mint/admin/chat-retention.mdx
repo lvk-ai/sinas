@@ -39,7 +39,7 @@ An agent's **retention** setting overrides the default for chats with that agent
 |---|---|
 | unset / `null` | The deployment default (`CHAT_RETENTION_DAYS`) |
 | `0` (config: `"never"`) | Keep forever |
-| `N` | `N` days after the last activity |
+| `N` | `N` days after the last activity, at most `36500` (100 years) |
 
 ```yaml
 agents:

@@ -1,7 +1,7 @@
 """chat_retention: agents.retention_days and the chat_retention_runs audit table
 
 agents.retention_days is the per-agent override of CHAT_RETENTION_DAYS
-(NULL = the deployment default, 0 = keep forever). Nullable with no
+(NULL = the deployment default, 0 = keep forever, at most 36500 days). Nullable with no
 default, so adding it rewrites nothing and changes no agent's behavior.
 
 chat_retention_runs holds one row per real retention run: trigger, actor,
@@ -27,7 +27,7 @@ depends_on = None
 def upgrade() -> None:
     op.add_column("agents", sa.Column("retention_days", sa.Integer(), nullable=True))
     op.create_check_constraint(
-        "ck_agents_retention_days_non_negative", "agents", "retention_days IS NULL OR retention_days >= 0"
+        "ck_agents_retention_days_non_negative", "agents", "retention_days IS NULL OR retention_days BETWEEN 0 AND 36500"
     )
     op.create_table(
         "chat_retention_runs",

@@ -10,6 +10,9 @@ from urllib.parse import urlsplit
 from app.core.config import settings
 
 NEVER = "never"
+# Longest retention an agent can set (100 years); the console caps input at
+# the same value. Anything longer is a typo, and 0 / "never" says forever.
+MAX_RETENTION_DAYS = 36500
 GLOBAL = "global"
 AGENT = "agent"
 
@@ -37,6 +40,10 @@ def normalize_retention_days(value: Any) -> Optional[int]:
         raise ValueError("retentionDays must be a number of days, 0 or 'never'")
     if value < 0:
         raise ValueError("retentionDays can't be negative (0 or 'never' keeps chats forever)")
+    if value > MAX_RETENTION_DAYS:
+        raise ValueError(
+            f"retentionDays can be at most {MAX_RETENTION_DAYS} (100 years); use 0 or 'never' to keep chats forever"
+        )
     return value
 
 
