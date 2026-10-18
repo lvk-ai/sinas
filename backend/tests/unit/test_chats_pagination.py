@@ -8,7 +8,7 @@ cursor for the next one in the X-Next-Cursor header.
 import base64
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -141,26 +141,57 @@ async def test_search_treats_wildcards_literally(client, db, test_user):
     assert [c["title"] for c in r.json()] == ["100% done"]
 
 
-@pytest.mark.parametrize(
-    "cursor",
-    [
-        "not-base64!!",
-        base64.urlsafe_b64encode(b"not json").decode(),
-        base64.urlsafe_b64encode(b"[1, 2]").decode(),
-        base64.urlsafe_b64encode(json.dumps({"u": BASE.isoformat()}).encode()).decode(),
-        base64.urlsafe_b64encode(
-            json.dumps({"u": "yesterday", "i": str(uuid.uuid4())}).encode()
-        ).decode(),
-        base64.urlsafe_b64encode(
-            json.dumps({"u": BASE.isoformat(), "i": "nope"}).encode()
-        ).decode(),
-        # A timestamp without a timezone is ambiguous against timestamptz.
-        base64.urlsafe_b64encode(
-            json.dumps({"u": "2026-01-01T00:00:00", "i": str(uuid.uuid4())}).encode()
-        ).decode(),
-        "A" * 300,
-    ],
-)
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _cursor(payload) -> str:
+    return _b64(json.dumps(payload).encode())
+
+
+_U = BASE.isoformat()
+_I = str(uuid.uuid4())
+
+INVALID_CURSORS = {
+    # Not base64, not UTF-8, not JSON
+    "bad-base64": "not-base64!!",
+    "one-char": "A",
+    "non-ascii": "é" * 8,
+    "not-utf8": _b64(b"\xff\xfe\xfd\xfc"),
+    "not-json": _b64(b"not json"),
+    "too-long": "A" * 300,
+    # JSON, but not an object
+    "list": _cursor([_U, _I]),
+    "string": _cursor("x"),
+    "number": _cursor(1),
+    "null": _cursor(None),
+    # Missing or extra keys
+    "empty-object": _cursor({}),
+    "no-i": _cursor({"u": _U}),
+    "no-u": _cursor({"i": _I}),
+    "extra-key": _cursor({"u": _U, "i": _I, "x": 1}),
+    # Wrong types for i
+    "i-int": _cursor({"u": _U, "i": 123}),
+    "i-null": _cursor({"u": _U, "i": None}),
+    "i-list": _cursor({"u": _U, "i": [_I]}),
+    "i-object": _cursor({"u": _U, "i": {"hex": _I}}),
+    "i-bool": _cursor({"u": _U, "i": True}),
+    # Wrong types for u
+    "u-int": _cursor({"u": 1767225600, "i": _I}),
+    "u-null": _cursor({"u": None, "i": _I}),
+    "u-list": _cursor({"u": [_U], "i": _I}),
+    "u-object": _cursor({"u": {"t": _U}, "i": _I}),
+    # Right types, wrong values
+    "u-not-a-date": _cursor({"u": "yesterday", "i": _I}),
+    "i-not-a-uuid": _cursor({"u": _U, "i": "nope"}),
+    # A timestamp without a timezone is ambiguous against timestamptz.
+    "u-naive": _cursor({"u": "2026-01-01T00:00:00", "i": _I}),
+    # Before year 1 once in UTC.
+    "u-out-of-range": _cursor({"u": "0001-01-01T00:00:00+14:00", "i": _I}),
+}
+
+
+@pytest.mark.parametrize("cursor", INVALID_CURSORS.values(), ids=INVALID_CURSORS.keys())
 async def test_invalid_cursor_is_400(client, test_user, cursor):
     r = await client.get("/chats", params={"cursor": cursor}, headers=auth_headers(test_user))
     assert r.status_code == 400, r.text
@@ -284,3 +315,16 @@ async def test_cursor_headers_exposed_to_browsers(client, test_user):
     )
     exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
     assert {"x-next-cursor", "link"} <= exposed
+
+
+async def test_cursor_in_another_timezone_is_the_same_point(client, db, test_user):
+    chats = [await _chat(db, test_user, BASE + timedelta(seconds=i)) for i in range(4)]
+    after = sorted(chats, key=lambda c: (c.updated_at, c.id), reverse=True)[1]
+    plus_two = after.updated_at.astimezone(timezone(timedelta(hours=2)))
+    r = await client.get(
+        "/chats",
+        params={"cursor": encode_chat_cursor(plus_two, after.id)},
+        headers=auth_headers(test_user),
+    )
+    assert r.status_code == 200, r.text
+    assert [c["id"] for c in r.json()] == _expected(chats)[2:]
