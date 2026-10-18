@@ -40,6 +40,9 @@ class Chat(Base):
     updated_at: Mapped[updated_at]
 
     __table_args__ = (
+        # GET /chats: a user's chats, newest first, keyset-paginated on
+        # (updated_at, id); scanned backward for the descending order.
+        Index("ix_chats_user_id_updated_at_id", "user_id", "updated_at", "id"),
         Index(
             "uq_chat_agent_session_key",
             "agent_id",
@@ -73,6 +76,9 @@ class Message(Base):
     created_at: Mapped[created_at]
 
     __table_args__ = (
+        # A chat's last message (GET /chats, PUT /chats/{id}) and its
+        # messages in order: max(created_at) per chat is one index probe.
+        Index("ix_messages_chat_id_created_at", "chat_id", "created_at"),
         # Time-window stats (GET /messages/stats) read these instead of the
         # heap: the INCLUDE columns make the grouped counts index-only, and
         # the partial index covers the few messages that carry tool calls.

@@ -101,7 +101,7 @@ DELETE /api/v1/agents/{namespace}/{name}    # Delete agent
 ```
 POST   /agents/{namespace}/{name}/invoke             # Invoke (sync request/response)
 POST   /agents/{namespace}/{name}/chats              # Create chat
-GET    /chats                                        # List user's chats
+GET    /chats                                        # List user's chats (pageable: ?limit, ?cursor)
 GET    /chats/{id}                                   # Get chat with messages
 PUT    /chats/{id}                                   # Update chat
 DELETE /chats/{id}                                   # Delete chat
@@ -166,6 +166,29 @@ curl -X POST https://yourdomain.com/agents/default/default/chats \
 ```
 
 **Chat archiving** — Chats can be archived via `PUT /chats/{id}` with `{"archived": true}`. Archived chats are hidden from the default list but can be included with `?include_archived=true`.
+
+**Listing chats** — `GET /chats` returns the caller's own chats, most recently updated first, each with `last_message_at`. It takes these query parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `include_archived` | `false` | Include archived chats |
+| `q` | — | Only chats whose title contains this text (case-insensitive) |
+| `limit` | — | Page size, 1–200. Passing `limit` or `cursor` turns on pagination |
+| `cursor` | — | The `X-Next-Cursor` value of the previous page. Pages hold 50 chats unless `limit` says otherwise |
+
+The body is a JSON array of chats either way. Without `limit` or `cursor`, every matching chat is returned in one response, as in earlier versions. That stays supported, but it is slow for accounts with many chats, so new clients should page. When paging, a response that has more chats after it carries the cursor for the next page in the `X-Next-Cursor` header, and the same next page as a relative URL in a `Link: <...>; rel="next"` header. The last page has neither header. Treat the cursor as opaque, and pass the same filters with it. An invalid cursor returns `400`.
+
+```bash
+# First page of 50
+curl -i "https://yourdomain.com/chats?limit=50" -H "Authorization: Bearer $TOKEN"
+# X-Next-Cursor: eyJ1IjoiMjAyNi0xMC0xOFQx...
+
+# Next page
+curl -i "https://yourdomain.com/chats?limit=50&cursor=eyJ1IjoiMjAyNi0xMC0xOFQx..." \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Pages are keyset-based on `(updated_at, id)`. A chat that is created or updated while you page moves to the front of the list: later pages neither repeat nor skip the other chats, and the moved chat shows up when you fetch the first page again.
 
 **Agent-to-agent calls** go through the Redis queue so sub-agents run in separate workers, avoiding recursive blocking. Results stream back via Redis Streams.
 
