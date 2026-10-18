@@ -1,10 +1,13 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
 import { Link } from 'react-router-dom';
 import { Plus, Trash2, Search, Bot, ArchiveRestore, Clock } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Chat, ChatCreate } from '../types';
 import { SchemaFormField } from '../components/SchemaFormField';
+import { applyChatChange, type ChatPages } from '../lib/chatPages';
+
+const PAGE_SIZE = 50;
 
 function formatRelativeTime(dateStr: string): string {
   const date = new Date(dateStr);
@@ -33,13 +36,39 @@ export function Chats() {
   const [selectedAssistantId, setSelectedAssistantId] = useState<string>('');
   const [inputParams, setInputParams] = useState<Record<string, any>>({});
   const [searchQuery, setSearchQuery] = useState('');
+  const [q, setQ] = useState('');  // `searchQuery`, once typing pauses
   const [showArchived, setShowArchived] = useState(false);
 
-  const { data: chats, isLoading } = useQuery({
-    queryKey: ['chats', showArchived],
-    queryFn: () => apiClient.listChats(showArchived),
+  useEffect(() => {
+    const timer = setTimeout(() => setQ(searchQuery.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // The search and the archived toggle are part of the key: changing either
+  // starts a fresh list from the first page.
+  const chatList = useInfiniteQuery({
+    queryKey: ['chats', 'list', showArchived, q],
+    queryFn: ({ pageParam }) =>
+      apiClient.listChatsPage({ includeArchived: showArchived, q, limit: PAGE_SIZE, cursor: pageParam }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.nextCursor,
+    placeholderData: keepPreviousData,
     retry: false,
   });
+  const chats = chatList.data?.pages.flatMap((page) => page.chats);
+  const isLoading = chatList.isLoading;
+
+  // Put a created, archived or restored chat into every cached list
+  // (each key holds its own filter) instead of refetching their pages.
+  const applyToCachedLists = (chat: Chat) => {
+    for (const query of queryClient.getQueryCache().findAll({ queryKey: ['chats', 'list'] })) {
+      const [, , includeArchived, search] = query.queryKey as [string, string, boolean, string];
+      queryClient.setQueryData<ChatPages<Chat>>(query.queryKey, (data) =>
+        applyChatChange(data, chat, { includeArchived, q: search }),
+      );
+    }
+    queryClient.invalidateQueries({ queryKey: ['chats', 'latest'] });
+  };
 
   const { data: assistants } = useQuery({
     queryKey: ['assistants'],
@@ -50,8 +79,8 @@ export function Chats() {
   const createMutation = useMutation({
     mutationFn: ({ namespace, name, data }: { namespace: string; name: string; data: ChatCreate }) =>
       apiClient.createChatWithAgent(namespace, name, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    onSuccess: (chat) => {
+      applyToCachedLists(chat);
       setShowCreateModal(false);
       setNewChatTitle('');
       setSelectedAssistantId('');
@@ -59,17 +88,18 @@ export function Chats() {
     },
   });
 
+  // DELETE archives the chat and returns no body: rebuild it from the row.
   const deleteMutation = useMutation({
-    mutationFn: (chatId: string) => apiClient.deleteChat(chatId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    mutationFn: (chat: Chat) => apiClient.deleteChat(chat.id),
+    onSuccess: (_, chat) => {
+      applyToCachedLists({ ...chat, archived: true, updated_at: new Date().toISOString() });
     },
   });
 
   const unarchiveMutation = useMutation({
     mutationFn: (chatId: string) => apiClient.updateChat(chatId, { archived: false }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    onSuccess: (chat) => {
+      applyToCachedLists(chat);
     },
   });
 
@@ -92,8 +122,9 @@ export function Chats() {
     }
   };
 
-  const filteredChats = chats?.filter((chat: any) =>
-    chat.title.toLowerCase().includes(searchQuery.toLowerCase())
+  // The server filters by title (`q`); this only covers the debounce gap.
+  const filteredChats = chats?.filter((chat) =>
+    chat.title.toLowerCase().includes(searchQuery.trim().toLowerCase())
   );
 
   return (
@@ -140,7 +171,10 @@ export function Chats() {
       <div className="card">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-100">Your Chats</h2>
-          <span className="text-sm text-gray-500">{filteredChats?.length || 0} chats</span>
+          <span className="text-sm text-gray-500">
+            {filteredChats?.length || 0}
+            {chatList.hasNextPage ? '+' : ''} chats
+          </span>
         </div>
 
         {isLoading ? (
@@ -248,7 +282,7 @@ export function Chats() {
                           <button
                             onClick={() => {
                               if (confirm('Archive this chat? It can be restored later.')) {
-                                deleteMutation.mutate(chat.id);
+                                deleteMutation.mutate(chat);
                               }
                             }}
                             className="p-1 text-red-600 hover:text-red-900 hover:bg-red-900/20 rounded"
@@ -264,6 +298,18 @@ export function Chats() {
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {chatList.hasNextPage && (
+          <div className="flex justify-center pt-4">
+            <button
+              onClick={() => chatList.fetchNextPage()}
+              disabled={chatList.isFetchingNextPage}
+              className="btn-secondary text-sm"
+            >
+              {chatList.isFetchingNextPage ? 'Loading…' : 'Load more chats'}
+            </button>
           </div>
         )}
       </div>
