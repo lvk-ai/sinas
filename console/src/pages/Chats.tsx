@@ -7,6 +7,9 @@ import type { Chat, ChatCreate } from '../types';
 import { SchemaFormField } from '../components/SchemaFormField';
 import { applyChatChange, inFlightFetch, type ChatPages } from '../lib/chatPages';
 
+// GET /chats accepts at most this many characters in `q`.
+const SEARCH_MAX_LENGTH = 200;
+
 const PAGE_SIZE = 50;
 
 function formatRelativeTime(dateStr: string): string {
@@ -168,6 +171,7 @@ export function Chats() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search chats..."
+            maxLength={SEARCH_MAX_LENGTH}
             className="input w-full !pl-11"
           />
         </div>
@@ -196,6 +200,14 @@ export function Chats() {
           <div className="text-center py-12">
             <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
             <p className="text-gray-400 mt-2">Loading chats...</p>
+          </div>
+        ) : chatList.isError && !chatList.data ? (
+          // The first page failed: say so, rather than "no chats".
+          <div className="text-center py-12">
+            <p className="text-red-400 mb-3">{getApiErrorMessage(chatList.error, 'Could not load chats')}</p>
+            <button onClick={() => chatList.refetch()} className="btn btn-secondary">
+              Try again
+            </button>
           </div>
         ) : !filteredChats || filteredChats.length === 0 ? (
           <div className="text-center py-12 text-gray-500">
