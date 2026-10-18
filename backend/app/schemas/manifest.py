@@ -33,7 +33,13 @@ def validate_public_info(value: Any) -> dict[str, Any]:
 class ResourceRef(BaseModel):
     """Reference to a SINAS resource."""
 
-    type: str = Field(..., description="Resource type: agent, function, skill, collection")
+    type: str = Field(
+        ...,
+        description=(
+            "Resource type: agent, function, skill, collection, connector, query, store, "
+            "component, pipeline, mcp_server"
+        ),
+    )
     namespace: str = Field(default="default", description="Resource namespace")
     name: str = Field(..., description="Resource name")
 

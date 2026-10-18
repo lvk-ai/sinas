@@ -61,7 +61,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Dry-run a package install. Shows what resources would be "
                 "created, updated, or skipped. Also returns variable "
-                "declarations if the package requires install-time input. "
+                "declarations if the package requires install-time input, "
+                "and the packages it requires (dependencies): installed "
+                "already, installed first from a package repository, or "
+                "missing. "
                 "Call this before sinas_package_install."
             ),
             "parameters": {
@@ -82,6 +85,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "instance": {
                         "type": "string",
                         "description": "Install name for a package declaring package.multiInstance: true (lowercase, dashes), so it can be installed more than once. Defaults to the package name.",
+                    },
+                    "dependency_variables": {
+                        "type": "object",
+                        "description": "Variable values for the packages it requires that the install installs first, keyed by their install name (the preview lists them under dependencies, each with its own variables).",
                     },
                 },
             },
@@ -116,6 +123,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "instance": {
                         "type": "string",
                         "description": "Install name for a package declaring package.multiInstance: true (lowercase, dashes), so it can be installed more than once. Defaults to the package name.",
+                    },
+                    "dependency_variables": {
+                        "type": "object",
+                        "description": "Variable values for the packages it requires that the install installs first, keyed by their install name (the preview lists them under dependencies, each with its own variables).",
                     },
                 },
             },
@@ -348,7 +359,8 @@ async def _preview(db, arguments, user_id, permissions):
 
     service = PackageService(db)
     result, variable_declarations, requires_input, install_info = await service.preview(
-        yaml_content, user_id, variables=variables, instance=arguments.get("instance")
+        yaml_content, user_id, variables=variables, instance=arguments.get("instance"),
+        dependency_variables=arguments.get("dependency_variables"),
     )
     response = _apply_response_to_dict(result)
     if variable_declarations:
@@ -367,9 +379,14 @@ async def _install(db, arguments, user_id, permissions):
 
     service = PackageService(db)
     package, result = await service.install(
-        yaml_content, user_id, variables=variables, instance=arguments.get("instance")
+        yaml_content, user_id, variables=variables, instance=arguments.get("instance"),
+        dependency_variables=arguments.get("dependency_variables"),
     )
     return {
+        "installed_dependencies": [
+            {"name": p.name, "package_name": p.package_name, "version": p.version}
+            for p, _ in service.installed_dependencies
+        ],
         "package": {
             "name": package.name,
             "package_name": package.package_name,

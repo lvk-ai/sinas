@@ -1,27 +1,70 @@
 """Manifest validation service — checks resource existence and permission satisfaction."""
+from typing import Any
+
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_permission
 from app.models.agent import Agent
+from app.models.component import Component
+from app.models.connector import Connector
 from app.models.manifest import Manifest
 from app.models.file import Collection
 from app.models.function import Function
+from app.models.mcp_server import McpServer
+from app.models.pipeline import Pipeline
+from app.models.query import Query
 from app.models.skill import Skill
 from app.models.state import State
+from app.models.store import Store
 from app.schemas.manifest import ManifestStatusResponse, PermissionStatus, ResourceStatus, StoreDependencyStatus
 
-# Map resource type strings to SQLAlchemy models (accept both singular and plural)
-RESOURCE_TYPE_MAP = {
-    "agent": Agent,
-    "agents": Agent,
-    "function": Function,
-    "functions": Function,
-    "skill": Skill,
-    "skills": Skill,
-    "collection": Collection,
-    "collections": Collection,
+# The resource types a manifest's requiredResources may name -> (model, the
+# config kind it is declared under). One table for both checks of them: the
+# config parser's (a config or package declaring a manifest whose required
+# resource exists nowhere is refused) and /status's (ready or missing now).
+MANIFEST_RESOURCE_TYPES = {
+    "agent": (Agent, "agents"),
+    "function": (Function, "functions"),
+    "skill": (Skill, "skills"),
+    "collection": (Collection, "collections"),
+    "connector": (Connector, "connectors"),
+    "query": (Query, "queries"),
+    "store": (Store, "stores"),
+    "component": (Component, "components"),
+    "pipeline": (Pipeline, "pipelines"),
+    "mcp_server": (McpServer, "mcpServers"),
 }
+# /status also accepts plurals (manifests registered through the API).
+_PLURALS = {"queries": "query", "mcp_servers": "mcp_server"}
+for _singular in MANIFEST_RESOURCE_TYPES:
+    _PLURALS.setdefault(_singular + "s", _singular)
+RESOURCE_TYPE_MAP = {
+    **{t: model for t, (model, _kind) in MANIFEST_RESOURCE_TYPES.items()},
+    **{p: MANIFEST_RESOURCE_TYPES[s][0] for p, s in _PLURALS.items()},
+}
+
+
+async def check_required_resources(
+    db: AsyncSession, required_resources: list[dict[str, Any]]
+) -> tuple[list[ResourceStatus], list[ResourceStatus]]:
+    """(satisfied, missing) for a manifest's requiredResources, as they are
+    now. A type this check doesn't know is reported missing."""
+    satisfied: list[ResourceStatus] = []
+    missing: list[ResourceStatus] = []
+    for res_ref in required_resources or []:
+        res_type = res_ref.get("type", "")
+        res_ns = res_ref.get("namespace", "default")
+        res_name = res_ref.get("name", "")
+        status = ResourceStatus(type=res_type, namespace=res_ns, name=res_name, exists=False)
+
+        model = RESOURCE_TYPE_MAP.get(res_type)
+        if model is not None:
+            resource = await model.get_by_name(db, namespace=res_ns, name=res_name)
+            status.exists = resource is not None
+
+        (satisfied if status.exists else missing).append(status)
+    return satisfied, missing
 
 
 async def validate_manifest_status(
@@ -36,27 +79,7 @@ async def validate_manifest_status(
     Returns a structured status showing which resources exist and which
     permissions the user has.
     """
-    satisfied: list[ResourceStatus] = []
-    missing: list[ResourceStatus] = []
-
-    # Check each required resource
-    for res_ref in manifest.required_resources or []:
-        res_type = res_ref.get("type", "")
-        res_ns = res_ref.get("namespace", "default")
-        res_name = res_ref.get("name", "")
-
-        model = RESOURCE_TYPE_MAP.get(res_type)
-        status = ResourceStatus(type=res_type, namespace=res_ns, name=res_name, exists=False)
-
-        if model is not None:
-            resource = await model.get_by_name(db, namespace=res_ns, name=res_name)
-            if resource is not None:
-                status.exists = True
-
-        if status.exists:
-            satisfied.append(status)
-        else:
-            missing.append(status)
+    satisfied, missing = await check_required_resources(db, manifest.required_resources or [])
 
     # Check required permissions
     req_granted: list[str] = []

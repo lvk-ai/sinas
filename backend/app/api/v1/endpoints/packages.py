@@ -16,7 +16,7 @@ from app.schemas.package import (
     PackagePreviewRequest,
     PackageResponse,
 )
-from app.services.package_service import PackageService
+from app.services.package_service import PackageInUse, PackageService
 from app.schemas.package_repository import CatalogEntry
 
 
@@ -47,15 +47,19 @@ async def _source(db: AsyncSession, body) -> tuple[str, Optional[str], Optional[
 async def _with_status(db: AsyncSession, packages: list, model):
     """Packages as `model`, with the repository each follows and whether an
     update is published there."""
+    from app.services import package_dependencies as deps
     from app.services import package_repositories as repos
 
     status_by_id = await repos.package_status(db, packages)
+    installed = list((await deps.installed_packages(db)).values())
+    dependencies_by_id = deps.dependency_status(packages, installed)
     out = []
     for package in packages:
         item = model.model_validate(package).model_dump()
         status = dict(status_by_id.get(package.id, {}))
         item["source_repository"] = status.pop("repository", None) or package.source_repository
         item.update(status)
+        item.update(dependencies_by_id.get(package.id, {}))
         out.append(model(**item))
     return out
 
@@ -88,14 +92,21 @@ async def install_package(
             instance=body.instance,
             source=(repository, file_url) if repository is not None else None,
             adopt_unmanaged=body.adoptUnmanaged,
+            dependency_variables=body.dependencyVariables,
+            allow_breaking_dependents=body.allowBreakingDependents,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    (shown,) = await _with_status(db, [package], PackageResponse)
+    installed_dependencies = service.installed_dependencies
+    shown = await _with_status(db, [package] + [p for p, _ in installed_dependencies], PackageResponse)
     return PackageInstallResponse(
-        package=shown.model_dump(mode="json"),
+        package=shown[0].model_dump(mode="json"),
         apply=apply_result.model_dump(mode="json"),
+        dependencies=[
+            {"package": shown_dep.model_dump(mode="json"), "apply": dep_result.model_dump(mode="json")}
+            for shown_dep, (_p, dep_result) in zip(shown[1:], installed_dependencies)
+        ],
     )
 
 
@@ -114,12 +125,15 @@ async def preview_package(
         raise HTTPException(status_code=403, detail="Not authorized to preview packages")
     set_permission_used(request, "sinas.packages.install:all", has_perm=True)
 
-    source, _repository, _url = await _source(db, body)
+    source, repository, _url = await _source(db, body)
     service = PackageService(db)
     try:
         result, variable_declarations, requires_input, install_info = await service.preview(
             source, user_id, variables=body.variables, instance=body.instance,
             adopt_unmanaged=body.adoptUnmanaged,
+            dependency_variables=body.dependencyVariables,
+            allow_breaking_dependents=body.allowBreakingDependents,
+            repository=repository,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -240,6 +254,11 @@ async def uninstall_package(
     service = PackageService(db)
     try:
         deleted_counts = await service.uninstall(name, actor_user_id=str(user_id))
+    except PackageInUse as e:
+        # Installed packages require it: uninstall those first.
+        raise HTTPException(
+            status_code=409, detail={"message": str(e), "required_by": e.dependents}
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
