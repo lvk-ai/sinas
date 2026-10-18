@@ -376,13 +376,15 @@ class TestInstall:
     async def test_dependency_variables(self, db, admin_user, fake_repos):
         dep, root = f"gmail{_uid()}", f"triage{_uid()}"
         await fake_repos.add(db, admin_user, f"r{_uid()}", [package_yaml(dep, variable="GREETING")])
-        root_yaml = package_yaml(root, requires=[{"name": dep}])
+        root_yaml = package_yaml(root, requires=[{"name": dep}], uses_skills=[f"{dep}/hello"])
         service = PackageService(db)
 
         result, _, _, info = await service.preview(root_yaml, str(admin_user.id))
         entry = _deps(info)[dep]
         assert entry["requires_input"] and [v["name"] for v in entry["variables"]] == ["GREETING"]
         assert not result.success
+        # What it lacks is the dependency's values, not the skill it will provide.
+        assert not any(f"{dep}/hello" in e for e in result.errors), result.errors
 
         values = {dep: {"GREETING": "Hi there."}}
         result, _, _, info = await service.preview(root_yaml, str(admin_user.id), dependency_variables=values)

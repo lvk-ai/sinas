@@ -241,6 +241,34 @@ def _declared_resources(config: SinasConfig) -> dict[str, dict[str, bool]]:
     return out
 
 
+def _declared_resources_raw(yaml_content: str) -> dict[str, dict[str, bool]]:
+    """_declared_resources from the YAML as written, for a package whose
+    preview didn't get as far as parsing (it still needs values): its
+    dependents' previews then report what is really wrong with them, not
+    references to resources it is about to provide."""
+    try:
+        doc = yaml.safe_load(yaml_content)
+    except Exception:
+        return {}
+    spec = doc.get("spec") if isinstance(doc, dict) else None
+    if not isinstance(spec, dict):
+        return {}
+    out: dict[str, dict[str, bool]] = {}
+    for kind in _REFERABLE_KINDS:
+        items = spec.get(kind)
+        out[kind] = {
+            f"{item.get('namespace', 'default')}/{item['name']}": item.get("isActive") is not False
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+    roles = spec.get("roles")
+    out["roles"] = {
+        r["name"]: True for r in (roles if isinstance(roles, list) else [])
+        if isinstance(r, dict) and isinstance(r.get("name"), str)
+    }
+    return out
+
+
 class PackageInUse(ValueError):
     """An uninstall refused: other installed packages require this one."""
 
@@ -588,9 +616,12 @@ class PackageService:
                     entry.yaml, user_id, variables=dependency_variables.get(entry.install_name),
                     instance=entry.instance, extra_pending=provided,
                 )
-                if dep_config is not None:
-                    for kind, keys in _declared_resources(dep_config).items():
-                        provided.setdefault(kind, {}).update(keys)
+                declared = (
+                    _declared_resources(dep_config) if dep_config is not None
+                    else _declared_resources_raw(resolve_install_name(entry.yaml, entry.instance)[1])
+                )
+                for kind, keys in declared.items():
+                    provided.setdefault(kind, {}).update(keys)
                 if not dep_result.success or dep_result.errors:
                     failed_dependencies.append(entry.install_name)
                 item.update({
