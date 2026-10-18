@@ -435,6 +435,23 @@ class TestDependentRows:
 
 
 class TestArchiveAndRestore:
+    async def test_restore_plan_checks_a_long_chat_in_batches(self, world):
+        """More message ids than the driver's 32,767 query arguments: the
+        conflict check runs in batches and still finds a clash at the end."""
+        agent = await world.agent(retention_days=10)
+        chat_id = await world.chat(agent, idle_days=20, messages=1)
+        other = await world.chat(agent, idle_days=1, messages=1)  # stays: not expired
+        store = FakeStore()
+        await run(world, store)
+        archive = parse_archive(next(iter(store.objects.values())))
+        async with world.sessions() as db:
+            clash = (await db.execute(select(Message.id).where(Message.chat_id == other))).scalar_one()
+        archive.messages += [{"id": str(uuid.uuid4())} for _ in range(40_000)] + [{"id": str(clash)}]
+        async with world.sessions() as db:
+            plan = await plan_restore(db, archive)
+        assert not plan.ok and any("message id(s) already exist" in c for c in plan.conflicts)
+        assert not await world.exists(chat_id)
+
     async def test_archive_content_round_trips_through_restore(self, world):
         agent = await world.agent(retention_days=10)
         chat_id = await world.chat(agent, idle_days=20, messages=3)
@@ -800,6 +817,23 @@ class TestEligibilityRaces:
 
 
 class TestContinuations:
+    async def test_blocked_chats_count_against_the_run_cap(self, world, monkeypatch):
+        """A backlog of chats that must be left alone may not keep a run
+        scanning past its chat cap: each one counts, like a processed chat."""
+        monkeypatch.setattr(settings, "chat_retention_max_chats_per_run", 2)
+        parked = [await world.chat(idle_days=300 - i) for i in range(3)]
+        newest = await world.chat(idle_days=50)
+        await world.add(*[
+            PendingCompletion(chat_id=c, user_id=world.user_id, channel_id="c", pending={"t": {}},
+                              results={}, remaining=1, conversation_context={})
+            for c in parked
+        ])
+        store = FakeStore()
+        result = await run(world, store)
+        assert result["status"] == "partial"
+        assert result["counts"]["skipped"] == {"parked": 2}
+        assert store.puts == [] and await world.exists(newest)
+
     async def test_cap_one_with_an_always_failing_oldest_chat_still_progresses(self, world, monkeypatch):
         monkeypatch.setattr(settings, "chat_retention_max_chats_per_run", 1)
         stuck = await world.chat(idle_days=300)

@@ -702,14 +702,18 @@ async def _process(engine, sessions, policy, overrides, store, now, tally: _Tall
             if not rows:
                 return
             for row in rows:
+                # Budget first, and skipped chats count against it too: a
+                # backlog of blocked chats must not keep a run scanning past
+                # the operator's chat cap or time limit.
+                if out_of_budget():
+                    tally.more_remaining = True
+                    return
                 if row.blocked:
                     tally.candidates += 1
                     tally.skipped[row.blocked] += 1
                     cursor = tally.cursor = (row.updated_at, row.id)
+                    processed += 1
                     continue
-                if out_of_budget():
-                    tally.more_remaining = True
-                    return
                 tally.candidates += 1
                 cursor = tally.cursor = (row.updated_at, row.id)
                 processed += 1

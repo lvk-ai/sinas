@@ -26,6 +26,9 @@ from app.models.tool_call_result import ToolCallResult
 from app.models.user import User
 from app.services.retention.archive import ParsedArchive
 
+# Message ids per conflict query (asyncpg allows at most 32,767 arguments).
+_ID_BATCH = 5000
+
 
 def _dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -93,10 +96,14 @@ async def plan_restore(
     if (await db.execute(select(Chat.id).where(Chat.id == chat_id))).scalar_one_or_none():
         plan.conflicts.append(f"chat {chat_id} already exists")
     message_ids = [uuid.UUID(m["id"]) for m in archive.messages]
-    if message_ids:
-        taken = (await db.execute(select(Message.id).where(Message.id.in_(message_ids)))).scalars().all()
-        if taken:
-            plan.conflicts.append(f"{len(taken)} message id(s) already exist (e.g. {taken[0]})")
+    taken: list = []
+    # In batches: one IN with every id of a long chat would exceed the
+    # driver's 32,767 query arguments.
+    for i in range(0, len(message_ids), _ID_BATCH):
+        batch = message_ids[i:i + _ID_BATCH]
+        taken += (await db.execute(select(Message.id).where(Message.id.in_(batch)))).scalars().all()
+    if taken:
+        plan.conflicts.append(f"{len(taken)} message id(s) already exist (e.g. {taken[0]})")
 
     # Owner: the archived user, else the archived email, else --user-email.
     owner = await db.get(User, uuid.UUID(chat["user_id"]))
