@@ -1,10 +1,16 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient } from '../lib/api';
+import { keepPreviousData, useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { apiClient, getApiErrorMessage } from '../lib/api';
 import { Link } from 'react-router-dom';
 import { Plus, Trash2, Search, Bot, ArchiveRestore, Clock } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Chat, ChatCreate } from '../types';
 import { SchemaFormField } from '../components/SchemaFormField';
+import { applyChatChange, inFlightFetch, type ChatPages } from '../lib/chatPages';
+
+// GET /chats accepts at most this many characters in `q`.
+const SEARCH_MAX_LENGTH = 200;
+
+const PAGE_SIZE = 50;
 
 function formatRelativeTime(dateStr: string): string {
   const date = new Date(dateStr);
@@ -33,13 +39,54 @@ export function Chats() {
   const [selectedAssistantId, setSelectedAssistantId] = useState<string>('');
   const [inputParams, setInputParams] = useState<Record<string, any>>({});
   const [searchQuery, setSearchQuery] = useState('');
+  const [q, setQ] = useState('');  // `searchQuery`, once typing pauses
   const [showArchived, setShowArchived] = useState(false);
 
-  const { data: chats, isLoading } = useQuery({
-    queryKey: ['chats', showArchived],
-    queryFn: () => apiClient.listChats(showArchived),
+  useEffect(() => {
+    const timer = setTimeout(() => setQ(searchQuery.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // The search and the archived toggle are part of the key: changing either
+  // starts a fresh list from the first page.
+  const listKey = ['chats', 'list', showArchived, q];
+  const chatList = useInfiniteQuery({
+    queryKey: listKey,
+    queryFn: ({ pageParam }) =>
+      apiClient.listChatsPage({ includeArchived: showArchived, q, limit: PAGE_SIZE, cursor: pageParam }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.nextCursor,
+    placeholderData: keepPreviousData,
     retry: false,
   });
+  const chats = chatList.data?.pages.flatMap((page) => page.chats);
+  const isLoading = chatList.isLoading;
+
+  // Put a created, archived or restored chat into every cached list
+  // (each key holds its own filter) instead of refetching their pages.
+  const applyToCachedLists = async (chat: Chat) => {
+    const lists = queryClient.getQueryCache().findAll({ queryKey: ['chats', 'list'] });
+    const inFlight = lists.map((query) => inFlightFetch(query.state));
+    // A list response still on its way was read before this change and
+    // would overwrite the edit: cancel it (its state reverts), edit, then
+    // redo it, so a "Load more" in progress still delivers its page.
+    await queryClient.cancelQueries({ queryKey: ['chats', 'list'] });
+    for (const query of lists) {
+      const [, , includeArchived, search] = query.queryKey as [string, string, boolean, string];
+      queryClient.setQueryData<ChatPages<Chat>>(query.queryKey, (data) =>
+        applyChatChange(data, chat, { includeArchived, q: search }),
+      );
+    }
+    const shown = queryClient.getQueryCache().find({ queryKey: listKey, exact: true });
+    lists.forEach((query, i) => {
+      if (inFlight[i] === 'next-page' && query === shown) {
+        chatList.fetchNextPage();
+      } else if (inFlight[i] !== 'none') {
+        queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true });
+      }
+    });
+    queryClient.invalidateQueries({ queryKey: ['chats', 'latest'] });
+  };
 
   const { data: assistants } = useQuery({
     queryKey: ['assistants'],
@@ -50,8 +97,8 @@ export function Chats() {
   const createMutation = useMutation({
     mutationFn: ({ namespace, name, data }: { namespace: string; name: string; data: ChatCreate }) =>
       apiClient.createChatWithAgent(namespace, name, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    onSuccess: (chat) => {
+      applyToCachedLists(chat);
       setShowCreateModal(false);
       setNewChatTitle('');
       setSelectedAssistantId('');
@@ -59,17 +106,18 @@ export function Chats() {
     },
   });
 
+  // DELETE archives the chat and returns no body: rebuild it from the row.
   const deleteMutation = useMutation({
-    mutationFn: (chatId: string) => apiClient.deleteChat(chatId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    mutationFn: (chat: Chat) => apiClient.deleteChat(chat.id),
+    onSuccess: (_, chat) => {
+      applyToCachedLists({ ...chat, archived: true, updated_at: new Date().toISOString() });
     },
   });
 
   const unarchiveMutation = useMutation({
     mutationFn: (chatId: string) => apiClient.updateChat(chatId, { archived: false }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['chats'] });
+    onSuccess: (chat) => {
+      applyToCachedLists(chat);
     },
   });
 
@@ -92,8 +140,9 @@ export function Chats() {
     }
   };
 
-  const filteredChats = chats?.filter((chat: any) =>
-    chat.title.toLowerCase().includes(searchQuery.toLowerCase())
+  // The server filters by title (`q`); this only covers the debounce gap.
+  const filteredChats = chats?.filter((chat) =>
+    chat.title.toLowerCase().includes(searchQuery.trim().toLowerCase())
   );
 
   return (
@@ -122,6 +171,7 @@ export function Chats() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search chats..."
+            maxLength={SEARCH_MAX_LENGTH}
             className="input w-full !pl-11"
           />
         </div>
@@ -140,13 +190,24 @@ export function Chats() {
       <div className="card">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-100">Your Chats</h2>
-          <span className="text-sm text-gray-500">{filteredChats?.length || 0} chats</span>
+          <span className="text-sm text-gray-500">
+            {filteredChats?.length || 0}
+            {chatList.hasNextPage ? '+' : ''} chats
+          </span>
         </div>
 
         {isLoading ? (
           <div className="text-center py-12">
             <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
             <p className="text-gray-400 mt-2">Loading chats...</p>
+          </div>
+        ) : chatList.isError && !chatList.data ? (
+          // The first page failed: say so, rather than "no chats".
+          <div className="text-center py-12">
+            <p className="text-red-400 mb-3">{getApiErrorMessage(chatList.error, 'Could not load chats')}</p>
+            <button onClick={() => chatList.refetch()} className="btn btn-secondary">
+              Try again
+            </button>
           </div>
         ) : !filteredChats || filteredChats.length === 0 ? (
           <div className="text-center py-12 text-gray-500">
@@ -248,7 +309,7 @@ export function Chats() {
                           <button
                             onClick={() => {
                               if (confirm('Archive this chat? It can be restored later.')) {
-                                deleteMutation.mutate(chat.id);
+                                deleteMutation.mutate(chat);
                               }
                             }}
                             className="p-1 text-red-600 hover:text-red-900 hover:bg-red-900/20 rounded"
@@ -264,6 +325,27 @@ export function Chats() {
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {chatList.hasNextPage && (
+          <div className="flex flex-col items-center gap-2 pt-4">
+            {chatList.isFetchNextPageError && !chatList.isFetchingNextPage && (
+              <p className="text-sm text-red-400">
+                {getApiErrorMessage(chatList.error, 'Could not load more chats')}
+              </p>
+            )}
+            <button
+              onClick={() => chatList.fetchNextPage()}
+              disabled={chatList.isFetchingNextPage}
+              className="btn-secondary text-sm"
+            >
+              {chatList.isFetchingNextPage
+                ? 'Loading…'
+                : chatList.isFetchNextPageError
+                  ? 'Try again'
+                  : 'Load more chats'}
+            </button>
           </div>
         )}
       </div>

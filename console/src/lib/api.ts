@@ -1,4 +1,5 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
+import { chatListParams, type ChatListFilter, type ChatListPage } from './chatPages';
 import type {
   AdminCreateResetLinkResponse,
   ConfigRestoreResult,
@@ -396,10 +397,12 @@ class APIClient {
   }
 
   // Chats (Runtime API)
-  async listChats(includeArchived: boolean = false): Promise<Chat[]> {
-    const params = includeArchived ? { include_archived: true } : {};
-    const response = await this.runtimeClient.get('/chats', { params });
-    return response.data;
+  /** One page of the caller's chats, newest first; `nextCursor` is null on the last page. */
+  async listChatsPage(
+    options: Partial<ChatListFilter> & { limit: number; cursor?: string | null },
+  ): Promise<ChatListPage<Chat>> {
+    const response = await this.runtimeClient.get('/chats', { params: chatListParams(options) });
+    return { chats: response.data, nextCursor: response.headers['x-next-cursor'] || null };
   }
 
   async getChat(chatId: string): Promise<ChatWithMessages> {

@@ -42,9 +42,10 @@ export function Dashboard() {
     retry: false,
   });
 
-  const { data: chats } = useQuery({
-    queryKey: ['chats'],
-    queryFn: () => apiClient.listChats(),
+  // Onboarding only needs to know whether there is a chat at all.
+  const { data: latestChats } = useQuery({
+    queryKey: ['chats', 'latest'],
+    queryFn: () => apiClient.listChatsPage({ limit: 1 }),
     enabled: !!user,
     retry: false,
   });
@@ -52,7 +53,7 @@ export function Dashboard() {
   // Onboarding state
   const hasProviders = (llmProviders?.filter((p) => p.is_active)?.length || 0) > 0;
   const hasAgents = (agents?.length || 0) > 0;
-  const hasChats = (chats?.length || 0) > 0;
+  const hasChats = (latestChats?.chats.length || 0) > 0;
   const allComplete = hasProviders && hasAgents && hasChats;
   const showOnboarding = !onboardingDismissed && !allComplete;
 
