@@ -107,3 +107,70 @@ export function runSummary(counts: RunCounts | null | undefined): string {
   if (counts.more_remaining) extras.push('more left for the next run');
   return parts.join(', ') + (extras.length ? `; ${extras.join(', ')}` : '');
 }
+
+/**
+ * The agent form's error for the retention field, or null. Only a value the
+ * user changed is checked: a stored value is sent back as it is, so an
+ * unrelated edit never fails on it.
+ */
+export function retentionInputError(mode: RetentionMode, daysText: string, touched: boolean): string | null {
+  if (!touched || mode !== 'days' || parseRetentionDays(daysText) !== null) return null;
+  return `Enter a whole number of days, 1 to ${MAX_RETENTION_DAYS.toLocaleString('en-US')}.`;
+}
+
+export interface RunLimits {
+  max_chats_per_run: number | null;
+  max_run_seconds: number | null;
+}
+
+/**
+ * What one run handles at most, or null when it doesn't matter (everything
+ * eligible fits and there is no time limit).
+ */
+export function runLimitNote(limits: RunLimits, eligible?: number): string | null {
+  const capped = !!limits.max_chats_per_run && (eligible === undefined || eligible > limits.max_chats_per_run);
+  if (!capped && !limits.max_run_seconds) return null;
+  const parts: string[] = [];
+  if (limits.max_chats_per_run) parts.push(`up to ${plural(limits.max_chats_per_run, 'chat')}`);
+  if (limits.max_run_seconds) parts.push(`for at most ${plural(Math.max(1, Math.round(limits.max_run_seconds / 60)), 'minute')}`);
+  return `One run handles ${parts.join(', ')}; whatever is left goes in later runs.`;
+}
+
+/**
+ * The preview's verdict. The counts are chats that are eligible, not a
+ * promise: a run can be refused, capped, or skip a chat that is in use when
+ * it gets there.
+ */
+export function previewSummary(
+  totals: { chats: number; messages: number },
+  wouldArchive: boolean,
+  refusal: string | null,
+): string {
+  const one = totals.chats === 1;
+  const eligible = `${plural(totals.chats, 'expired chat')} (${plural(totals.messages, 'message')}) ${one ? 'is' : 'are'} past ${one ? 'its' : 'their'} retention period`;
+  if (refusal) return `${eligible}, but a run now would be refused: ${refusal}`;
+  return `${eligible}. A run archives ${wouldArchive ? 'each, then deletes it' : 'nothing (there is no archive destination) and deletes them'}.`;
+}
+
+/** The "Run now" confirmation. */
+export function confirmRunMessage(
+  eligible: { chats: number; messages: number } | null,
+  archived: boolean,
+  limits: RunLimits,
+): string {
+  const what = eligible
+    ? `Eligible as of the last preview: ${plural(eligible.chats, 'chat')} (${plural(eligible.messages, 'message')}).`
+    : 'Every chat past its retention period is eligible.';
+  const how = archived
+    ? 'Each chat the run reaches is archived and then permanently deleted from the database.'
+    : 'Each chat the run reaches is permanently deleted; there is no archive destination.';
+  const limit = runLimitNote(limits, eligible?.chats);
+  return [
+    'Run chat retention now?',
+    '',
+    what,
+    how,
+    ...(limit ? [limit] : []),
+    "Chats in use when the run reaches them are skipped. This can't be undone from the console.",
+  ].join('\n');
+}

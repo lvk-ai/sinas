@@ -2,7 +2,16 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Archive, Eye, Loader2, Play, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 import { apiClient } from '../lib/api';
-import { describeRetention, formatBytes, plural, runSummary, skipLabel } from '../lib/retention';
+import {
+  confirmRunMessage,
+  describeRetention,
+  formatBytes,
+  plural,
+  previewSummary,
+  runLimitNote,
+  runSummary,
+  skipLabel,
+} from '../lib/retention';
 import type { RetentionPreview, RetentionRun } from '../types';
 
 function when(iso: string | null | undefined): string {
@@ -57,6 +66,7 @@ function RunLine({ run }: { run: RetentionRun }) {
 }
 
 function PreviewTable({ preview }: { preview: RetentionPreview }) {
+  const limitNote = runLimitNote(preview.policy, preview.totals.chats);
   if (preview.agents.length === 0) {
     return <p className="text-sm text-gray-400">No chats are past their retention period right now.</p>;
   }
@@ -91,10 +101,15 @@ function PreviewTable({ preview }: { preview: RetentionPreview }) {
           </tbody>
         </table>
       </div>
-      <p className="text-sm text-gray-300">
-        A run now would {preview.would_archive ? 'archive and delete' : 'delete (no archive destination)'}{' '}
-        {plural(preview.totals.chats, 'chat')} ({plural(preview.totals.messages, 'message')}).
-      </p>
+      {preview.refusal ? (
+        <div className="p-3 rounded-lg text-sm flex gap-2 bg-surface-1 border border-line text-gray-300">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-yellow-400" />
+          <span>{previewSummary(preview.totals, preview.would_archive, preview.refusal)}</span>
+        </div>
+      ) : (
+        <p className="text-sm text-gray-300">{previewSummary(preview.totals, preview.would_archive, null)}</p>
+      )}
+      {limitNote && <p className="text-xs text-gray-400">{limitNote}</p>}
       {preview.notes.map((n) => (
         <p key={n} className="text-xs text-gray-500">{n}</p>
       ))}
@@ -111,7 +126,10 @@ export function RetentionPanel() {
     queryKey: ['retention-status'],
     queryFn: () => apiClient.getRetentionStatus(),
     retry: false,
-    refetchInterval: (query) => (query.state.data?.in_progress ? 5000 : 60000),
+    // Not for a 403 (no read permission): asking again won't change it.
+    refetchInterval: (query) =>
+      (query.state.error as any)?.response?.status === 403 ? false : query.state.data?.in_progress ? 5000 : 60000,
+    refetchOnWindowFocus: (query) => (query.state.error as any)?.response?.status !== 403,
   });
 
   const previewMutation = useMutation({
@@ -143,11 +161,7 @@ export function RetentionPanel() {
 
   const { policy, destination } = status;
   const confirmRun = () => {
-    const what = preview
-      ? `${plural(preview.totals.chats, 'chat')} (${plural(preview.totals.messages, 'message')}) as of the last preview`
-      : 'every chat past its retention period';
-    const how = destination.configured ? 'archived and then permanently deleted from the database' : 'permanently deleted (there is no archive destination)';
-    if (window.confirm(`Run chat retention now?\n\n${what} will be ${how}. This can't be undone from the console.`)) {
+    if (window.confirm(confirmRunMessage(preview ? preview.totals : null, destination.configured, policy))) {
       runMutation.mutate();
     }
   };

@@ -10,7 +10,7 @@ import { useAuth } from '../lib/auth-context';
 import {
   MAX_RETENTION_DAYS,
   defaultOptionLabel,
-  parseRetentionDays,
+  retentionInputError,
   retentionDaysFor,
   retentionMode,
   type RetentionMode,
@@ -112,7 +112,10 @@ export function AgentDetail() {
   // (formData.retention_days holds the last valid value).
   const [retentionChoice, setRetentionChoice] = useState<RetentionMode>('default');
   const [retentionText, setRetentionText] = useState('');
-  const retentionInvalid = retentionChoice === 'days' && parseRetentionDays(retentionText) === null;
+  // Only what the user changes is validated: a stored value goes back as is.
+  const [retentionTouched, setRetentionTouched] = useState(false);
+  const retentionError = retentionInputError(retentionChoice, retentionText, retentionTouched);
+  const retentionInvalid = retentionError !== null;
   // A server may be bound more than once (REST and config allow it; the
   // allowed tools are the union). The editor shows that union and writes
   // it back as one binding, so editing never drops a sibling's patterns.
@@ -173,6 +176,7 @@ export function AgentDetail() {
       });
       setRetentionChoice(retentionMode(agent.retention_days));
       setRetentionText(agent.retention_days ? String(agent.retention_days) : '');
+      setRetentionTouched(false);
     }
   }, [agent]);
 
@@ -183,11 +187,13 @@ export function AgentDetail() {
     queryFn: () => apiClient.getRetentionStatus(),
     retry: false,
     staleTime: 60_000,
+    refetchOnWindowFocus: false,
   });
 
   const chooseRetention = (mode: RetentionMode, text: string) => {
     setRetentionChoice(mode);
     setRetentionText(text);
+    setRetentionTouched(true);
     const days = retentionDaysFor(mode, text);
     if (days !== undefined) setFormData((prev) => ({ ...prev, retention_days: days }));
   };
@@ -625,11 +631,7 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   </>
                 )}
               </div>
-              {retentionInvalid && (
-                <p className="text-xs text-red-400 mt-1">
-                  Enter a whole number of days, 1 to {MAX_RETENTION_DAYS.toLocaleString('en-US')}.
-                </p>
-              )}
+              {retentionError && <p className="text-xs text-red-400 mt-1">{retentionError}</p>}
               <p className="text-xs text-gray-500 mt-1">
                 How long chats with this agent are kept after their last activity before they are archived and
                 deleted. Changing it takes the chat retention admin permission.

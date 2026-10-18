@@ -1375,7 +1375,9 @@ class APIClient {
 
   // Chat retention (admin)
   async getRetentionStatus(): Promise<RetentionStatus> {
-    const response = await this.configClient.get('/retention/status');
+    // 403 is expected for everyone but admins (the agent form and the System
+    // page ask anyway, to show the default): no error toast for it.
+    const response = await this.configClient.get('/retention/status', { quietStatuses: [403] } as QuietRequestConfig);
     return response.data;
   }
 

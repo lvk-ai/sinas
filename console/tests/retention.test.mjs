@@ -60,6 +60,52 @@ test('run summary', () => {
   );
 });
 
+test('only a value the user changed is validated (a stored one is sent back as is)', () => {
+  assert.equal(m.retentionInputError('days', '40000', false), null, 'loaded from the API, untouched');
+  assert.match(m.retentionInputError('days', '40000', true), /1 to 36,500/);
+  assert.match(m.retentionInputError('days', '', true), /whole number/);
+  assert.equal(m.retentionInputError('days', '30', true), null);
+  assert.equal(m.retentionInputError('default', '', true), null);
+  assert.equal(m.retentionInputError('never', 'x', true), null);
+});
+
+test('run limits are mentioned only when they matter', () => {
+  const none = { max_chats_per_run: null, max_run_seconds: null };
+  assert.equal(m.runLimitNote(none, 500), null);
+  assert.equal(m.runLimitNote({ max_chats_per_run: 100, max_run_seconds: null }, 40), null, 'everything fits');
+  assert.equal(
+    m.runLimitNote({ max_chats_per_run: 100, max_run_seconds: null }, 400),
+    'One run handles up to 100 chats; whatever is left goes in later runs.',
+  );
+  assert.equal(
+    m.runLimitNote({ max_chats_per_run: 100, max_run_seconds: 3300 }, 4),
+    'One run handles up to 100 chats, for at most 55 minutes; whatever is left goes in later runs.',
+  );
+  assert.match(m.runLimitNote({ max_chats_per_run: 100, max_run_seconds: null }), /up to 100 chats/, 'count unknown');
+});
+
+test('the preview reports eligible chats, and a refusal instead of promising deletions', () => {
+  const totals = { chats: 4, messages: 16 };
+  assert.equal(
+    m.previewSummary(totals, true, null),
+    '4 expired chats (16 messages) are past their retention period. A run archives each, then deletes it.',
+  );
+  const refused = m.previewSummary(totals, false, 'Chat retention is disabled.');
+  assert.match(refused, /^4 expired chats .* but a run now would be refused: Chat retention is disabled\.$/);
+  assert.doesNotMatch(refused, /delet/);
+  assert.match(m.previewSummary({ chats: 1, messages: 1 }, true, null), /^1 expired chat \(1 message\) is past its/);
+});
+
+test('the confirmation calls the counts eligible and states the run limits', () => {
+  const limits = { max_chats_per_run: 100, max_run_seconds: null };
+  const msg = m.confirmRunMessage({ chats: 400, messages: 9000 }, true, limits);
+  assert.match(msg, /Eligible as of the last preview: 400 chats \(9,000 messages\)\./);
+  assert.match(msg, /archived and then permanently deleted/);
+  assert.match(msg, /up to 100 chats; whatever is left goes in later runs/);
+  assert.doesNotMatch(m.confirmRunMessage({ chats: 3, messages: 9 }, true, limits), /later runs/);
+  assert.match(m.confirmRunMessage(null, false, limits), /Every chat past its retention period is eligible\.[\s\S]*no archive destination/);
+});
+
 test('skip reasons and sizes read as words', () => {
   assert.equal(m.skipLabel('pending_approval'), 'tool approval pending');
   assert.equal(m.skipLabel('something_new'), 'something new');
