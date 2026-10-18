@@ -503,6 +503,20 @@ class TestInstall:
         await savepoint.rollback()
         assert await _installed(db, dep) is None
 
+    async def test_a_plan_that_did_not_settle_is_refused(self, db, admin_user, fake_repos, monkeypatch):
+        """A resolve that hit its round limit reports a problem without any
+        one entry being blocked; the install must refuse it as the preview does."""
+        from app.services import package_dependencies as deps
+
+        async def unsettled(*args, **kwargs):
+            return deps.Plan(problems=["Requirements did not settle after 50 rounds"])
+
+        monkeypatch.setattr(deps, "resolve_plan", unsettled)
+        root = f"triage{_uid()}"
+        with pytest.raises(ValueError, match="did not settle"):
+            await PackageService(db).install(package_yaml(root, requires=[{"name": "anything"}]), str(admin_user.id))
+        assert await _installed(db, root) is None
+
     async def test_dependency_variables(self, db, admin_user, fake_repos):
         dep, root = f"gmail{_uid()}", f"triage{_uid()}"
         await fake_repos.add(db, admin_user, f"r{_uid()}", [package_yaml(dep, variable="GREETING")])
@@ -589,6 +603,21 @@ class TestUninstallAndUpgrade:
         assert result.success and info["breaks"] == [], result.errors
         await service.install(templated, str(admin_user.id), variables={"VERSION": "1.5.0"})
         assert (await _installed(db, dep)).version == "1.5.0"
+
+    async def test_an_empty_version_still_breaks_dependents(self, db, admin_user, fake_repos):
+        """version: "" (or an empty value for its variable) is no version: it
+        satisfies no range, so dependents are still protected."""
+        dep, root = f"gmail{_uid()}", f"triage{_uid()}"
+        service = PackageService(db)
+        await service.install(package_yaml(dep), str(admin_user.id))
+        await service.install(package_yaml(root, requires=[{"name": dep, "version": ">=1,<2"}]), str(admin_user.id))
+
+        empty = package_yaml(dep, "")
+        result, _, _, info = await service.preview(empty, str(admin_user.id))
+        assert not result.success and [b["dependent"] for b in info["breaks"]] == [root]
+        with pytest.raises(ValueError, match="would break"):
+            await service.install(empty, str(admin_user.id))
+        assert (await _installed(db, dep)).version == "1.0.0"
 
     async def test_an_upgrade_rechecks_its_own_requirements(self, db, admin_user, fake_repos):
         dep, root = f"gmail{_uid()}", f"triage{_uid()}"
