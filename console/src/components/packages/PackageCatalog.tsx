@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowUpCircle, BookOpen, Check, GitBranch, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
+import { AlertTriangle, ArrowUpCircle, BookOpen, Check, GitBranch, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
 import { apiClient } from '../../lib/api';
-import { formatRequirement } from '../../lib/packageDependencies';
+import { formatRequirement, requirementState } from '../../lib/packageDependencies';
 import type { InstalledPackage, PackageCatalogEntry } from '../../types';
 import type { InstallTarget } from './InstallPackageModal';
 import { isForbidden, useAddOfficialRepository, usePackageRepositories } from './hooks';
@@ -214,16 +214,19 @@ function CatalogCard({
               <GitBranch className="w-3 h-3" />
               Requires
               {entry.requires!.map((r) => {
-                const target = r.instance || r.name;
-                const present = (installed || []).some((p) => p.name === target);
+                // Whether it's met is the server's call (its range semantics).
+                const { tone, note } = requirementState(r);
                 return (
                   <span
-                    key={target}
-                    className="px-1.5 py-0.5 rounded font-mono bg-surface-2 text-gray-300"
-                    title={present ? 'Installed' : 'Installed first when you install this package'}
+                    key={r.install_name}
+                    className={`px-1.5 py-0.5 rounded font-mono bg-surface-2 ${
+                      tone === 'warn' ? 'text-amber-400' : 'text-gray-300'
+                    }`}
+                    title={tone === 'neutral' ? `${note}: installed first when you install this package` : note}
                   >
                     {formatRequirement(r)}
-                    {present && <Check className="w-3 h-3 inline ml-1 text-green-400" />}
+                    {tone === 'ok' && <Check className="w-3 h-3 inline ml-1 text-green-400" />}
+                    {tone === 'warn' && <AlertTriangle className="w-3 h-3 inline ml-1" />}
                   </span>
                 );
               })}

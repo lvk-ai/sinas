@@ -5,6 +5,7 @@ import { apiClient } from '../../lib/api';
 import {
   BLOCKED_LABEL,
   dependencyPayload,
+  installWarnings,
   planSummary,
   sentValues,
   variableDefaults,
@@ -37,7 +38,6 @@ export type InstallTarget =
 
 type InstallStep = 'input' | 'preview' | 'installing' | 'done';
 
-const BROAD_ROLE_WARNING = 'Broad role permission';
 
 const sortedEntries = (values: Record<string, any> | undefined) =>
   Object.keys(values ?? {}).sort().map((k) => [k, values![k]]);
@@ -238,12 +238,11 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const breaks: DependencyBreak[] = previewResult?.breaks || [];
   // The consent covers every package the install installs: the ones it
   // installs first too, their broad permissions named after them.
-  const broadRoleWarnings: string[] = [
-    ...plan.toInstall.flatMap((d) =>
-      (d.preview?.warnings || []).filter((w) => w.startsWith(BROAD_ROLE_WARNING)).map((w) => `${d.install_name}: ${w}`),
-    ),
-    ...(previewResult?.warnings || []).filter((w: string) => w.startsWith(BROAD_ROLE_WARNING)),
-  ];
+  // Every warning is shown, the dependencies' named after them.
+  const { all: allWarnings, broad: broadRoleWarnings } = installWarnings(
+    previewResult?.dependencies,
+    previewResult?.warnings,
+  );
   // Consent covers exactly the permissions this preview showed, for exactly
   // its values: a new preview or any edit withdraws it.
   const broadKey = `${previewedKey}|${JSON.stringify(broadRoleWarnings)}`;
@@ -455,20 +454,15 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               </div>
             )}
 
-            {((previewResult.warnings?.length ?? 0) > 0 || broadRoleWarnings.length > 0) && (
+            {allWarnings.length > 0 && (
               <div className="p-3 bg-yellow-900/20 border border-yellow-900/30 rounded">
                 <div className="flex items-center gap-2 mb-1">
                   <AlertTriangle className="w-4 h-4 text-yellow-400" />
                   <span className="text-sm font-medium text-yellow-300">Warnings</span>
                 </div>
-                {(previewResult.warnings || []).map((w: string, i: number) => (
+                {allWarnings.map((w, i) => (
                   <p key={i} className="text-sm text-yellow-400/80">{w}</p>
                 ))}
-                {broadRoleWarnings
-                  .filter((w) => !(previewResult.warnings || []).includes(w))
-                  .map((w) => (
-                    <p key={w} className="text-sm text-yellow-400/80">{w}</p>
-                  ))}
                 {broadRoleWarnings.length > 0 && (
                   <label className="flex items-start gap-2 mt-3 cursor-pointer">
                     <input

@@ -50,6 +50,34 @@ test('dependency values go to the packages the plan installs, blank secrets left
   assert.equal(m.dependencyPayload(values, undefined), undefined);
 });
 
+test('every warning of the packages installed first is shown, named after them; broad ones feed the consent', () => {
+  const broad = 'Broad role permission (install requires allowBroadRolePermissions=true): role r: sinas.x';
+  const entries = [
+    plan('gmail', 'install', { preview: { success: true, changes: [], errors: [], warnings: ["Skipped skill 'gmail/x': edited by hand", broad] } }),
+    plan('drive', 'satisfied', { preview: { success: true, changes: [], errors: [], warnings: ['not shown: nothing to install'] } }),
+    plan('slack', 'install'),  // no preview (e.g. it failed before one)
+  ];
+  const { all, broad: consent } = m.installWarnings(entries, ['own warning', broad]);
+  assert.deepEqual(all, ["gmail: Skipped skill 'gmail/x': edited by hand", `gmail: ${broad}`, 'own warning', broad]);
+  assert.deepEqual(consent, [`gmail: ${broad}`, broad]);
+  assert.deepEqual(m.installWarnings(undefined, undefined), { all: [], broad: [] });
+});
+
+test("a requirement's state is the server's verdict, with what is in the way", () => {
+  const req = (extra) => ({ name: 'gmail', version: '>=2', install_name: 'gmail', ...extra });
+  assert.deepEqual(m.requirementState(req({ status: 'satisfied', installed_version: '2.1.0' })), {
+    tone: 'ok', note: 'Installed: 2.1.0',
+  });
+  assert.deepEqual(m.requirementState(req({ status: 'incompatible', reason: 'version', installed_version: '1.0.0' })), {
+    tone: 'warn', note: "Installed 1.0.0, which doesn't satisfy >=2",
+  });
+  assert.deepEqual(
+    m.requirementState(req({ status: 'incompatible', reason: 'other_package', installed_package: 'slack' })),
+    { tone: 'warn', note: "Name taken: 'gmail' is package slack" },
+  );
+  assert.deepEqual(m.requirementState(req({ status: 'missing' })), { tone: 'neutral', note: 'Not installed' });
+});
+
 test('defaults pre-fill a form; absent and null defaults do not', () => {
   assert.deepEqual(
     m.variableDefaults([{ name: 'A', default: 'x' }, { name: 'B' }, { name: 'C', default: null }, { name: 'D', default: false }]),

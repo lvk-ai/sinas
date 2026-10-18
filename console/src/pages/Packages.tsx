@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { apiClient } from '../lib/api';
 import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store, ShieldAlert, GitBranch } from 'lucide-react';
 import { useState } from 'react';
-import { formatRequirement } from '../lib/packageDependencies';
+import { formatRequirement, requirementState } from '../lib/packageDependencies';
 import { InstallPackageModal, type InstallTarget } from '../components/packages/InstallPackageModal';
 import { LoadError } from '../components/packages/LoadError';
 import { isForbidden } from '../components/packages/hooks';
@@ -31,13 +31,7 @@ function PackageDependencies({ pkg }: { pkg: InstalledPackage }) {
               className={`px-1.5 py-0.5 rounded font-mono ${
                 r.status === 'satisfied' ? 'bg-surface-2 text-gray-300' : 'bg-red-900/30 text-red-400'
               }`}
-              title={
-                r.status === 'satisfied'
-                  ? `Installed: ${r.installed_version}`
-                  : r.status === 'missing'
-                    ? 'Not installed'
-                    : `Installed ${r.installed_version ?? ''} doesn't meet the requirement`
-              }
+              title={requirementState(r).note}
             >
               {formatRequirement(r)}
               {r.status !== 'satisfied' && ` (${r.status})`}

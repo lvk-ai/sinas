@@ -3,7 +3,28 @@
 // sends for the packages it installs first. Pure, so npm test covers it.
 // docs/design/package-dependencies.md
 
-import type { DependencyPlanEntry, PackageRequirement } from '../types';
+import type { DependencyPlanEntry, PackageRequirement, PackageRequirementStatus } from '../types';
+
+/** How a requirement stands now, as the server judged it (one
+ * implementation of the version ranges: the backend's): `ok` when met, a
+ * warning when something else is in the way, neutral when simply not
+ * installed. */
+export function requirementState(req: PackageRequirementStatus): { tone: 'ok' | 'warn' | 'neutral'; note: string } {
+  if (req.status === 'satisfied') {
+    return { tone: 'ok', note: `Installed: ${req.installed_version ?? 'unknown version'}` };
+  }
+  if (req.status === 'incompatible') {
+    if (req.reason === 'other_package') {
+      return {
+        tone: 'warn',
+        note: `Name taken: '${req.install_name}' is package ${req.installed_package ?? 'another package'}`,
+      };
+    }
+    const installed = req.installed_version ? `Installed ${req.installed_version}` : 'Installed';
+    return { tone: 'warn', note: `${installed}, which doesn't satisfy ${req.version ?? 'the requirement'}` };
+  }
+  return { tone: 'neutral', note: 'Not installed' };
+}
 
 /** "gmail >=1.2,<2", "mail (as mail-support)", "slack". */
 export function formatRequirement(req: PackageRequirement): string {
@@ -27,6 +48,31 @@ export function planSummary(entries: DependencyPlanEntry[] | undefined): PlanSum
     satisfied: all.filter((e) => e.status === 'satisfied'),
     blocked: all.filter((e) => e.status !== 'install' && e.status !== 'satisfied'),
   };
+}
+
+export const BROAD_ROLE_WARNING = 'Broad role permission';
+
+/** Every warning of an install: each package it installs first (all of
+ * them, named after the package: a skipped hand-edited resource matters as
+ * much there), then the package's own. `broad` are the ones the broad role
+ * permission consent covers. */
+export function installWarnings(
+  entries: DependencyPlanEntry[] | undefined,
+  own: string[] | undefined,
+): { all: string[]; broad: string[] } {
+  const all: string[] = [];
+  const broad: string[] = [];
+  for (const d of planSummary(entries).toInstall) {
+    for (const w of d.preview?.warnings ?? []) {
+      all.push(`${d.install_name}: ${w}`);
+      if (w.startsWith(BROAD_ROLE_WARNING)) broad.push(`${d.install_name}: ${w}`);
+    }
+  }
+  for (const w of own ?? []) {
+    all.push(w);
+    if (w.startsWith(BROAD_ROLE_WARNING)) broad.push(w);
+  }
+  return { all, broad };
 }
 
 /** Why a blocked entry blocks, for its badge. */

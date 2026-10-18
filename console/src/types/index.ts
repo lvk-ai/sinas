@@ -740,7 +740,11 @@ export interface PackageRequirement {
 export interface PackageRequirementStatus extends PackageRequirement {
   install_name: string;
   status: 'satisfied' | 'missing' | 'incompatible';
+  /** Why it's incompatible: out of range, or the install name holds another package. */
+  reason?: 'version' | 'other_package' | null;
   installed_version?: string | null;
+  /** The declared name of what is installed under install_name. */
+  installed_package?: string | null;
 }
 
 /** One entry of a preview's dependency plan, dependencies first. */
@@ -925,8 +929,8 @@ export interface PackageCatalogEntry {
   readme_url?: string | null;
   /** The index says it may be installed more than once (package.multiInstance). */
   multi_instance?: boolean;
-  /** The packages it requires, from the repository index. */
-  requires?: PackageRequirement[];
+  /** The packages it requires, from the repository index, each with its status now. */
+  requires?: PackageRequirementStatus[];
   installed: PackageCatalogInstall[];
   update_available: boolean;
 }
