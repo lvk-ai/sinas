@@ -705,6 +705,14 @@ class TestDryRunAndStatus:
         assert status["next_run"] is not None
         assert status["in_progress"] is None
 
+    async def test_a_queued_run_no_worker_took_stops_counting_as_in_progress(self, world):
+        await world.add(ChatRetentionRun(trigger="api", status="queued", created_at=NOW - timedelta(minutes=20)))
+        async with world.sessions() as db:
+            assert (await job.status(db))["in_progress"] is None
+        await world.add(ChatRetentionRun(trigger="api", status="queued", created_at=NOW))
+        async with world.sessions() as db:
+            assert (await job.status(db))["in_progress"]["status"] == "queued"
+
     async def test_scheduled_tick_waits_for_the_schedule(self, world, monkeypatch):
         old = await world.chat(idle_days=100)
         # Fires once a year, long ago this year: a deployment that never ran waits.

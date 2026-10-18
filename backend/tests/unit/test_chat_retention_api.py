@@ -81,6 +81,8 @@ class TestPermissions:
         assert queued[0][0] == "chat_retention_run_job"
         assert queued[0][1]["run_id"] == run_id
         assert queued[0][1]["_queue_name"] == "sinas:queue:agents"
+        # Only what arq's enqueue_job takes, plus the job's own run_id.
+        assert set(queued[0][1]) == {"run_id", "_job_id", "_queue_name"}
         run = await db.get(ChatRetentionRun, uuid.UUID(run_id))
         assert run.status == "queued" and run.trigger == "api"
         assert run.actor_user_id == admin_user.id

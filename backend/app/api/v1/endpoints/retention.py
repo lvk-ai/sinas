@@ -89,16 +89,16 @@ async def retention_run(
 
     try:
         from app.core.redis import get_arq_pool
-        from app.services.retention.policy import RetentionPolicy
 
-        policy = RetentionPolicy.from_settings()
         pool = await get_arq_pool()
+        # The job's timeout is the worker's (func(..., timeout=) in
+        # AgentWorkerSettings): arq takes no per-enqueue timeout, and an
+        # unknown _-kwarg would reach the job as an argument.
         await pool.enqueue_job(
             RUN_JOB,
             run_id=str(run.id),
             _job_id=f"chat-retention-{run.id}",
             _queue_name=AGENT_QUEUE,
-            _job_timeout=(policy.max_run_seconds or 6 * 3600) + 600,
         )
     except Exception as e:
         run.status = FAILED

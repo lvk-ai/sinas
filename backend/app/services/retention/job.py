@@ -743,9 +743,16 @@ def _in_progress(run: Optional[ChatRetentionRun], policy: RetentionPolicy, now: 
     """A run queued or running, and recent enough to still be alive."""
     if run is None or run.status not in (QUEUED, RUNNING):
         return False
+    if run.status == QUEUED:
+        # A worker picks a queued run up within seconds; one still queued
+        # after this never will (its job failed or was lost).
+        return run.created_at is not None and now - run.created_at < QUEUED_STALE_AFTER
     since = run.started_at or run.created_at
     limit = timedelta(seconds=(policy.max_run_seconds or 6 * 3600) + 15 * 60)
     return since is not None and now - since < limit
+
+
+QUEUED_STALE_AFTER = timedelta(minutes=15)
 
 
 async def scheduled_tick(engine: Optional[AsyncEngine] = None, now: Optional[datetime] = None) -> Optional[dict]:
