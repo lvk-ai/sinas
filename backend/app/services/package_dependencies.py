@@ -13,6 +13,7 @@ function containers.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -231,6 +232,9 @@ INVALID = "invalid"
 BLOCKING = (MISSING, INCOMPATIBLE, CYCLE, INVALID)
 
 MAX_DEPTH = 10
+# Rounds of the constraint fixpoint (see resolve_plan); a graph that hasn't
+# settled by then is refused rather than resolved forever.
+MAX_ROUNDS = 50
 
 
 @dataclass
@@ -250,6 +254,9 @@ class PlanEntry:
     yaml: str | None = field(default=None, repr=False)
     file_url: str | None = None
     requires: list[str] = field(default_factory=list)  # install names it requires
+    # An INSTALL entry whose own requirements depend on its variables, which
+    # haven't been given yet: resolved on a preview with its values.
+    needs_input: bool = False
 
     @property
     def required_by(self) -> list[str]:
@@ -271,6 +278,7 @@ class PlanEntry:
             "constraints": self.constraints,
             "required_by": self.required_by,
             "requires": self.requires,
+            "needs_input": self.needs_input,
             "message": self.message,
         }
 
@@ -281,6 +289,8 @@ class Plan:
     requires it). The root package itself is not in it."""
 
     entries: list[PlanEntry] = field(default_factory=list)
+    # Problems not tied to one entry (the fixpoint didn't settle).
+    problems: list[str] = field(default_factory=list)
 
     @property
     def to_install(self) -> list[PlanEntry]:
@@ -288,10 +298,12 @@ class Plan:
 
     @property
     def blocking(self) -> list[PlanEntry]:
-        return [e for e in self.entries if e.status in BLOCKING]
+        """What refuses an install: an unmet requirement, or a package to
+        install whose own requirements still wait for its values."""
+        return [e for e in self.entries if e.status in BLOCKING or e.needs_input]
 
     def errors(self) -> list[str]:
-        return [f"Requirement '{e.install_name}': {e.message}" for e in self.blocking]
+        return self.problems + [f"Requirement '{e.install_name}': {e.message}" for e in self.blocking]
 
 
 def _requirements_of(yaml_content: str, values: dict[str, Any] | None = None) -> list[Any]:
@@ -300,17 +312,30 @@ def _requirements_of(yaml_content: str, values: dict[str, Any] | None = None) ->
     its instance through a variable. YAML that doesn't parse, or has no
     package metadata, requires nothing here: the package's own validation
     reports it."""
+    requirements, _missing = _nested_requirements(yaml_content, values)
+    return requirements
+
+
+def _nested_requirements(yaml_content: str, values: dict[str, Any] | None = None) -> tuple[list[Any], list[str]]:
+    """(package.requires, variables it still waits for). When a requirement
+    names a variable that has no value yet (given, or a declared default),
+    the requirements can't be read until it has one: ([], those names), not
+    an error. Raises (pydantic ValidationError) only for requirements that
+    are invalid with every value they use filled in."""
     from app.schemas.config import PackageMetadataConfig
 
     text = _substitute_known(yaml_content, values or {})
     try:
         doc = yaml.safe_load(text)
     except yaml.YAMLError:
-        return []
+        return [], []
     meta = doc.get("package") if isinstance(doc, dict) else None
     if not isinstance(meta, dict) or not meta.get("requires"):
-        return []
-    return PackageMetadataConfig.model_validate(meta).requires
+        return [], []
+    waiting = sorted(set(_VAR.findall(json.dumps(meta.get("requires"), default=str))))
+    if waiting:
+        return [], waiting
+    return PackageMetadataConfig.model_validate(meta).requires, []
 
 
 _VAR = re.compile(r"\$\{\{\s*vars\.([A-Z][A-Z0-9_]*)\s*\}\}")
@@ -340,24 +365,30 @@ async def installed_packages(db: AsyncSession) -> dict[str, Package]:
     return {p.name: p for p in (await db.execute(select(Package))).scalars()}
 
 
-def _candidates(repositories: list, name: str, hint: str | None, dependent_repo: str | None):
-    """Active repositories offering `name`, in preference order: the hint,
-    the dependent's own repository, then the rest by name."""
-    offering = []
-    for repository in repositories:
-        entry = next((p for p in (repository.index or {}).get("packages", []) if p["name"] == name), None)
-        if entry is not None:
-            offering.append((repository, entry))
+@dataclass(frozen=True)
+class _Constraint:
+    """One package's requirement on an install name."""
 
-    def rank(item):
-        repository = item[0]
-        if hint and repository.name == hint:
-            return (0, repository.name)
-        if dependent_repo and repository.name == dependent_repo:
-            return (1, repository.name)
-        return (2, repository.name)
+    required_by: str
+    name: str
+    version: str | None
+    repository: str | None       # the requirement's hint
+    dependent_repo: str | None   # where the requiring package comes from
 
-    return sorted(offering, key=rank)
+
+def _describe(constraints: list[_Constraint]) -> str:
+    return ", ".join(
+        f"'{c.required_by}' requires {c.name}{' ' + c.version if c.version else ''}" for c in constraints
+    )
+
+
+def _version_order(version: str):
+    # Versions that aren't semver-style sort below every one that is.
+    return _key(version) or ((), ())
+
+
+def _fits(version: str, constraints: list[_Constraint]) -> bool:
+    return all(satisfies(version, c.version) for c in constraints)
 
 
 async def resolve_plan(
@@ -372,12 +403,29 @@ async def resolve_plan(
     """Resolve the root package's requirements against what is installed and
     what the active package repositories offer, recursively.
 
-    A satisfied requirement is not descended into (its own requirements were
-    checked when it was installed). A package to install is fetched and
-    checked against its index checksum, and its own requirements resolved.
-    Cycles, packages no active repository offers in range, and installed
-    packages out of range are entries with a blocking status, never raised:
-    the preview shows them all at once.
+    Every constraint on an install name, from anywhere in the graph, is
+    collected before a version is chosen for it (a fixpoint: choosing a
+    package to install adds its own requirements, which may constrain others,
+    which are then chosen again), so the result doesn't depend on the order
+    requirements are listed in or met:
+
+    - An installed package must meet all of them, or it is `incompatible`
+      (never upgraded automatically), listing the ones it doesn't meet.
+    - A package to install comes from the most preferred active repository
+      whose version meets all of them. Preference: a repository some
+      requirement names as its hint, then one a requiring package comes from,
+      then the rest; ties by repository name. Each repository's index lists
+      one version per package, so this picks among repositories, not among
+      versions of one repository.
+    - Limit: the choice is made per install name. There is no backtracking
+      over alternative versions that would change which packages are
+      required at all (a different version of A requiring a different C);
+      the first consistent choice per name is kept.
+
+    A satisfied (installed) requirement is not resolved further, but its
+    stored requirements are followed to find cycles through installed
+    packages. Cycles, unmet requirements and packages that can't be had are
+    entries with a blocking status, never raised: the preview shows them all.
     """
     from app.services import package_repositories as repos
     from app.services.package_service import resolve_install_name
@@ -385,120 +433,214 @@ async def resolve_plan(
     installed = await installed_packages(db)
     repositories = await repos._repositories(db)
     dependency_variables = dependency_variables or {}
-    entries: dict[str, PlanEntry] = {}
-    order: list[PlanEntry] = []
 
-    async def visit(req, required_by: str, path: list[str], dependent_repo: str | None, depth: int):
-        target = req.install_name
-        constraint = {"required_by": required_by, "version": req.version}
+    constraints: dict[str, dict[str, _Constraint]] = {}
+    imposed: dict[str, list[str]] = {}   # what a package to install requires, by install name
+    decided: dict[str, PlanEntry] = {}
+    signatures: dict[str, tuple] = {}
+    fetched: dict[tuple[str, str], Any] = {}
 
-        if target in path:
-            cycle = " → ".join(path[path.index(target):] + [target])
-            entry = entries.get(target)
-            if entry is None:
-                entry = PlanEntry(install_name=target, package_name=req.name, status=CYCLE)
-                entries[target] = entry
-                order.append(entry)
-            entry.status, entry.message = CYCLE, f"circular requirement: {cycle}"
-            entry.constraints.append(constraint)
-            return
+    def add(required_by: str, reqs: list[Any], dependent_repo: str | None) -> None:
+        for r in reqs:
+            constraints.setdefault(r.install_name, {})[required_by] = _Constraint(
+                required_by, r.name, r.version, r.repository, dependent_repo
+            )
+        imposed[required_by] = [r.install_name for r in reqs]
 
-        entry = entries.get(target)
-        if entry is not None:
-            # Required again (a diamond): every constraint must hold.
-            entry.constraints.append(constraint)
-            if entry.status in BLOCKING:
-                return
-            if entry.package_name != req.name:
-                entry.status = INCOMPATIBLE
-                entry.message = (
-                    f"'{required_by}' requires package '{req.name}' as '{target}', "
-                    f"but '{target}' is package '{entry.package_name}'"
-                )
-            elif not satisfies(entry.version, req.version):
-                which = "installed" if entry.status == SATISFIED else "planned"
-                entry.status = INCOMPATIBLE
-                entry.message = (
-                    f"'{required_by}' requires {req.name} {req.version}, but the {which} "
-                    f"version is {entry.version}"
-                )
-            return
+    def withdraw(by: str) -> None:
+        for target in imposed.pop(by, []):
+            constraints.get(target, {}).pop(by, None)
+
+    async def fetch(repository, name: str):
+        key = (repository.name, name)
+        if key not in fetched:
+            try:
+                fetched[key] = await repos.fetch_package(db, repository, name)
+            except repos.RepositoryError as e:
+                fetched[key] = e
+        return fetched[key]
+
+    async def decide(target: str, cons: list[_Constraint]) -> tuple[PlanEntry, list[Any]]:
+        listed = [{"required_by": c.required_by, "version": c.version} for c in cons]
+        names = sorted({c.name for c in cons})
+        if len(names) > 1:
+            return PlanEntry(
+                install_name=target, package_name=names[0], status=INCOMPATIBLE, constraints=listed,
+                message=f"different packages are required as '{target}': {_describe(cons)}",
+            ), []
+        name = names[0]
 
         package = installed.get(target)
         if package is not None:
             declared = package.package_name or package.name
             entry = PlanEntry(
-                install_name=target, package_name=declared, status=SATISFIED,
-                constraints=[constraint], version=package.version, installed_version=package.version,
+                install_name=target, package_name=declared, status=SATISFIED, constraints=listed,
+                version=package.version, installed_version=package.version,
             )
-            if declared != req.name:
+            if declared != name:
                 entry.status = INCOMPATIBLE
-                entry.message = f"'{target}' is installed, but it is package '{declared}', not '{req.name}'"
-            elif not satisfies(package.version, req.version):
-                entry.status = INCOMPATIBLE
-                entry.message = (
-                    f"{req.name} {package.version} is installed, but '{required_by}' requires "
-                    f"{req.version}; update it first"
-                )
-            entries[target] = entry
-            order.append(entry)
-            return
+                entry.message = f"'{target}' is installed, but it is package '{declared}', not '{name}'"
+            else:
+                unmet = [c for c in cons if not satisfies(package.version, c.version)]
+                if unmet:
+                    entry.status = INCOMPATIBLE
+                    entry.message = (
+                        f"{name} {package.version} is installed, but {_describe(unmet)}; update it first"
+                    )
+            return entry, []
 
-        entry = PlanEntry(install_name=target, package_name=req.name, status=MISSING, constraints=[constraint])
-        entries[target] = entry
-        if depth > MAX_DEPTH:
-            entry.message = f"requirements nest deeper than {MAX_DEPTH} levels"
-            order.append(entry)
-            return
-
-        candidates = _candidates(repositories, req.name, req.repository, dependent_repo)
-        chosen = next(
-            ((r, e) for r, e in candidates if satisfies(e["version"], req.version)), None
-        )
+        entry = PlanEntry(install_name=target, package_name=name, status=MISSING, constraints=listed)
+        hints = {c.repository for c in cons if c.repository}
+        dependents = {c.dependent_repo for c in cons if c.dependent_repo}
+        offering = []
+        for repository in repositories:
+            index_entry = next(
+                (p for p in (repository.index or {}).get("packages", []) if p["name"] == name), None
+            )
+            if index_entry is not None:
+                rank = 0 if repository.name in hints else 1 if repository.name in dependents else 2
+                offering.append((rank, repository.name, repository, index_entry))
+        offering.sort(key=lambda o: (o[0], o[1]))
+        chosen = next((o for o in offering if _fits(o[3]["version"], cons)), None)
         if chosen is None:
-            if candidates:
-                offered = ", ".join(f"{e['version']} in {r.name}" for r, e in candidates)
+            if offering:
+                offered = ", ".join(f"{o[3]['version']} in {o[1]}" for o in offering)
                 entry.message = (
-                    f"not installed, and no active repository offers {req.name} {req.version} "
-                    f"(offered: {offered})"
+                    f"not installed, and no active repository offers a version that meets all of: "
+                    f"{_describe(cons)} (offered: {offered})"
                 )
             else:
-                entry.message = f"not installed, and no active package repository offers '{req.name}'"
-            order.append(entry)
-            return
+                entry.message = f"not installed, and no active package repository offers '{name}'"
+            return entry, []
 
-        repository, index_entry = chosen
-        try:
-            text, fetched, url = await repos.fetch_package(db, repository, req.name)
-        except repos.RepositoryError as e:
-            entry.message = f"could not be fetched from '{repository.name}': {e}"
-            order.append(entry)
-            return
-        if not satisfies(fetched["version"], req.version):
+        repository = chosen[2]
+        result = await fetch(repository, name)
+        if isinstance(result, Exception):
+            entry.message = f"could not be fetched from '{repository.name}': {result}"
+            return entry, []
+        text, index_entry, url = result
+        if not _fits(index_entry["version"], cons):
             # The index moved on while fetching (a refresh).
-            entry.message = f"{repository.name} now offers {req.name} {fetched['version']}, outside {req.version}"
-            order.append(entry)
-            return
+            entry.message = (
+                f"{repository.name} now offers {name} {index_entry['version']}, which doesn't meet "
+                f"all of: {_describe(cons)}"
+            )
+            return entry, []
 
-        entry.version, entry.repository, entry.file_url = fetched["version"], repository.name, url
+        entry.version, entry.repository, entry.file_url = index_entry["version"], repository.name, url
         try:
             # It must be installable under that name (multiInstance rule).
-            _name, substituted, _declared, _multi = resolve_install_name(text, entry.instance)
-            nested = _requirements_of(substituted, dependency_variables.get(target))
+            _n, substituted, _d, _m = resolve_install_name(text, entry.instance)
+            nested, waiting = _nested_requirements(substituted, dependency_variables.get(target))
         except Exception as e:  # ValueError, yaml / pydantic errors
             entry.status = INVALID
-            entry.message = f"{req.name} {fetched['version']} from {repository.name} can't be installed as '{target}': {e}"
-            order.append(entry)
-            return
+            entry.message = (
+                f"{name} {entry.version} from {repository.name} can't be installed as '{target}': {e}"
+            )
+            return entry, []
         entry.status, entry.yaml = INSTALL, text
+        if waiting:
+            entry.needs_input = True
+            entry.message = (
+                f"its own requirements use its variables ({', '.join(waiting)}): give their values "
+                "and preview again"
+            )
         entry.requires = [r.install_name for r in nested]
-        for sub in nested:
-            await visit(sub, target, path + [target], repository.name, depth + 1)
-        order.append(entry)  # after what it requires
+        return entry, nested
 
-    for req in requirements:
-        await visit(req, root_install_name, [root_install_name], root_repository, 1)
-    return Plan(entries=order)
+    add(root_install_name, list(requirements), root_repository)
+    settled = False
+    for _round in range(MAX_ROUNDS):
+        changed = False
+        for target in sorted(constraints):
+            if target == root_install_name:
+                continue  # a requirement back to the root: a cycle, found below
+            cons = sorted(constraints[target].values(), key=lambda c: c.required_by)
+            if not cons:
+                if target in decided:
+                    # Nothing requires it any more (a requirer chose otherwise).
+                    del decided[target]
+                    signatures.pop(target, None)
+                    withdraw(target)
+                    changed = True
+                continue
+            signature = tuple(cons)
+            if signatures.get(target) == signature:
+                continue
+            signatures[target] = signature
+            entry, nested = await decide(target, cons)
+            decided[target] = entry
+            withdraw(target)
+            add(target, nested, entry.repository)
+            changed = True
+        if not changed:
+            settled = True
+            break
+
+    plan = Plan()
+    if not settled:
+        plan.problems.append(
+            f"the requirements didn't settle after {MAX_ROUNDS} rounds of resolution; refusing"
+        )
+
+    # Cycles: through the plan, and through what is installed already (an
+    # installed package's stored requirements), from the root.
+    def edges(node: str) -> list[str]:
+        if node == root_install_name:
+            return [r.install_name for r in requirements]
+        entry = decided.get(node)
+        if entry is not None and entry.status == INSTALL:
+            return list(entry.requires)
+        package = installed.get(node)
+        if package is not None:
+            return [_target(e) for e in package.requires or []]
+        return []
+
+    finished: set[str] = set()
+
+    def find_cycles(node: str, path: list[str]) -> None:
+        for nxt in edges(node):
+            if nxt in path:
+                cycle = path[path.index(nxt):] + [nxt]
+                # Reported on the first package of the path the plan shows.
+                for name in path[1:] + [nxt]:
+                    if name in decided:
+                        decided[name].status = CYCLE
+                        decided[name].message = f"circular requirement: {' → '.join(cycle)}"
+                        break
+                continue
+            if nxt not in finished:
+                find_cycles(nxt, path + [nxt])
+        finished.add(node)
+
+    find_cycles(root_install_name, [root_install_name])
+
+    # The plan: what the root reaches, dependencies before dependents.
+    order: list[PlanEntry] = []
+    placed: set[str] = set()
+
+    def plan_edges(node: str) -> list[str]:
+        # Only the root and packages to install add entries to the plan.
+        entry = decided.get(node)
+        if node == root_install_name or (entry is not None and entry.status == INSTALL):
+            return edges(node)
+        return []
+
+    def place(node: str, depth: int) -> None:
+        for nxt in plan_edges(node):
+            if nxt in placed or nxt == root_install_name or nxt not in decided:
+                continue
+            placed.add(nxt)
+            if depth + 1 > MAX_DEPTH:
+                decided[nxt].status = MISSING
+                decided[nxt].message = f"requirements nest deeper than {MAX_DEPTH} levels"
+            else:
+                place(nxt, depth + 1)
+            order.append(decided[nxt])
+
+    place(root_install_name, 0)
+    plan.entries = order
+    return plan
 
 
 async def lock_packages(db: AsyncSession) -> None:

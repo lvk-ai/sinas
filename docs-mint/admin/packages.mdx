@@ -193,10 +193,12 @@ This is not the `dependencies` resource kind, which approves Python packages for
 | `install` | Not installed; an active package repository offers a version in range. It is installed first. |
 | `missing` | Not installed, and no active repository offers a version in range. |
 | `incompatible` | Installed, but out of range (update it first), or that install name holds another package. |
-| `cycle` | The requirements lead back to a package on their own path. |
+| `cycle` | The requirements lead back to a package on their own path, also through installed packages (upgrading `a` to require `b` when `b` requires `a`). |
 | `invalid` | The required package can't be installed as asked (e.g. an `instance` for a package without `multiInstance`). |
 
-Any status but the first two refuses the install. A missing package is looked for in the requirement's `repository` first, then in the repository the dependent comes from, then in the other active repositories by name; each file is checked against its index checksum, as every repository install is. An installed dependency is never upgraded automatically.
+Any status but the first two refuses the install. When several packages require the same one, every one of their constraints must hold at once: the plan collects them all before picking a version, and a refusal names the constraints that can't be met and who set them. A missing package comes from the first repository, in this order, whose version meets every constraint: one a requirement names as its `repository`, one a requiring package comes from, then the others by name. Each file is checked against its index checksum, as every repository install is. An installed dependency is never upgraded automatically.
+
+A required package whose own `requires` uses one of its variables (`instance: ${{ vars.MAILBOX }}`) is listed with `needs_input` and its variable declarations; preview again with its values in `dependencyVariables` to resolve what it requires.
 
 Everything the plan installs is installed in **one transaction** with the package itself: if any of them fails, nothing is installed. Each package has its own variables; the preview lists every package to install with its variable declarations, and the install takes their values in `dependencyVariables`, keyed by install name:
 

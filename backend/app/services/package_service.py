@@ -206,6 +206,19 @@ def _describe_breaks(breaks: list[dict]) -> str:
     )
 
 
+def _breaks(install_name: str, declared_name: Optional[str], version: Optional[str], installed: list) -> list[dict]:
+    """The installed packages a package of this name and version under this
+    install name would leave outside their stated range. One check for
+    preview and install, on the version as it will be installed (variables
+    substituted). A version still waiting for a variable can't be judged
+    yet: the preview asks for the value, and the install refuses without it."""
+    from app.services.package_dependencies import broken_dependents
+
+    if not declared_name or not version or "${{" in version:
+        return []
+    return broken_dependents(install_name, declared_name, version, installed)
+
+
 def _declared_meta(yaml_content: str) -> tuple[Optional[str], Optional[str]]:
     """(package.name, package.version) from raw YAML, best effort."""
     try:
@@ -346,13 +359,13 @@ class PackageService:
             requirements = deps._requirements_of(substituted, variables)
         except Exception as e:
             raise ValueError(f"Package validation failed: package: {e}") from e
-        declared_name, version = _declared_meta(substituted)
+        # Name and version as installed: with its variables substituted
+        # (version: ${{ vars.VERSION }}), as the preview checks them.
+        declared_name, version = _declared_meta(deps._substitute_known(substituted, variables or {}))
         installed = await deps.installed_packages(self.db)
         existing = installed.get(install_name)
 
-        breaks = deps.broken_dependents(
-            install_name, declared_name or install_name, version or "", list(installed.values())
-        ) if declared_name else []
+        breaks = _breaks(install_name, declared_name, version, list(installed.values()))
         if breaks and not allow_breaking_dependents:
             raise ValueError(
                 f"Installing {declared_name} {version} as '{install_name}' "
@@ -596,7 +609,9 @@ class PackageService:
             requirements = []
         installed = await deps.installed_packages(self.db)
         existing = installed.get(install_name)
-        root_meta = _declared_meta(substituted)
+        # Name and version with its variables substituted, as the install
+        # reads them (version: ${{ vars.VERSION }}).
+        root_meta = _declared_meta(deps._substitute_known(substituted, variables or {}))
         plan = await deps.resolve_plan(
             self.db,
             root_name=root_meta[0] or install_name,
@@ -637,9 +652,7 @@ class PackageService:
         )
 
         version = config.package.version if config is not None else root_meta[1]
-        breaks = deps.broken_dependents(
-            install_name, root_meta[0] or install_name, version, list(installed.values())
-        ) if version else []
+        breaks = _breaks(install_name, root_meta[0], version, list(installed.values()))
         install_info["dependencies"] = planned
         install_info["breaks"] = breaks
 

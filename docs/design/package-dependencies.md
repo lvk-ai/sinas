@@ -135,43 +135,67 @@ declare `multiInstance` (the existing `resolve_install_name` rule).
 
 ## 5. Resolving a plan
 
-`package_dependencies.resolve_plan` walks the requirements depth-first and
-returns an ordered plan, dependencies before dependents, with one entry per
-required install:
+`package_dependencies.resolve_plan` returns an ordered plan, dependencies
+before dependents, with one entry per required install:
 
 | status          | meaning | install |
 |-----------------|---------|---------|
-| `satisfied`     | installed, the right package, version in range | nothing to do |
-| `install`       | not installed; an active repository offers a version in range | installed first |
-| `missing`       | not installed and no active repository offers a version in range | refused |
-| `incompatible`  | installed, but out of range or a different package under that name | refused |
-| `cycle`         | the requirement leads back to a package on its own path | refused |
+| `satisfied`     | installed, the right package, every constraint met | nothing to do |
+| `install`       | not installed; an active repository offers a version meeting every constraint | installed first |
+| `missing`       | not installed and no active repository offers a version meeting every constraint | refused |
+| `incompatible`  | installed, but a constraint isn't met, or a different package holds that name | refused |
+| `cycle`         | the requirements lead back to a package on their own path | refused |
+| `invalid`       | the package can't be installed as asked (e.g. an `instance` for a single-instance package) | refused |
+
+**Constraints first, then versions (a fixpoint).** Every constraint on an
+install name, from anywhere in the graph, is collected before a version is
+chosen for it. Choosing a package to install adds its own requirements, which
+may constrain other names; those are then decided again with the new set, until
+nothing changes (at most 50 rounds, else refused). So a shared dependency
+isn't locked to whatever the first requirement seen allowed (`>=1` taking 1.5
+when another package needs `>=2` and 2.5 exists), and the result doesn't
+depend on the order requirements are listed in. An entry lists every
+constraint and who imposed it; a refusal names the ones that can't be met.
 
 Rules:
 
-- **A satisfied dependency is not descended into.** Its own requirements were
-  checked when it was installed.
+- **A satisfied dependency is not resolved further**: its own requirements
+  were checked when it was installed. Its *stored* requirements are still
+  followed to find cycles (below).
 - **A package to install is fetched (SHA-256 verified, as every repository
-  install is) and its own `requires` resolved the same way**, recursively.
-- **Diamonds** (two packages needing the same one) resolve to one entry; every
-  constraint on it must hold, and its `required_by` lists both.
+  install is) and its own `requires` resolved the same way.**
+- **Which version / repository:** a repository's index lists one version per
+  package (its latest), so choosing a version means choosing a repository.
+  The package comes from the most preferred active repository whose version
+  meets every constraint. Preference: a repository some requirement names as
+  its `repository` hint, then one a requiring package comes from, then the
+  rest; ties by repository name. The hint is a preference, not a pin: every
+  active repository is one the operator added, and the plan names the
+  repository each package comes from before the operator confirms.
+- **Limit: no backtracking across graph shapes.** The choice is made per
+  install name. If a different version of A would require a different set of
+  packages that happens to make everything fit, that alternative isn't
+  explored: the first consistent choice per name is kept. With one version
+  per package per repository that is rarely a real alternative.
+- **No automatic upgrades.** An installed dependency that doesn't meet every
+  constraint is `incompatible`; the operator updates it first (which runs the
+  upgrade checks in §7). This keeps a plan to "install A" from silently
+  changing an installed B under its other dependents.
 - **Cycles** fail with the path (`a → b → a`), including a requirement back to
-  the package being installed.
-- **Where a missing package comes from:** the active repositories offering a
-  package of that name at a version in range, in this order: the
-  requirement's `repository` hint, then the repository the dependent itself
-  comes from, then the other active repositories by name. A repository's
-  index lists one version per package (its latest), so "available" means
-  "that version is in range". The hint is a preference, not a pin: every
-  active repository is one the operator added. The plan names the repository
-  each package comes from, so the operator sees it before confirming.
-- **No automatic upgrades.** An installed dependency outside the range is
-  `incompatible`; the operator updates it first (which runs the upgrade
-  checks in §7). This keeps a plan to "install A" from silently changing an
-  installed B under its other dependents.
+  the package being installed, and cycles **through installed packages**,
+  found by following their stored requirements: upgrading `a` to require an
+  installed `b` that already requires `a` is refused. Accepting it would leave
+  two packages that block each other's uninstall.
+- **Requirements that use variables.** A package to install whose own
+  `requires` names a variable without a value yet (`instance: ${{
+  vars.MAILBOX }}`) stays an `install` entry with `needs_input`: the preview
+  returns its variable declarations, and the next preview with
+  `dependencyVariables` resolves its requirements. Only values that still
+  don't make a valid requirement make it `invalid`. An install with an entry
+  still waiting for input is refused.
 
-The resolver has a recursion bound (depth 10) as a backstop against an index
-generating requirements endlessly under fresh names.
+The plan also stops at depth 10, as a backstop against an index generating
+requirements endlessly under fresh names.
 
 ## 6. Install semantics: one transaction
 
@@ -249,7 +273,9 @@ Installing a package that is already installed is an upgrade:
 - Its **new** `requires` are resolved like any install (new dependencies get
   installed, incompatible ones refuse).
 - Its **dependents** are checked: every installed package requiring it must
-  accept the new version. If one doesn't, the preview lists it (`breaks:
+  accept the new version, as it will be installed (variables substituted, so
+  `version: ${{ vars.VERSION }}` is judged by its value; preview and install
+  share this check). If one doesn't, the preview lists it (`breaks:
   [{dependent, constraint}]`) and the install is refused unless
   `allowBreakingDependents: true` — the force flag. It is the only override:
   a forced upgrade leaves a dependent whose stated constraint no longer
