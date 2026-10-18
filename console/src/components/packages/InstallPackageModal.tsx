@@ -721,6 +721,10 @@ function DependencyPlan({ entries }: { entries: DependencyPlanEntry[] }) {
             Required by {d.required_by.join(', ')}
             {d.preview && d.preview.success && ` · ${d.preview.changes.filter((c) => c.action !== 'unchanged').length} resource change(s)`}
           </p>
+          {d.needs_input && d.message && (
+            // Its own requirements depend on its variables: the form below asks for them.
+            <p className="text-xs text-amber-400 ml-1">{d.message}</p>
+          )}
           {d.preview && !d.preview.success && (d.preview.errors || []).map((e, i) => (
             <p key={i} className="text-xs text-red-400/90 ml-1">{e}</p>
           ))}

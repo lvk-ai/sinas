@@ -760,6 +760,9 @@ export interface DependencyPlanEntry {
   constraints: { required_by: string; version?: string | null }[];
   required_by: string[];
   requires: string[];
+  /** An 'install' entry whose own requirements wait for its variables:
+   * fill them in and preview again to resolve what it requires. */
+  needs_input?: boolean;
   message?: string | null;
   /** For 'install' entries: its own variables and dry run. */
   variables?: any[];

@@ -78,6 +78,13 @@ test("a requirement's state is the server's verdict, with what is in the way", (
   assert.deepEqual(m.requirementState(req({ status: 'missing' })), { tone: 'neutral', note: 'Not installed' });
 });
 
+test('a package waiting for values to resolve its own requirements is still one to install, and gets its values', () => {
+  const waiting = plan('b', 'install', { needs_input: true, requires: [], variables: [{ name: 'MAILBOX', type: 'text' }] });
+  assert.deepEqual(m.planSummary([waiting]).toInstall.map((e) => e.install_name), ['b']);
+  assert.deepEqual(m.planSummary([waiting]).blocked, []);
+  assert.deepEqual(m.dependencyPayload({ b: { MAILBOX: 'mail-support' } }, [waiting]), { b: { MAILBOX: 'mail-support' } });
+});
+
 test('defaults pre-fill a form; absent and null defaults do not', () => {
   assert.deepEqual(
     m.variableDefaults([{ name: 'A', default: 'x' }, { name: 'B' }, { name: 'C', default: null }, { name: 'D', default: false }]),
