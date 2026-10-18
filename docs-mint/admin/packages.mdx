@@ -158,6 +158,65 @@ Guard rails:
 
 The console shows an *Install as* field on the preview of a multi-instance package; the package agent tools (`sinas_package_preview`, `sinas_package_install`) take `instance` the same way.
 
+## Dependencies
+
+A package can say it needs another package. A support-triage package whose agent uses the `gmail` package's connector and skills declares it in `package.requires`:
+
+```yaml
+package:
+  name: support-mailbox-triage
+  version: "1.0.0"
+  requires:
+    - name: gmail
+      version: ">=1.2,<2"           # optional: any version when left out
+      repository: sinas-official    # optional: where to look first
+spec:
+  agents:
+    - namespace: support
+      name: triage
+      enabledConnectors:
+        - connector: gmail/api       # the dependency's resources, by namespace/name
+      enabledSkills: [gmail/search-syntax]
+```
+
+- **`name`** is the package's name. **`version`** is a range in pyproject style: comma-separated clauses with `>=`, `>`, `<=`, `<`, `==`, `!=` and `~=`, and `==1.2.*`. A pre-release only matches when a clause names one, so `<2` does not admit `2.0.0-rc.1`.
+- **`repository`** names the package repository to look in first.
+- **`instance`** picks the install of a [multi-instance](#installing-a-package-more-than-once) package; left out, it is the install named after the package. Variables are substituted into the whole YAML, so `instance: ${{ vars.MAILBOX }}` lets the operator choose at install.
+
+This is not the `dependencies` resource kind, which approves Python packages for functions.
+
+**Install and preview.** The preview resolves each requirement, recursively, and lists the plan:
+
+| Status | Meaning |
+|---|---|
+| `satisfied` | Installed, and its version is in range. |
+| `install` | Not installed; an active package repository offers a version in range. It is installed first. |
+| `missing` | Not installed, and no active repository offers a version in range. |
+| `incompatible` | Installed, but out of range (update it first), or that install name holds another package. |
+| `cycle` | The requirements lead back to a package on their own path. |
+| `invalid` | The required package can't be installed as asked (e.g. an `instance` for a package without `multiInstance`). |
+
+Any status but the first two refuses the install. A missing package is looked for in the requirement's `repository` first, then in the repository the dependent comes from, then in the other active repositories by name; each file is checked against its index checksum, as every repository install is. An installed dependency is never upgraded automatically.
+
+Everything the plan installs is installed in **one transaction** with the package itself: if any of them fails, nothing is installed. Each package has its own variables; the preview lists every package to install with its variable declarations, and the install takes their values in `dependencyVariables`, keyed by install name:
+
+```
+POST /api/v1/packages/install
+{ "repository": "sinas-official", "package": "support-mailbox-triage",
+  "variables": { ... },
+  "dependencyVariables": { "gmail": { "GOOGLE_CLIENT_ID": "..." } } }
+```
+
+`allowBroadRolePermissions` covers every package the install installs; `adoptUnmanaged` covers only the package you asked for.
+
+**References.** A package's resources may refer to its dependencies' resources by `namespace/name`, and a manifest's `requiredResources` may list them. Both are checked at install — in the preview too, counting what the planned dependencies declare. A package that refers to another package's resources *without* declaring the requirement still installs only if they exist, and gets no uninstall protection: declare what you use.
+
+**Uninstall.** A package other installed packages require can't be uninstalled; the response (`409`) lists them. Uninstall the dependents first. Packages installed as a dependency are marked so, and once nothing requires them any more, as orphaned. They are not removed automatically.
+
+**Upgrades.** Installing a newer version resolves its requirements again, installing new ones. If an installed package requires this one in a range the new version is outside of, the preview lists it under `breaks` and the install is refused, unless you pass `allowBreakingDependents: true`.
+
+**API.** The preview response carries `dependencies` (the plan; each package to install with `variables`, `requires_input` and its own `preview`) and `breaks`. `GET /api/v1/packages` and `GET /api/v1/packages/{name}` include `requires` (each with its current `status`), `required_by`, `installed_as_dependency` and `orphaned`. The catalog includes each package's `requires` from the repository index. The package agent tools take `dependency_variables`.
+
 ## Install-time Variables
 
 Packages can declare typed variables that are prompted during installation. Variables are substituted into the YAML before resources are persisted — the resulting resources contain literal values, no runtime template evaluation.

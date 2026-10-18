@@ -72,5 +72,7 @@ class CatalogEntry(BaseModel):
     author: Optional[str] = None
     readme_url: Optional[str] = None
     multi_instance: bool = False  # the index says it may be installed more than once
+    # The packages it requires, from the index: [{name, version?, repository?, instance?}].
+    requires: list[dict[str, Any]] = Field(default_factory=list)
     installed: list[CatalogInstall] = Field(default_factory=list)
     update_available: bool = False

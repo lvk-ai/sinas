@@ -2,7 +2,7 @@
 Configuration parser and validator
 Validates declarative configuration before application
 """
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 from sqlalchemy import select
@@ -62,7 +62,10 @@ class ConfigParser:
 
     @staticmethod
     async def parse_and_validate(
-        config_yaml: str, db: Optional[AsyncSession] = None, strict: bool = True
+        config_yaml: str,
+        db: Optional[AsyncSession] = None,
+        strict: bool = True,
+        extra_names: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[SinasConfig], ConfigValidation]:
         """
         Parse and validate SINAS configuration
@@ -71,6 +74,10 @@ class ConfigParser:
             config_yaml: YAML configuration string
             db: Optional database session for reference validation
             strict: If True, treat warnings as errors
+            extra_names: resources about to exist that references may name,
+                by config kind ({"skills": {"gmail/search", ...}}): what the
+                packages planned before this one declare, in a preview
+                (docs/design/package-dependencies.md)
 
         Returns:
             Tuple of (parsed config, validation result)
@@ -109,19 +116,26 @@ class ConfigParser:
                 )
 
         # Validate references
-        await ConfigParser._validate_references(config, validation, db)
+        await ConfigParser._validate_references(config, validation, db, extra_names or {})
 
         return config, validation
 
     @staticmethod
     async def _validate_references(
-        config: SinasConfig, validation: ConfigValidation, db: Optional[AsyncSession]
+        config: SinasConfig,
+        validation: ConfigValidation,
+        db: Optional[AsyncSession],
+        extra_names: Optional[dict[str, Any]] = None,
     ):
         """Validate cross-references within configuration"""
         errors = validation.errors
         spec = (
             config.spec.model_dump() if hasattr(config.spec, "model_dump") else config.spec.dict()
         )
+        extra_names = extra_names or {}
+
+        def extra(kind: str) -> set[str]:
+            return set(extra_names.get(kind) or ())
 
         # Collect all role names from config
         role_names = {r["name"] for r in spec.get("roles", [])}
@@ -193,17 +207,43 @@ class ConfigParser:
             result = await db.execute(select(Component.namespace, Component.name))
             db_component_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
 
-        # Combined sets (config + database)
-        all_role_names = role_names | db_role_names
-        all_function_names = function_names | db_function_names
-        all_agent_names = agent_names | db_agent_names
-        all_skill_names = skill_names | db_skill_names
-        all_collection_names = collection_names | db_collection_names
-        all_component_names = component_names | db_component_names
+        # Combined sets (config + database + about to exist)
+        all_role_names = role_names | db_role_names | extra("roles")
+        all_function_names = function_names | db_function_names | extra("functions")
+        all_agent_names = agent_names | db_agent_names | extra("agents")
+        all_skill_names = skill_names | db_skill_names | extra("skills")
+        all_collection_names = collection_names | db_collection_names | extra("collections")
+        all_component_names = component_names | db_component_names | extra("components")
         all_database_connection_names = database_connection_names | db_database_connection_names
-        all_query_names = query_names | db_query_names
-        # Validate manifest resource references
-        valid_resource_types = {"agent", "function", "skill", "collection"}
+        all_query_names = query_names | db_query_names | extra("queries")
+        # Validate manifest resource references: the resource types the
+        # manifest /status check knows (one table, manifest_validator).
+        from app.services.manifest_validator import MANIFEST_RESOURCE_TYPES
+
+        valid_resource_types = set(MANIFEST_RESOURCE_TYPES)
+        lookup = {
+            "agent": all_agent_names,
+            "function": all_function_names,
+            "skill": all_skill_names,
+            "collection": all_collection_names,
+            "component": all_component_names,
+            "query": all_query_names,
+        }
+
+        async def names_of(res_type: str) -> set[str]:
+            # Kinds the checks above don't load, looked up only when a
+            # manifest asks for one.
+            if res_type not in lookup:
+                model, kind = MANIFEST_RESOURCE_TYPES[res_type]
+                names = {
+                    f"{c.get('namespace', 'default')}/{c['name']}" for c in spec.get(kind, [])
+                } | extra(kind)
+                if db:
+                    result = await db.execute(select(model.namespace, model.name))
+                    names |= {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
+                lookup[res_type] = names
+            return lookup[res_type]
+
         for i, manifest in enumerate(spec.get("manifests", [])):
             for j, res in enumerate(manifest.get("requiredResources", [])):
                 res_type = res.get("type", "")
@@ -221,13 +261,7 @@ class ConfigParser:
                 res_ref = f"{res_ns}/{res_name}"
 
                 # Check if the referenced resource exists in config or DB
-                lookup = {
-                    "agent": all_agent_names,
-                    "function": all_function_names,
-                    "skill": all_skill_names,
-                    "collection": all_collection_names,
-                }
-                if res_ref not in lookup.get(res_type, set()):
+                if res_ref not in await names_of(res_type):
                     errors.append(
                         ConfigValidationError(
                             path=f"spec.manifests[{i}].requiredResources[{j}]",
@@ -324,7 +358,7 @@ class ConfigParser:
 
             result = await db.execute(select(PipelineModel.namespace, PipelineModel.name))
             db_pipeline_names = {f"{namespace}/{name}" for (namespace, name) in result.fetchall()}
-        all_pipeline_names = pipeline_names | db_pipeline_names
+        all_pipeline_names = pipeline_names | db_pipeline_names | extra("pipelines")
 
         # Validate webhook references
         for i, webhook in enumerate(spec.get("webhooks", [])):

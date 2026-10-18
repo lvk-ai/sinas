@@ -54,6 +54,20 @@ class PackageInstallRequest(BaseModel):
             "config manages are still skipped. Off by default."
         ),
     )
+    dependencyVariables: Optional[dict[str, dict[str, Any]]] = Field(
+        None,
+        description=(
+            "Variable values for the required packages the install installs, keyed by "
+            "their install name (the preview lists them under dependencies)."
+        ),
+    )
+    allowBreakingDependents: bool = Field(
+        False,
+        description=(
+            "Install (upgrade) even though installed packages requiring this one don't "
+            "accept the new version (listed by preview as breaks). Off by default."
+        ),
+    )
 
 
 class PackagePreviewRequest(BaseModel):
@@ -75,6 +89,12 @@ class PackagePreviewRequest(BaseModel):
             "Preview the install with adoptUnmanaged: resources created or edited by "
             "hand are listed as updates the package takes over, each with a warning."
         ),
+    )
+    dependencyVariables: Optional[dict[str, dict[str, Any]]] = Field(
+        None, description="Variable values for required packages to install, by install name",
+    )
+    allowBreakingDependents: bool = Field(
+        False, description="Preview the install as if accepting broken dependents",
     )
 
 
@@ -111,6 +131,13 @@ class PackageResponse(BaseModel):
     installed_by: uuid.UUID
     installed_at: datetime
     updated_at: Optional[datetime]
+    # Package dependencies (docs/design/package-dependencies.md): what it
+    # requires, each with its status now; the installs requiring it; whether
+    # a dependency plan installed it, and whether nothing requires it now.
+    requires: list[dict[str, Any]] = Field(default_factory=list)
+    required_by: list[str] = Field(default_factory=list)
+    installed_as_dependency: bool = False
+    orphaned: bool = False
 
     class Config:
         from_attributes = True
@@ -128,6 +155,10 @@ class PackageListResponse(BaseModel):
     source_repository: Optional[str] = None
     latest_version: Optional[str] = None
     update_available: bool = False
+    requires: list[dict[str, Any]] = Field(default_factory=list)
+    required_by: list[str] = Field(default_factory=list)
+    installed_as_dependency: bool = False
+    orphaned: bool = False
 
     class Config:
         from_attributes = True
@@ -137,3 +168,5 @@ class PackageInstallResponse(BaseModel):
     """Response from package install."""
     package: dict[str, Any]
     apply: dict[str, Any]
+    # Required packages this install installed first: [{package, apply}].
+    dependencies: list[dict[str, Any]] = Field(default_factory=list)

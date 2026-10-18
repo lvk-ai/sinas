@@ -12,7 +12,7 @@ Manifests are application declarations that describe what resources, permissions
 |---|---|
 | `namespace` / `name` | Unique identifier |
 | `description` | What this manifest declares |
-| `required_resources` | Resource references: `[{"type": "agent", "namespace": "...", "name": "..."}]` |
+| `required_resources` | Resource references: `[{"type": "agent", "namespace": "...", "name": "..."}]`. Types: `agent`, `function`, `skill`, `collection`, `connector`, `query`, `store`, `component`, `pipeline`, `mcp_server`. A config or package declaring a manifest whose required resource exists nowhere is refused; a package may require its [dependencies'](/admin/packages#dependencies) resources. |
 | `required_permissions` | Permissions the application needs |
 | `optional_permissions` | Optional permissions for extended features |
 | `exposed_namespaces` | Namespace filter per resource type (e.g., `{"agents": ["support"]}`) |

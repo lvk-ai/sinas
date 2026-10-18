@@ -180,7 +180,10 @@ class TestPackageInstances:
         result, _, _, info = await PackageService(db).preview(
             MULTI_YAML.format(pkg=pkg), str(admin_user.id), instance=f"{pkg}-work"
         )
-        assert info == {"instance": f"{pkg}-work", "package_name": pkg, "multi_instance": True}
+        assert info == {
+            "instance": f"{pkg}-work", "package_name": pkg, "multi_instance": True,
+            "dependencies": [], "breaks": [],
+        }
         assert any(f"{pkg}-work" in c.resourceName for c in result.changes)
         assert await _connectors(db, f"{pkg}-work") == []  # dry run
 
