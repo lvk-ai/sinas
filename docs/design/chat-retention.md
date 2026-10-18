@@ -71,9 +71,25 @@ The agent worker's arq cron (where the package repository refresh lives)
 runs `chat_retention_tick_job` every 10 minutes, `unique=True` so one worker
 runs it. The tick starts a run when the cron expression
 `CHAT_RETENTION_SCHEDULE` (default `30 3 * * *`, UTC) had a fire time since
-the last scheduled run started, or when the last run stopped at its time or
-size budget with chats left over (`partial`): a large first backlog is
-worked through in consecutive runs instead of waiting a day each time.
+the last scheduled run started, or when the last run, whoever started it
+(schedule, Run now, CLI), stopped before the end: at its time or size budget
+(`partial`) or cut off (`interrupted`). A large first backlog is worked
+through in consecutive runs instead of waiting a day each time.
+
+**Continuations pick up where the last run stopped.** Every run saves its
+counts and a cursor, the last chat it looked at in selection order
+`(chats.updated_at, id)`, after each batch. A run that follows a partial,
+interrupted or failed one starts after that cursor; one that follows a
+completed run starts from the oldest chat. Skipped and failed chats count
+against `CHAT_RETENTION_MAX_CHATS_PER_RUN` (a run must end), but they can't
+starve the rest: the chain walks past them, and the next fresh chain (the
+next scheduled fire) retries them, which is their backoff.
+
+**Interrupted runs.** A run the worker cancels (job timeout, shutdown)
+records itself `interrupted` with its counts and cursor, then lets the
+cancellation through. One that died outright (process killed) stays
+`running` on record: past its window, the status shows it as interrupted,
+and the next tick records it so and continues from its cursor.
 
 "Run now" (`POST /retention/run`) records a queued run and queues
 `chat_retention_run_job` on the agent queue; the HTTP request doesn't wait
@@ -118,16 +134,26 @@ again in the next run.
    reads nothing after taking the lock (READ COMMITTED: no snapshot held),
    holds no row lock, blocks nothing but another claim on the same chat, and
    is released when the runner dies.
-2. **Snapshot** in a short read transaction: the chat, its messages (by
-   `created_at, id`), its `tool_call_results`, its workbench file list.
+2. **Snapshot and eligibility from one read**: one REPEATABLE READ
+   transaction checks the chat still qualifies under the *current* policy
+   (retention on; idle past its agent's current effective days, newest
+   message included; nothing blocking) and reads the chat, its messages
+   (by `created_at, id`), its `tool_call_results` and its workbench file
+   list. A chat that was written to after selection is skipped here
+   (`not_eligible`), before anything is uploaded.
 3. **Upload** (no transaction open). A failure → counted, nothing deleted,
-   the chat comes up again next run.
+   the chat comes up again next run. An archive whose uncompressed size
+   would exceed what a restore reads back (512 MiB) is not uploaded: the
+   chat is kept and counted as `too_large` ("too large to archive safely").
 4. **Delete**, one short transaction: `SELECT … FOR UPDATE SKIP LOCKED` on
-   the chat row (taken by anything else → skipped), re-check the blocked
-   states and that the chat is still exactly what was archived (message
-   count, newest message, `updated_at`); changed → rolled back, re-archived
-   next run. Then delete the chat-owned rows and the chat, commit, remove
-   the workbench's stored blobs (best effort, as the expiry sweep does).
+   the chat row (taken by anything else → skipped), then, under that lock,
+   the same eligibility check again from the database (a message, a
+   `retentionDays` change to never, or retention switched off since the
+   upload → `not_eligible`, kept) and a check that the chat is still
+   exactly what was archived (a digest of everything in the archive;
+   changed → `changed`, kept, archived again next run). Then delete the
+   chat-owned rows and the chat, commit, remove the workbench's stored
+   blobs (best effort, as the expiry sweep does).
 5. Release the claim.
 
 A crash or failure between 3 and 4 leaves an archived chat in Postgres; the
@@ -266,7 +292,17 @@ exactly as it was in Postgres.
   own consumers (Functions › Executions). Documented as not covered.
 - **Budgets.** `CHAT_RETENTION_MAX_CHATS_PER_RUN` (default 0, no limit) and
   `CHAT_RETENTION_MAX_RUN_SECONDS` (default 3300) end a run as `partial`;
-  the next tick continues.
+  the next tick continues after its cursor (§3).
+- **Oversized chats are kept, not archived.** The writer applies the
+  reader's 512 MiB cap rather than the reader streaming without one: an
+  archive nobody can restore must never be the reason a chat is deleted.
+- **`retentionDays` is capped at 36500** (100 years), in the spec, the REST
+  schemas and a CHECK constraint, the same cap as the console's input.
+- **Restore and session keys.** One active chat per (agent, session key):
+  if the agent's session continues in a newer chat, the restore detaches
+  the restored chat from the session (restores it without its key) and
+  says so, rather than failing the insert. `--detach-session` does that on
+  request. An empty or null title restores as an empty title.
 
 ## 7. Out of scope (v1)
 

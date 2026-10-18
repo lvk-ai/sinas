@@ -118,7 +118,8 @@ class World:
             return agent
 
     async def chat(self, agent: Agent | None = None, *, idle_days: float = 100, messages: int = 2,
-                   last_message_days: float | None = None, user_id=None) -> uuid.UUID:
+                   last_message_days: float | None = None, user_id=None, title: str = "retention test chat",
+                   session_key: str | None = None) -> uuid.UUID:
         """A chat last updated `idle_days` ago whose newest message is
         `last_message_days` ago (default: as old as the chat)."""
         updated = NOW - timedelta(days=idle_days)
@@ -129,7 +130,8 @@ class World:
                 agent_id=agent.id if agent else None,
                 agent_namespace=agent.namespace if agent else None,
                 agent_name=agent.name if agent else None,
-                title="retention test chat",
+                title=title,
+                session_key=session_key,
                 created_at=updated - timedelta(days=1),
                 updated_at=updated,
             )
@@ -586,9 +588,27 @@ class TestFailures:
                 await db.commit()
 
         result = await run(world, FakeStore(on_put=new_message))
-        assert result["counts"]["skipped"] == {"changed": 1}
+        # The new message makes it active again: no longer eligible, by the
+        # re-check under the row lock.
+        assert result["counts"]["skipped"] == {"not_eligible": 1}
         assert await world.exists(chat_id)
         assert await world.count(Message, Message.chat_id == chat_id) == 3
+
+    async def test_chat_changed_without_activity_during_upload_is_kept(self, world):
+        """Still eligible (no new activity), but not what was archived: the
+        digest check keeps it, to be archived again next run."""
+        chat_id = await world.chat(idle_days=100)
+
+        async def edit_message(key):
+            async with world.sessions() as db:
+                await db.execute(
+                    Message.__table__.update().where(Message.chat_id == chat_id).values(content="edited")
+                )
+                await db.commit()
+
+        result = await run(world, FakeStore(on_put=edit_message))
+        assert result["counts"]["skipped"] == {"changed": 1}
+        assert await world.exists(chat_id)
 
     async def test_errors_never_carry_content(self, world, caplog):
         chat_id = await world.chat(idle_days=100)
@@ -724,3 +744,216 @@ class TestDryRunAndStatus:
 
 async def _fail_if_called(**kwargs):
     raise AssertionError("no run was due")
+
+
+
+# ---------------------------------------------------------------------------
+# Review round: eligibility races, starvation, size, continuations,
+# cancellation, restore edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEligibilityRaces:
+    async def test_message_between_selection_and_snapshot(self, world, monkeypatch):
+        """A turn writes to the chat (and finishes) after selection, before the
+        snapshot: the snapshot's own eligibility check sees it. Nothing is
+        uploaded or deleted."""
+        chat_id = await world.chat(idle_days=100)
+        real = job._has_live_background_job
+
+        async def turn_happens(cid):
+            async with world.sessions() as db:
+                db.add(Message(chat_id=chat_id, role="user", content="back again"))
+                await db.commit()
+            return await real(cid)
+
+        monkeypatch.setattr(job, "_has_live_background_job", turn_happens)
+        store = FakeStore()
+        result = await run(world, store)
+        assert result["counts"]["skipped"] == {"not_eligible": 1}
+        assert store.puts == []
+        assert await world.exists(chat_id)
+
+    async def test_agent_switched_to_never_after_selection(self, world):
+        agent = await world.agent(retention_days=5)
+        chat_id = await world.chat(agent, idle_days=50)
+
+        async def keep_forever(key):
+            async with world.sessions() as db:
+                await db.execute(Agent.__table__.update().where(Agent.id == agent.id).values(retention_days=0))
+                await db.commit()
+
+        result = await run(world, FakeStore(on_put=keep_forever))
+        assert result["counts"]["skipped"] == {"not_eligible": 1}
+        assert result["counts"]["deleted"] == 0
+        assert await world.exists(chat_id)
+
+    async def test_retention_switched_off_mid_run(self, world, monkeypatch):
+        chat_id = await world.chat(idle_days=100)
+
+        async def switch_off(key):
+            monkeypatch.setattr(settings, "chat_retention_enabled", False)
+
+        result = await run(world, FakeStore(on_put=switch_off))
+        assert result["counts"]["deleted"] == 0
+        assert await world.exists(chat_id)
+
+
+class TestContinuations:
+    async def test_cap_one_with_an_always_failing_oldest_chat_still_progresses(self, world, monkeypatch):
+        monkeypatch.setattr(settings, "chat_retention_max_chats_per_run", 1)
+        stuck = await world.chat(idle_days=300)
+        second = await world.chat(idle_days=200)
+        third = await world.chat(idle_days=150)
+
+        class FailsForOne(FakeStore):
+            async def put(self, key, body, **kw):
+                if str(stuck) in key:
+                    raise ArchiveUploadError("PutObject refused: InternalError (HTTP 500)")
+                await super().put(key, body, **kw)
+
+        store = FailsForOne()
+        r1 = await run(world, store)
+        assert r1["status"] == "partial" and r1["counts"]["failed"] == {"upload": 1}
+        r2 = await run(world, store)  # continues after the stuck chat
+        assert r2["counts"]["deleted"] == 1
+        r3 = await run(world, store)
+        assert r3["counts"]["deleted"] == 1 and r3["status"] == "completed"
+        assert not await world.exists(second) and not await world.exists(third)
+        assert await world.exists(stuck)
+        # A fresh chain (after a completed run) retries the stuck one.
+        r4 = await run(world, store)
+        assert r4["counts"]["failed"] == {"upload": 1}
+
+    async def test_scheduled_tick_continues_a_partial_manual_run(self, world, monkeypatch):
+        monkeypatch.setattr(settings, "chat_retention_schedule", "0 0 1 1 *")  # long since fired
+        now = datetime(2026, 6, 1, tzinfo=UTC)
+        await world.add(
+            ChatRetentionRun(trigger="schedule", status="completed", created_at=now - timedelta(days=3),
+                             started_at=now - timedelta(days=3), finished_at=now - timedelta(days=3)),
+            ChatRetentionRun(trigger="api", status="partial", created_at=now - timedelta(days=1),
+                             started_at=now - timedelta(days=1), finished_at=now - timedelta(days=1)),
+        )
+        called = []
+
+        async def fake_run(**kwargs):
+            called.append(kwargs["trigger"])
+            return {"status": "completed"}
+
+        monkeypatch.setattr(job, "run_retention", fake_run)
+        assert await job.scheduled_tick(engine=world.engine, now=now) is not None
+        assert called == ["schedule"]
+
+
+class TestTooLarge:
+    async def test_a_chat_over_the_archive_size_limit_is_kept(self, world, monkeypatch):
+        from app.services.retention import archive as fmt
+
+        monkeypatch.setattr(fmt, "MAX_UNCOMPRESSED_BYTES", 300)
+        big = await world.chat(idle_days=100, messages=10)
+        store = FakeStore()
+        result = await run(world, store)
+        assert result["counts"]["skipped"] == {"too_large": 1}
+        assert store.puts == []
+        assert await world.exists(big)
+
+
+class TestInterruptions:
+    async def test_cancelled_mid_run_is_recorded_as_interrupted_with_its_counts(self, world, monkeypatch):
+        monkeypatch.setattr(settings, "chat_retention_batch_size", 1)
+        first = await world.chat(idle_days=300)
+        second = await world.chat(idle_days=200)
+        reached_second = asyncio.Event()
+
+        class Hangs(FakeStore):
+            async def put(self, key, body, **kw):
+                if str(second) in key:
+                    reached_second.set()
+                    await asyncio.sleep(60)
+                await super().put(key, body, **kw)
+
+        task = asyncio.create_task(run(world, Hangs()))
+        await asyncio.wait_for(reached_second.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with world.sessions() as db:
+            record = (await db.execute(select(ChatRetentionRun))).scalars().one()
+        assert record.status == "interrupted"
+        assert record.counts["deleted"] == 1 and record.counts["archived"] == 1
+        assert record.cursor_chat_id == second
+        assert not await world.exists(first) and await world.exists(second)
+        async with world.sessions() as db:
+            assert (await job.status(db))["last_run"]["status"] == "interrupted"
+
+    async def test_a_run_that_died_shows_as_interrupted(self, world, monkeypatch):
+        old = NOW - timedelta(hours=10)
+        await world.add(ChatRetentionRun(trigger="schedule", status="running", created_at=old, started_at=old,
+                                         counts={"deleted": 3}))
+        async with world.sessions() as db:
+            status = await job.status(db)
+        assert status["in_progress"] is None
+        assert status["last_run"]["status"] == "interrupted"
+        assert status["last_run"]["counts"] == {"deleted": 3}
+        # The tick records it so, and continues it.
+        called = []
+
+        async def fake_run(**kwargs):
+            called.append(1)
+            return {}
+
+        monkeypatch.setattr(job, "run_retention", fake_run)
+        await job.scheduled_tick(engine=world.engine)
+        async with world.sessions() as db:
+            assert (await db.execute(select(ChatRetentionRun.status))).scalar_one() == "interrupted"
+        assert called == [1]
+
+
+class TestRestoreEdges:
+    async def test_empty_title_round_trips(self, world):
+        chat_id = await world.chat(idle_days=100, title="")
+        store = FakeStore()
+        await run(world, store)
+        archive = parse_archive(next(iter(store.objects.values())))
+        assert archive.chat["title"] == ""
+        async with world.sessions() as db:
+            plan = await plan_restore(db, archive)
+            assert plan.ok, plan.conflicts
+            await apply_restore(db, archive, plan)
+            await db.commit()
+        async with world.sessions() as db:
+            assert (await db.get(Chat, chat_id)).title == ""
+
+    async def test_session_continued_elsewhere_is_detached_not_a_failed_insert(self, world):
+        agent = await world.agent()
+        old = await world.chat(agent, idle_days=100, session_key="ticket-42")
+        store = FakeStore()
+        await run(world, store)
+        assert not await world.exists(old)
+        newer = await world.chat(agent, idle_days=0, session_key="ticket-42")  # the session went on
+        archive = parse_archive(next(iter(store.objects.values())))
+        async with world.sessions() as db:
+            plan = await plan_restore(db, archive)
+            assert plan.ok and plan.session_detached
+            assert any(str(newer) in note for note in plan.notes)
+            await apply_restore(db, archive, plan)
+            await db.commit()
+        async with world.sessions() as db:
+            assert (await db.get(Chat, old)).session_key is None
+            assert (await db.get(Chat, newer)).session_key == "ticket-42"
+
+    async def test_detach_session_on_request(self, world):
+        agent = await world.agent()
+        old = await world.chat(agent, idle_days=100, session_key="ticket-7")
+        store = FakeStore()
+        await run(world, store)
+        archive = parse_archive(next(iter(store.objects.values())))
+        async with world.sessions() as db:
+            plan = await plan_restore(db, archive)
+            assert plan.ok and not plan.session_detached  # nothing conflicts: kept
+            plan = await plan_restore(db, archive, detach_session=True)
+            assert plan.session_detached
+            await apply_restore(db, archive, plan)
+            await db.commit()
+        async with world.sessions() as db:
+            assert (await db.get(Chat, old)).session_key is None

@@ -21,6 +21,9 @@ COMPLETED = "completed"
 PARTIAL = "partial"  # a budget ended it with chats left: the next tick continues
 FAILED = "failed"
 REFUSED = "refused"  # misconfigured (e.g. archive with no destination): nothing done
+# Stopped without finishing (worker cancelled, job timed out, process died):
+# its counts are what it got done; the next tick continues from its cursor.
+INTERRUPTED = "interrupted"
 
 TRIGGERS = ("schedule", "api", "cli")
 
@@ -47,3 +50,8 @@ class ChatRetentionRun(Base):
     # {"namespace/name" | "(no agent)": {"archived": n, "deleted": n}}
     per_agent: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     error: Mapped[Optional[str]] = mapped_column(Text)
+    # The last chat the run looked at, in selection order (chats.updated_at,
+    # chats.id): a continuation of a partial or interrupted run starts after
+    # it, so chats that keep failing or being skipped can't starve the rest.
+    cursor_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    cursor_chat_id: Mapped[Optional[uuid.UUID]] = mapped_column(GUID())
