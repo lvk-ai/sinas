@@ -1,11 +1,11 @@
 import { keepPreviousData, useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiClient } from '../lib/api';
+import { apiClient, getApiErrorMessage } from '../lib/api';
 import { Link } from 'react-router-dom';
 import { Plus, Trash2, Search, Bot, ArchiveRestore, Clock } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { Chat, ChatCreate } from '../types';
 import { SchemaFormField } from '../components/SchemaFormField';
-import { applyChatChange, type ChatPages } from '../lib/chatPages';
+import { applyChatChange, inFlightFetch, type ChatPages } from '../lib/chatPages';
 
 const PAGE_SIZE = 50;
 
@@ -46,8 +46,9 @@ export function Chats() {
 
   // The search and the archived toggle are part of the key: changing either
   // starts a fresh list from the first page.
+  const listKey = ['chats', 'list', showArchived, q];
   const chatList = useInfiniteQuery({
-    queryKey: ['chats', 'list', showArchived, q],
+    queryKey: listKey,
     queryFn: ({ pageParam }) =>
       apiClient.listChatsPage({ includeArchived: showArchived, q, limit: PAGE_SIZE, cursor: pageParam }),
     initialPageParam: null as string | null,
@@ -60,13 +61,27 @@ export function Chats() {
 
   // Put a created, archived or restored chat into every cached list
   // (each key holds its own filter) instead of refetching their pages.
-  const applyToCachedLists = (chat: Chat) => {
-    for (const query of queryClient.getQueryCache().findAll({ queryKey: ['chats', 'list'] })) {
+  const applyToCachedLists = async (chat: Chat) => {
+    const lists = queryClient.getQueryCache().findAll({ queryKey: ['chats', 'list'] });
+    const inFlight = lists.map((query) => inFlightFetch(query.state));
+    // A list response still on its way was read before this change and
+    // would overwrite the edit: cancel it (its state reverts), edit, then
+    // redo it, so a "Load more" in progress still delivers its page.
+    await queryClient.cancelQueries({ queryKey: ['chats', 'list'] });
+    for (const query of lists) {
       const [, , includeArchived, search] = query.queryKey as [string, string, boolean, string];
       queryClient.setQueryData<ChatPages<Chat>>(query.queryKey, (data) =>
         applyChatChange(data, chat, { includeArchived, q: search }),
       );
     }
+    const shown = queryClient.getQueryCache().find({ queryKey: listKey, exact: true });
+    lists.forEach((query, i) => {
+      if (inFlight[i] === 'next-page' && query === shown) {
+        chatList.fetchNextPage();
+      } else if (inFlight[i] !== 'none') {
+        queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true });
+      }
+    });
     queryClient.invalidateQueries({ queryKey: ['chats', 'latest'] });
   };
 
@@ -302,13 +317,22 @@ export function Chats() {
         )}
 
         {chatList.hasNextPage && (
-          <div className="flex justify-center pt-4">
+          <div className="flex flex-col items-center gap-2 pt-4">
+            {chatList.isFetchNextPageError && !chatList.isFetchingNextPage && (
+              <p className="text-sm text-red-400">
+                {getApiErrorMessage(chatList.error, 'Could not load more chats')}
+              </p>
+            )}
             <button
               onClick={() => chatList.fetchNextPage()}
               disabled={chatList.isFetchingNextPage}
               className="btn-secondary text-sm"
             >
-              {chatList.isFetchingNextPage ? 'Loading…' : 'Load more chats'}
+              {chatList.isFetchingNextPage
+                ? 'Loading…'
+                : chatList.isFetchNextPageError
+                  ? 'Try again'
+                  : 'Load more chats'}
             </button>
           </div>
         )}

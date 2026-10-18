@@ -60,6 +60,16 @@ test('a searched list only takes chats whose title matches, case-insensitively',
   assert.deepEqual(ids(m.applyChatChange(pages(['a']), chat('n', 'other'), searched)), [['a']]);
 });
 
+test('in-flight fetches: none, a next page, or the pages themselves', () => {
+  assert.equal(m.inFlightFetch({ fetchStatus: 'idle', fetchMeta: null }), 'none');
+  // A paused query is not fetching either: nothing will arrive to overwrite the edit.
+  assert.equal(m.inFlightFetch({ fetchStatus: 'paused', fetchMeta: { fetchMore: { direction: 'forward' } } }), 'none');
+  assert.equal(m.inFlightFetch({ fetchStatus: 'fetching', fetchMeta: { fetchMore: { direction: 'forward' } } }), 'next-page');
+  assert.equal(m.inFlightFetch({ fetchStatus: 'fetching', fetchMeta: null }), 'pages');
+  assert.equal(m.inFlightFetch({ fetchStatus: 'fetching' }), 'pages');
+  assert.equal(m.inFlightFetch({ fetchStatus: 'fetching', fetchMeta: { fetchMore: { direction: 'backward' } } }), 'pages');
+});
+
 test('nothing cached: nothing to update', () => {
   assert.equal(m.applyChatChange(undefined, chat('n'), ALL), undefined);
   const empty = { pages: [], pageParams: [] };

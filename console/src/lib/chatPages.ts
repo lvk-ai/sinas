@@ -65,3 +65,18 @@ export function applyChatChange<T extends ChatLike>(
   }
   return { ...data, pages };
 }
+
+/**
+ * What a list query was fetching, from react-query's query state: nothing,
+ * its next page (fetchNextPage), or its pages (a load or refetch). Writing
+ * to the cache means cancelling that fetch first (its response was read
+ * before the change and would overwrite it), so it has to be redone after.
+ */
+export function inFlightFetch(state: {
+  fetchStatus: string;
+  fetchMeta?: unknown;
+}): 'none' | 'next-page' | 'pages' {
+  if (state.fetchStatus !== 'fetching') return 'none';
+  const meta = state.fetchMeta as { fetchMore?: { direction?: string } } | null | undefined;
+  return meta?.fetchMore?.direction === 'forward' ? 'next-page' : 'pages';
+}
