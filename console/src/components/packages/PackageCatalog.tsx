@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowUpCircle, BookOpen, Check, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
+import { AlertTriangle, ArrowUpCircle, BookOpen, Check, GitBranch, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
 import { apiClient } from '../../lib/api';
+import { formatRequirement, requirementState } from '../../lib/packageDependencies';
 import type { InstalledPackage, PackageCatalogEntry } from '../../types';
 import type { InstallTarget } from './InstallPackageModal';
 import { isForbidden, useAddOfficialRepository, usePackageRepositories } from './hooks';
@@ -205,6 +206,32 @@ function CatalogCard({
           </div>
           {entry.description && <p className="text-sm text-gray-400 mt-0.5">{entry.description}</p>}
           {entry.author && <p className="text-xs text-gray-500 mt-1">by {entry.author}</p>}
+          {(entry.requires?.length ?? 0) > 0 && (
+            <p
+              className="flex items-center gap-1.5 flex-wrap text-xs text-gray-500 mt-1"
+              title="Installed first when missing, from the active repositories"
+            >
+              <GitBranch className="w-3 h-3" />
+              Requires
+              {entry.requires!.map((r) => {
+                // Whether it's met is the server's call (its range semantics).
+                const { tone, note } = requirementState(r);
+                return (
+                  <span
+                    key={r.install_name}
+                    className={`px-1.5 py-0.5 rounded font-mono bg-surface-2 ${
+                      tone === 'warn' ? 'text-amber-400' : 'text-gray-300'
+                    }`}
+                    title={tone === 'neutral' ? `${note}: installed first when you install this package` : note}
+                  >
+                    {formatRequirement(r)}
+                    {tone === 'ok' && <Check className="w-3 h-3 inline ml-1 text-green-400" />}
+                    {tone === 'warn' && <AlertTriangle className="w-3 h-3 inline ml-1" />}
+                  </span>
+                );
+              })}
+            </p>
+          )}
 
           {(entry.installed.length > 0 || installedElsewhere.length > 0) && (
             <div className="flex flex-wrap gap-2 mt-2">

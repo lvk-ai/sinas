@@ -231,8 +231,29 @@ def parse_index(raw: bytes) -> dict[str, Any]:
             # Optional: the package may be installed more than once. Only a
             # real boolean counts; anything else is dropped, never fatal.
             "multi_instance": entry.get("multiInstance") is True,
+            # Optional: the packages it requires, as its package.requires
+            # declares them. Informational (the catalog shows it); installs
+            # use the requirements in the checksum-verified file.
+            "requires": _index_requires(entry.get("requires")),
         })
     return {"schema": INDEX_SCHEMA, "packages": clean}
+
+
+def _index_requires(value: Any) -> list[dict[str, Any]]:
+    """An index entry's requires, validated one by one: a malformed
+    requirement is dropped, never a reason to refuse the index."""
+    from app.schemas.config import PackageRequirement
+
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        try:
+            req = PackageRequirement.model_validate(item)
+        except Exception:
+            continue
+        out.append(req.model_dump(exclude_none=True))
+    return out
 
 
 async def refresh(db: AsyncSession, repository: PackageRepository) -> PackageRepository:
@@ -447,8 +468,11 @@ def _readme_url(repository: PackageRepository, entry: dict[str, Any]) -> Optiona
 async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
     """Every package every active repository offers, with what is installed
     of it and whether an update is available."""
+    from app.services.package_dependencies import requirement_status
+
     repositories = await _repositories(db)
     installed = list((await db.execute(select(Package))).scalars())
+    by_name = {p.name: p for p in installed}
     out = []
     for repository in repositories:
         for entry in (repository.index or {}).get("packages", []):
@@ -467,6 +491,9 @@ async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
                 "readme_url": _readme_url(repository, entry),
                 # Indexes stored before the field existed have no key: false.
                 "multi_instance": entry.get("multi_instance") is True,
+                # Each with whether what is installed meets it now (the same
+                # check GET /packages makes), for the catalog to show.
+                "requires": [requirement_status(r, by_name) for r in entry.get("requires") or []],
                 "installed": [
                     {"name": p.name, "version": p.version, "update_available": is_newer(entry["version"], p.version)}
                     for p in mine

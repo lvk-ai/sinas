@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, uuid_pk
@@ -37,6 +37,17 @@ class Package(Base):
     values: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}"
     )  # Variable values from last install (secret values stored as "***")
+    # The installed version's package.requires, normalized, each with the
+    # install name it targets: [{name, version, repository, instance,
+    # install_name}]. Dependents of a package are the rows whose requires
+    # target its name (docs/design/package-dependencies.md).
+    requires: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    # Installed by a dependency plan rather than asked for directly.
+    installed_as_dependency: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     installed_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
     installed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

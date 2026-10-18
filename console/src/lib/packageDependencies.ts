@@ -1,0 +1,131 @@
+// Package dependencies (package.requires) in the console: how a requirement
+// reads, what a preview's dependency plan says, and the values an install
+// sends for the packages it installs first. Pure, so npm test covers it.
+// docs/design/package-dependencies.md
+
+import type { DependencyPlanEntry, PackageRequirement, PackageRequirementStatus } from '../types';
+
+/** How a requirement stands now, as the server judged it (one
+ * implementation of the version ranges: the backend's): `ok` when met, a
+ * warning when something else is in the way, neutral when simply not
+ * installed. */
+export function requirementState(req: PackageRequirementStatus): { tone: 'ok' | 'warn' | 'neutral'; note: string } {
+  if (req.status === 'satisfied') {
+    return { tone: 'ok', note: `Installed: ${req.installed_version ?? 'unknown version'}` };
+  }
+  if (req.status === 'incompatible') {
+    if (req.reason === 'other_package') {
+      return {
+        tone: 'warn',
+        note: `Name taken: '${req.install_name}' is package ${req.installed_package ?? 'another package'}`,
+      };
+    }
+    const installed = req.installed_version ? `Installed ${req.installed_version}` : 'Installed';
+    return { tone: 'warn', note: `${installed}, which doesn't satisfy ${req.version ?? 'the requirement'}` };
+  }
+  return { tone: 'neutral', note: 'Not installed' };
+}
+
+/** "gmail >=1.2,<2", "mail (as mail-support)", "slack". */
+export function formatRequirement(req: PackageRequirement): string {
+  const range = req.version ? ` ${req.version}` : '';
+  const instance = req.instance && req.instance !== req.name ? ` (as ${req.instance})` : '';
+  return `${req.name}${range}${instance}`;
+}
+
+export interface PlanSummary {
+  /** Installed first, in this order. */
+  toInstall: DependencyPlanEntry[];
+  satisfied: DependencyPlanEntry[];
+  /** Missing, incompatible, circular or invalid: the install is refused. */
+  blocked: DependencyPlanEntry[];
+}
+
+export function planSummary(entries: DependencyPlanEntry[] | undefined): PlanSummary {
+  const all = entries ?? [];
+  return {
+    toInstall: all.filter((e) => e.status === 'install'),
+    satisfied: all.filter((e) => e.status === 'satisfied'),
+    blocked: all.filter((e) => e.status !== 'install' && e.status !== 'satisfied'),
+  };
+}
+
+export const BROAD_ROLE_WARNING = 'Broad role permission';
+
+/** Every warning of an install: each package it installs first (all of
+ * them, named after the package: a skipped hand-edited resource matters as
+ * much there), then the package's own. `broad` are the ones the broad role
+ * permission consent covers. */
+export function installWarnings(
+  entries: DependencyPlanEntry[] | undefined,
+  own: string[] | undefined,
+): { all: string[]; broad: string[] } {
+  const all: string[] = [];
+  const broad: string[] = [];
+  for (const d of planSummary(entries).toInstall) {
+    for (const w of d.preview?.warnings ?? []) {
+      all.push(`${d.install_name}: ${w}`);
+      if (w.startsWith(BROAD_ROLE_WARNING)) broad.push(`${d.install_name}: ${w}`);
+    }
+  }
+  for (const w of own ?? []) {
+    all.push(w);
+    if (w.startsWith(BROAD_ROLE_WARNING)) broad.push(w);
+  }
+  return { all, broad };
+}
+
+/** Why a blocked entry blocks, for its badge. */
+export const BLOCKED_LABEL: Record<string, string> = {
+  missing: 'Not available',
+  incompatible: 'Incompatible',
+  cycle: 'Circular',
+  invalid: "Can't install",
+};
+
+/** A blank secret is left out: the server then keeps an existing secret of
+ * that name (or reports it missing), where an empty string would overwrite
+ * it with nothing. */
+export function sentValues(
+  values: Record<string, any> | undefined,
+  declarations: { name: string; type?: string }[] | undefined,
+): Record<string, any> | undefined {
+  const secrets = new Set((declarations ?? []).filter((v) => v.type === 'secret').map((v) => v.name));
+  const sent = Object.fromEntries(
+    Object.entries(values ?? {}).filter(([k, v]) => !(secrets.has(k) && (v === '' || v == null))),
+  );
+  return Object.keys(sent).length > 0 ? sent : undefined;
+}
+
+/** The required packages whose variables the dialog asks for: those it
+ * installs, and one made invalid that has variables (a value of its own may
+ * be what made it invalid, so its fields stay, to be corrected). */
+export function configurableEntries(entries: DependencyPlanEntry[] | undefined): DependencyPlanEntry[] {
+  return (entries ?? []).filter(
+    (e) => (e.status === 'install' || e.status === 'invalid') && (e.variables?.length ?? 0) > 0,
+  );
+}
+
+/** dependencyVariables for a preview or install: the values entered for each
+ * package the dialog asks values for (configurableEntries), keyed by its
+ * install name. Values for packages no longer in the plan are left out. */
+export function dependencyPayload(
+  values: Record<string, Record<string, any>>,
+  entries: DependencyPlanEntry[] | undefined,
+): Record<string, Record<string, any>> | undefined {
+  const out: Record<string, Record<string, any>> = {};
+  for (const entry of configurableEntries(entries)) {
+    const sent = sentValues(values[entry.install_name], entry.variables);
+    if (sent) out[entry.install_name] = sent;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** The defaults a package to install declares, to pre-fill its form. */
+export function variableDefaults(declarations: { name: string; default?: any }[] | undefined): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const v of declarations ?? []) {
+    if (v.default !== undefined && v.default !== null) out[v.name] = v.default;
+  }
+  return out;
+}

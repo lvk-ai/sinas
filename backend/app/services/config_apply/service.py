@@ -41,8 +41,14 @@ class ConfigApplyService:
         prune_missing: bool = False,
         supplied_secrets: Optional[set[str]] = None,
         adopt_unmanaged: bool = False,
+        extra_pending_references: Optional[dict[str, dict[str, bool]]] = None,
     ):
         self.db = db
+        # Previews only: what other packages in the same dependency plan
+        # declare, by kind ({"connectors": {"gmail/api": True}}). Their dry
+        # runs create nothing, so a reference to one of their resources can
+        # only be satisfied from here, as one to this config's own.
+        self.extra_pending_references = extra_pending_references or {}
         # Package installs: take over resources made or edited by hand
         # instead of skipping them (see ownership_decision).
         self.adopt_unmanaged = adopt_unmanaged
@@ -187,6 +193,10 @@ class ConfigApplyService:
         # Identity providers grant roles by name; roles apply first.
         if "roles" not in self.skip_resource_types:
             self._pending_references["roles"] = {item.name: True for item in config.spec.roles}
+        for kind, keys in self.extra_pending_references.items():
+            merged = self._pending_references.setdefault(kind, {})
+            for key, active in keys.items():
+                merged.setdefault(key, active)
         if not dry_run:
             # Promotions to "the default" serialize on a lock taken before any
             # row lock this apply takes (lock order: see lock_singleton).
