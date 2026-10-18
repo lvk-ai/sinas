@@ -215,7 +215,7 @@ POST /api/v1/packages/install
 
 **Upgrades.** Installing a newer version resolves its requirements again, installing new ones. If an installed package requires this one in a range the new version is outside of, the preview lists it under `breaks` and the install is refused, unless you pass `allowBreakingDependents: true`.
 
-**API.** The preview response carries `dependencies` (the plan; each package to install with `variables`, `requires_input` and its own `preview`) and `breaks`. `GET /api/v1/packages` and `GET /api/v1/packages/{name}` include `requires` (each with its current `status`), `required_by`, `installed_as_dependency` and `orphaned`. The catalog includes each package's `requires` from the repository index. The package agent tools take `dependency_variables`.
+**API.** The preview response carries `dependencies` (the plan; each package to install with `variables`, `requires_input` and its own `preview`) and `breaks`. `GET /api/v1/packages` and `GET /api/v1/packages/{name}` include `requires` (each with its current `status`), `required_by`, `installed_as_dependency` and `orphaned`. The catalog includes each package's `requires` from the repository index, each with its `status` against what is installed (`satisfied`; `incompatible` with `reason` `version` or `other_package`; `missing`). The package agent tools take `dependency_variables`.
 
 ## Install-time Variables
 

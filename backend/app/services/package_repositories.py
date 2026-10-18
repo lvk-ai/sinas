@@ -468,8 +468,11 @@ def _readme_url(repository: PackageRepository, entry: dict[str, Any]) -> Optiona
 async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
     """Every package every active repository offers, with what is installed
     of it and whether an update is available."""
+    from app.services.package_dependencies import requirement_status
+
     repositories = await _repositories(db)
     installed = list((await db.execute(select(Package))).scalars())
+    by_name = {p.name: p for p in installed}
     out = []
     for repository in repositories:
         for entry in (repository.index or {}).get("packages", []):
@@ -488,7 +491,9 @@ async def catalog(db: AsyncSession) -> list[dict[str, Any]]:
                 "readme_url": _readme_url(repository, entry),
                 # Indexes stored before the field existed have no key: false.
                 "multi_instance": entry.get("multi_instance") is True,
-                "requires": list(entry.get("requires") or []),
+                # Each with whether what is installed meets it now (the same
+                # check GET /packages makes), for the catalog to show.
+                "requires": [requirement_status(r, by_name) for r in entry.get("requires") or []],
                 "installed": [
                     {"name": p.name, "version": p.version, "update_available": is_newer(entry["version"], p.version)}
                     for p in mine

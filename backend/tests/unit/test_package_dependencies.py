@@ -581,15 +581,32 @@ class TestRepositories:
         index = repos.parse_index(json.dumps({"schema": repos.INDEX_SCHEMA, "packages": [bare]}).encode())
         assert index["packages"][0]["requires"] == []
 
-    async def test_the_catalog_shows_requires(self, client, db, admin_user, fake_repos):
-        dep, root = f"gmail{_uid()}", f"triage{_uid()}"
-        await fake_repos.add(db, admin_user, f"r{_uid()}", [
-            package_yaml(dep), package_yaml(root, requires=[{"name": dep, "version": ">=1"}]),
-        ], extra={root: {"requires": [{"name": dep, "version": ">=1"}]}})
+    async def test_the_catalog_shows_requires_with_their_status(self, client, db, admin_user, fake_repos):
+        """Met only when the install name holds the required package at a
+        version in range."""
+        ok, old, other, absent, root = (f"{x}{_uid()}" for x in ("ok", "old", "other", "absent", "triage"))
+        service = PackageService(db)
+        await service.install(package_yaml(ok, "1.5.0"), str(admin_user.id))
+        await service.install(package_yaml(old, "1.0.0"), str(admin_user.id))
+        await service.install(package_yaml(other), str(admin_user.id))
+        requires = [
+            {"name": ok, "version": ">=1"},
+            {"name": old, "version": ">=2"},
+            {"name": f"mail{_uid()}", "instance": other},   # the name holds another package
+            {"name": absent},
+        ]
+        await fake_repos.add(db, admin_user, f"r{_uid()}", [package_yaml(root, requires=requires)],
+                             extra={root: {"requires": requires}})
         catalog = (await client.get("/api/v1/packages/catalog", headers=auth_headers(admin_user))).json()
-        by_name = {e["name"]: e for e in catalog}
-        assert by_name[root]["requires"] == [{"name": dep, "version": ">=1"}]
-        assert by_name[dep]["requires"] == []
+        (entry,) = [e for e in catalog if e["name"] == root]
+        got = [(r["install_name"], r["status"], r["reason"], r["installed_version"]) for r in entry["requires"]]
+        assert got == [
+            (ok, "satisfied", None, "1.5.0"),
+            (old, "incompatible", "version", "1.0.0"),
+            (other, "incompatible", "other_package", "1.0.0"),
+            (absent, "missing", None, None),
+        ]
+        assert entry["requires"][0]["version"] == ">=1" and entry["requires"][2]["installed_package"] == other
 
     async def test_resolution_order(self, db, admin_user, fake_repos):
         """The requirement's hint, then the dependent's own repository, then
