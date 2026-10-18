@@ -20,7 +20,7 @@ from app.services.resources.base import ApplierError, ApplyContext, ReferenceNot
 
 _FIELDS = (
     "description", "model", "max_tokens", "system_prompt", "icon", "default_job_timeout",
-    "default_keep_alive", "is_active", "temperature",
+    "default_keep_alive", "is_active", "temperature", "retention_days",
 )
 _LISTS = (
     "enabled_functions", "enabled_agents", "enabled_queries", "enabled_components",
@@ -110,6 +110,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
             icon=row.icon or None,
             default_job_timeout=row.default_job_timeout,
             default_keep_alive=bool(row.default_keep_alive),
+            retention_days=row.retention_days,
             system_tools=list(row.system_tools or []),
             tool_approvals=dict(row.tool_approvals) if row.tool_approvals else None,
             enabled_mcp_servers=[

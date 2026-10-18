@@ -78,6 +78,9 @@ class AgentSpec(SpecModel):
     icon: Optional[str] = None
     default_job_timeout: Optional[int] = None
     default_keep_alive: bool = False
+    # Chat retention override in days: None = the deployment default
+    # (CHAT_RETENTION_DAYS), 0 = keep forever ("never" in config).
+    retention_days: Optional[int] = None
     system_tools: list[Any] = Field(default_factory=list)
     # Permission modes: {"default": "auto"|"ask", "rules": [{"match", "action"}]}.
     # Validated at save time so a bad rule never waits to fail in a chat.
@@ -102,6 +105,13 @@ class AgentSpec(SpecModel):
             tools = data.get("tools")
             normalized.append({**data, "tools": sorted(tools or [])})
         return sorted(normalized, key=lambda x: str(x.get("server", "")))
+
+    @field_validator("retention_days", mode="before")
+    @classmethod
+    def _retention_days(cls, value: Any) -> Any:
+        from app.services.retention.policy import normalize_retention_days
+
+        return normalize_retention_days(value)
 
     @field_validator("tool_approvals", mode="before")
     @classmethod

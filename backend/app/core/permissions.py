@@ -406,6 +406,10 @@ DEFAULT_ROLE_PERMISSIONS = {
         # System (admin-only - queues, workers, containers)
         # "sinas.system.read:all"
         # "sinas.system.update:all"
+        # Chat retention (admin-only): status and dry run; real runs, and
+        # changing an agent's retentionDays
+        # "sinas.retention.read:all"
+        # "sinas.retention.update:all"
         # Stores (admin-only, namespace-based)
         # "sinas.stores/*/*.read:all" - Read all stores
         # "sinas.stores/*/*.read_state:all" - Read all states in any store

@@ -524,6 +524,7 @@ class WorkerSettings:
 
 
 # Import agent jobs for combined worker
+from arq import func
 from arq.cron import cron
 
 from app.queue.agent_jobs import (
@@ -570,6 +571,29 @@ async def refresh_model_prices_job(ctx: dict) -> bool:
     return await refresh_url_ratecard_due()
 
 
+async def chat_retention_tick_job(ctx: dict) -> bool:
+    """Start a chat retention run when CHAT_RETENTION_SCHEDULE says so (or
+    continue one a budget cut short). Does nothing unless retention is
+    enabled. See docs/design/chat-retention.md."""
+    from app.services.retention.job import scheduled_tick
+
+    return await scheduled_tick() is not None
+
+
+async def chat_retention_run_job(ctx: dict, run_id: str) -> str:
+    """A run queued by POST /retention/run ("Run now")."""
+    import uuid as _uuid
+
+    from app.services.retention.job import run_retention
+
+    result = await run_retention(trigger="api", run_id=_uuid.UUID(run_id))
+    return result["status"]
+
+
+def _retention_job_timeout() -> int:
+    return (settings.chat_retention_max_run_seconds or 6 * 3600) + 600
+
+
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
@@ -577,6 +601,7 @@ class AgentWorkerSettings:
         execute_agent_message_job,
         execute_agent_resume_job,
         execute_agent_delegate_resume_job,
+        func(chat_retention_run_job, timeout=_retention_job_timeout(), max_tries=1),
     ]
     # Deferred-round expiry sweep: minutely, deduplicated across workers
     # (arq cron unique=True). Runs here — not on the sub-agent worker — so
@@ -594,6 +619,16 @@ class AgentWorkerSettings:
         # or the copy is older than model_prices_refresh_hours (so a failing
         # URL is retried every 10 minutes, the last good copy kept meanwhile).
         cron(refresh_model_prices_job, minute=set(range(3, 60, 10)), second=40, unique=True),
+        # Every 10 minutes; starts a run only when CHAT_RETENTION_SCHEDULE
+        # fired since the last scheduled run (or that one ended "partial").
+        cron(
+            chat_retention_tick_job,
+            minute=set(range(1, 60, 10)),
+            second=20,
+            unique=True,
+            timeout=_retention_job_timeout(),
+            max_tries=1,
+        ),
     ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown

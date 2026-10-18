@@ -49,6 +49,22 @@ def _same_provider(agent: Agent, requested: Optional[uuid.UUID]) -> None:
         raise HTTPException(status_code=409, detail="The LLM provider changed while saving; try again")
 
 
+RETENTION_PERMISSION = "sinas.retention.update:all"
+
+
+def _require_retention_permission(req: Request, permissions: dict) -> None:
+    """Changing an agent's chat retention decides when other users' chats
+    with it are archived and deleted: an admin decision, not the agent
+    owner's."""
+    if not check_permission(permissions, RETENTION_PERMISSION):
+        set_permission_used(req, RETENTION_PERMISSION, has_perm=False)
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to change an agent's chat retention (needs sinas.retention.update:all)",
+        )
+    set_permission_used(req, RETENTION_PERMISSION)
+
+
 async def _any_state(db: AsyncSession, namespace: str, name: str, user_id=None) -> Optional[Agent]:
     stmt = select(Agent).where(Agent.namespace == namespace, Agent.name == name)
     if user_id is not None:
@@ -82,6 +98,8 @@ async def create_agent(
         set_permission_used(req, create_perm, has_perm=False)
         raise HTTPException(status_code=403, detail="Not authorized to create agents")
     set_permission_used(req, create_perm)
+    if agent_data.retention_days is not None:
+        _require_retention_permission(req, permissions)
 
     ctx = rest.api_context(db, user_id)
     if agent_data.is_default:
@@ -210,6 +228,11 @@ async def update_agent(
         for field, value in agent_data.model_dump(exclude_unset=True).items()
         if value is not None and field != "llm_provider_id"
     }
+    # retention_days: an explicit null means back to the deployment default.
+    if "retention_days" in agent_data.model_fields_set:
+        patch["retention_days"] = agent_data.retention_days
+        if agent_data.retention_days != agent.retention_days:
+            _require_retention_permission(req, permissions)
     requested = agent_data.llm_provider_id
     if requested is not None and requested != agent.llm_provider_id:
         patch["llm_provider_name"] = await _provider_name(requested, db)

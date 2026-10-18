@@ -281,6 +281,9 @@ class AgentConfig(BaseModel):
     isActive: Optional[bool] = None
     defaultJobTimeout: Optional[int] = None
     defaultKeepAlive: bool = False
+    # Chat retention override: days since a chat's last activity; 0 or
+    # "never" = keep forever; unset = the deployment default.
+    retentionDays: Optional[Union[int, str]] = None
     systemTools: list[Any] = Field(
         default_factory=list,
         description=(
@@ -305,6 +308,13 @@ class AgentConfig(BaseModel):
         from app.services.approval_rules import validate_tool_approvals
 
         return validate_tool_approvals(v)
+
+    @field_validator("retentionDays", mode="before")
+    @classmethod
+    def _retention_days(cls, v):
+        from app.services.retention.policy import normalize_retention_days
+
+        return normalize_retention_days(v)
 
 
 

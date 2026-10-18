@@ -33,6 +33,7 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `hooks` | Message lifecycle hooks. `{"on_user_message": [...], "on_assistant_message": [...]}` |
 | `system_tools` | Platform capabilities. List of strings or config objects. See [System Tools](#system-tools). |
 | `tool_approvals` | Permission mode: which tool calls run unattended and which stop for the user's approval. `{"default": "auto"\|"ask", "rules": [{"match": "<glob over tool name>", "action": "auto"\|"ask"}]}`, first matching rule wins. Config key: `toolApprovals`. See [Way of Working](/build-resources/way-of-working#tool-approvals). |
+| `retention_days` | How long chats with this agent are kept after their last activity before they are archived and deleted: `null` = the deployment default, `0` = keep forever (`"never"` in config), `N` = N days. Only applies when the operator has switched [chat retention](/admin/chat-retention) on. Changing it takes `sinas.retention.update:all`. Config key: `retentionDays`. |
 | `icon` | Icon reference (see [Icons](#icons)) |
 
 **Wildcard patterns** for `enabled_*` fields:

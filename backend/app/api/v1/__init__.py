@@ -26,6 +26,7 @@ from .endpoints import (
     queries,
     queue,
     request_logs,
+    retention,
     system,
     roles,
     schedules,
@@ -81,6 +82,7 @@ router.include_router(containers.router)
 router.include_router(workers.router)
 router.include_router(queue.router)
 router.include_router(system.router)
+router.include_router(retention.router)
 
 # Package routes
 router.include_router(packages.router)

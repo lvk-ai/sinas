@@ -1,0 +1,170 @@
+---
+title: "Chat Retention"
+description: "Archive old chats to write-only object storage, then delete them"
+---
+
+
+Chats and their messages stay in the database until something removes them. Chat retention removes chats that have been idle for longer than a retention period: each one is first written to an archive in S3-compatible object storage, and deleted from the database only once the storage has confirmed the write.
+
+Retention is **off by default**. Nothing is archived or deleted until an operator switches it on.
+
+## How it works
+
+- **Age is measured from a chat's last activity**: the newest of its last update and its newest message. A chat that is still in use is never removed, however long ago it started.
+- **A nightly run** (on a schedule you set) finds chats past their retention period, oldest first, and handles them one at a time: archive, then delete.
+- **Chats something will still write to are left alone**: a turn running, a round waiting on an `ask_user` answer, a sub-agent or a background job, an unanswered tool approval, a pending wakeup timer or a live watch, an MCP task still running. They come up again in the next run.
+- **Checked twice, from the database.** Whether a chat still qualifies (retention on, idle past its agent's current setting, nothing waiting on it) is checked when it is read for archiving and again, with the chat locked, right before the delete. A chat written to, or whose agent was switched to "keep forever", in the meantime is kept.
+- **Failures keep the chat.** If the upload fails, nothing is deleted. If the delete fails after the upload, the next run uploads the chat again to the same object key and then deletes it.
+- **Chats too large to archive safely are kept.** An archive larger than a restore reads back (512 MB uncompressed) is never uploaded; the chat stays and the run counts it as skipped (`too_large`).
+- **Several runners are safe.** Each chat is claimed before it is handled; a runner skips chats another runner has.
+- **Every run is recorded** (who or what started it, the policy, and how many chats were archived, deleted, skipped and why, or failed), and logged. Neither the record nor the logs contain message content or chat titles.
+
+## Configuration
+
+Retention is configured with environment variables on the backend and worker containers (with Helm, through `extraEnv`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `CHAT_RETENTION_ENABLED` | `false` | The switch. Off: no run deletes anything, whatever else is set. |
+| `CHAT_RETENTION_DAYS` | `0` | Default retention in days since last activity. `0` (or unset) keeps chats forever unless an agent sets its own. |
+| `CHAT_RETENTION_ACTION` | `archive` | `archive`: archive each chat, then delete it; without an archive destination, runs are refused and nothing is deleted. `delete`: deleting without an archive is allowed (a configured destination is still written first). |
+| `CHAT_RETENTION_SCHEDULE` | `30 3 * * *` | When runs start, as a cron expression in UTC. |
+| `CHAT_RETENTION_BATCH_SIZE` | `200` | Chats read per batch. |
+| `CHAT_RETENTION_MAX_CHATS_PER_RUN` | `0` | Stop a run after this many chats (`0`: no limit). A run that stops early, or is interrupted, is continued ten minutes later from where it stopped, so a large first backlog is worked through in steps and a chat that keeps failing doesn't hold up the rest (it is retried on the next scheduled run). |
+| `CHAT_RETENTION_MAX_RUN_SECONDS` | `3300` | Stop a run after this long; continued the same way. |
+
+### Per agent
+
+An agent's **retention** setting overrides the default for chats with that agent: the console's agent form, `retention_days` in the API, `retentionDays` in config.
+
+| Value | Means |
+|---|---|
+| unset / `null` | The deployment default (`CHAT_RETENTION_DAYS`) |
+| `0` (config: `"never"`) | Keep forever |
+| `N` | `N` days after the last activity, at most `36500` (100 years) |
+
+```yaml
+agents:
+  - namespace: support
+    name: triage
+    retentionDays: 30
+  - namespace: legal
+    name: contracts
+    retentionDays: never
+```
+
+Changing an agent's retention through the API takes the `sinas.retention.update:all` permission, not just permission to edit the agent: it decides when other people's chats are deleted. Chats whose agent was deleted use the default.
+
+### Archive destination
+
+Any S3-compatible storage: AWS S3, Google Cloud Storage through its [S3 interoperability API](https://cloud.google.com/storage/docs/interoperability) (HMAC keys), MinIO, Cloudflare R2.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CHAT_ARCHIVE_S3_BUCKET` | _(none)_ | The bucket. Setting it configures the destination. |
+| `CHAT_ARCHIVE_S3_PREFIX` | `sinas/chats` | Key prefix. |
+| `CHAT_ARCHIVE_S3_ENDPOINT_URL` | _(AWS S3)_ | For other providers, e.g. `https://storage.googleapis.com`, `https://<account>.r2.cloudflarestorage.com`, `http://minio:9000`. |
+| `CHAT_ARCHIVE_S3_REGION` | _(none)_ | The bucket's region (`auto` for R2). |
+| `CHAT_ARCHIVE_S3_ACCESS_KEY_ID`, `CHAT_ARCHIVE_S3_SECRET_ACCESS_KEY`, `CHAT_ARCHIVE_S3_SESSION_TOKEN` | _(none)_ | Static credentials. Unset: the standard AWS credential chain (environment, web identity / IRSA, ECS and EKS pod identity, instance profile). |
+| `CHAT_ARCHIVE_S3_KMS_KEY_ID` | _(none)_ | Encrypt with SSE-KMS under this key. Unset: the bucket's default encryption. |
+| `CHAT_ARCHIVE_S3_ADDRESSING_STYLE` | `auto` | `path` or `virtual`. `auto` uses path-style with a custom endpoint, virtual-hosted for AWS. |
+| `CHAT_ARCHIVE_S3_TIMEOUT_SECONDS` | `60` | Timeout of one upload. |
+
+The admin panel and API show where archives go and whether static keys or the default chain are used, never the credentials.
+
+## Write-only access
+
+Sinas only ever **writes** archives. It never reads, lists, checks or deletes them: a retry writes the same key again. Give its credentials `s3:PutObject` on the prefix and nothing else:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SinasChatArchiveWriteOnly",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-sinas-archive/sinas/chats/*"
+    }
+  ]
+}
+```
+
+With `CHAT_ARCHIVE_S3_KMS_KEY_ID`, add `kms:GenerateDataKey` on that key (and `kms:Encrypt` if your key policy requires it). Not `kms:Decrypt`: Sinas never reads an archive back.
+
+Credentials that can read archives belong to whoever restores them, kept apart from Sinas.
+
+### Recommended bucket settings
+
+- **Versioning on**, so a second write to a key keeps the first version.
+- **Object Lock** (WORM) with a default retention in **compliance** or **governance** mode, for as long as you must keep archives. Nobody, Sinas included, can then change or remove an archive before it expires. Sinas sends `Content-MD5` with every upload, which S3 requires for writes into an Object Lock bucket.
+- **SSE-KMS** encryption with a key whose decrypt permission is limited to the people who restore.
+- **Block public access**, and a lifecycle rule that expires archives once you no longer have to keep them.
+
+## Archive format
+
+One object per chat, at `<prefix>/<yyyy>/<mm>/<chat id>.jsonl.gz` (the year and month the chat was created): gzip-compressed JSON lines.
+
+| Line | Contents |
+|---|---|
+| First | `"type": "chat"`: format name and version, Sinas version, when it was archived, the retention applied (days, from the agent or the default, last activity) and the chat itself: id, owner id and email, agent id and namespace/name, title, archived flag, created and updated times, session key, chat metadata. The workbench's file list (names, sizes, hashes). |
+| Then | One `"type": "message"` line per message, in order: id, role, content, tool calls, tool call id, name, created time. |
+| Then | One `"type": "tool_result"` line per stored tool result of the chat. |
+| Last | `"type": "manifest"`: counts, and a SHA-256 over every byte before it. |
+
+The object's metadata holds `sinas-chat-id`, `sinas-format-version` and `sinas-sha256` (of the compressed object).
+
+**Never archived:** credentials of any kind, a chat's stream channel, wakeup watch tokens, MCP server task ids, API key ids. Message content is archived as it was: if someone pasted a secret into a chat, it is in that chat's archive just as it was in the database.
+
+### Not archived (and what happens to it)
+
+| Data | What happens |
+|---|---|
+| Workbench files | **Deleted with the chat, not archived.** The archive lists them (name, size, hash). |
+| LLM usage records (`llm_usage`) | Kept. They hold no content and are needed for cost reporting. |
+| Function execution records | Kept, unlinked from the chat. Their input and output can hold tool arguments and results. |
+| Answered tool approvals, spent wakeups, finished MCP tasks | Deleted with the chat. |
+| Request logs (ClickHouse) | Kept for `CLICKHOUSE_RETENTION_DAYS` (default 90), then removed by ClickHouse's own TTL. |
+
+## Running and checking
+
+**Admin › System › Chat retention** in the console shows the policy, the archive destination, the last run, a preview of what a run would do now, and **Run now**.
+
+The same through the API (admins only):
+
+| Endpoint | Permission | |
+|---|---|---|
+| `GET /api/v1/retention/status` | `sinas.retention.read:all` | Policy, destination, agent overrides, last run, run in progress, next scheduled run |
+| `POST /api/v1/retention/run?dry_run=true` | `sinas.retention.read:all` | What a run would archive and delete now, per agent, and what it would leave alone and why. Changes nothing. |
+| `POST /api/v1/retention/run?dry_run=false` | `sinas.retention.update:all` | Queue a run now (`202`); follow it in the status |
+
+And from the command line, inside the backend container:
+
+```bash
+python -m app.cli retention            # the preview, as JSON (same as --dry-run)
+python -m app.cli retention --run      # a run, now
+```
+
+## Restoring a chat
+
+Restoring is done from the command line, with credentials that can read the archive. The command takes an `s3://` URI (read with the standard AWS credential chain, or `--profile`) or a local file:
+
+```bash
+# Check an archive and see what a restore would do
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+python -m app.cli restore-chat s3://my-sinas-archive/sinas/chats/2026/01/<chat id>.jsonl.gz --dry-run
+
+# Restore it
+python -m app.cli restore-chat ./<chat id>.jsonl.gz
+```
+
+| Option | |
+|---|---|
+| `--dry-run` | Verify and report; write nothing |
+| `--endpoint-url`, `--region`, `--profile` | Where and how to read an `s3://` archive |
+| `--user-email` | The owner to restore to when the archived user no longer exists |
+| `--detach-session` | Restore without the chat's session key. Done anyway, with a note, when the agent's session has continued in a newer chat |
+
+The archive is verified in full first (format, every line, the manifest's counts and checksum); a damaged archive is refused. A restore writes the chat and its messages under their original ids, in one transaction. It refuses when the chat or any of its messages already exists. The owner is the archived user, else the user with the archived email, else `--user-email`. The agent is linked again by namespace and name if it exists. Stored tool results are restored while they haven't expired. Workbench files aren't in the archive and aren't restored.
+
+The restored chat counts as active from the moment it's restored, so it gets a full retention period again.

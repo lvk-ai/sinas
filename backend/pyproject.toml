@@ -59,6 +59,11 @@ dependencies = [
     # replaced the client API (mcp.Client, transports as context managers),
     # so an unbounded range would let an image resolve a breaking major.
     "mcp>=2.2.0,<3",
+    # Chat retention archive (PutObject to S3-compatible storage) and the
+    # restore CLI. boto3 for the AWS credential chain (env, web identity /
+    # IRSA, ECS and EKS pod identity, instance metadata) and SigV4; called
+    # from a thread, so no async wrapper (aiobotocore pins botocore tightly).
+    "boto3>=1.35.0,<2",
 ]
 
 # Exact versions + hashes for everything (transitive included) live in
