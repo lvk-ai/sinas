@@ -1,8 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, Eye, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, Check, Eye, GitBranch, Package as PackageIcon, RefreshCw, X } from 'lucide-react';
 import { apiClient } from '../../lib/api';
-import type { ApplyChange, PackageSource } from '../../types';
+import {
+  BLOCKED_LABEL,
+  configurableEntries,
+  dependencyPayload,
+  installWarnings,
+  planSummary,
+  sentValues,
+  variableDefaults,
+} from '../../lib/packageDependencies';
+import type { ApplyChange, DependencyBreak, DependencyPlanEntry, PackageSource } from '../../types';
 import { errorMessage } from './hooks';
 
 // Kinds a package never deletes on uninstall (deleted_with_package = False
@@ -30,23 +39,29 @@ export type InstallTarget =
 
 type InstallStep = 'input' | 'preview' | 'installing' | 'done';
 
-const BROAD_ROLE_WARNING = 'Broad role permission';
 
-/** The values, install name and take-over choice a preview (or an install)
- * is for, as one comparable key: Confirm installs exactly what the shown
- * preview was for. */
-const requestKey = (
-  variables: Record<string, any> | undefined,
-  instance: string | undefined,
-  adoptUnmanaged: boolean | undefined,
-) =>
+const sortedEntries = (values: Record<string, any> | undefined) =>
+  Object.keys(values ?? {}).sort().map((k) => [k, values![k]]);
+
+type PreviewRequest = {
+  variables?: Record<string, any>;
+  instance?: string;
+  adoptUnmanaged?: boolean;
+  dependencyVariables?: Record<string, Record<string, any>>;
+  allowBreakingDependents?: boolean;
+};
+
+/** The values, install name and choices a preview (or an install) is for,
+ * as one comparable key: Confirm installs exactly what the shown preview
+ * was for. */
+const requestKey = (r: PreviewRequest) =>
   JSON.stringify([
-    Object.keys(variables ?? {}).sort().map((k) => [k, variables![k]]),
-    (instance ?? '').trim(),
-    !!adoptUnmanaged,
+    sortedEntries(r.variables),
+    (r.instance ?? '').trim(),
+    !!r.adoptUnmanaged,
+    sortedEntries(r.dependencyVariables).map(([k, v]) => [k, sortedEntries(v)]),
+    !!r.allowBreakingDependents,
   ]);
-
-type PreviewRequest = { variables?: Record<string, any>; instance?: string; adoptUnmanaged?: boolean };
 
 /** Preview → variables → confirm → install, for either kind of target. */
 export function InstallPackageModal({ target, onClose }: { target: InstallTarget; onClose: () => void }) {
@@ -66,12 +81,20 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const [previewedKey, setPreviewedKey] = useState<string | null>(null);
   // Take over resources the package declares that were edited by hand.
   const [adoptUnmanaged, setAdoptUnmanaged] = useState(false);
+  // Values for the packages the install installs first, by install name.
+  const [dependencyValues, setDependencyValues] = useState<Record<string, Record<string, any>>>({});
+  // Upgrade although installed packages requiring this one don't accept the version.
+  const [allowBreaking, setAllowBreaking] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Any edit to what would be installed withdraws the consent: it was given
   // for the permissions a preview of other values showed.
   const setVariable = (name: string, value: any) => {
     setVariableValues((prev) => ({ ...prev, [name]: value }));
+    setAcceptedBroad(null);
+  };
+  const setDependencyVariable = (installName: string, name: string, value: any) => {
+    setDependencyValues((prev) => ({ ...prev, [installName]: { ...prev[installName], [name]: value } }));
     setAcceptedBroad(null);
   };
   const changeInstanceName = (value: string) => {
@@ -85,34 +108,46 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
       : { source: yamlInput };
 
   const previewMutation = useMutation({
-    mutationFn: ({ variables, instance, adoptUnmanaged }: PreviewRequest) =>
-      apiClient.previewPackage(source(), { variables, instance, adoptUnmanaged: adoptUnmanaged || undefined }),
+    mutationFn: ({ variables, instance, adoptUnmanaged, dependencyVariables, allowBreakingDependents }: PreviewRequest) =>
+      apiClient.previewPackage(source(), {
+        variables,
+        instance,
+        adoptUnmanaged: adoptUnmanaged || undefined,
+        dependencyVariables,
+        allowBreakingDependents: allowBreakingDependents || undefined,
+      }),
     onSuccess: (data, request) => {
       setPreviewResult(data);
-      setPreviewedKey(requestKey(request.variables, request.instance, request.adoptUnmanaged));
+      setPreviewedKey(requestKey(request));
       setAcceptedBroad(null);
       // Pre-fill variable defaults (a preview with them is still to be run:
       // until then the form differs from what was previewed)
       if (data.variables?.length) {
-        const defaults: Record<string, any> = {};
-        for (const v of data.variables) {
-          if (v.default !== undefined && v.default !== null) {
-            defaults[v.name] = v.default;
-          }
-        }
+        const defaults = variableDefaults(data.variables);
         setVariableValues(prev => ({ ...defaults, ...prev }));
+      }
+      // The same for each package the install would install first.
+      const toInstall = configurableEntries(data.dependencies);
+      if (toInstall.length) {
+        setDependencyValues((prev) => {
+          const next = { ...prev };
+          for (const d of toInstall) next[d.install_name] = { ...variableDefaults(d.variables), ...prev[d.install_name] };
+          return next;
+        });
       }
       setInstallStep('preview');
     },
   });
 
   const installMutation = useMutation({
-    mutationFn: ({ variables, instance, adoptUnmanaged }: PreviewRequest) =>
+    mutationFn: ({ variables, instance, adoptUnmanaged, dependencyVariables, allowBreakingDependents }: PreviewRequest) =>
       apiClient.installPackage(source(), {
         variables,
         instance,
         allowBroadRolePermissions: allowBroadRolePermissions || undefined,
         adoptUnmanaged: adoptUnmanaged || undefined,
+        dependencyVariables,
+        allowBreakingDependents: allowBreakingDependents || undefined,
       }),
     onSuccess: (data) => {
       setInstallResult(data);
@@ -127,39 +162,47 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     },
   });
 
-  /** The values to send. A blank secret is left out: the server then keeps
-   * an existing secret of that name (or reports it missing), where an empty
-   * string would overwrite it with nothing. */
-  const payloadValues = (): Record<string, any> | undefined => {
-    const secretNames = new Set(
-      (previewResult?.variables || []).filter((v: any) => v.type === 'secret').map((v: any) => v.name),
-    );
-    const sent = Object.fromEntries(
-      Object.entries(variableValues).filter(([k, v]) => !(secretNames.has(k) && (v === '' || v == null))),
-    );
-    return Object.keys(sent).length > 0 ? sent : undefined;
-  };
+  /** The values to send (a blank secret is left out, see sentValues). */
+  const payloadValues = (): Record<string, any> | undefined =>
+    sentValues(variableValues, previewResult?.variables);
 
-  const runPreview = (adopt: boolean = adoptUnmanaged) => {
-    const vars = payloadValues();
-    previewMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined, adoptUnmanaged: adopt });
+  /** What to send: these values, for the packages the shown plan installs. */
+  const currentRequest = (
+    overrides: Partial<Pick<PreviewRequest, 'adoptUnmanaged' | 'allowBreakingDependents'>> = {},
+  ): PreviewRequest => ({
+    variables: payloadValues(),
+    instance: instanceName.trim() || undefined,
+    adoptUnmanaged,
+    dependencyVariables: dependencyPayload(dependencyValues, previewResult?.dependencies),
+    allowBreakingDependents: allowBreaking,
+    ...overrides,
+  });
+
+  const runPreview = (overrides: Partial<Pick<PreviewRequest, 'adoptUnmanaged' | 'allowBreakingDependents'>> = {}) => {
+    previewMutation.mutate(currentRequest(overrides));
   };
 
   // Taking over hand-edited resources changes what the install does to
   // them: show it, by previewing again with the choice.
   const changeAdoptUnmanaged = (adopt: boolean) => {
     setAdoptUnmanaged(adopt);
-    runPreview(adopt);
+    runPreview({ adoptUnmanaged: adopt });
+  };
+  // Accepting broken dependents changes the verdict: preview again with it.
+  const changeAllowBreaking = (allow: boolean) => {
+    setAllowBreaking(allow);
+    runPreview({ allowBreakingDependents: allow });
   };
 
-  // A repository package has nothing to paste: preview it straight away
-  // (once, also under StrictMode's double effect run).
-  const autoPreviewed = useRef(false);
+  // A repository package has nothing to paste: preview it straight away.
+  // Once, also under StrictMode's mount-unmount-mount: the first run's timer
+  // is cleared, and the mutation starts after the remount, so the observer
+  // that shows its progress is the one subscribed (a mutation started before
+  // the simulated unmount left the button "Previewing..." for good).
   useEffect(() => {
-    if (fromRepository && !autoPreviewed.current) {
-      autoPreviewed.current = true;
-      runPreview();
-    }
+    if (!fromRepository) return;
+    const timer = setTimeout(() => runPreview(), 0);
+    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -182,8 +225,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   // The preview (its changes, warnings, broad permissions) is for one set of
   // values and one install name; after any edit it no longer describes what
   // Confirm would install.
-  const previewStale =
-    !!previewResult && previewedKey !== requestKey(payloadValues(), instanceName, adoptUnmanaged);
+  const previewStale = !!previewResult && previewedKey !== requestKey(currentRequest());
   const instanceStale =
     !!previewResult?.multi_instance &&
     (instanceName.trim() || previewResult.package_name) !== previewResult.instance;
@@ -193,8 +235,14 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   // successful preview for exactly these values is the gate.
   const previewFailed = !!previewResult && (previewResult.success === false || (previewResult.errors || []).length > 0);
 
-  const broadRoleWarnings: string[] = (previewResult?.warnings || []).filter((w: string) =>
-    w.startsWith(BROAD_ROLE_WARNING),
+  const plan = planSummary(previewResult?.dependencies);
+  const breaks: DependencyBreak[] = previewResult?.breaks || [];
+  // The consent covers every package the install installs: the ones it
+  // installs first too, their broad permissions named after them.
+  // Every warning is shown, the dependencies' named after them.
+  const { all: allWarnings, broad: broadRoleWarnings } = installWarnings(
+    previewResult?.dependencies,
+    previewResult?.warnings,
   );
   // Consent covers exactly the permissions this preview showed, for exactly
   // its values: a new preview or any edit withdraws it.
@@ -224,6 +272,8 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
     ? `'${effectiveName}' is already installed: choose a new install name`
     : previewStale
       ? 'Preview with these values first'
+      : plan.blocked.length > 0
+        ? 'Its required packages can\'t all be installed'
       : previewFailed
         ? 'The preview failed: fix the values, then preview again'
         : broadRoleWarnings.length > 0 && !allowBroadRolePermissions
@@ -233,8 +283,7 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
   const handleInstall = () => {
     if (blockedBecause) return;
     setInstallStep('installing');
-    const vars = payloadValues();
-    installMutation.mutate({ variables: vars, instance: instanceName.trim() || undefined, adoptUnmanaged });
+    installMutation.mutate(currentRequest());
   };
 
   const title =
@@ -338,6 +387,38 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
         {/* Step 2: Preview */}
         {installStep === 'preview' && previewResult && (
           <div className="space-y-4">
+            {(previewResult.dependencies?.length ?? 0) > 0 && (
+              <DependencyPlan entries={previewResult.dependencies} />
+            )}
+
+            {breaks.length > 0 && (
+              <div className="p-3 bg-red-900/20 border border-red-900/30 rounded">
+                <div className="flex items-center gap-2 mb-1">
+                  <AlertTriangle className="w-4 h-4 text-red-400" />
+                  <span className="text-sm font-medium text-red-300">Packages that require this one</span>
+                </div>
+                {breaks.map((b) => (
+                  <p key={`${b.dependent}-${b.requires}`} className="text-sm text-red-400/90">
+                    <span className="font-mono">{b.dependent}</span> requires{' '}
+                    <span className="font-mono">{b.requires}{b.version ? ` ${b.version}` : ''}</span>, which this version doesn't meet.
+                  </p>
+                ))}
+                <label className="flex items-start gap-2 mt-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allowBreaking}
+                    disabled={previewMutation.isPending}
+                    onChange={(e) => changeAllowBreaking(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 text-primary-600 border-line rounded"
+                  />
+                  <span className="text-sm text-gray-300">
+                    Install anyway. Those packages stay installed but no longer get the version they ask for;
+                    updating them first is safer.
+                  </span>
+                </label>
+              </div>
+            )}
+
             <div className="p-3 bg-blue-900/20 border border-blue-900/30 rounded">
               <h3 className="text-sm font-medium text-blue-300 mb-2">Preview - Changes to apply:</h3>
               {previewResult.changes && previewResult.changes.length > 0 ? (
@@ -374,13 +455,13 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               </div>
             )}
 
-            {previewResult.warnings && previewResult.warnings.length > 0 && (
+            {allWarnings.length > 0 && (
               <div className="p-3 bg-yellow-900/20 border border-yellow-900/30 rounded">
                 <div className="flex items-center gap-2 mb-1">
                   <AlertTriangle className="w-4 h-4 text-yellow-400" />
                   <span className="text-sm font-medium text-yellow-300">Warnings</span>
                 </div>
-                {previewResult.warnings.map((w: string, i: number) => (
+                {allWarnings.map((w, i) => (
                   <p key={i} className="text-sm text-yellow-400/80">{w}</p>
                 ))}
                 {broadRoleWarnings.length > 0 && (
@@ -460,61 +541,34 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
               </div>
             )}
 
+            {/* Configuration of each package the install installs first; one
+                a value made invalid keeps its fields, to correct the value */}
+            {configurableEntries(previewResult.dependencies).map((d) => (
+                <div key={d.install_name} className="p-3 bg-surface-2 border border-line-soft rounded">
+                  <h3 className="text-sm font-medium text-gray-200 mb-1">
+                    Configuration: <span className="font-mono">{d.install_name}</span>
+                  </h3>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Required package, installed first ({d.package_name} {d.version}).
+                  </p>
+                  {d.status === 'invalid' && d.message && (
+                    <p className="text-xs text-red-400/90 mb-3">{d.message}. Correct the values and preview again.</p>
+                  )}
+                  <VariableFields
+                    declarations={d.variables!}
+                    values={dependencyValues[d.install_name] ?? {}}
+                    onChange={(name, value) => setDependencyVariable(d.install_name, name, value)}
+                  />
+                </div>
+              ))}
+
             {/* Variable form (if package requires input) */}
             {previewResult.variables && previewResult.variables.length > 0 && (
               <div className="p-3 bg-surface-2 border border-line-soft rounded">
-                <h3 className="text-sm font-medium text-gray-200 mb-3">Configuration</h3>
-                <div className="space-y-3">
-                  {previewResult.variables.map((v: any) => (
-                    <div key={v.name}>
-                      <label className="block text-xs font-medium text-gray-400 mb-1">
-                        {v.description || v.name}
-                        {v.required && !v.default && <span className="text-red-400 ml-1">*</span>}
-                      </label>
-
-                      {v.type === 'boolean' ? (
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={variableValues[v.name] ?? v.default ?? false}
-                            onChange={(e) => setVariable(v.name, e.target.checked)}
-                            className="w-4 h-4 text-primary-600 border-line rounded"
-                          />
-                          <span className="text-sm text-gray-300 font-mono">{v.name}</span>
-                        </label>
-                      ) : v.type === 'enum' && v.choices ? (
-                        <select
-                          value={variableValues[v.name] ?? v.default ?? ''}
-                          onChange={(e) => setVariable(v.name, e.target.value)}
-                          className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
-                        >
-                          <option value="">Select...</option>
-                          {v.choices.map((c: string) => (
-                            <option key={c} value={c}>{c}</option>
-                          ))}
-                        </select>
-                      ) : v.type === 'resource_ref' && v.resource === 'llm_providers' ? (
-                        <LLMProviderSelect
-                          value={variableValues[v.name] ?? ''}
-                          onChange={(val) => setVariable(v.name, val)}
-                        />
-                      ) : v.type === 'resource_ref' && v.resource === 'database_connections' ? (
-                        <DatabaseConnectionSelect
-                          value={variableValues[v.name] ?? ''}
-                          onChange={(val) => setVariable(v.name, val)}
-                        />
-                      ) : (
-                        <input
-                          type={v.type === 'secret' ? 'password' : 'text'}
-                          value={variableValues[v.name] ?? v.default ?? ''}
-                          placeholder={v.example || (v.type === 'secret' ? 'Leave blank to keep an existing secret' : `Enter ${v.name}`)}
-                          onChange={(e) => setVariable(v.name, e.target.value)}
-                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
+                <h3 className="text-sm font-medium text-gray-200 mb-3">
+                  Configuration{plan.toInstall.length > 0 && <>: <span className="font-mono">{previewResult.instance}</span></>}
+                </h3>
+                <VariableFields declarations={previewResult.variables} values={variableValues} onChange={setVariable} />
               </div>
             )}
 
@@ -602,6 +656,17 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
                     {installResult.package.name} v{installResult.package.version}
                   </p>
                 )}
+                {(installResult.dependencies || []).length > 0 && (
+                  <p className="text-sm text-gray-400 mt-1">
+                    Also installed:{' '}
+                    {installResult.dependencies.map((d: any, i: number) => (
+                      <span key={d.package.name}>
+                        {i > 0 && ', '}
+                        <span className="font-mono">{d.package.name}</span> v{d.package.version}
+                      </span>
+                    ))}
+                  </p>
+                )}
               </div>
             )}
 
@@ -629,6 +694,125 @@ export function InstallPackageModal({ target, onClose }: { target: InstallTarget
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** What the package requires: already installed, installed first, or why
+ * it can't be. */
+function DependencyPlan({ entries }: { entries: DependencyPlanEntry[] }) {
+  const { toInstall, satisfied, blocked } = planSummary(entries);
+  return (
+    <div className="p-3 bg-surface-2 border border-line-soft rounded space-y-2">
+      <h3 className="text-sm font-medium text-gray-200 flex items-center gap-2">
+        <GitBranch className="w-4 h-4 text-gray-400" />
+        Required packages
+      </h3>
+      {toInstall.map((d) => (
+        <div key={d.install_name} className="text-sm">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-green-900/30 text-green-400">Also installs</span>
+            <PackageIcon className="w-3.5 h-3.5 text-gray-500" />
+            <span className="font-mono text-gray-200">{d.install_name}</span>
+            <span className="font-mono text-gray-400">{d.version}</span>
+            {d.repository && <span className="text-xs text-gray-500">from <span className="font-mono">{d.repository}</span></span>}
+            {d.install_name !== d.package_name && (
+              <span className="text-xs text-gray-500">instance of <span className="font-mono">{d.package_name}</span></span>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 ml-1 mt-0.5">
+            Required by {d.required_by.join(', ')}
+            {d.preview && d.preview.success && ` · ${d.preview.changes.filter((c) => c.action !== 'unchanged').length} resource change(s)`}
+          </p>
+          {d.needs_input && d.message && (
+            // Its own requirements depend on its variables: the form below asks for them.
+            <p className="text-xs text-amber-400 ml-1">{d.message}</p>
+          )}
+          {d.preview && !d.preview.success && (d.preview.errors || []).map((e, i) => (
+            <p key={i} className="text-xs text-red-400/90 ml-1">{e}</p>
+          ))}
+        </div>
+      ))}
+      {satisfied.map((d) => (
+        <div key={d.install_name} className="flex items-center gap-2 text-sm flex-wrap">
+          <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-surface-0 text-gray-400">
+            <Check className="w-3 h-3" />
+            Installed
+          </span>
+          <span className="font-mono text-gray-300">{d.install_name}</span>
+          <span className="font-mono text-gray-500">{d.version}</span>
+        </div>
+      ))}
+      {blocked.map((d) => (
+        <div key={d.install_name} className="text-sm">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-red-900/30 text-red-400">
+              {BLOCKED_LABEL[d.status] ?? d.status}
+            </span>
+            <span className="font-mono text-gray-200">{d.install_name}</span>
+          </div>
+          {d.message && <p className="text-xs text-red-400/90 ml-1 mt-0.5">{d.message}</p>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** A package's install-time variables as form fields. */
+function VariableFields({
+  declarations,
+  values,
+  onChange,
+}: {
+  declarations: any[];
+  values: Record<string, any>;
+  onChange: (name: string, value: any) => void;
+}) {
+  return (
+    <div className="space-y-3">
+      {declarations.map((v: any) => (
+        <div key={v.name}>
+          <label className="block text-xs font-medium text-gray-400 mb-1">
+            {v.description || v.name}
+            {v.required && !v.default && <span className="text-red-400 ml-1">*</span>}
+          </label>
+
+          {v.type === 'boolean' ? (
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={values[v.name] ?? v.default ?? false}
+                onChange={(e) => onChange(v.name, e.target.checked)}
+                className="w-4 h-4 text-primary-600 border-line rounded"
+              />
+              <span className="text-sm text-gray-300 font-mono">{v.name}</span>
+            </label>
+          ) : v.type === 'enum' && v.choices ? (
+            <select
+              value={values[v.name] ?? v.default ?? ''}
+              onChange={(e) => onChange(v.name, e.target.value)}
+              className="w-full px-2.5 py-1.5 text-sm bg-surface-0 border border-line rounded text-gray-200"
+            >
+              <option value="">Select...</option>
+              {v.choices.map((c: string) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          ) : v.type === 'resource_ref' && v.resource === 'llm_providers' ? (
+            <LLMProviderSelect value={values[v.name] ?? ''} onChange={(val) => onChange(v.name, val)} />
+          ) : v.type === 'resource_ref' && v.resource === 'database_connections' ? (
+            <DatabaseConnectionSelect value={values[v.name] ?? ''} onChange={(val) => onChange(v.name, val)} />
+          ) : (
+            <input
+              type={v.type === 'secret' ? 'password' : 'text'}
+              value={values[v.name] ?? v.default ?? ''}
+              placeholder={v.example || (v.type === 'secret' ? 'Leave blank to keep an existing secret' : `Enter ${v.name}`)}
+              onChange={(e) => onChange(v.name, e.target.value)}
+              className="w-full px-2.5 py-1.5 text-sm font-mono bg-surface-0 border border-line rounded text-gray-200 placeholder-gray-600"
+            />
+          )}
+        </div>
+      ))}
     </div>
   );
 }
