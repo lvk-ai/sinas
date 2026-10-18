@@ -1,8 +1,9 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { apiClient } from '../lib/api';
-import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store, ShieldAlert } from 'lucide-react';
+import { Package, Plus, Trash2, Download, Upload, X, Check, ArrowUpCircle, Library, Store, ShieldAlert, GitBranch } from 'lucide-react';
 import { useState } from 'react';
+import { formatRequirement } from '../lib/packageDependencies';
 import { InstallPackageModal, type InstallTarget } from '../components/packages/InstallPackageModal';
 import { LoadError } from '../components/packages/LoadError';
 import { isForbidden } from '../components/packages/hooks';
@@ -12,6 +13,50 @@ import type { InstalledPackage } from '../types';
 
 type Tab = 'installed' | 'catalog' | 'repositories';
 const TABS: Tab[] = ['installed', 'catalog', 'repositories'];
+
+/** "Requires" (each with whether it's met now) and "Required by". */
+function PackageDependencies({ pkg }: { pkg: InstalledPackage }) {
+  const requires = pkg.requires ?? [];
+  const requiredBy = pkg.required_by ?? [];
+  if (requires.length === 0 && requiredBy.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1 mt-1.5 text-xs text-gray-500">
+      {requires.length > 0 && (
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <GitBranch className="w-3 h-3" />
+          Requires
+          {requires.map((r) => (
+            <span
+              key={r.install_name}
+              className={`px-1.5 py-0.5 rounded font-mono ${
+                r.status === 'satisfied' ? 'bg-surface-2 text-gray-300' : 'bg-red-900/30 text-red-400'
+              }`}
+              title={
+                r.status === 'satisfied'
+                  ? `Installed: ${r.installed_version}`
+                  : r.status === 'missing'
+                    ? 'Not installed'
+                    : `Installed ${r.installed_version ?? ''} doesn't meet the requirement`
+              }
+            >
+              {formatRequirement(r)}
+              {r.status !== 'satisfied' && ` (${r.status})`}
+            </span>
+          ))}
+        </div>
+      )}
+      {requiredBy.length > 0 && (
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <GitBranch className="w-3 h-3 rotate-180" />
+          Required by
+          {requiredBy.map((name) => (
+            <span key={name} className="px-1.5 py-0.5 rounded font-mono bg-surface-2 text-gray-300">{name}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Packages() {
   const queryClient = useQueryClient();
@@ -251,6 +296,21 @@ export function Packages() {
                         Update available → <span className="font-mono">{pkg.latest_version}</span>
                       </span>
                     )}
+                    {pkg.orphaned ? (
+                      <span
+                        className="text-xs px-2 py-0.5 bg-surface-2 text-gray-400 rounded"
+                        title="Installed as a required package; nothing requires it any more. It is not removed automatically."
+                      >
+                        orphaned dependency
+                      </span>
+                    ) : pkg.installed_as_dependency && (
+                      <span
+                        className="text-xs px-2 py-0.5 bg-surface-2 text-gray-400 rounded"
+                        title="Installed because another package requires it"
+                      >
+                        dependency
+                      </span>
+                    )}
                   </div>
                   {pkg.description && <p className="text-sm text-gray-400 mt-0.5">{pkg.description}</p>}
                   <div className="flex flex-wrap gap-3 mt-1 text-xs text-gray-500">
@@ -269,6 +329,7 @@ export function Packages() {
                       </span>
                     )}
                   </div>
+                  <PackageDependencies pkg={pkg} />
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
                   {pkg.update_available && pkg.source_repository && (
@@ -290,9 +351,14 @@ export function Packages() {
                         uninstallMutation.mutate(pkg.name);
                       }
                     }}
-                    className="p-2 text-gray-500 hover:text-red-600 hover:bg-hover-strong rounded-md transition-colors"
-                    disabled={uninstallMutation.isPending}
-                    title="Uninstall"
+                    className="p-2 text-gray-500 hover:text-red-600 hover:bg-hover-strong rounded-md transition-colors disabled:opacity-40 disabled:hover:text-gray-500 disabled:cursor-not-allowed"
+                    // Packages that require it would be left without it: uninstall those first.
+                    disabled={uninstallMutation.isPending || (pkg.required_by?.length ?? 0) > 0}
+                    title={
+                      (pkg.required_by?.length ?? 0) > 0
+                        ? `Required by ${pkg.required_by!.join(', ')}: uninstall those first`
+                        : 'Uninstall'
+                    }
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>

@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowUpCircle, BookOpen, Check, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
+import { ArrowUpCircle, BookOpen, Check, GitBranch, Library, Package, Plus, Search, ShieldAlert, Upload } from 'lucide-react';
 import { apiClient } from '../../lib/api';
+import { formatRequirement } from '../../lib/packageDependencies';
 import type { InstalledPackage, PackageCatalogEntry } from '../../types';
 import type { InstallTarget } from './InstallPackageModal';
 import { isForbidden, useAddOfficialRepository, usePackageRepositories } from './hooks';
@@ -205,6 +206,29 @@ function CatalogCard({
           </div>
           {entry.description && <p className="text-sm text-gray-400 mt-0.5">{entry.description}</p>}
           {entry.author && <p className="text-xs text-gray-500 mt-1">by {entry.author}</p>}
+          {(entry.requires?.length ?? 0) > 0 && (
+            <p
+              className="flex items-center gap-1.5 flex-wrap text-xs text-gray-500 mt-1"
+              title="Installed first when missing, from the active repositories"
+            >
+              <GitBranch className="w-3 h-3" />
+              Requires
+              {entry.requires!.map((r) => {
+                const target = r.instance || r.name;
+                const present = (installed || []).some((p) => p.name === target);
+                return (
+                  <span
+                    key={target}
+                    className="px-1.5 py-0.5 rounded font-mono bg-surface-2 text-gray-300"
+                    title={present ? 'Installed' : 'Installed first when you install this package'}
+                  >
+                    {formatRequirement(r)}
+                    {present && <Check className="w-3 h-3 inline ml-1 text-green-400" />}
+                  </span>
+                );
+              })}
+            </p>
+          )}
 
           {(entry.installed.length > 0 || installedElsewhere.length > 0) && (
             <div className="flex flex-wrap gap-2 mt-2">

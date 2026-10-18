@@ -717,6 +717,57 @@ export interface InstalledPackage {
   source_repository?: string | null;  // the repository it follows for updates
   latest_version?: string | null;
   update_available: boolean;
+  /** What it requires (package.requires), each with its status now. */
+  requires?: PackageRequirementStatus[];
+  /** Install names of the installed packages that require it. */
+  required_by?: string[];
+  /** Installed by a dependency plan rather than asked for directly. */
+  installed_as_dependency?: boolean;
+  /** Installed as a dependency, and nothing requires it any more. */
+  orphaned?: boolean;
+}
+
+/** A package another package requires (package.requires). */
+export interface PackageRequirement {
+  name: string;
+  /** A version range, pyproject style: ">=1.2,<2". Absent: any version. */
+  version?: string | null;
+  repository?: string | null;
+  /** The install of a multi-instance package; absent: the package's own name. */
+  instance?: string | null;
+}
+
+export interface PackageRequirementStatus extends PackageRequirement {
+  install_name: string;
+  status: 'satisfied' | 'missing' | 'incompatible';
+  installed_version?: string | null;
+}
+
+/** One entry of a preview's dependency plan, dependencies first. */
+export interface DependencyPlanEntry {
+  install_name: string;
+  package_name: string;
+  status: 'satisfied' | 'install' | 'missing' | 'incompatible' | 'cycle' | 'invalid';
+  /** Installed version (satisfied) or the version that will be installed. */
+  version?: string | null;
+  installed_version?: string | null;
+  /** Where an 'install' entry comes from. */
+  repository?: string | null;
+  constraints: { required_by: string; version?: string | null }[];
+  required_by: string[];
+  requires: string[];
+  message?: string | null;
+  /** For 'install' entries: its own variables and dry run. */
+  variables?: any[];
+  requires_input?: boolean;
+  preview?: { success: boolean; changes: ApplyChange[]; errors: string[]; warnings: string[] };
+}
+
+/** An installed package an upgrade would leave outside its stated range. */
+export interface DependencyBreak {
+  dependent: string;
+  requires: string;
+  version?: string | null;
 }
 
 /** Where an install or preview takes its package from: pasted YAML, or a
@@ -732,6 +783,10 @@ export interface PackageInstallOptions {
   /** Take over declared resources that were created or edited by hand
    * (skipped otherwise). Uninstalling the package then deletes them. */
   adoptUnmanaged?: boolean;
+  /** Variable values for the required packages the install installs, by install name. */
+  dependencyVariables?: Record<string, Record<string, any>>;
+  /** Upgrade although installed packages requiring it don't accept the new version. */
+  allowBreakingDependents?: boolean;
 }
 
 /** One resource in a config apply or package install/preview result. */
@@ -870,6 +925,8 @@ export interface PackageCatalogEntry {
   readme_url?: string | null;
   /** The index says it may be installed more than once (package.multiInstance). */
   multi_instance?: boolean;
+  /** The packages it requires, from the repository index. */
+  requires?: PackageRequirement[];
   installed: PackageCatalogInstall[];
   update_available: boolean;
 }
