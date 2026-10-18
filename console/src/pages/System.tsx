@@ -3,6 +3,7 @@ import { apiClient } from '../lib/api';
 import { useAuth } from '../lib/auth-context';
 import { clickHouseFeature } from '../lib/clickhouse';
 import { ClickHouseDisabledNote } from '../components/ClickHouseNotice';
+import { RetentionPanel } from '../components/RetentionPanel';
 import { useState, Fragment, type ReactNode } from 'react';
 import { Server, Plus, Minus, RefreshCw, AlertTriangle, RotateCcw, Box, X, AlertCircle, Info, RotateCw, Trash2, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 
@@ -926,6 +927,9 @@ export function System() {
           )}
         </div>
       )}
+
+      {/* Chat retention (admins only: renders nothing on a 403) */}
+      <RetentionPanel />
     </div>
   );
 }

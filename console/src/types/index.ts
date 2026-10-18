@@ -325,6 +325,8 @@ export interface Agent {
   is_default: boolean;
   default_job_timeout: number | null;
   default_keep_alive: boolean;
+  /** Chat retention override in days: null = the deployment default, 0 = keep forever. */
+  retention_days: number | null;
   system_tools: Array<string | { name: string; connections?: string[] }>;
   created_at: string;
   updated_at: string;
@@ -359,6 +361,8 @@ export interface AgentCreate {
   is_default?: boolean;
   default_job_timeout?: number;
   default_keep_alive?: boolean;
+  /** null = the deployment default (on update: back to it), 0 = keep forever. */
+  retention_days?: number | null;
   system_tools?: Array<string | { name: string; connections?: string[] }>;
 }
 
@@ -394,6 +398,8 @@ export interface AgentUpdate {
   is_default?: boolean;
   default_job_timeout?: number;
   default_keep_alive?: boolean;
+  /** null = the deployment default (on update: back to it), 0 = keep forever. */
+  retention_days?: number | null;
   system_tools?: Array<string | { name: string; connections?: string[] }>;
 }
 
@@ -1747,4 +1753,83 @@ export interface ConfigRestoreResult {
   resource_key: string;
   resource_id: string | null;
   revision: ConfigRevision | null;
+}
+
+// Chat retention (GET /retention/status, POST /retention/run)
+
+export interface RetentionPolicy {
+  enabled: boolean;
+  default_days: number | null;
+  action: 'archive' | 'delete';
+  schedule: string;
+  batch_size: number;
+  max_chats_per_run: number | null;
+  max_run_seconds: number | null;
+}
+
+/** Where archives go. Never credentials: only whether static keys or the default chain are used. */
+export interface RetentionDestination {
+  configured: boolean;
+  bucket?: string;
+  prefix?: string;
+  endpoint?: string;
+  region?: string | null;
+  sse_kms?: boolean;
+  credentials?: string;
+}
+
+export interface RetentionRunCounts {
+  candidates: number;
+  archived: number;
+  deleted: number;
+  messages_deleted: number;
+  bytes_archived: number;
+  skipped: Record<string, number>;
+  failed: Record<string, number>;
+  more_remaining: boolean;
+}
+
+export interface RetentionRun {
+  id: string;
+  trigger: 'schedule' | 'api' | 'cli';
+  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'refused';
+  actor_email: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  counts: RetentionRunCounts | null;
+  per_agent: Record<string, { archived: number; deleted: number; messages_deleted: number }> | null;
+  error: string | null;
+}
+
+export interface RetentionStatus {
+  policy: RetentionPolicy;
+  destination: RetentionDestination;
+  agent_overrides: Array<{ agent: string; retention_days: number }>;
+  schedule_error: string | null;
+  next_run: string | null;
+  refusal: string | null;
+  in_progress: RetentionRun | null;
+  last_run: RetentionRun | null;
+}
+
+export interface RetentionPreviewAgent {
+  agent: string;
+  retention_days: number;
+  source: 'agent' | 'global';
+  chats: number;
+  messages: number;
+  blocked: Record<string, number>;
+}
+
+export interface RetentionPreview {
+  dry_run: true;
+  as_of: string;
+  policy: RetentionPolicy;
+  destination: RetentionDestination;
+  would_archive: boolean;
+  refusal: string | null;
+  agents: RetentionPreviewAgent[];
+  totals: { chats: number; messages: number; blocked: Record<string, number> };
+  notes: string[];
 }
