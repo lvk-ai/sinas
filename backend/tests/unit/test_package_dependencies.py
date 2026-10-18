@@ -423,7 +423,16 @@ class TestPlan:
         _, _, _, info = await service.preview(
             other_root, str(admin_user.id), dependency_variables={f"b2{tag}": bad[b]}
         )
-        assert _deps(info)[f"b2{tag}"]["status"] == "invalid"
+        entry = _deps(info)[f"b2{tag}"]
+        assert entry["status"] == "invalid"
+        # Its variables are still listed, so the value can be corrected...
+        assert [v["name"] for v in entry["variables"]] == ["MAILBOX"] and entry["requires_input"]
+        # ...and a corrected value resolves it.
+        result, _, _, info = await service.preview(
+            other_root, str(admin_user.id), dependency_variables={f"b2{tag}": {"MAILBOX": f"{mail}-other"}}
+        )
+        assert result.success, result.errors
+        assert _deps(info)[f"b2{tag}"]["status"] == "install"
 
     async def test_a_cycle_through_installed_packages_is_refused(self, db, admin_user, fake_repos):
         """Upgrading a to require installed b, while b requires a: both would
