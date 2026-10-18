@@ -71,6 +71,11 @@ class TestSchedule:
         started = self.NOW.replace(minute=31)
         assert run_is_due("30 3 * * *", self.NOW, started, PARTIAL)
 
+    def test_interrupted_run_continues_on_the_next_tick(self):
+        started = self.NOW.replace(minute=31)
+        assert run_is_due("30 3 * * *", self.NOW, started, "interrupted")
+        assert not run_is_due("30 3 * * *", self.NOW, started, "failed")
+
     def test_first_run_waits_for_the_schedule(self):
         afternoon = datetime(2026, 10, 18, 14, 0, tzinfo=UTC)
         assert not run_is_due("30 3 * * *", afternoon, None, None)
@@ -154,6 +159,24 @@ class TestArchiveFormat:
         a = fmt.build_archive({"archived_at": "t"}, chat, messages, results)
         b = fmt.build_archive({"archived_at": "t"}, chat, messages, results)
         assert a.body == b.body
+
+    @pytest.mark.parametrize("title", ["", None])
+    def test_empty_or_null_title_round_trips(self, title):
+        chat, messages, results = _sample()
+        chat["title"] = title
+        parsed = fmt.parse_archive(fmt.build_archive({}, chat, messages, results).body)
+        assert parsed.chat["title"] == title
+
+    def test_title_must_be_present(self):
+        chat, messages, results = _sample()
+        del chat["title"]
+        with pytest.raises(fmt.InvalidArchiveError, match="title"):
+            fmt.parse_archive(fmt.build_archive({}, chat, messages, results).body)
+
+    def test_uncompressed_size_is_reported(self):
+        chat, messages, results = _sample()
+        built = fmt.build_archive({}, chat, messages, results)
+        assert built.uncompressed_bytes == len(gzip.decompress(built.body))
 
     def test_tampering_is_detected(self):
         chat, messages, results = _sample()

@@ -156,11 +156,13 @@ def run_is_due(
     last_run_status: Optional[str],
 ) -> bool:
     """Whether the cron tick should start a run: the schedule fired since the
-    last scheduled run started, or the last run stopped at a budget with
-    chats left (it continues, rather than waiting for the next fire)."""
-    from app.models.retention_run import PARTIAL
+    last scheduled run started, or the last run (`last_run_status`, of any
+    trigger: scheduled, Run now or the CLI) stopped before the end, at a
+    budget or interrupted, so it continues rather than waiting for the next
+    fire."""
+    from app.models.retention_run import INTERRUPTED, PARTIAL
 
-    if last_run_status == PARTIAL:
+    if last_run_status in (PARTIAL, INTERRUPTED):
         return True
     fired = previous_fire(schedule, now)
     if last_scheduled_start is None:

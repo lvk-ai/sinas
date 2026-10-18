@@ -45,6 +45,11 @@ class RestorePlan:
     messages: int = 0
     tool_results: int = 0  # restorable (not expired)
     tool_results_expired: int = 0
+    # The archived session key goes back on the chat unless it's detached:
+    # on request (--detach-session), or because the agent already has an
+    # active chat on that session (a unique key: the restore would fail).
+    session_key: Optional[str] = None
+    session_detached: bool = False
     conflicts: list[str] = field(default_factory=list)  # any → nothing is written
     notes: list[str] = field(default_factory=list)
 
@@ -60,13 +65,19 @@ class RestorePlan:
             "messages": self.messages,
             "tool_results": self.tool_results,
             "tool_results_expired": self.tool_results_expired,
+            "session_detached": self.session_detached,
             "conflicts": self.conflicts,
             "notes": self.notes,
         }
 
 
 async def plan_restore(
-    db: AsyncSession, archive: ParsedArchive, *, user_email: Optional[str] = None, now: Optional[datetime] = None
+    db: AsyncSession,
+    archive: ParsedArchive,
+    *,
+    user_email: Optional[str] = None,
+    detach_session: bool = False,
+    now: Optional[datetime] = None,
 ) -> RestorePlan:
     now = now or datetime.now(UTC)
     chat = archive.chat
@@ -117,6 +128,29 @@ async def plan_restore(
         else:
             plan.notes.append(f"agent {ns}/{name} doesn't exist here: the chat is restored unlinked")
 
+    # Session continuity: one active chat per (agent, session_key).
+    plan.session_key = chat.get("session_key") or None
+    if plan.session_key:
+        if detach_session:
+            plan.session_key, plan.session_detached = None, True
+            plan.notes.append("restored without its session key (--detach-session)")
+        elif plan.agent_id is not None and not chat.get("archived"):
+            newer = (
+                await db.execute(
+                    select(Chat.id).where(
+                        Chat.agent_id == plan.agent_id,
+                        Chat.session_key == plan.session_key,
+                        Chat.archived.is_(False),
+                    )
+                )
+            ).scalars().first()
+            if newer is not None:
+                plan.session_key, plan.session_detached = None, True
+                plan.notes.append(
+                    f"the agent's session this chat belonged to now continues in chat {newer}: restored "
+                    "without its session key (a standalone chat; that session keeps going in the newer one)"
+                )
+
     for r in archive.tool_results:
         expires = _dt(r.get("expires_at"))
         if expires is not None and expires > now:
@@ -153,7 +187,7 @@ async def apply_restore(
             title=c.get("title") or "",
             archived=bool(c.get("archived")),
             expires_at=_dt(c.get("expires_at")),
-            session_key=c.get("session_key"),
+            session_key=plan.session_key,
             job_timeout=c.get("job_timeout"),
             keep_alive=c.get("keep_alive"),
             chat_metadata=c.get("chat_metadata"),

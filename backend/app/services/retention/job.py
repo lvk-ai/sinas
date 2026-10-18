@@ -17,6 +17,7 @@ content or titles: chat ids and counts only.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -52,6 +53,7 @@ from app.models.pending_completion import PendingCompletion
 from app.models.retention_run import (
     COMPLETED,
     FAILED,
+    INTERRUPTED,
     PARTIAL,
     QUEUED,
     REFUSED,
@@ -87,6 +89,11 @@ CLAIMED = "claimed"  # another runner has it
 LOCKED = "locked"  # its row was locked at delete time
 CHANGED = "changed"  # written to after the snapshot: archived again next run
 GONE = "gone"  # deleted meanwhile
+# No longer qualifies, by the database at that moment: it was written to,
+# its agent's retention changed, or retention was switched off. Checked when
+# it is snapshotted and again, under the row lock, right before the delete.
+NOT_ELIGIBLE = "not_eligible"
+TOO_LARGE = "too_large"  # its archive would exceed what a restore reads back
 
 _UNSET: Any = object()
 
@@ -231,6 +238,34 @@ def refusal(policy: RetentionPolicy, has_store: bool) -> Optional[str]:
     return None
 
 
+async def ineligible_reason(db: AsyncSession, chat_id: uuid.UUID, now: datetime) -> Optional[str]:
+    """Why the chat doesn't qualify for retention right now, by what the
+    database says in this transaction under the CURRENT policy (switch,
+    default, its agent's retentionDays): None when it does."""
+    policy = RetentionPolicy.from_settings()
+    if not policy.enabled:
+        return NOT_ELIGIBLE
+    row = (
+        await db.execute(eligible_stmt(policy.global_days, 0, now).where(Chat.id == chat_id))
+    ).one_or_none()
+    if row is None:
+        return NOT_ELIGIBLE
+    return row.blocked or None
+
+
+async def eligible_snapshot(sessions, chat_id: uuid.UUID, now: datetime) -> tuple[Optional["Snapshot"], Optional[str]]:
+    """The chat's snapshot and its eligibility from one consistent read
+    (REPEATABLE READ: both see the same database state). (snapshot, None)
+    when it qualifies, else (None, reason)."""
+    async with sessions() as db:
+        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        reason = await ineligible_reason(db, chat_id, now)
+        if reason:
+            return None, reason
+        snapshot = await load_snapshot(db, chat_id)
+        return (snapshot, None) if snapshot is not None else (None, GONE)
+
+
 # ---------------------------------------------------------------------------
 # Snapshot
 # ---------------------------------------------------------------------------
@@ -356,10 +391,14 @@ def _last_activity(snapshot: Snapshot) -> Optional[str]:
 
 
 async def delete_chat(db: AsyncSession, chat_id: uuid.UUID, digest: str, now: datetime) -> tuple[str, int, list[str]]:
-    """Delete an archived chat, if it's still exactly what was archived and
-    nothing blocks it. Returns ("deleted", messages, stored paths to remove
-    after the commit) or (skip reason, 0, []). Commits on delete, rolls back
-    otherwise."""
+    """Delete an archived chat, if it still qualifies (by the database now,
+    under the current policy) and is still exactly what was archived.
+    Returns ("deleted", messages, stored paths to remove after the commit)
+    or (skip reason, 0, []). Commits on delete, rolls back otherwise.
+
+    Everything is checked under the row lock: a message insert's foreign key
+    check waits for it, so nothing can land between the checks and the
+    delete."""
     from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
     from app.services import chat_steering
 
@@ -370,12 +409,10 @@ async def delete_chat(db: AsyncSession, chat_id: uuid.UUID, digest: str, now: da
         gone = (await db.execute(select(Chat.id).where(Chat.id == chat_id))).scalar_one_or_none() is None
         await db.rollback()
         return (GONE if gone else LOCKED), 0, []
-    blocked = (
-        await db.execute(select(blocked_expr(now)).select_from(Chat).where(Chat.id == chat_id))
-    ).scalar_one_or_none()
-    if blocked:
+    reason = await ineligible_reason(db, chat_id, now)
+    if reason:
         await db.rollback()
-        return blocked, 0, []
+        return reason, 0, []
     if await chat_steering.is_chat_locked(str(chat_id)):
         await db.rollback()
         return RUNNING_TURN, 0, []
@@ -467,6 +504,7 @@ class _Tally:
     failed: Counter = field(default_factory=Counter)
     per_agent: dict[str, dict[str, int]] = field(default_factory=dict)
     more_remaining: bool = False
+    cursor: Optional[tuple[datetime, uuid.UUID]] = None  # the last chat looked at
 
     def agent(self, label: str) -> dict[str, int]:
         return self.per_agent.setdefault(label, {"archived": 0, "deleted": 0, "messages_deleted": 0})
@@ -506,16 +544,54 @@ async def _start_run(sessions, run_id, trigger, actor_user_id, actor_email, poli
         return run.id
 
 
+def _record(run: ChatRetentionRun, tally: Optional[_Tally]) -> None:
+    run.counts = tally.counts() if tally else None
+    run.per_agent = dict(tally.per_agent) if tally else None
+    if tally and tally.cursor:
+        run.cursor_updated_at, run.cursor_chat_id = tally.cursor
+
+
+async def _save_progress(sessions, run_id, tally: _Tally) -> None:
+    """Counts and cursor so far (after every batch): an interrupted run's
+    record says what it did, and a continuation knows where to start."""
+    async with sessions() as db:
+        run = await db.get(ChatRetentionRun, run_id)
+        if run is not None:
+            _record(run, tally)
+            await db.commit()
+
+
 async def _finish_run(sessions, run_id, status, tally: Optional[_Tally], error: Optional[str]) -> dict[str, Any]:
     async with sessions() as db:
         run = await db.get(ChatRetentionRun, run_id)
         run.status = status
         run.finished_at = datetime.now(UTC)
-        run.counts = tally.counts() if tally else None
-        run.per_agent = tally.per_agent if tally else None
+        _record(run, tally)
         run.error = error
         await db.commit()
         return serialize_run(run)
+
+
+async def _continue_from(sessions, run_id) -> Optional[tuple[datetime, uuid.UUID]]:
+    """Where this run starts: after the cursor of the previous run when that
+    one stopped before the end (partial, interrupted, failed); from the
+    oldest chat when it completed. So a chain of capped runs walks forward
+    past chats that keep failing, and a fresh chain retries them later."""
+    async with sessions() as db:
+        previous = (
+            await db.execute(
+                select(ChatRetentionRun)
+                .where(
+                    ChatRetentionRun.id != run_id,
+                    ChatRetentionRun.status.in_((COMPLETED, PARTIAL, INTERRUPTED, FAILED)),
+                )
+                .order_by(ChatRetentionRun.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if previous is None or previous.status == COMPLETED or previous.cursor_chat_id is None:
+        return None
+    return previous.cursor_updated_at, previous.cursor_chat_id
 
 
 def serialize_run(run: Optional[ChatRetentionRun]) -> Optional[dict[str, Any]]:
@@ -568,12 +644,27 @@ async def run_retention(
         return await _finish_run(sessions, run_id, REFUSED, None, refused)
 
     tally = _Tally()
+    start_after = await _continue_from(sessions, run_id)
     try:
-        await _process(engine, sessions, policy, overrides, store, now, tally)
+        await _process(engine, sessions, policy, overrides, store, now, tally, run_id, start_after)
     except Exception as e:
         error = _safe_error(e)
         logger.error("Chat retention run %s failed: %s", run_id, error)
         return await _finish_run(sessions, run_id, FAILED, tally, error)
+    except BaseException:
+        # Cancelled (job timeout, worker shutdown): record what it did, then
+        # let the cancellation through. Shielded so the record is written
+        # even though this task is being cancelled.
+        logger.warning(
+            "Chat retention run %s interrupted after %d archived, %d deleted", run_id, tally.archived, tally.deleted
+        )
+        try:
+            await asyncio.shield(
+                _finish_run(sessions, run_id, INTERRUPTED, tally, "Interrupted: the worker stopped or the job timed out")
+            )
+        except BaseException:  # pragma: no cover - best effort while going down
+            logger.error("Chat retention run %s: could not record the interruption", run_id)
+        raise
 
     status = PARTIAL if tally.more_remaining else COMPLETED
     logger.info(
@@ -585,13 +676,13 @@ async def run_retention(
     return await _finish_run(sessions, run_id, status, tally, None)
 
 
-async def _process(engine, sessions, policy, overrides, store, now, tally: _Tally) -> None:
+async def _process(engine, sessions, policy, overrides, store, now, tally: _Tally, run_id, start_after=None) -> None:
     min_days = _shortest_days(policy, overrides)
     if min_days is None:
         return
     started = time.monotonic()
     processed = 0
-    cursor: Optional[tuple[datetime, uuid.UUID]] = None
+    cursor: Optional[tuple[datetime, uuid.UUID]] = start_after
 
     def out_of_budget() -> bool:
         if policy.max_chats_per_run and processed >= policy.max_chats_per_run:
@@ -614,15 +705,16 @@ async def _process(engine, sessions, policy, overrides, store, now, tally: _Tall
                 if row.blocked:
                     tally.candidates += 1
                     tally.skipped[row.blocked] += 1
-                    cursor = (row.updated_at, row.id)
+                    cursor = tally.cursor = (row.updated_at, row.id)
                     continue
                 if out_of_budget():
                     tally.more_remaining = True
                     return
                 tally.candidates += 1
-                cursor = (row.updated_at, row.id)
+                cursor = tally.cursor = (row.updated_at, row.id)
                 processed += 1
                 await _process_chat(sessions, claims, store, policy, row, now, tally)
+            await _save_progress(sessions, run_id, tally)
             if len(rows) < policy.batch_size:
                 return
 
@@ -645,10 +737,9 @@ async def _process_chat(sessions, claims: Claims, store, policy, row, now, tally
             tally.skipped[BACKGROUND_JOB] += 1
             return
         stage = "snapshot"
-        async with sessions() as db:
-            snapshot = await load_snapshot(db, chat_id)
+        snapshot, reason = await eligible_snapshot(sessions, chat_id, now)
         if snapshot is None:
-            tally.skipped[GONE] += 1
+            tally.skipped[reason] += 1
             return
 
         if store is not None:
@@ -669,6 +760,14 @@ async def _process_chat(sessions, claims: Claims, store, policy, row, now, tally
                 snapshot.tool_results,
                 snapshot.workbench,
             )
+            if built.uncompressed_bytes > fmt.MAX_UNCOMPRESSED_BYTES:
+                # A restore couldn't read it back: keep the chat, say why.
+                tally.skipped[TOO_LARGE] += 1
+                logger.warning(
+                    "Chat retention: chat %s kept, too large to archive safely (%d bytes uncompressed)",
+                    chat_id, built.uncompressed_bytes,
+                )
+                return
             key = fmt.object_key(archive_prefix(), chat_id, snapshot.created_at)
             await store.put(
                 key,
@@ -753,6 +852,39 @@ def _in_progress(run: Optional[ChatRetentionRun], policy: RetentionPolicy, now: 
 
 
 QUEUED_STALE_AFTER = timedelta(minutes=15)
+STALE_ERROR = "Interrupted: no longer running (the worker stopped or the job was lost)"
+
+
+def _stale(run: Optional[ChatRetentionRun], policy: RetentionPolicy, now: datetime) -> bool:
+    """Queued or running on record, but past the window a live one stays in."""
+    return run is not None and run.status in (QUEUED, RUNNING) and not _in_progress(run, policy, now)
+
+
+async def _mark_stale(db: AsyncSession, policy: RetentionPolicy, now: datetime) -> None:
+    """Record runs that died without saying so (process killed) as
+    interrupted, keeping the counts and cursor they saved per batch."""
+    rows = (
+        await db.execute(select(ChatRetentionRun).where(ChatRetentionRun.status.in_((QUEUED, RUNNING))))
+    ).scalars().all()
+    changed = False
+    for run in rows:
+        if _stale(run, policy, now):
+            run.status, run.finished_at, run.error = INTERRUPTED, now, STALE_ERROR
+            changed = True
+    if changed:
+        await db.commit()
+
+
+async def _last_outcome(db: AsyncSession) -> Optional[str]:
+    """How the most recent run that got going ended, whatever started it."""
+    return (
+        await db.execute(
+            select(ChatRetentionRun.status)
+            .where(ChatRetentionRun.status.in_((COMPLETED, PARTIAL, INTERRUPTED, FAILED)))
+            .order_by(ChatRetentionRun.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 async def scheduled_tick(engine: Optional[AsyncEngine] = None, now: Optional[datetime] = None) -> Optional[dict]:
@@ -770,10 +902,14 @@ async def scheduled_tick(engine: Optional[AsyncEngine] = None, now: Optional[dat
     sessions = async_sessionmaker(engine or async_engine, class_=AsyncSession, expire_on_commit=False)
     async with sessions() as db:
         latest, scheduled = await _latest_runs(db)
-    if _in_progress(latest, policy, now):
-        return None
+        if _in_progress(latest, policy, now):
+            return None
+        await _mark_stale(db, policy, now)
+        # A partial or interrupted run continues whoever started it (the
+        # schedule, Run now or the CLI).
+        last_outcome = await _last_outcome(db)
     last_start = (scheduled.started_at or scheduled.created_at) if scheduled else None
-    if not run_is_due(policy.schedule, now, last_start, scheduled.status if scheduled else None):
+    if not run_is_due(policy.schedule, now, last_start, last_outcome):
         return None
     return await run_retention(trigger="schedule", engine=engine)
 
@@ -867,6 +1003,11 @@ async def status(db: AsyncSession, now: Optional[datetime] = None) -> dict[str, 
         "next_run": next_run,
         "refusal": refusal(policy, get_archive_store() is not None),
         "in_progress": serialize_run(latest) if _in_progress(latest, policy, now) else None,
-        "last_run": serialize_run(last_finished),
+        # One that died without recording it shows as what it is.
+        "last_run": (
+            {**serialize_run(latest), "status": INTERRUPTED, "error": STALE_ERROR}
+            if _stale(latest, policy, now)
+            else serialize_run(last_finished)
+        ),
     }
 

@@ -97,7 +97,9 @@ async def _restore_chat(args) -> int:
 
     try:
         async with AsyncSessionLocal() as db:
-            plan = await plan_restore(db, archive, user_email=args.user_email)
+            plan = await plan_restore(
+                db, archive, user_email=args.user_email, detach_session=args.detach_session
+            )
             report = {"valid": True, "dry_run": args.dry_run, **plan.report()}
             if args.dry_run or not plan.ok:
                 print(json.dumps(report, indent=2))
@@ -135,6 +137,12 @@ def main(argv: list[str] | None = None) -> int:
     restore.add_argument("--profile", help="AWS profile to read with (default: the standard chain).")
     restore.add_argument(
         "--user-email", help="Owner to restore to when the archived user no longer exists here."
+    )
+    restore.add_argument(
+        "--detach-session",
+        action="store_true",
+        help="Restore without the chat's session key (done anyway when the agent's session "
+        "continues in a newer chat).",
     )
     args = parser.parse_args(argv)
 

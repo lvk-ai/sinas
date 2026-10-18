@@ -37,10 +37,14 @@ _REQUIRED = {
     MESSAGE: ("id", "role", "created_at"),
     TOOL_RESULT: ("id", "tool_call_id", "tool_name", "source", "created_at", "expires_at"),
 }
-_CHAT_REQUIRED = ("id", "user_id", "title", "created_at")
+# Must be present and non-empty. The title must be present but may be
+# empty or null (the API allows an empty title).
+_CHAT_REQUIRED = ("id", "user_id", "created_at")
 
 # A decompressed archive larger than this is refused (a gzip bomb, or not
-# an archive): far above any real chat.
+# an archive): far above any real chat. The job applies the same limit
+# before uploading: a chat whose archive would exceed it is skipped ("too
+# large to archive safely") and kept, never archived unreadably and deleted.
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 
 
@@ -94,6 +98,7 @@ class BuiltArchive:
     sha256: str  # of the gzip bytes (object metadata)
     content_sha256: str  # the manifest's: of the uncompressed lines before it
     counts: dict[str, int]
+    uncompressed_bytes: int  # what parse_archive will read back (capped there)
 
 
 def build_archive(
@@ -124,7 +129,11 @@ def build_archive(
     # mtime=0: the same content compresses to the same bytes.
     body = gzip.compress(payload, compresslevel=6, mtime=0)
     return BuiltArchive(
-        body=body, sha256=hashlib.sha256(body).hexdigest(), content_sha256=content_sha, counts=counts
+        body=body,
+        sha256=hashlib.sha256(body).hexdigest(),
+        content_sha256=content_sha,
+        counts=counts,
+        uncompressed_bytes=len(payload),
     )
 
 
@@ -178,6 +187,8 @@ def parse_archive(data: bytes) -> ParsedArchive:
     chat = first.get("chat")
     if not isinstance(chat, dict) or any(chat.get(k) in (None, "") for k in _CHAT_REQUIRED):
         raise InvalidArchiveError(f"line 1: chat record lacks one of {', '.join(_CHAT_REQUIRED)}")
+    if "title" not in chat or not isinstance(chat["title"], (str, type(None))):
+        raise InvalidArchiveError("line 1: chat record lacks its title")
     _uuid(chat["id"], "line 1: chat id")
     _uuid(chat["user_id"], "line 1: chat user_id")
 

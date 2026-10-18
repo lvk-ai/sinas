@@ -13,7 +13,9 @@ Retention is **off by default**. Nothing is archived or deleted until an operato
 - **Age is measured from a chat's last activity**: the newest of its last update and its newest message. A chat that is still in use is never removed, however long ago it started.
 - **A nightly run** (on a schedule you set) finds chats past their retention period, oldest first, and handles them one at a time: archive, then delete.
 - **Chats something will still write to are left alone**: a turn running, a round waiting on an `ask_user` answer, a sub-agent or a background job, an unanswered tool approval, a pending wakeup timer or a live watch, an MCP task still running. They come up again in the next run.
+- **Checked twice, from the database.** Whether a chat still qualifies (retention on, idle past its agent's current setting, nothing waiting on it) is checked when it is read for archiving and again, with the chat locked, right before the delete. A chat written to, or whose agent was switched to "keep forever", in the meantime is kept.
 - **Failures keep the chat.** If the upload fails, nothing is deleted. If the delete fails after the upload, the next run uploads the chat again to the same object key and then deletes it.
+- **Chats too large to archive safely are kept.** An archive larger than a restore reads back (512 MB uncompressed) is never uploaded; the chat stays and the run counts it as skipped (`too_large`).
 - **Several runners are safe.** Each chat is claimed before it is handled; a runner skips chats another runner has.
 - **Every run is recorded** (who or what started it, the policy, and how many chats were archived, deleted, skipped and why, or failed), and logged. Neither the record nor the logs contain message content or chat titles.
 
@@ -28,7 +30,7 @@ Retention is configured with environment variables on the backend and worker con
 | `CHAT_RETENTION_ACTION` | `archive` | `archive`: archive each chat, then delete it; without an archive destination, runs are refused and nothing is deleted. `delete`: deleting without an archive is allowed (a configured destination is still written first). |
 | `CHAT_RETENTION_SCHEDULE` | `30 3 * * *` | When runs start, as a cron expression in UTC. |
 | `CHAT_RETENTION_BATCH_SIZE` | `200` | Chats read per batch. |
-| `CHAT_RETENTION_MAX_CHATS_PER_RUN` | `0` | Stop a run after this many chats (`0`: no limit). A run that stops early is continued ten minutes later, so a large first backlog is worked through in steps. |
+| `CHAT_RETENTION_MAX_CHATS_PER_RUN` | `0` | Stop a run after this many chats (`0`: no limit). A run that stops early, or is interrupted, is continued ten minutes later from where it stopped, so a large first backlog is worked through in steps and a chat that keeps failing doesn't hold up the rest (it is retried on the next scheduled run). |
 | `CHAT_RETENTION_MAX_RUN_SECONDS` | `3300` | Stop a run after this long; continued the same way. |
 
 ### Per agent
@@ -161,6 +163,7 @@ python -m app.cli restore-chat ./<chat id>.jsonl.gz
 | `--dry-run` | Verify and report; write nothing |
 | `--endpoint-url`, `--region`, `--profile` | Where and how to read an `s3://` archive |
 | `--user-email` | The owner to restore to when the archived user no longer exists |
+| `--detach-session` | Restore without the chat's session key. Done anyway, with a note, when the agent's session has continued in a newer chat |
 
 The archive is verified in full first (format, every line, the manifest's counts and checksum); a damaged archive is refused. A restore writes the chat and its messages under their original ids, in one transaction. It refuses when the chat or any of its messages already exists. The owner is the archived user, else the user with the archived email, else `--user-email`. The agent is linked again by namespace and name if it exists. Stored tool results are restored while they haven't expired. Workbench files aren't in the archive and aren't restored.
 

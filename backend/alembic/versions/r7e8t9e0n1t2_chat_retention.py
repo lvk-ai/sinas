@@ -43,6 +43,8 @@ def upgrade() -> None:
         sa.Column("counts", sa.JSON(), nullable=True),
         sa.Column("per_agent", sa.JSON(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("cursor_updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("cursor_chat_id", GUID(), nullable=True),
     )
     op.create_index("ix_chat_retention_runs_created_at", "chat_retention_runs", ["created_at"])
 
