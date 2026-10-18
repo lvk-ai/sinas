@@ -1,5 +1,6 @@
 """Runtime chat endpoints - agent chat creation, message execution, and chat management."""
 import asyncio
+import base64
 import json
 import logging
 import traceback
@@ -8,10 +9,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jsonschema
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sse_starlette.sse import EventSourceResponse
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
@@ -1054,61 +1056,148 @@ async def answer_pending_input(
     )
 
 
+CHATS_PAGE_DEFAULT = 50
+CHATS_PAGE_MAX = 200
+_CURSOR_MAX_LEN = 256
+
+
+def encode_chat_cursor(updated_at: datetime, chat_id: uuid.UUID) -> str:
+    """Opaque keyset cursor: base64url of the last row's (updated_at, id)."""
+    raw = json.dumps({"u": updated_at.isoformat(), "i": str(chat_id)}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _parse_chat_cursor(cursor: str) -> Optional[tuple[datetime, uuid.UUID]]:
+    """(updated_at, id) from a cursor, or None unless it has exactly the
+    shape encode_chat_cursor writes: {"u": aware ISO datetime, "i": UUID}."""
+    if len(cursor) > _CURSOR_MAX_LEN:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii") + b"=" * (-len(cursor) % 4))
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:  # non-ASCII, bad base64, not UTF-8, not JSON
+        return None
+    if not isinstance(data, dict) or set(data) != {"u", "i"}:
+        return None
+    u, i = data["u"], data["i"]
+    if not isinstance(u, str) or not isinstance(i, str):
+        return None
+    try:
+        updated_at = datetime.fromisoformat(u)
+        chat_id = uuid.UUID(i)
+        if updated_at.tzinfo is None:  # ambiguous against timestamptz
+            return None
+        # In UTC, as the driver sends it; out of range (year 1 at +14:00) fails here.
+        updated_at = updated_at.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    return updated_at, chat_id
+
+
+def decode_chat_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Inverse of encode_chat_cursor; anything malformed is a 400."""
+    parsed = _parse_chat_cursor(cursor)
+    if parsed is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor")
+    return parsed
+
+
 @router.get("/chats", response_model=list[ChatResponse])
 async def list_chats(
     request: Request,
+    response: Response,
     include_archived: bool = Query(False, description="Include archived chats"),
+    q: Optional[str] = Query(
+        None, max_length=200, description="Only chats whose title contains this text (case-insensitive)"
+    ),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=CHATS_PAGE_MAX,
+        description=(
+            f"Page size (1-{CHATS_PAGE_MAX}). Passing `limit` or `cursor` turns on pagination; "
+            "without either, every matching chat is returned, as before."
+        ),
+    ),
+    cursor: Optional[str] = Query(
+        None,
+        description=(
+            "Opaque cursor from a previous page's `X-Next-Cursor` header. "
+            f"Pages hold {CHATS_PAGE_DEFAULT} chats unless `limit` says otherwise."
+        ),
+    ),
     current_user_data: tuple = Depends(get_current_user_with_permissions),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all chats for the current user. Always filtered by user ownership."""
+    """List the caller's chats, most recently updated first.
+
+    Always filtered by user ownership. The body is a list of chats either
+    way; when paginated (`limit` or `cursor` given) and more chats follow,
+    the `X-Next-Cursor` response header carries the cursor for the next
+    page, and `Link` the same as a `rel="next"` URL. No header: last page.
+    Pages are keyset-based on (updated_at, id): chats created or updated
+    while a client pages move to the front, so later pages neither repeat
+    nor skip the other chats; the moved ones show on a fresh first page.
+    """
     user_id, permissions = current_user_data
     # No permission check needed - always filtered by user_id below
 
-    # Subquery for last message timestamp
-    last_message_subq = (
-        select(Message.chat_id, func.max(Message.created_at).label("last_message_at"))
-        .group_by(Message.chat_id)
-        .subquery()
-    )
+    paginated = limit is not None or cursor is not None
+    page_size = limit or CHATS_PAGE_DEFAULT
 
-    # Join with User and last message subquery
-    query = (
-        select(Chat, User.email, last_message_subq.c.last_message_at)
-        .join(User, Chat.user_id == User.id)
-        .outerjoin(last_message_subq, Chat.id == last_message_subq.c.chat_id)
-        .where(Chat.user_id == user_id)
-    )
-
+    filters = [Chat.user_id == user_id]
     if not include_archived:
-        query = query.where(Chat.archived == False)
+        filters.append(Chat.archived.is_(False))
+    if q and q.strip():
+        filters.append(Chat.title.icontains(q.strip(), autoescape=True))
+    if cursor is not None:
+        after_updated_at, after_id = decode_chat_cursor(cursor)
+        filters.append(tuple_(Chat.updated_at, Chat.id) < (after_updated_at, after_id))
 
-    result = await db.execute(query.order_by(Chat.updated_at.desc()))
+    # Select the page of chats first (ix_chats_user_id_updated_at_id), then
+    # look up each one's last message on ix_messages_chat_id_created_at: one
+    # index probe per returned chat instead of aggregating every message.
+    page_query = select(Chat).where(*filters).order_by(Chat.updated_at.desc(), Chat.id.desc())
+    if paginated:
+        page_query = page_query.limit(page_size + 1)
+    page = aliased(Chat, page_query.subquery("page"))
+    last_message_at = (
+        select(func.max(Message.created_at)).where(Message.chat_id == page.id).scalar_subquery()
+    )
+    result = await db.execute(
+        select(page, User.email, last_message_at)
+        .join(User, page.user_id == User.id)
+        .order_by(page.updated_at.desc(), page.id.desc())
+    )
     rows = result.all()
 
-    # Build response with user_email and last_message_at
-    chats_response = []
-    for chat, email, last_message_at in rows:
-        chats_response.append(
-            ChatResponse(
-                id=chat.id,
-                user_id=chat.user_id,
-                user_email=email,
-                agent_id=chat.agent_id,
-                agent_namespace=chat.agent_namespace,
-                agent_name=chat.agent_name,
-                title=chat.title,
-                archived=chat.archived,
-                expires_at=chat.expires_at,
-                keep_alive=chat.keep_alive,
-                active_channel_id=chat.active_channel_id,
-                created_at=chat.created_at,
-                updated_at=chat.updated_at,
-                last_message_at=last_message_at,
-            )
-        )
+    if paginated and len(rows) > page_size:
+        rows = rows[:page_size]
+        last = rows[-1][0]
+        next_cursor = encode_chat_cursor(last.updated_at, last.id)
+        next_url = request.url.include_query_params(cursor=next_cursor, limit=page_size)
+        response.headers["X-Next-Cursor"] = next_cursor
+        response.headers["Link"] = f'<{next_url.path}?{next_url.query}>; rel="next"'
 
-    return chats_response
+    return [
+        ChatResponse(
+            id=chat.id,
+            user_id=chat.user_id,
+            user_email=email,
+            agent_id=chat.agent_id,
+            agent_namespace=chat.agent_namespace,
+            agent_name=chat.agent_name,
+            title=chat.title,
+            archived=chat.archived,
+            expires_at=chat.expires_at,
+            keep_alive=chat.keep_alive,
+            active_channel_id=chat.active_channel_id,
+            created_at=chat.created_at,
+            updated_at=chat.updated_at,
+            last_message_at=last_message_at,
+        )
+        for chat, email, last_message_at in rows
+    ]
 
 
 @router.get("/chats/{chat_id}", response_model=ChatWithMessages)
