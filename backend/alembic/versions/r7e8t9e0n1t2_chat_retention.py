@@ -9,7 +9,7 @@ policy, counts. See docs/design/chat-retention.md. The index on chats that
 selection reads is built concurrently in the next revision.
 
 Revision ID: r7e8t9e0n1t2
-Revises: c4h5a6t7p8g9
+Revises: p7k8g9d0e1p2
 Create Date: 2026-10-18
 """
 
@@ -19,7 +19,7 @@ from alembic import op
 from app.models.base import GUID
 
 revision = "r7e8t9e0n1t2"
-down_revision = "c4h5a6t7p8g9"
+down_revision = "p7k8g9d0e1p2"
 branch_labels = None
 depends_on = None
 

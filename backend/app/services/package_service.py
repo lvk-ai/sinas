@@ -199,6 +199,101 @@ def _instance_conflicts(warnings: list[str]) -> list[str]:
     return [str(w) for w in warnings if isinstance(w, OwnershipSkip)]
 
 
+def _describe_breaks(breaks: list[dict]) -> str:
+    return ", ".join(
+        f"'{b['dependent']}' requires {b['requires']}{' ' + b['version'] if b.get('version') else ''}"
+        for b in breaks
+    )
+
+
+def _breaks(install_name: str, declared_name: Optional[str], version: Optional[str], installed: list) -> list[dict]:
+    """The installed packages a package of this name and version under this
+    install name would leave outside their stated range. One check for
+    preview and install, on the version as it will be installed (variables
+    substituted). A version still waiting for a variable can't be judged
+    yet: the preview asks for the value, and the install refuses without it."""
+    from app.services.package_dependencies import broken_dependents
+
+    # An empty version is judged like any other: it satisfies no range.
+    if not declared_name or version is None or "${{" in version:
+        return []
+    return broken_dependents(install_name, declared_name, version, installed)
+
+
+def _declared_meta(yaml_content: str) -> tuple[Optional[str], Optional[str]]:
+    """(package.name, package.version) from raw YAML, best effort."""
+    try:
+        doc = yaml.safe_load(yaml_content)
+    except Exception:
+        return None, None
+    meta = doc.get("package") if isinstance(doc, dict) else None
+    if not isinstance(meta, dict):
+        return None, None
+    name, version = meta.get("name"), meta.get("version", "1.0.0")
+    return (name if isinstance(name, str) else None), (str(version) if version is not None else None)
+
+
+# Kinds a package's resources are referred to under, as pending references
+# hold them (see ConfigApplyService.apply_config).
+_REFERABLE_KINDS = (
+    "functions", "agents", "pipelines", "skills", "queries", "stores", "collections",
+    "components", "connectors", "mcpServers",
+)
+
+
+def _declared_resources(config: SinasConfig) -> dict[str, dict[str, bool]]:
+    """What a package declares, by kind and "namespace/name" (roles by name),
+    with whether it is declared active: what a dependent's dry run may count
+    as about to exist."""
+    out: dict[str, dict[str, bool]] = {}
+    for kind in _REFERABLE_KINDS:
+        out[kind] = {
+            f"{item.namespace}/{item.name}": getattr(item, "isActive", True) is not False
+            for item in getattr(config.spec, kind, None) or []
+        }
+    out["roles"] = {role.name: True for role in config.spec.roles}
+    return out
+
+
+def _declared_resources_raw(yaml_content: str) -> dict[str, dict[str, bool]]:
+    """_declared_resources from the YAML as written, for a package whose
+    preview didn't get as far as parsing (it still needs values): its
+    dependents' previews then report what is really wrong with them, not
+    references to resources it is about to provide."""
+    try:
+        doc = yaml.safe_load(yaml_content)
+    except Exception:
+        return {}
+    spec = doc.get("spec") if isinstance(doc, dict) else None
+    if not isinstance(spec, dict):
+        return {}
+    out: dict[str, dict[str, bool]] = {}
+    for kind in _REFERABLE_KINDS:
+        items = spec.get(kind)
+        out[kind] = {
+            f"{item.get('namespace', 'default')}/{item['name']}": item.get("isActive") is not False
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+    roles = spec.get("roles")
+    out["roles"] = {
+        r["name"]: True for r in (roles if isinstance(roles, list) else [])
+        if isinstance(r, dict) and isinstance(r.get("name"), str)
+    }
+    return out
+
+
+class PackageInUse(ValueError):
+    """An uninstall refused: other installed packages require this one."""
+
+    def __init__(self, name: str, dependents: list[str]):
+        self.dependents = dependents
+        super().__init__(
+            f"Package '{name}' is required by {', '.join(repr(d) for d in dependents)}; "
+            "uninstall those first"
+        )
+
+
 class PackageService:
     """Service for managing installable integration packages."""
 
@@ -214,27 +309,147 @@ class PackageService:
         instance: Optional[str] = None,
         source: Optional[tuple[str, str]] = None,
         adopt_unmanaged: bool = False,
+        dependency_variables: Optional[dict[str, dict[str, Any]]] = None,
+        allow_breaking_dependents: bool = False,
     ) -> tuple[Package, ConfigApplyResponse]:
         """
-        Install a package from YAML content.
+        Install a package from YAML content, with the packages it requires
+        (docs/design/package-dependencies.md).
 
         Args:
             yaml_content: YAML string with kind: SinasPackage
             user_id: ID of the user installing the package
             variables: Install-time variable values (keyed by variable name)
             allow_broad_role_permissions: accept package roles whose granted
-                permissions reach outside the package's own namespaces
+                permissions reach outside the package's own namespaces (for
+                every package the install installs)
             instance: install name for a multi-instance package (defaults to
                 the package name); substituted for ${{ install.name }}
             source: (repository name, file URL) when installed from a package
                 repository; recorded in the same commit as the install
             adopt_unmanaged: take over declared resources made or edited by
                 hand instead of skipping them (the operator's opt-in; an
-                uninstall then deletes them)
+                uninstall then deletes them). This package only, not its
+                dependencies.
+            dependency_variables: variable values for the packages the
+                install installs as dependencies, by their install name
+            allow_breaking_dependents: upgrade even when an installed package
+                requiring this one doesn't accept the new version
+
+        The required packages that aren't installed are installed first, from
+        the active package repositories, all in this one transaction: if any
+        of them (or this package) fails, nothing is committed. Those are in
+        self.installed_dependencies afterwards, as (Package, result) pairs.
 
         Returns:
             Tuple of (Package record, ConfigApplyResponse)
         """
+        from app.services import package_dependencies as deps
+
+        self.installed_dependencies: list[tuple[Package, ConfigApplyResponse]] = []
+        dependency_variables = dependency_variables or {}
+        # Installs and uninstalls one at a time: the plan below reads what is
+        # installed, and must still be true at the commit.
+        await deps.lock_packages(self.db)
+
+        install_name, substituted, declared_name, _multi = resolve_install_name(yaml_content, instance)
+        # What it requires, from the YAML with its variables. Only that: the
+        # package as a whole is validated once what it requires is installed
+        # (its references may name their resources).
+        try:
+            requirements = deps._requirements_of(substituted, variables)
+        except Exception as e:
+            raise ValueError(f"Package validation failed: package: {e}") from e
+        # Name and version as installed: with its variables substituted
+        # (version: ${{ vars.VERSION }}), as the preview checks them.
+        declared_name, version = _declared_meta(deps._substitute_known(substituted, variables or {}))
+        installed = await deps.installed_packages(self.db)
+        existing = installed.get(install_name)
+
+        breaks = _breaks(install_name, declared_name, version, list(installed.values()))
+        if breaks and not allow_breaking_dependents:
+            raise ValueError(
+                f"Installing {declared_name} {version} as '{install_name}' "
+                f"would break packages that require it: {_describe_breaks(breaks)}. Update those "
+                "first, or install with allowBreakingDependents=true."
+            )
+
+        plan = await deps.resolve_plan(
+            self.db,
+            root_name=declared_name or install_name,
+            root_install_name=install_name,
+            requirements=requirements,
+            root_repository=source[0] if source else (existing.source_repository if existing else None),
+            dependency_variables=dependency_variables,
+        )
+        # errors(), not just blocking entries: a resolve that didn't settle
+        # reports a problem without any one entry being blocked.
+        if plan.errors():
+            raise ValueError(
+                "Package not installed: its requirements can't be met. " + "; ".join(plan.errors())
+            )
+
+        services: list[ConfigApplyService] = []
+        for entry in plan.to_install:
+            try:
+                dep_package, dep_result, dep_service = await self._install_one(
+                    entry.yaml,
+                    user_id,
+                    variables=dependency_variables.get(entry.install_name),
+                    allow_broad_role_permissions=allow_broad_role_permissions,
+                    instance=entry.instance,
+                    source=(entry.repository, entry.file_url),
+                    as_dependency=True,
+                )
+            except ValueError as e:
+                raise ValueError(
+                    f"Required package '{entry.install_name}' ({entry.package_name} {entry.version} "
+                    f"from {entry.repository}) failed to install, so nothing was installed: {e}"
+                ) from e
+            services.append(dep_service)
+            self.installed_dependencies.append((dep_package, dep_result))
+
+        package, result, service = await self._install_one(
+            yaml_content,
+            user_id,
+            variables=variables,
+            allow_broad_role_permissions=allow_broad_role_permissions,
+            instance=instance,
+            source=source,
+            adopt_unmanaged=adopt_unmanaged,
+        )
+        services.append(service)
+        if breaks:
+            result.warnings.append(
+                "Installed although packages requiring it don't accept this version "
+                f"(allowBreakingDependents): {_describe_breaks(breaks)}"
+            )
+
+        # Single commit for everything: the dependencies and the package.
+        await self.db.commit()
+        # auto_commit=False means each apply service left its notifications
+        # queued for us; without this a package's schedules never reach the
+        # running scheduler and its CDC triggers aren't picked up until restart.
+        for applied in services:
+            await applied.flush_notifications()
+        await self.db.refresh(package)
+        for dep_package, _ in self.installed_dependencies:
+            await self.db.refresh(dep_package)
+
+        return package, result
+
+    async def _install_one(
+        self,
+        yaml_content: str,
+        user_id: str,
+        variables: Optional[dict[str, Any]] = None,
+        allow_broad_role_permissions: bool = False,
+        instance: Optional[str] = None,
+        source: Optional[tuple[str, str]] = None,
+        adopt_unmanaged: bool = False,
+        as_dependency: bool = False,
+    ) -> tuple[Package, ConfigApplyResponse, ConfigApplyService]:
+        """One package of an install: applied and recorded, not committed."""
         # The install name first: it may appear inside variable defaults too.
         install_name, yaml_content, declared_name, multi = resolve_install_name(yaml_content, instance)
 
@@ -322,6 +537,8 @@ class PackageService:
             )
         result.warnings.extend(role_advisories)
 
+        from app.services.package_dependencies import stored_requires
+
         # Create or update package record
         if existing_package:
             existing_package.package_name = declared_name
@@ -331,6 +548,7 @@ class PackageService:
             existing_package.source_url = config.package.url
             existing_package.source_yaml = yaml_content
             existing_package.values = resolved_values
+            existing_package.requires = stored_requires(config.package.requires)
             package = existing_package
         else:
             package = Package(
@@ -342,22 +560,19 @@ class PackageService:
                 source_url=config.package.url,
                 source_yaml=yaml_content,
                 values=resolved_values,
+                requires=stored_requires(config.package.requires),
+                installed_as_dependency=as_dependency,
                 installed_by=user_id,
             )
             self.db.add(package)
         if source is not None:
             # Where its updates are looked for from now on.
             package.source_repository, package.source_url = source
+        # Rows (and the record) visible to what applies next in this
+        # transaction: a dependent's references, its plan.
+        await self.db.flush()
 
-        # Single commit for everything
-        await self.db.commit()
-        # auto_commit=False means the apply service left its notifications
-        # queued for us; without this a package's schedules never reach the
-        # running scheduler and its CDC triggers aren't picked up until restart.
-        await apply_service.flush_notifications()
-        await self.db.refresh(package)
-
-        return package, result
+        return package, result, apply_service
 
     async def preview(
         self,
@@ -366,14 +581,122 @@ class PackageService:
         variables: Optional[dict[str, Any]] = None,
         instance: Optional[str] = None,
         adopt_unmanaged: bool = False,
+        dependency_variables: Optional[dict[str, dict[str, Any]]] = None,
+        allow_breaking_dependents: bool = False,
+        repository: Optional[str] = None,
     ) -> tuple[ConfigApplyResponse, list[dict], bool, dict[str, Any]]:
         """
-        Preview a package install (dry run).
+        Preview a package install (dry run), with the packages it requires.
+
+        `repository` is the package repository the package comes from, if
+        any: required packages are looked for there after their own hint.
 
         Returns:
             Tuple of (ConfigApplyResponse, variable_declarations, requires_input, install_info)
-            where install_info is {"instance", "package_name", "multi_instance"}.
+            where install_info is {"instance", "package_name", "multi_instance",
+            "dependencies", "breaks"}: the dependency plan (each entry to
+            install with its own variables and preview) and the installed
+            packages an upgrade would break.
         """
+        from app.services import package_dependencies as deps
+
+        dependency_variables = dependency_variables or {}
+        install_name, substituted, _declared, _multi = resolve_install_name(yaml_content, instance)
+
+        # The plan first: the root's dry run needs what its dependencies
+        # would create. Read from the YAML with the values given, best
+        # effort: an invalid package reports itself in its own preview.
+        try:
+            requirements = deps._requirements_of(substituted, variables)
+        except Exception:
+            requirements = []
+        installed = await deps.installed_packages(self.db)
+        existing = installed.get(install_name)
+        # Name and version with its variables substituted, as the install
+        # reads them (version: ${{ vars.VERSION }}).
+        root_meta = _declared_meta(deps._substitute_known(substituted, variables or {}))
+        plan = await deps.resolve_plan(
+            self.db,
+            root_name=root_meta[0] or install_name,
+            root_install_name=install_name,
+            requirements=requirements,
+            root_repository=repository or (existing.source_repository if existing else None),
+            dependency_variables=dependency_variables,
+        )
+
+        provided: dict[str, dict[str, bool]] = {}
+        planned: list[dict[str, Any]] = []
+        failed_dependencies: list[str] = []
+        for entry in plan.entries:
+            item = entry.as_dict()
+            if entry.status == deps.INSTALL:
+                dep_result, dep_vars, dep_needs, _info, dep_config = await self._preview_one(
+                    entry.yaml, user_id, variables=dependency_variables.get(entry.install_name),
+                    instance=entry.instance, extra_pending=provided,
+                )
+                declared = (
+                    _declared_resources(dep_config) if dep_config is not None
+                    else _declared_resources_raw(resolve_install_name(entry.yaml, entry.instance)[1])
+                )
+                for kind, keys in declared.items():
+                    provided.setdefault(kind, {}).update(keys)
+                if not dep_result.success or dep_result.errors:
+                    failed_dependencies.append(entry.install_name)
+                item.update({
+                    "variables": dep_vars,
+                    "requires_input": dep_needs,
+                    "preview": dep_result.model_dump(mode="json"),
+                })
+            elif entry.status == deps.INVALID and entry.yaml:
+                # Its variables may be what made it invalid (a value that
+                # isn't a usable instance name): list them, so the values
+                # can be corrected and previewed again.
+                declarations = self._extract_variable_declarations(entry.yaml)
+                item.update({"variables": declarations, "requires_input": bool(declarations)})
+            planned.append(item)
+
+        result, variable_declarations, requires_input, install_info, config = await self._preview_one(
+            yaml_content, user_id, variables=variables, instance=instance,
+            adopt_unmanaged=adopt_unmanaged, extra_pending=provided,
+        )
+
+        version = config.package.version if config is not None else root_meta[1]
+        breaks = _breaks(install_name, root_meta[0], version, list(installed.values()))
+        install_info["dependencies"] = planned
+        install_info["breaks"] = breaks
+
+        for message in plan.errors():
+            result.errors.append(message)
+        for name in failed_dependencies:
+            result.errors.append(
+                f"Required package '{name}' can't be installed as previewed: see its preview "
+                "(it may need values for its variables)"
+            )
+        if breaks:
+            message = (
+                f"Would break packages that require '{install_name}': {_describe_breaks(breaks)}"
+            )
+            if allow_breaking_dependents:
+                result.warnings.append(message + " (allowBreakingDependents)")
+            else:
+                result.errors.append(message + ". Update those first, or install with allowBreakingDependents=true.")
+        if result.errors:
+            result.success = False
+        return result, variable_declarations, requires_input, install_info
+
+    async def _preview_one(
+        self,
+        yaml_content: str,
+        user_id: str,
+        variables: Optional[dict[str, Any]] = None,
+        instance: Optional[str] = None,
+        adopt_unmanaged: bool = False,
+        extra_pending: Optional[dict[str, dict[str, bool]]] = None,
+    ) -> tuple[ConfigApplyResponse, list[dict], bool, dict[str, Any], Optional[SinasConfig]]:
+        """One package's dry run. `extra_pending`: what the packages planned
+        before it declare (see ConfigApplyService.extra_pending_references).
+        The last element is the parsed package, or None when it didn't get
+        that far (it needs values, or doesn't validate)."""
         install_name, yaml_content, declared_name, multi = resolve_install_name(yaml_content, instance)
         install_info = {"instance": install_name, "package_name": declared_name, "multi_instance": multi}
 
@@ -389,7 +712,7 @@ class PackageService:
             failed = ConfigApplyResponse(
                 success=False, summary=ConfigApplySummary(), changes=[], errors=[message]
             )
-            return failed, variable_declarations, True, install_info
+            return failed, variable_declarations, True, install_info, None
 
         # Resolve variables whenever the package declares any, with the values
         # given or none: the same rules as the install (defaults, an existing
@@ -406,7 +729,11 @@ class PackageService:
                     raise
                 return needs_input(str(e))
 
-        config, validation = await ConfigParser.parse_and_validate(yaml_content, db=self.db)
+        # A reference (or manifest requirement) may name what the packages
+        # planned before this one declare: the dry run doesn't create them.
+        config, validation = await ConfigParser.parse_and_validate(
+            yaml_content, db=self.db, extra_names=extra_pending
+        )
 
         if not validation.is_valid:
             errors = [str(e) for e in validation.errors]
@@ -439,6 +766,7 @@ class PackageService:
                 if v.get("type") == "secret" and (variables or {}).get(v["name"]) is not None
             },
             adopt_unmanaged=adopt_unmanaged,
+            extra_pending_references=extra_pending,
         )
 
         result = await apply_service.apply_config(config, dry_run=True)
@@ -465,7 +793,7 @@ class PackageService:
             )
         result.warnings.extend(role_advisories)
 
-        return result, variable_declarations, requires_input, install_info
+        return result, variable_declarations, requires_input, install_info, config
 
     async def uninstall(self, package_name: str, actor_user_id: Optional[str] = None) -> dict:
         """
@@ -482,6 +810,17 @@ class PackageService:
         package = result.scalar_one_or_none()
         if not package:
             raise ValueError(f"Package '{package_name}' is not installed")
+
+        # Not while installed packages require it: their references to its
+        # resources would dangle. Locked against an install planning on it.
+        from app.services import package_dependencies as deps
+
+        await deps.lock_packages(self.db)
+        dependents = deps.dependents_of(
+            package_name, list((await deps.installed_packages(self.db)).values())
+        )
+        if dependents:
+            raise PackageInUse(package_name, sorted(d.name for d in dependents))
 
         deleted_counts = {}
 

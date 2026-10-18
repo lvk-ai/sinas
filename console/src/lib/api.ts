@@ -273,7 +273,9 @@ class APIClient {
           if (detail) {
             errorMessage = typeof detail === 'string'
               ? detail
-              : JSON.stringify(detail, null, 2);
+              : typeof detail?.message === 'string'
+                ? detail.message  // a structured detail (e.g. 409 with required_by) carries its own message
+                : JSON.stringify(detail, null, 2);
           } else {
             // Include the entire response body if no detail field
             errorMessage = `${error.message}\n\nResponse: ${JSON.stringify(error.response.data, null, 2)}`;

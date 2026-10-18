@@ -787,6 +787,37 @@ class ConfigSpec(BaseModel):
     databaseTriggers: list[DatabaseTriggerConfig] = Field(default_factory=list)
 
 
+class PackageRequirement(BaseModel):
+    """Another package this package needs (docs/design/package-dependencies.md).
+    Not the `dependencies` resource kind, which approves Python packages."""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., pattern=r"^[a-z0-9][a-z0-9._-]*$", max_length=255)
+    # A version range, pyproject style: ">=1.2,<2", "~=1.4", "==1.2.*".
+    # Left out: any version.
+    version: Optional[str] = None
+    # Repository to look in first when the package has to be installed.
+    repository: Optional[str] = Field(None, max_length=100)
+    # Which install of the package: its install name. Left out: the package's
+    # own name (its default install). For multiInstance packages.
+    instance: Optional[str] = Field(None, pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+    @field_validator("version")
+    @classmethod
+    def _valid_range(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        from app.services.package_dependencies import parse_range
+
+        parse_range(value)  # raises ValueError with the reason
+        return value.strip()
+
+    @property
+    def install_name(self) -> str:
+        return self.instance or self.name
+
+
 class PackageMetadataConfig(BaseModel):
     """Package metadata for SinasPackage kind"""
 
@@ -800,6 +831,24 @@ class PackageMetadataConfig(BaseModel):
     # then use ${{ install.name }} wherever uniqueness matters (namespaces,
     # role names, permission keys); it resolves to the install name.
     multiInstance: bool = False
+    # Other packages this one needs, installed first when missing.
+    requires: list[PackageRequirement] = Field(default_factory=list)
+
+    @field_validator("requires", mode="before")
+    @classmethod
+    def _none_is_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+    @model_validator(mode="after")
+    def _requirements_are_distinct(self):
+        seen: set[str] = set()
+        for req in self.requires:
+            if req.name == self.name:
+                raise ValueError(f"package '{self.name}' can't require itself")
+            if req.install_name in seen:
+                raise ValueError(f"package.requires lists '{req.install_name}' twice")
+            seen.add(req.install_name)
+        return self
 
 
 class SinasConfig(BaseModel):
