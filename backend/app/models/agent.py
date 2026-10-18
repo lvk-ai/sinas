@@ -4,6 +4,7 @@ from typing import Any, Optional
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Integer,
@@ -21,7 +22,12 @@ from .mixins import PermissionMixin
 
 class Agent(Base, PermissionMixin):
     __tablename__ = "agents"
-    __table_args__ = (UniqueConstraint("namespace", "name", name="uix_agent_namespace_name"),)
+    __table_args__ = (
+        UniqueConstraint("namespace", "name", name="uix_agent_namespace_name"),
+        CheckConstraint(
+            "retention_days IS NULL OR retention_days >= 0", name="ck_agents_retention_days_non_negative"
+        ),
+    )
 
     id: Mapped[uuid_pk]
     user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -127,6 +133,9 @@ class Agent(Base, PermissionMixin):
     # Long-running workflow settings
     default_job_timeout: Mapped[Optional[int]] = mapped_column(Integer)
     default_keep_alive: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    # Chat retention override, in days since a chat's last activity: NULL =
+    # the deployment default (CHAT_RETENTION_DAYS), 0 = keep forever.
+    retention_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Opt-in Sinas platform capabilities: ["codeExecution", {"name": "databaseIntrospection", "connections": [...]}]
     system_tools: Mapped[list] = mapped_column(
         JSON, nullable=False, default=list, server_default="[]"

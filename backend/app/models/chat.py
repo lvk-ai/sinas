@@ -43,6 +43,9 @@ class Chat(Base):
         # GET /chats: a user's chats, newest first, keyset-paginated on
         # (updated_at, id); scanned backward for the descending order.
         Index("ix_chats_user_id_updated_at_id", "user_id", "updated_at", "id"),
+        # Chat retention: chats idle the longest, keyset-paginated on
+        # (updated_at, id) across all users.
+        Index("ix_chats_updated_at_id", "updated_at", "id"),
         Index(
             "uq_chat_agent_session_key",
             "agent_id",

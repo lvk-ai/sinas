@@ -304,6 +304,51 @@ class Settings(BaseSettings):
     pipeline_job_timeout: int = 1800  # hard ceiling for one queued run (incl. agent steps)
     pipeline_run_retention_days: int = 30  # pipeline_runs rows older than this are pruned
 
+    # Chat retention (docs/design/chat-retention.md). Off unless enabled:
+    # nothing is archived or deleted on a deployment that hasn't opted in.
+    chat_retention_enabled: bool = False
+    # Global default, in days since a chat's last activity; 0 = keep
+    # forever. An agent's retentionDays overrides it (0 = keep forever).
+    chat_retention_days: int = 0
+    # archive: write each chat to the archive destination, then delete it
+    # (no destination = refused, nothing deleted). delete: deleting without
+    # an archive is allowed; a configured destination is still written first.
+    chat_retention_action: str = "archive"
+    chat_retention_schedule: str = "30 3 * * *"  # cron, UTC
+    chat_retention_batch_size: int = 200
+    chat_retention_max_chats_per_run: int = 0  # 0 = no limit; a capped run ends "partial"
+    chat_retention_max_run_seconds: int = 3300  # a run past this ends "partial"; the next tick continues
+    # Archive destination: any S3-compatible endpoint (AWS S3, GCS interop,
+    # MinIO, R2). Sinas only ever calls PutObject. Credentials unset = the
+    # standard AWS chain (env, web identity / IRSA, ECS / EKS pod identity,
+    # instance metadata).
+    chat_archive_s3_bucket: Optional[str] = None
+    chat_archive_s3_prefix: str = "sinas/chats"
+    chat_archive_s3_endpoint_url: Optional[str] = None  # unset = AWS S3
+    chat_archive_s3_region: Optional[str] = None
+    chat_archive_s3_access_key_id: Optional[str] = None
+    chat_archive_s3_secret_access_key: Optional[str] = None
+    chat_archive_s3_session_token: Optional[str] = None
+    chat_archive_s3_kms_key_id: Optional[str] = None  # set = SSE-KMS with this key
+    chat_archive_s3_addressing_style: str = "auto"  # auto | path | virtual
+    chat_archive_s3_timeout_seconds: int = 60
+
+    @field_validator("chat_retention_action")
+    @classmethod
+    def _check_retention_action(cls, v: str) -> str:
+        v = (v or "archive").strip().lower()
+        if v not in ("archive", "delete"):
+            raise ValueError("CHAT_RETENTION_ACTION must be 'archive' or 'delete'")
+        return v
+
+    @field_validator("chat_archive_s3_addressing_style")
+    @classmethod
+    def _check_addressing_style(cls, v: str) -> str:
+        v = (v or "auto").strip().lower()
+        if v not in ("auto", "path", "virtual"):
+            raise ValueError("CHAT_ARCHIVE_S3_ADDRESSING_STYLE must be auto, path or virtual")
+        return v
+
     # Agent job settings
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)

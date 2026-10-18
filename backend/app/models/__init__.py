@@ -50,6 +50,7 @@ from .user import (
 from .chat_wakeup import ChatWakeup
 from .mcp_task import McpTask
 from .package_repository import PackageRepository
+from .retention_run import ChatRetentionRun
 from .identity_provider import IdentityProvider
 from .webhook import Webhook
 

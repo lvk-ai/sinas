@@ -82,6 +82,7 @@
               "admin/permissions",
               "admin/system",
               "admin/usage-cost",
+              "admin/chat-retention",
               "admin/config-manager",
               "admin/icons"
             ]

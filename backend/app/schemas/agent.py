@@ -135,6 +135,15 @@ class AgentCreate(BaseModel):
     # Long-running workflow settings
     default_job_timeout: Optional[int] = Field(None, gt=0, description="Default job timeout in seconds for chats with this agent")
     default_keep_alive: Optional[bool] = Field(False, description="Default keep_alive for chats with this agent")
+    retention_days: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "Chat retention override, in days since a chat's last activity: null = the "
+            "deployment default (CHAT_RETENTION_DAYS), 0 = keep forever. Setting it takes "
+            "sinas.retention.update:all."
+        ),
+    )
     system_tools: Optional[list[Union[str, SystemToolConfig]]] = Field(
         default=None,
         description=(
@@ -225,6 +234,10 @@ class AgentUpdate(BaseModel):
     # Long-running workflow settings
     default_job_timeout: Optional[int] = Field(None, gt=0)
     default_keep_alive: Optional[bool] = None
+    # Unlike the other fields, an explicit null here means "back to the
+    # deployment default" (left out = unchanged). Changing it takes
+    # sinas.retention.update:all.
+    retention_days: Optional[int] = Field(None, ge=0)
     system_tools: Optional[list[Union[str, SystemToolConfig]]] = None
     tool_approvals: Optional[dict[str, Any]] = None
 
@@ -272,6 +285,7 @@ class AgentResponse(BaseModel):
     is_default: bool
     default_job_timeout: Optional[int] = None
     default_keep_alive: bool = False
+    retention_days: Optional[int] = None
     system_tools: list[Union[str, SystemToolConfig]] = []
     tool_approvals: Optional[dict[str, Any]] = None
     created_at: datetime
