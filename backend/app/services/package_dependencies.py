@@ -147,18 +147,29 @@ def _target(entry: dict[str, Any]) -> str:
 
 
 def requirement_status(entry: dict[str, Any], installed: dict[str, Package]) -> dict[str, Any]:
-    """A stored requirement against what is installed now: satisfied,
-    missing or incompatible, with the installed version."""
+    """A requirement (as stored, or as an index lists it) against what is
+    installed now: status satisfied, missing or incompatible, with the
+    installed version and package, and for incompatible the reason:
+    "version" (out of range) or "other_package" (the install name holds a
+    different package)."""
     target = _target(entry)
     package = installed.get(target)
-    out = {**entry, "install_name": target, "installed_version": None}
+    out = {
+        **entry, "install_name": target, "installed_version": None,
+        "installed_package": None, "reason": None,
+    }
     if package is None:
         return {**out, "status": "missing"}
     out["installed_version"] = package.version
-    if (package.package_name or package.name) != entry.get("name"):
-        return {**out, "status": "incompatible"}
-    if not satisfies(package.version, entry.get("version")):
-        return {**out, "status": "incompatible"}
+    out["installed_package"] = package.package_name or package.name
+    if out["installed_package"] != entry.get("name"):
+        return {**out, "status": "incompatible", "reason": "other_package"}
+    try:
+        in_range = satisfies(package.version, entry.get("version"))
+    except ValueError:
+        in_range = False  # an unparseable range (an index is read leniently)
+    if not in_range:
+        return {**out, "status": "incompatible", "reason": "version"}
     return {**out, "status": "satisfied"}
 
 
