@@ -40,6 +40,52 @@ def _acting_as_job_key(job):
     return wrapper
 
 
+def agent_job_timeout_ceiling() -> int:
+    """The longest any one agent job may run (AGENT_JOB_TIMEOUT_MAX, never
+    below AGENT_JOB_TIMEOUT)."""
+    return max(settings.agent_job_timeout_max, settings.agent_job_timeout)
+
+
+def agent_job_timeout(requested: Optional[int]) -> int:
+    """The timeout one agent job runs under: the job_timeout it was queued
+    with (the chat's, else its agent's), else AGENT_JOB_TIMEOUT; capped at
+    the ceiling."""
+    seconds = requested if requested and requested > 0 else settings.agent_job_timeout
+    return min(seconds, agent_job_timeout_ceiling())
+
+
+def agent_function_timeout() -> int:
+    """arq's own timeout for the agent job functions (func(..., timeout=)):
+    past the longest per-job timeout, so the job's own (below) always fires
+    first and its cleanup runs before arq would cancel it."""
+    return agent_job_timeout_ceiling() + 60
+
+
+def _within_job_timeout(
+    job: Callable[..., Awaitable[None]],
+) -> Callable[..., Awaitable[None]]:
+    """Enforce the job's own `job_timeout`. arq has no per-job timeout (its
+    enqueue_job takes none; an unknown `_job_timeout` just reaches the job
+    as an argument), only the function's, so the job applies it: on expiry
+    the job is cancelled exactly as arq's timeout would cancel it (its
+    cleanup reports "cancelled or timed out") and TimeoutError fails it."""
+
+    @functools.wraps(job)
+    async def run(ctx: dict[str, Any], **kwargs: Any) -> Any:
+        from app.services import chat_steering
+
+        seconds = agent_job_timeout(kwargs.get("job_timeout"))
+        # The chat lock the job takes lives as long as the job may run.
+        token = chat_steering.current_job_timeout.set(seconds)
+        try:
+            async with asyncio.timeout(seconds):
+                return await job(ctx, **kwargs)
+        finally:
+            chat_steering.current_job_timeout.reset(token)
+
+    return run
+
+
 def _is_suspension_chunk(chunk: dict) -> bool:
     """A chunk announcing the tool round suspended on pending completions
     (delegations, ask_user questions). The job must then end WITHOUT a
@@ -173,6 +219,7 @@ async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db)
 
 
 @_acting_as_job_key
+@_within_job_timeout
 async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     """
     Process an agent message in a worker.
@@ -437,6 +484,7 @@ async def _persist_turn_error(chat_id: str, error: Exception) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@_within_job_timeout
 async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     """
     Resume agent processing after tool approval in a worker.
@@ -555,6 +603,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                             defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
                             enqueued_at=kwargs.get("enqueued_at"),
                             rejected_tool_call_ids=rejected_tool_call_ids,
+                            job_timeout=kwargs.get("job_timeout"),
                         ),
                         redis=redis, base_fields=base_fields,
                     ):
@@ -654,6 +703,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@_within_job_timeout
 async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     """Continue a parent conversation suspended on sub-agent delegations.
 
@@ -733,6 +783,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                     channel_id=channel_id, conversation_context=context,
                     defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
                     enqueued_at=kwargs.get("enqueued_at"),
+                    job_timeout=kwargs.get("job_timeout"),
                 ),
                 redis=redis, base_fields=base_fields,
             ):

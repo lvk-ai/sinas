@@ -17,6 +17,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.chat import Chat, Message
 from app.models.user import User
 from app.services import chat_steering
@@ -86,6 +87,130 @@ class TestLockHeartbeat:
         assert await chat_steering.refresh_chat_lock(chat_id, token="not-ours") is False
         await chat_steering.release_chat_lock(chat_id, token)
         assert await chat_steering.refresh_chat_lock(chat_id, token=token) is False
+
+
+class TestLockHeldForTheWholeTurn:
+    """The lock lives as long as the turn, not as long as AGENT_JOB_TIMEOUT:
+    a heartbeat keeps it through one long tool call, and its TTL comes from
+    the timeout the running job is actually held to."""
+
+    @pytest.fixture
+    def short_lock(self, monkeypatch):
+        # TTL 2s, heartbeat every 0.3s.
+        monkeypatch.setattr(settings, "agent_job_timeout", 1)
+        monkeypatch.setattr(chat_steering, "LOCK_TTL_MARGIN", 1)
+        monkeypatch.setattr(chat_steering, "_heartbeat_interval", lambda ttl: 0.3)
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_longer_than_the_ttl_keeps_the_lock(self, short_lock):
+        import asyncio
+
+        chat_id = f"lock-long-{uuid.uuid4().hex}"
+        token = await chat_steering.acquire_chat_lock(chat_id)
+        try:
+            # One "tool call" of 3.5s: no round boundary, so no refresh_chat_lock.
+            await asyncio.sleep(3.5)
+            assert await chat_steering.is_chat_locked(chat_id)
+            # A second turn on the chat is still refused.
+            assert await chat_steering.acquire_chat_lock(chat_id) is None
+        finally:
+            await chat_steering.release_chat_lock(chat_id, token)
+        second = await chat_steering.acquire_chat_lock(chat_id)
+        assert second
+        await chat_steering.release_chat_lock(chat_id, second)
+
+    @pytest.mark.asyncio
+    async def test_ttl_comes_from_the_jobs_enforced_timeout(self, monkeypatch):
+        from app.core.redis import get_redis
+        from app.queue.agent_jobs import _within_job_timeout
+
+        monkeypatch.setattr(settings, "agent_job_timeout", 600)
+        monkeypatch.setattr(settings, "agent_job_timeout_max", 3600)
+        redis = await get_redis()
+        ttls = {}
+
+        @_within_job_timeout
+        async def job(ctx, **kwargs):
+            chat_id = f"lock-ttl-{uuid.uuid4().hex}"
+            token = await chat_steering.acquire_chat_lock(chat_id)
+            try:
+                ttls[kwargs.get("job_timeout")] = await redis.ttl(f"chat:loop-lock:{chat_id}")
+            finally:
+                await chat_steering.release_chat_lock(chat_id, token)
+
+        await job({}, job_timeout=1800)
+        await job({}, job_timeout=86400)  # capped at AGENT_JOB_TIMEOUT_MAX
+        await job({})
+        assert 1800 < ttls[1800] <= 1800 + chat_steering.LOCK_TTL_MARGIN
+        assert 3600 < ttls[86400] <= 3600 + chat_steering.LOCK_TTL_MARGIN
+        assert 600 < ttls[None] <= 600 + chat_steering.LOCK_TTL_MARGIN
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_stops_when_the_turn_completes(self, short_lock):
+        chat_id = f"lock-done-{uuid.uuid4().hex}"
+        token = await chat_steering.acquire_chat_lock(chat_id)
+        heartbeat = chat_steering._heartbeats[token]
+        await chat_steering.release_chat_lock(chat_id, token)
+        await _settled(heartbeat)
+        assert heartbeat.done() and token not in chat_steering._heartbeats
+        assert not await chat_steering.is_chat_locked(chat_id)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_stops_when_the_job_times_out(self, short_lock, monkeypatch):
+        import asyncio
+
+        from app.queue.agent_jobs import _within_job_timeout
+
+        monkeypatch.setattr(settings, "agent_job_timeout_max", 3600)
+        chat_id = f"lock-cancel-{uuid.uuid4().hex}"
+        held = {}
+
+        @_within_job_timeout
+        async def job(ctx, **kwargs):
+            # As the real jobs do: take the lock, release it in `finally`.
+            token = await chat_steering.acquire_chat_lock(chat_id)
+            held["heartbeat"] = chat_steering._heartbeats[token]
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await chat_steering.release_chat_lock(chat_id, token)
+
+        with pytest.raises(TimeoutError):
+            await job({}, job_timeout=0.5)
+        await _settled(held["heartbeat"])
+        assert held["heartbeat"].done()
+        assert not await chat_steering.is_chat_locked(chat_id)
+
+    @pytest.mark.asyncio
+    async def test_a_lost_lock_is_not_taken_back(self, short_lock):
+        import asyncio
+
+        from app.core.redis import get_redis
+
+        chat_id = f"lock-lost-{uuid.uuid4().hex}"
+        key = f"chat:loop-lock:{chat_id}"
+        token = await chat_steering.acquire_chat_lock(chat_id)
+        heartbeat = chat_steering._heartbeats[token]
+        redis = await get_redis()
+        # Expired and taken over by another loop.
+        await redis.set(key, "someone-else", ex=50)
+        await asyncio.sleep(1)
+        assert heartbeat.done() and token not in chat_steering._heartbeats
+        assert await redis.get(key) == "someone-else"
+        assert await redis.ttl(key) > 40  # not re-extended to our 2s TTL
+        # And our late release leaves theirs alone.
+        await chat_steering.release_chat_lock(chat_id, token)
+        assert await redis.get(key) == "someone-else"
+        await redis.delete(key)
+
+
+async def _settled(task):
+    import asyncio
+
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 1)
+    except (asyncio.CancelledError, TimeoutError):
+        pass
 
 
 class TestInterruptFlag:

@@ -322,8 +322,6 @@ class QueueService:
             "_job_id": job_id,
             "_queue_name": SUB_AGENT_QUEUE if use_sub_queue else AGENT_QUEUE,
         }
-        if job_timeout is not None:
-            enqueue_kwargs["_job_timeout"] = job_timeout
 
         await pool.enqueue_job(
             "execute_agent_message_job",
@@ -341,6 +339,9 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            # The job enforces it (agent_jobs._within_job_timeout): arq's
+            # enqueue_job takes no per-job timeout.
+            job_timeout=job_timeout,
             **enqueue_kwargs,
         )
 
@@ -406,8 +407,6 @@ class QueueService:
             "_job_id": job_id,
             "_queue_name": "sinas:queue:agents",
         }
-        if job_timeout is not None:
-            enqueue_kwargs["_job_timeout"] = job_timeout
         if defer_seconds:
             enqueue_kwargs["_defer_by"] = timedelta(seconds=defer_seconds)
 
@@ -427,6 +426,9 @@ class QueueService:
             api_key_id=current_api_key_id(),
             attempt=attempt,
             enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
+            # The job enforces it (agent_jobs._within_job_timeout): arq's
+            # enqueue_job takes no per-job timeout.
+            job_timeout=job_timeout,
             **enqueue_kwargs,
         )
 
@@ -484,8 +486,6 @@ class QueueService:
             "_job_id": job_id,
             "_queue_name": SUB_AGENT_QUEUE if use_sub_queue else AGENT_QUEUE,
         }
-        if job_timeout is not None:
-            enqueue_kwargs["_job_timeout"] = job_timeout
         if defer_seconds:
             enqueue_kwargs["_defer_by"] = timedelta(seconds=defer_seconds)
 
@@ -503,6 +503,9 @@ class QueueService:
             api_key_id=current_api_key_id(),
             attempt=attempt,
             enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
+            # The job enforces it (agent_jobs._within_job_timeout): arq's
+            # enqueue_job takes no per-job timeout.
+            job_timeout=job_timeout,
             **enqueue_kwargs,
         )
 

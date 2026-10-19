@@ -167,7 +167,8 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 |---|---|---|
 | `MAX_TOOL_ITERATIONS` | `25` | Max consecutive tool-call rounds per message |
 | `MAX_HISTORY_MESSAGES` | `100` | Messages loaded for conversation context |
-| `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds) |
+| `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds). A chat's or agent's `job_timeout` overrides it for that chat's messages |
+| `AGENT_JOB_TIMEOUT_MAX` | `3600` | Cap on a chat's or agent's `job_timeout` (seconds); a longer one runs this long |
 | `AGENT_DELEGATE_TIMEOUT` | `600` | How long a parent agent waits for a delegated sub-agent (block mode). Raise together with `AGENT_JOB_TIMEOUT` — in block mode the parent's own job clock keeps running while it waits |
 | `AGENT_DELEGATE_MODE` | `block` | `block`: parent holds its worker slot while awaiting sub-agents. `suspend`: parent job ends at delegation and a resume job continues the conversation when the children finish (frees the slot) |
 | `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |

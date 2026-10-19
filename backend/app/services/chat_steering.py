@@ -8,9 +8,10 @@ loop instead of racing it (injection).
 Mechanics:
 
 - Lock: a Redis SET NX token per chat, held for the duration of one agent
-  loop (send, stream, or a resume/continuation job). The TTL is generous —
-  the agent job timeout plus slack — so a crashed worker can never wedge a
-  chat forever.
+  loop (send, stream, or a resume/continuation job). A heartbeat keeps it
+  alive for the whole loop, even through one long tool call; its TTL — the
+  running job's timeout plus slack — is what frees the chat after a
+  crashed worker, so a chat can never be wedged forever.
 - Interrupt: a Redis flag checked at tool-round boundaries. The loop
   consumes it, writes an "interrupted by operator" system marker into the
   transcript, and stops. The flag has its own TTL so an interrupt aimed at
@@ -22,7 +23,9 @@ Mechanics:
   while the lock is held is picked up naturally. MessageService uses the
   lock to decide send-vs-inject.
 """
+import asyncio
 import logging
+import math
 import time
 import uuid
 from contextvars import ContextVar
@@ -47,29 +50,81 @@ current_lock_token: ContextVar[Optional[str]] = ContextVar("current_lock_token",
 INTERRUPT_TTL = 600
 
 
+# The timeout the agent job running in this task is held to (set by
+# agent_jobs._within_job_timeout). The lock's TTL is sized from it, so a
+# chat whose job_timeout is longer than AGENT_JOB_TIMEOUT keeps its lock
+# for as long as its turn may run.
+current_job_timeout: ContextVar[Optional[float]] = ContextVar("current_job_timeout", default=None)
+
+# Slack on top of the job timeout before an abandoned lock (a crashed
+# worker) frees the chat.
+LOCK_TTL_MARGIN = 120
+
+# Held locks' heartbeat tasks, by token (see _heartbeat).
+_heartbeats: dict[str, asyncio.Task] = {}
+
+_EXTEND_SCRIPT = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+)
+
+
 def _lock_ttl() -> int:
-    return settings.agent_job_timeout + 120
+    timeout = current_job_timeout.get() or settings.agent_job_timeout
+    return math.ceil(timeout) + LOCK_TTL_MARGIN
+
+
+def _heartbeat_interval(ttl: float) -> float:
+    return max(1.0, ttl / 3)
+
+
+async def _heartbeat(chat_id: str, token: str, ttl: int) -> None:
+    """Keep a held lock alive for the whole turn, not just between tool
+    rounds: one tool call (a long code run, a slow MCP call) can outlast
+    the TTL, and another turn must not start on the chat meanwhile.
+    Extends only while the lock is still ours (token-checked); once it
+    isn't (expired and taken over), stops and never takes it back.
+    Cancelled by release_chat_lock, which every holder calls in a
+    `finally`, so it ends with the turn, however the turn ends."""
+    from app.core.redis import get_redis
+
+    try:
+        while True:
+            await asyncio.sleep(_heartbeat_interval(ttl))
+            try:
+                redis = await get_redis()
+                held = await redis.eval(_EXTEND_SCRIPT, 1, f"{_LOCK_PREFIX}{chat_id}", token, ttl)
+            except Exception as e:  # transient: the TTL covers a few misses
+                logger.warning("Chat lock heartbeat for %s failed: %s", chat_id, e)
+                continue
+            if not held:
+                logger.warning("Chat lock for %s is no longer ours; heartbeat stopped", chat_id)
+                return
+    finally:
+        if _heartbeats.get(token) is asyncio.current_task():
+            del _heartbeats[token]
 
 
 async def acquire_chat_lock(chat_id: str) -> Optional[str]:
     """Try to become the chat's one running loop. Returns a release token,
-    or None when another loop already holds the chat."""
+    or None when another loop already holds the chat. A held lock is kept
+    alive by a heartbeat until release_chat_lock."""
     from app.core.redis import get_redis
 
     redis = await get_redis()
     token = uuid.uuid4().hex
-    ok = await redis.set(f"{_LOCK_PREFIX}{chat_id}", token, nx=True, ex=_lock_ttl())
+    ttl = _lock_ttl()
+    ok = await redis.set(f"{_LOCK_PREFIX}{chat_id}", token, nx=True, ex=ttl)
     if ok:
         current_lock_token.set(token)
+        _heartbeats[token] = asyncio.create_task(_heartbeat(chat_id, token, ttl))
         return token
     return None
 
 
 async def refresh_chat_lock(chat_id: str, token: Optional[str] = None) -> bool:
-    """Heartbeat: extend the lock's TTL if we still hold it (token-checked,
-    atomic). Called at every tool-round boundary, so a loop that outlives
-    the base TTL — many rounds, or a chat with a long job_timeout — keeps
-    its exclusivity for as long as it is actually making progress. Returns
+    """Extend the lock's TTL if we still hold it (token-checked, atomic).
+    Called at every tool-round boundary on top of the heartbeat. Returns
     False when the lock is no longer ours (expired and taken over)."""
     from app.core.redis import get_redis
 
@@ -77,21 +132,21 @@ async def refresh_chat_lock(chat_id: str, token: Optional[str] = None) -> bool:
     if not token:
         return False
     redis = await get_redis()
-    script = (
-        "if redis.call('get', KEYS[1]) == ARGV[1] then "
-        "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
-    )
     try:
-        return bool(await redis.eval(script, 1, f"{_LOCK_PREFIX}{chat_id}", token, _lock_ttl()))
+        return bool(await redis.eval(_EXTEND_SCRIPT, 1, f"{_LOCK_PREFIX}{chat_id}", token, _lock_ttl()))
     except Exception as e:
         logger.warning(f"Failed to refresh chat lock for {chat_id}: {e}")
         return False
 
 
 async def release_chat_lock(chat_id: str, token: str) -> None:
-    """Release the lock if we still hold it (token-checked, atomic)."""
+    """Release the lock if we still hold it (token-checked, atomic), and
+    stop its heartbeat."""
     from app.core.redis import get_redis
 
+    heartbeat = _heartbeats.pop(token, None)
+    if heartbeat is not None:
+        heartbeat.cancel()
     redis = await get_redis()
     # Compare-and-delete so an expired-and-reacquired lock is never released
     # by the previous holder.
@@ -118,9 +173,6 @@ async def acquire_chat_lock_wait(chat_id: str, wait_seconds: float = 60) -> Opti
     """Acquire the lock, waiting up to `wait_seconds` for the current holder
     to finish. For continuation jobs (approval resume, delegate resume) that
     must run but should not race a still-active loop."""
-    import asyncio
-    import time
-
     deadline = time.monotonic() + wait_seconds
     while True:
         token = await acquire_chat_lock(chat_id)

@@ -351,6 +351,9 @@ class Settings(BaseSettings):
 
     # Agent job settings
     agent_job_timeout: int = 600  # Default timeout for agent jobs (10 minutes)
+    # Ceiling for a per-chat / per-agent job_timeout: a longer one is capped
+    # here. Also sets arq's backstop timeout for the agent job functions.
+    agent_job_timeout_max: int = 3600
     code_execution_timeout: int = 120  # Default timeout for code execution (2 minutes)
 
     # Workbench → sandbox sync caps (eager copy-in/copy-out per execution).
