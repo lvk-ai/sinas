@@ -1075,7 +1075,7 @@ class TestRoundFour:
 
     @pytest.mark.asyncio
     async def test_expired_chat_takes_its_workbench_along(self, db, chat, test_user, monkeypatch):
-        from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
+        from app.services.chat_deletion import delete_workbenches_for_chats
         from app.services.file_storage import get_storage
 
         uid = str(test_user.id)
@@ -1157,7 +1157,7 @@ class TestRoundFour:
     async def test_cleanup_leaves_ordinary_chat_collections_alone(self, db, chat, test_user):
         """Config apply may create an ordinary collection in `_chat` — even
         one named like a chat id. Expiry removes workbenches only."""
-        from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
+        from app.services.chat_deletion import delete_workbenches_for_chats
 
         plain = Collection(namespace="_chat", name=str(chat.id), kind="collection", user_id=test_user.id)
         db.add(plain)

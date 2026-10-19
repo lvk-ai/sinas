@@ -1,79 +1,81 @@
 """Hard-delete chats whose expires_at has passed."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
 from app.models.chat import Chat
+from app.services.chat_deletion import delete_chats_and_rows, remove_stored_files
 
 logger = logging.getLogger(__name__)
 
-
-async def delete_workbenches_for_chats(db, chat_ids) -> list[str]:
-    """Delete the workbench collections of `chat_ids` (rows only; the
-    caller commits) and return the storage paths of their file versions."""
-    from app.models.file import Collection, File, FileVersion
-
-    names = [str(cid) for cid in chat_ids]
-    workbench_ids = (
-        await db.execute(
-            select(Collection.id).where(
-                Collection.kind == "workbench",
-                Collection.namespace == "_chat",
-                Collection.name.in_(names),
-            )
-        )
-    ).scalars().all()
-    if not workbench_ids:
-        return []
-    paths = (
-        await db.execute(
-            select(FileVersion.storage_path)
-            .join(File, FileVersion.file_id == File.id)
-            .where(File.collection_id.in_(workbench_ids))
-        )
-    ).scalars().all()
-    await db.execute(delete(Collection).where(Collection.id.in_(workbench_ids)))
-    return sorted(set(paths))
+# Chats per transaction: short transactions, a bounded statement each.
+BATCH_SIZE = 100
 
 
-async def remove_stored_files(paths) -> None:
-    """Best effort: a stale blob is a leak, never a reason to keep a chat."""
-    if not paths:
-        return
-    from app.services.file_storage import get_storage
-
-    storage = get_storage()
-    for path in paths:
-        try:
-            await storage.delete(path)
-        except Exception as e:  # pragma: no cover - storage-specific
-            logger.warning("Could not remove stored file %s: %s", path, e)
+async def _delete_one(chat_id) -> bool:
+    """Delete one chat in its own transaction, unless another holds its
+    row. True if it was deleted."""
+    async with AsyncSessionLocal() as db:
+        locked = (
+            await db.execute(select(Chat.id).where(Chat.id == chat_id).with_for_update(skip_locked=True))
+        ).scalar_one_or_none()
+        if locked is None:
+            return False
+        _, paths = await delete_chats_and_rows(db, [chat_id])
+        await db.commit()
+    await remove_stored_files(paths)
+    return True
 
 
 async def cleanup_expired_chats() -> None:
-    """Delete expired chats in batches to avoid long transactions."""
-    async with AsyncSessionLocal() as db:
-        now = datetime.now(timezone.utc)
-        total_deleted = 0
-        while True:
-            result = await db.execute(
-                select(Chat.id)
-                .where(Chat.expires_at.isnot(None), Chat.expires_at < now)
-                .limit(100)
-            )
-            ids = [r[0] for r in result.all()]
+    """Delete expired chats with everything they own, in batches of short
+    transactions. A chat whose row another transaction holds (a turn
+    writing to it) is skipped and goes on a later run; a chat that fails to
+    delete is logged and skipped, never retried in a loop or allowed to
+    block the chats after it."""
+    now = datetime.now(UTC)
+    total_deleted = 0
+    failed: set = set()
+    passed_over: set = set()  # failed, or held by another transaction: for a later run
+    while True:
+        async with AsyncSessionLocal() as db:
+            stmt = select(Chat.id).where(Chat.expires_at.isnot(None), Chat.expires_at < now)
+            if passed_over:
+                stmt = stmt.where(Chat.id.notin_(passed_over))
+            ids = (
+                await db.execute(
+                    stmt.order_by(Chat.expires_at, Chat.id).limit(BATCH_SIZE).with_for_update(skip_locked=True)
+                )
+            ).scalars().all()
             if not ids:
                 break
-            # The chats' workbenches go with them: the collection rows (files
-            # and versions cascade) now, the stored bytes after the commit.
-            paths = await delete_workbenches_for_chats(db, ids)
-            await db.execute(delete(Chat).where(Chat.id.in_(ids)))
-            await db.commit()
+            try:
+                _, paths = await delete_chats_and_rows(db, ids)
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.warning("Expired-chat cleanup: batch of %d failed (%s); retrying one by one", len(ids), e)
+                paths = None
+        if paths is not None:
             await remove_stored_files(paths)
             total_deleted += len(ids)
+            continue
+        # Isolate the chat(s) that fail so the rest still go.
+        for chat_id in ids:
+            try:
+                if await _delete_one(chat_id):
+                    total_deleted += 1
+                else:
+                    passed_over.add(chat_id)
+            except Exception as e:
+                failed.add(chat_id)
+                passed_over.add(chat_id)
+                logger.error("Expired-chat cleanup: could not delete chat %s: %s", chat_id, e)
 
-        if total_deleted:
-            logger.info(f"Cleaned up {total_deleted} expired chat(s)")
+    if total_deleted:
+        logger.info("Cleaned up %d expired chat(s)", total_deleted)
+    if failed:
+        logger.error("Expired-chat cleanup: %d expired chat(s) could not be deleted", len(failed))

@@ -32,21 +32,18 @@ from sqlalchemy import (
     DateTime,
     and_,
     case,
-    delete,
     exists,
     func,
     literal,
     or_,
     select,
     tuple_,
-    update,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.models.agent import Agent
 from app.models.chat import Chat, Message
 from app.models.chat_wakeup import TIMER, WATCH, ChatWakeup
-from app.models.execution import Execution
 from app.models.mcp_task import McpTask
 from app.models.pending_approval import PendingToolApproval
 from app.models.pending_completion import PendingCompletion
@@ -62,6 +59,7 @@ from app.models.retention_run import (
 )
 from app.models.tool_call_result import ToolCallResult
 from app.models.user import User
+from app.services.chat_deletion import delete_chats_and_rows, remove_stored_files
 from app.services.retention import archive as fmt
 from app.services.retention.policy import (
     RetentionPolicy,
@@ -399,7 +397,6 @@ async def delete_chat(db: AsyncSession, chat_id: uuid.UUID, digest: str, now: da
     Everything is checked under the row lock: a message insert's foreign key
     check waits for it, so nothing can land between the checks and the
     delete."""
-    from app.scheduler.jobs.cleanup_expired_chats import delete_workbenches_for_chats
     from app.services import chat_steering
 
     locked = (
@@ -423,16 +420,7 @@ async def delete_chat(db: AsyncSession, chat_id: uuid.UUID, digest: str, now: da
 
     # Children first, explicitly: the database's ON DELETE rules for these
     # differ from what the models declare (see the design doc's table).
-    await db.execute(delete(PendingToolApproval).where(PendingToolApproval.chat_id == chat_id))
-    await db.execute(delete(PendingCompletion).where(PendingCompletion.chat_id == chat_id))
-    # Function execution records outlive the chat (their own log), unlinked.
-    await db.execute(update(Execution).where(Execution.chat_id == chat_id).values(chat_id=None))
-    await db.execute(delete(ToolCallResult).where(ToolCallResult.chat_id == chat_id))
-    await db.execute(delete(ChatWakeup).where(ChatWakeup.chat_id == chat_id))
-    await db.execute(delete(McpTask).where(McpTask.chat_id == chat_id))
-    paths = await delete_workbenches_for_chats(db, [chat_id])
-    deleted_messages = (await db.execute(delete(Message).where(Message.chat_id == chat_id))).rowcount or 0
-    await db.execute(delete(Chat).where(Chat.id == chat_id))
+    deleted_messages, paths = await delete_chats_and_rows(db, [chat_id])
     await db.commit()
     return "deleted", deleted_messages, paths
 
@@ -800,8 +788,6 @@ async def _process_chat(sessions, claims: Claims, store, policy, row, now, tally
         stats["messages_deleted"] += messages
         if paths:
             stage = "workbench_files"
-            from app.scheduler.jobs.cleanup_expired_chats import remove_stored_files
-
             try:
                 await remove_stored_files(paths)
             except Exception as e:  # the chat is deleted; a stale blob is a leak, not a failure
