@@ -8,7 +8,7 @@
   - `backend/app/services/usage_reports.py`, `backend/app/api/v1/endpoints/usage.py`: `/api/v1/usage/*`
   - `backend/app/providers/tracking.py`, `backend/app/scheduler/jobs/poll_provider_batches.py`: where rows are priced
   - `backend/app/schemas/spec/llm_provider.py`, `backend/app/services/resources/llm_providers.py`: provider pricing
-  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migrations `c1o2s3t4u5s6` (columns, table), `c2u3s4i5d6x7` (indexes) and `c3p4r5f6a7m8` (`pricing_provider`)
+  - `backend/app/models/llm_usage.py`, `backend/app/models/ratecard_cache.py`, migrations `c1o2s3t4u5s6` (columns, table), `c2u3s4i5d6x7` (indexes), `c3p4r5f6a7m8` (`pricing_provider`) and `b4f5i6l7l8b9` (marks existing batch rows)
   - `console/src/pages/Usage.tsx`, `console/src/pages/LLMProviders.tsx`, `console/src/components/Ratecard.tsx`, `console/src/lib/ratecard.ts`: Admin › Usage, the provider form's Pricing section and the providers' pricing overview
 - **Related docs:** `docs-mint/admin/usage-cost.mdx`
 
@@ -178,8 +178,10 @@ cost = uncached*input + cache_read*cache_read_price
 
 The batch poller (`poll_provider_batches`) wrote usage rows with
 `source="provider_batch"` and no other marker. It now sets `batch=True` and
-prices them in its own transaction. The migration marks existing
-`provider_batch` rows `batch=true`. Only succeeded results are recorded, as
+prices them in its own transaction. Migration `b4f5i6l7l8b9` marks existing
+`provider_batch` rows `batch=true`, 50k rows per statement, each committed
+on its own so `llm_usage` stays writable (doing it inside `c1o2s3t4u5s6`
+held ACCESS EXCLUSIVE on the table for the whole rewrite). Only succeeded results are recorded, as
 before. The model is the agent's model at poll time (as before), not
 necessarily the one at submit time.
 
