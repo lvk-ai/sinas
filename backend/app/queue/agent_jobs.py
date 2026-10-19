@@ -199,11 +199,19 @@ async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue, redis=None,
     return True
 
 
-async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db) -> bool:
+async def _stopped_by_interrupt(
+    chat_id: str, kwargs: dict, channel_id: str, db,
+    open_tool_calls: Optional[list[dict]] = None, rejected_ids: frozenset = frozenset(),
+) -> bool:
     """A continuation queued before an operator interrupt must not run on,
-    even though the running turn may have consumed the flag already."""
+    even though the running turn may have consumed the flag already.
+
+    `open_tool_calls`: the calls of a round that has no results yet (an
+    approval round); each is answered before the marker, so the assistant's
+    tool_calls are never left without matching results."""
     from app.models.chat import Message
     from app.services import chat_steering
+    from app.services.message_service import INTERRUPTED_TOOL_RESULT, REJECTED_TOOL_RESULT
     from app.services.stream_relay import stream_relay
 
     requested_at = await chat_steering.interrupt_requested_at(chat_id)
@@ -211,6 +219,16 @@ async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db)
     if requested_at is None or enqueued_at is None or float(enqueued_at) > requested_at:
         return False
     await chat_steering.consume_interrupt(chat_id)
+    for tc in open_tool_calls or []:
+        if tc.get("id"):
+            db.add(Message(
+                chat_id=chat_id, role="tool", tool_call_id=tc["id"], name=tc["function"]["name"],
+                content=REJECTED_TOOL_RESULT if tc["id"] in rejected_ids else INTERRUPTED_TOOL_RESULT,
+            ))
+    if open_tool_calls:
+        # Own transaction: created_at is the transaction's now(), so this
+        # orders the results before the marker.
+        await db.commit()
     db.add(Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER))
     await db.commit()
     await stream_relay.publish(channel_id, {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER})
@@ -585,67 +603,83 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                 if agent_obj:
                     status_templates = agent_obj.status_templates or {}
 
-            if approved:
-                # Continuations re-enter the loop, so they hold the chat lock
-                # like any other loop (waiting briefly for a running one).
-                from app.services import chat_steering
+            if not approved:
+                # Nothing in the round was allowed: every asked call of it is
+                # a rejected one (a job queued before rounds named none).
+                asked = await db.execute(
+                    select(PendingToolApproval.tool_call_id).where(
+                        PendingToolApproval.chat_id == pending_approval.chat_id,
+                        PendingToolApproval.message_id == pending_approval.message_id,
+                    )
+                )
+                rejected_tool_call_ids = list(dict.fromkeys([*rejected_tool_call_ids, *asked.scalars()]))
 
-                lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
-                if lock_token is None:
-                    # The approval is already resolved; giving up would strand
-                    # it. Come back when the running turn is done.
-                    if await _requeue_when_busy(
-                        kwargs, channel_id,
-                        lambda attempt: queue_service.enqueue_agent_resume(
-                            chat_id=chat_id, user_id=user_id, user_token=user_token,
-                            pending_approval_id=pending_approval_id, approved=approved,
-                            channel_id=channel_id, agent=base_fields.get("agent"),
-                            defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
-                            enqueued_at=kwargs.get("enqueued_at"),
-                            rejected_tool_call_ids=rejected_tool_call_ids,
-                            job_timeout=kwargs.get("job_timeout"),
-                        ),
-                        redis=redis, base_fields=base_fields,
-                    ):
-                        completed = True
-                    return
-                try:
-                    # Inside the release-protected block: a failure in the
-                    # stop check must not leave the chat locked.
-                    if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
-                        completed = True
-                        return
-                    # Execute the approved tool calls and stream the LLM response
-                    async for chunk in message_service._handle_tool_calls(
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        user_token=user_token,
-                        messages=pending_approval.conversation_context["messages"],
-                        tool_calls=pending_approval.all_tool_calls,
-                        provider=pending_approval.conversation_context.get("provider"),
-                        model=pending_approval.conversation_context.get("model"),
-                        temperature=pending_approval.conversation_context.get("temperature", 0.7),
-                        max_tokens=pending_approval.conversation_context.get("max_tokens"),
-                        tools=pending_approval.conversation_context.get("tools", []),
-                        status_templates=status_templates,
+            # Approved or not, the round continues: approved calls run,
+            # rejected ones get a rejection result the model reacts to.
+            # Continuations re-enter the loop, so they hold the chat lock
+            # like any other loop (waiting briefly for a running one).
+            from app.services import chat_steering
+
+            lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
+            if lock_token is None:
+                # The approval is already resolved; giving up would strand
+                # it. Come back when the running turn is done.
+                if await _requeue_when_busy(
+                    kwargs, channel_id,
+                    lambda attempt: queue_service.enqueue_agent_resume(
+                        chat_id=chat_id, user_id=user_id, user_token=user_token,
+                        pending_approval_id=pending_approval_id, approved=approved,
+                        channel_id=channel_id, agent=base_fields.get("agent"),
+                        defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                        enqueued_at=kwargs.get("enqueued_at"),
                         rejected_tool_call_ids=rejected_tool_call_ids,
-                    ):
-                        if isinstance(chunk, dict):
-                            if _is_suspension_chunk(chunk):
-                                _suspended = True
-                            await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
-                finally:
-                    await chat_steering.release_chat_lock(chat_id, lock_token)
-            else:
-                # Nothing in the round was allowed: report each rejection.
-                for tc in pending_approval.all_tool_calls or []:
-                    if tc.get("id") in rejected_tool_call_ids or tc.get("id") == pending_approval.tool_call_id:
-                        await stream_relay.publish(channel_id, {
-                            "type": "tool_rejected",
-                            "tool_call_id": tc.get("id"),
-                            "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
-                            "function_name": tc.get("function", {}).get("name"),
-                        }, ttl=stream_ttl)
+                        job_timeout=kwargs.get("job_timeout"),
+                    ),
+                    redis=redis, base_fields=base_fields,
+                ):
+                    completed = True
+                return
+            try:
+                # Inside the release-protected block: a failure in the
+                # stop check must not leave the chat locked.
+                if await _stopped_by_interrupt(
+                    chat_id, kwargs, channel_id, db,
+                    open_tool_calls=pending_approval.all_tool_calls,
+                    rejected_ids=frozenset(rejected_tool_call_ids),
+                ):
+                    completed = True
+                    return
+                if not approved:
+                    for tc in pending_approval.all_tool_calls or []:
+                        if tc.get("id") in rejected_tool_call_ids:
+                            await stream_relay.publish(channel_id, {
+                                "type": "tool_rejected",
+                                "tool_call_id": tc.get("id"),
+                                "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
+                                "function_name": tc.get("function", {}).get("name"),
+                            }, ttl=stream_ttl)
+                # Run the approved calls, answer the rejected ones, and
+                # stream the LLM response
+                async for chunk in message_service._handle_tool_calls(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    messages=pending_approval.conversation_context["messages"],
+                    tool_calls=pending_approval.all_tool_calls,
+                    provider=pending_approval.conversation_context.get("provider"),
+                    model=pending_approval.conversation_context.get("model"),
+                    temperature=pending_approval.conversation_context.get("temperature", 0.7),
+                    max_tokens=pending_approval.conversation_context.get("max_tokens"),
+                    tools=pending_approval.conversation_context.get("tools", []),
+                    status_templates=status_templates,
+                    rejected_tool_call_ids=rejected_tool_call_ids,
+                ):
+                    if isinstance(chunk, dict):
+                        if _is_suspension_chunk(chunk):
+                            _suspended = True
+                        await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            finally:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
 
         if _suspended:
             # The approved round suspended again (delegations or an ask_user

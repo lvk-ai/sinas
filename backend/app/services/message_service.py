@@ -59,6 +59,11 @@ from app.core.telemetry import get_tracer, otel_attr
 logger = logging.getLogger(__name__)
 _tracer = get_tracer()
 
+# Tool results for calls of a round that never ran: refused at the approval
+# gate, or stopped by an operator interrupt before execution.
+REJECTED_TOOL_RESULT = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+INTERRUPTED_TOOL_RESULT = json.dumps({"error": "Interrupted by operator before execution"})
+
 
 def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
     """A deferred_completer tool defers unconditionally unless its metadata
@@ -1101,7 +1106,7 @@ class MessageService:
             # The user said no to these at the approval gate: the model gets
             # a rejection result (so the transcript stays valid and it can
             # react), and nothing of them executes.
-            rejected_content = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+            rejected_content = REJECTED_TOOL_RESULT
             for tc in valid_tool_calls:
                 if tc["id"] in rejected_ids:
                     self.db.add(
@@ -1120,7 +1125,7 @@ class MessageService:
 
         await chat_steering.refresh_chat_lock(chat_id)  # heartbeat at the round boundary
         if await chat_steering.consume_interrupt(chat_id):
-            interrupted_result = json.dumps({"error": "Interrupted by operator before execution"})
+            interrupted_result = INTERRUPTED_TOOL_RESULT
             for tc in valid_tool_calls:
                 self.db.add(
                     Message(
