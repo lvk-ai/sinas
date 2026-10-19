@@ -42,9 +42,9 @@ ENCRYPTION_KEY="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(
 
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
-    echo "KEEP=1: leaving ${PREFIX}-* running (docker rm -f ${PREFIX}-sinas ${PREFIX}-redis ${PREFIX}-pg ${PREFIX}-kc)"
+    echo "KEEP=1: leaving ${PREFIX}-* running (docker rm -f -v ${PREFIX}-sinas ${PREFIX}-redis ${PREFIX}-pg ${PREFIX}-kc)"
   else
-    docker rm -f "${PREFIX}-sinas" "${PREFIX}-redis" "${PREFIX}-pg" "${PREFIX}-kc" >/dev/null 2>&1 || true
+    docker rm -f -v "${PREFIX}-sinas" "${PREFIX}-redis" "${PREFIX}-pg" "${PREFIX}-kc" >/dev/null 2>&1 || true
   fi
   rm -rf "$WORK"
 }
