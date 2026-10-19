@@ -112,9 +112,6 @@ class RoundFollower:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(self.timeout, 0)
         asked: set[str] = set()
-        # Events seen since the last run that reported its usage: a run cut
-        # off by the budget may have made calls nobody reported yet.
-        unreported = False
         channel_id, last_id = self.channel_id, self.last_id
         while channel_id:
             moved_to = None
@@ -139,13 +136,11 @@ class RoundFollower:
                         if moved_to:
                             break
                         continue
-                    unreported = True
                     yield event
                     if kind == "input_required" and event.get("tool_call_id"):
                         asked.add(event["tool_call_id"])
                     elif kind == ROUND_SUSPENDED:
                         self.usages.append(event.get("usage"))
-                        unreported = False
                         if asked & set(event.get("tool_call_ids") or []):
                             self.status = TURN_INPUT_REQUIRED
                             return
@@ -160,10 +155,11 @@ class RoundFollower:
             finally:
                 await stream.aclose()
             channel_id, last_id = moved_to, "0"
-        if unreported:
-            # Still in progress: what the cut-off run spent is unknown, so
-            # the request's total is too (reported as null, not too low).
-            self.usages.append(None)
+        # Still in progress when the budget ran out: a continuation may be
+        # running (or have been queued and started its first model call
+        # without emitting anything yet), so what it spent is unknown and so
+        # is the request's total — reported as null, never too low.
+        self.usages.append(None)
 
     async def run(self) -> RoundFollower:
         async for _ in self.events():

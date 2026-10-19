@@ -609,7 +609,8 @@ async def test_invoke_past_its_budget_reports_the_turn_in_progress(env, http, wo
     assert out["status"] == "in_progress"
     row = await _checkpoint(chat_id)
     assert out["channel_id"] == row.channel_id == (await _chat(chat_id)).active_channel_id
-    assert out["usage"]["calls"] == 1
+    # The turn goes on past this request: its total is not known here.
+    assert out["usage"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -803,10 +804,11 @@ async def test_following_reports_a_failed_continuation_and_runs_out_of_time(monk
     assert f.status == "in_progress" and f.usages == [None]
     assert sync_turns.combine_usage([_usage(1), *f.usages]) is None
 
-    # Nothing happened on the channel: nothing unreported.
+    # Nothing on the channel yet: a queued continuation may still be inside
+    # its first model call, so that is unknown too.
     _fake_channel(monkeypatch, [])
     f = await sync_turns.RoundFollower("c", timeout=0.3).run()
-    assert f.status == "in_progress" and f.usages == []
+    assert f.status == "in_progress" and f.usages == [None]
 
 
 async def test_following_moves_with_the_round(monkeypatch):

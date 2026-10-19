@@ -165,7 +165,7 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 - Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
 - `usage` is `null` only if it couldn't be worked out.
 - If the session's chat is already busy with another request, the message is queued into that run, `status` is `injected`, `reply` is empty and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
-- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. If the request ran out of time while that part was still running, `usage` is `null`, because those calls can't be counted yet. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
+- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. If the request runs out of time before the turn finishes (status `in_progress`), `usage` is `null`: the rest of the turn may already be making calls that can't be counted yet. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
 
 `POST /chats/{id}/messages` (non-streaming) returns the same `usage` with the reply message.
 

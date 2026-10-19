@@ -109,7 +109,7 @@ it on the channel (`done`, or the held-back `round_suspended`). The
 follower adds those parts to the request's own. If a continuation reports
 nothing (for example a worker from before this change), the total is
 `null`, not an under-count. The same holds when the request's budget runs
-out while a continuation is mid-run. The calls made after an answer belong to the
+out before a followed continuation reports (status `in_progress`), even before its first event. The calls made after an answer belong to the
 answer's request when it waits, and to no request when it doesn't. That is
 the same as a keep-alive stream, which never reported usage.
 
