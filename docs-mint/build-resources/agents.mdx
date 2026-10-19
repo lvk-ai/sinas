@@ -159,7 +159,7 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 
 - The fields are the same as the metrics of [`/api/v1/usage/summary`](/admin/usage-cost#api). `prompt_tokens` includes the cache reads and writes.
 - `cost_usd` adds up the calls that have a price. It's `null` when no call could be priced. When `unpriced_calls` is above 0, the cost covers only the priced calls. See [Usage & Cost](/admin/usage-cost) for setting prices.
-- Each call is also an `llm_usage` row, saved before the response is sent, so `/api/v1/usage` reports agree with it right away. (A call whose row takes more than 10 seconds to save is counted as unpriced rather than holding up the response.)
+- Each call is also an `llm_usage` row, saved before the response is sent, so `/api/v1/usage` reports agree with it right away. `cost_usd` only includes calls whose row was saved. If a row fails to save, or takes more than 10 seconds, that call still counts in `calls` and the token totals (it was made, and the provider bills it), but as unpriced, without its cost. In that rare case the tokens are higher than what `/api/v1/usage` has on record.
 - Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
 - `usage` is `null` only if it couldn't be worked out.
 - If the session's chat is already busy with another request, the message is queued into that run and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.

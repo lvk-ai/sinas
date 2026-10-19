@@ -319,6 +319,31 @@ async def test_cache_tokens(env, http):
     assert usage["prompt_tokens"] == 4100 and usage["calls"] == 2
 
 
+async def test_row_that_fails_to_commit_is_reported_unpriced(env, http, monkeypatch):
+    """The real insert prices the row, then its commit fails in Postgres: the
+    response must not claim a cost /usage has no row for."""
+    real_price_usage = llm_pricing.price_usage
+
+    async def price_then_break(session, values):
+        await real_price_usage(session, values)
+        assert values.get("cost_usd") is not None  # it was priced
+        values["provider_type"] = "x" * 100  # longer than the column: commit fails
+
+    monkeypatch.setattr(llm_pricing, "price_usage", price_then_break)
+    agent = await env["make_agent"]()
+    chat_id = await _new_session_chat(env["user"], agent, "unsaved")
+    _script(chat_id, _text("hello", _usage(1000, 100)))
+
+    usage = (await _invoke(http, env["user"], agent, {"message": "hi", "session_key": "unsaved"}))[
+        "usage"
+    ]
+
+    assert await _rows(chat_id) == []  # nothing saved
+    # The call happened and is counted, but without a cost.
+    assert (usage["calls"], usage["total_tokens"]) == (1, 1100)
+    assert usage["cost_usd"] is None and usage["unpriced_calls"] == 1
+
+
 async def test_unpriced_model_has_null_cost(env, http):
     agent = await env["make_agent"](UNPRICED_MODEL)
     chat_id = await _new_session_chat(env["user"], agent, "unpriced")
@@ -441,11 +466,14 @@ class _Fixed(BaseLLMProvider):
         return {}
 
 
-def _fake_insert(monkeypatch, price: Optional[Decimal] = None, delay: float = 0.0):
+def _fake_insert(
+    monkeypatch, price: Optional[Decimal] = None, delay: float = 0.0, saved: bool = True
+):
     async def insert(values):
         await asyncio.sleep(delay)
         if price is not None:
             values["cost_usd"] = price
+        return saved
 
     monkeypatch.setattr(tracking, "_insert_usage", insert)
 
@@ -485,6 +513,17 @@ async def test_collector_waits_for_inserts_and_flags_unfinished_ones(monkeypatch
     # Not committed in time: counted, but not silently priced.
     assert totals["calls"] == 1 and totals["cost_usd"] is None and totals["unpriced_calls"] == 1
     await asyncio.sleep(0.5)  # let the slow insert finish inside this test's loop
+
+
+async def test_collector_excludes_the_cost_of_rows_that_failed_to_save(monkeypatch):
+    llm = UsageTrackingProvider(_Fixed(_usage(10, 1)))
+    # Priced, then the commit failed: the cost must not be reported.
+    _fake_insert(monkeypatch, price=Decimal("0.25"), saved=False)
+    with collect_usage() as collector:
+        await llm.complete(messages=[], model="m")
+    totals = await collector.totals()
+    assert totals["calls"] == 1 and totals["total_tokens"] == 11
+    assert totals["cost_usd"] is None and totals["unpriced_calls"] == 1
 
 
 async def test_collector_without_calls():

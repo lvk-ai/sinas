@@ -207,7 +207,9 @@ class TurnUsage(BaseModel):
     same chat, calls made by delegated sub-agents (they run as separate
     jobs, under their own chats), and background compaction. Field names
     match the `/api/v1/usage/summary` metrics; each call is also an
-    `llm_usage` row, committed before the response is returned.
+    `llm_usage` row, committed before the response is returned. A call
+    whose row failed to save (or took over 10s) is counted with its tokens
+    but as unpriced, so `cost_usd` never includes a cost /usage lacks.
     """
 
     calls: int = Field(description="LLM calls made")

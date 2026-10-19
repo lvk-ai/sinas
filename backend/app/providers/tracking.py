@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 _CONTEXT_KEYS = ("user_id", "chat_id", "message_id", "agent", "source")
 
 
-async def _insert_usage(values: dict[str, Any]) -> None:
+async def _insert_usage(values: dict[str, Any]) -> bool:
+    """Price and save one llm_usage row. True only when the row committed."""
     try:
         from app.core.database import AsyncSessionLocal
         from app.models import LLMUsage
@@ -41,8 +42,10 @@ async def _insert_usage(values: dict[str, Any]) -> None:
             await price_usage(session, values)
             session.add(LLMUsage(**values))
             await session.commit()
+        return True
     except Exception as e:
         logger.warning(f"Failed to record LLM usage: {e}")
+        return False
 
 
 # How long UsageCollector.totals() waits for outstanding usage inserts.
@@ -55,6 +58,13 @@ _TOKEN_FIELDS = (
     "cache_read_tokens",
     "cache_write_tokens",
 )
+
+
+def _saved(task: asyncio.Task) -> bool:
+    """Whether an insert task finished and reported its row committed."""
+    if not task.done() or task.cancelled() or task.exception() is not None:
+        return False
+    return task.result() is True
 
 
 class UsageCollector:
@@ -82,13 +92,15 @@ class UsageCollector:
         them. Field names match the /usage/summary metrics.
 
         `cost_usd` adds up the priced calls and is None when calls were made
-        but none was priced. A call whose recording hadn't finished within
-        `timeout` counts as unpriced, so a slow insert shows in
-        `unpriced_calls` rather than as a silently lower cost.
+        but none was priced. `cost_usd` only ever includes rows that were
+        saved: a call whose row failed to commit, or hadn't committed within
+        `timeout`, counts as unpriced, so the cost matches what /usage
+        reports. Its tokens are still counted — the call was made and the
+        provider bills it — so in that rare case the token totals exceed
+        what /usage has on record; `unpriced_calls` shows it.
         """
         self._closed = True
         entries = list(self._entries)
-        pending: set[asyncio.Task] = set()
         if entries:
             _, pending = await asyncio.wait([task for _, task in entries], timeout=timeout)
             if pending:
@@ -104,7 +116,7 @@ class UsageCollector:
                 result[field] += int(values.get(field) or 0)
             if values.get("error") is not None:
                 result["errors"] += 1
-            call_cost = None if task in pending else values.get("cost_usd")
+            call_cost = values.get("cost_usd") if _saved(task) else None
             if call_cost is None:
                 result["unpriced_calls"] += 1
             else:
