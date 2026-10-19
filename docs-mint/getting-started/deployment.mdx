@@ -25,6 +25,44 @@ The installer will:
 
 All services start automatically: PostgreSQL, PgBouncer, Redis, ClickHouse, the backend API (port 8000), queue workers, the scheduler, and the web console (port 51245). Migrations run automatically on startup.
 
+### A specific version or release candidate
+
+By default the installer installs the latest release (`main`'s files, `:latest` images). To install a particular release or release candidate, fetch the installer from that tag and set `SINAS_VERSION`:
+
+```bash
+V=0.5.0-rc.2
+sudo curl -fsSL https://raw.githubusercontent.com/sinas-platform/sinas/$V/install.sh -o /tmp/sinas-install.sh \
+  && sudo SINAS_VERSION=$V bash /tmp/sinas-install.sh
+```
+
+This downloads that tag's `docker-compose.yml` and writes `IMAGE_TAG=$V` to `.env`, so files and images match. `SINAS_BRANCH=dev` installs `dev`'s files with the `:dev` images; for any other branch, also set `SINAS_IMAGE_TAG`.
+
+The choice is saved in `.env` as `SINAS_SOURCE` (for example `version:0.5.0-rc.2` or `branch:dev`) next to `IMAGE_TAG`. A later run without `SINAS_VERSION`, `SINAS_BRANCH` or `SINAS_IMAGE_TAG` reuses it and says so, so an update keeps files and images together. Running it with another `SINAS_VERSION` or `SINAS_BRANCH` moves the install there. The update command printed at the end of an install repeats the settings it used.
+
+### Non-interactive install
+
+For CI, provisioning scripts or agents, set `SINAS_NONINTERACTIVE=1` and pass the answers as environment variables instead of answering prompts:
+
+| Variable | Required | Description |
+|---|---|---|
+| `SINAS_DOMAIN` | yes | Domain name |
+| `SINAS_ACME_EMAIL` | yes | Email for SSL certificates |
+| `SINAS_SUPERADMIN_EMAIL` | no | Superadmin email (default: `SINAS_ACME_EMAIL`) |
+| `SINAS_AUTH_MODE` | no | `otp` (default), `password` or `password+otp` |
+| `SINAS_SUPERADMIN_PASSWORD` | no | Password modes only, at least 8 characters. Empty: a one-time setup link is printed at the end |
+| `SINAS_SMTP_HOST`, `SINAS_SMTP_USER`, `SINAS_SMTP_PASSWORD` | with `otp` or `password+otp` | SMTP server for login codes |
+| `SINAS_SMTP_PORT`, `SINAS_SMTP_DOMAIN` | no | SMTP port (default `587`) and from-domain |
+| `SINAS_CONFIGURE_FIREWALL` | no | `y` to configure UFW on Linux (default `n`) |
+| `SINAS_START` | no | `n` to write the configuration without starting Sinas (default `y`) |
+
+```bash
+sudo SINAS_NONINTERACTIVE=1 SINAS_VERSION=0.5.0-rc.2 \
+  SINAS_DOMAIN=sinas.example.com SINAS_ACME_EMAIL=ops@example.com SINAS_AUTH_MODE=password \
+  bash /tmp/sinas-install.sh
+```
+
+A missing or invalid answer stops the installer with an error before `.env` is written. An existing `.env` is kept, as in interactive runs. The setup link is printed on a line of its own under step 4 of the summary. The installer exits non-zero when the install did not finish: Sinas was to start and the backend is not running, or a password-mode superadmin got no setup link (the backend did not become ready, or it is a version before 0.5.0 without the setup-link command). It says where to look in each case. `SINAS_START=n` (configuration only) exits zero.
+
 ## Update
 
 ```bash
