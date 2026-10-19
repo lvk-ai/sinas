@@ -1,8 +1,10 @@
 """GET /chats: keyset pagination, filters, last message, backward compatibility.
 
 Without `limit` or `cursor` the endpoint returns every matching chat, as it
-always did. With either, it returns one page and, when more follow, the
-cursor for the next one in the X-Next-Cursor header.
+always did, up to CHATS_UNPAGINATED_MAX: past that it returns the first
+ones, says so in X-Truncated, and carries the cursor for the rest. With
+either, it returns one page and, when more follow, the cursor for the next
+one in the X-Next-Cursor header.
 """
 
 import base64
@@ -13,7 +15,8 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
-from app.api.runtime.endpoints.chats import CHATS_PAGE_DEFAULT, encode_chat_cursor
+from app.api.runtime.endpoints.chats import CHATS_PAGE_DEFAULT, CHATS_PAGE_MAX, encode_chat_cursor
+from app.core.config import Settings, settings
 from app.models.chat import Chat, Message
 from tests.conftest import auth_headers
 
@@ -314,7 +317,7 @@ async def test_cursor_headers_exposed_to_browsers(client, test_user):
         headers={**auth_headers(test_user), "Origin": "http://console.test"},
     )
     exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
-    assert {"x-next-cursor", "link"} <= exposed
+    assert {"x-next-cursor", "link", "x-truncated"} <= exposed
 
 
 async def test_cursor_in_another_timezone_is_the_same_point(client, db, test_user):
@@ -328,3 +331,63 @@ async def test_cursor_in_another_timezone_is_the_same_point(client, db, test_use
     )
     assert r.status_code == 200, r.text
     assert [c["id"] for c in r.json()] == _expected(chats)[2:]
+
+
+async def test_unpaginated_past_the_cap_is_truncated_with_a_cursor(
+    client, db, test_user, monkeypatch, caplog
+):
+    """A user with more chats than CHATS_UNPAGINATED_MAX gets the newest ones,
+    told so, with the cursor for the rest (one response of every chat could
+    take the backend's memory)."""
+    monkeypatch.setattr(settings, "chats_unpaginated_max", 5)
+    chats = [await _chat(db, test_user, BASE + timedelta(seconds=i)) for i in range(8)]
+    h = auth_headers(test_user)
+
+    with caplog.at_level("WARNING", logger="app.api.runtime.endpoints.chats"):
+        r = await client.get("/chats", headers=h)
+    assert r.status_code == 200
+    assert [c["id"] for c in r.json()] == _expected(chats)[:5]
+    assert r.headers["x-truncated"] == "true"
+    cursor = r.headers["x-next-cursor"]
+    link = r.headers["link"]
+    assert link.startswith("</chats?") and link.endswith('>; rel="next"')
+    assert f"cursor={cursor}" in link and f"limit={CHATS_PAGE_MAX}" in link
+    assert any(
+        "more than 5 chats" in rec.getMessage() and str(test_user.id) in rec.getMessage()
+        for rec in caplog.records
+    )
+
+    # The cursor continues where the truncated list stopped, as a page.
+    r2 = await client.get("/chats", params={"cursor": cursor}, headers=h)
+    assert [c["id"] for c in r2.json()] == _expected(chats)[5:]
+    assert "x-next-cursor" not in r2.headers and "x-truncated" not in r2.headers
+
+    # Filters carry over into the Link.
+    r3 = await client.get("/chats", params={"include_archived": "true"}, headers=h)
+    assert "include_archived=true" in r3.headers["link"]
+
+
+@pytest.mark.parametrize("n", [4, 5])
+async def test_unpaginated_up_to_the_cap_is_unchanged(client, db, test_user, monkeypatch, n):
+    monkeypatch.setattr(settings, "chats_unpaginated_max", 5)
+    chats = [await _chat(db, test_user, BASE + timedelta(seconds=i)) for i in range(n)]
+    r = await client.get("/chats", headers=auth_headers(test_user))
+    assert [c["id"] for c in r.json()] == _expected(chats)
+    for header in ("x-truncated", "x-next-cursor", "link"):
+        assert header not in r.headers
+
+
+async def test_cap_does_not_apply_to_pages(client, db, test_user, monkeypatch):
+    monkeypatch.setattr(settings, "chats_unpaginated_max", 2)
+    chats = [await _chat(db, test_user, BASE + timedelta(seconds=i)) for i in range(6)]
+    r = await client.get("/chats", params={"limit": 4}, headers=auth_headers(test_user))
+    assert [c["id"] for c in r.json()] == _expected(chats)[:4]
+    assert "x-truncated" not in r.headers
+    assert r.headers["x-next-cursor"]
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cap_must_be_positive(monkeypatch, value):
+    monkeypatch.setenv("CHATS_UNPAGINATED_MAX", value)
+    with pytest.raises(ValueError, match="CHATS_UNPAGINATED_MAX"):
+        Settings()

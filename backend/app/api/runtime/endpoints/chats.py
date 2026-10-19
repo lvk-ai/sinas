@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 from sse_starlette.sse import EventSourceResponse
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
@@ -1086,6 +1085,22 @@ async def answer_pending_input(
 CHATS_PAGE_DEFAULT = 50
 CHATS_PAGE_MAX = 200
 _CURSOR_MAX_LEN = 256
+# What GET /chats returns of each chat (with the creator's email and the last
+# message's time). Not chat_metadata: agent input, which can be large.
+_CHAT_LIST_COLUMNS = (
+    Chat.id,
+    Chat.user_id,
+    Chat.agent_id,
+    Chat.agent_namespace,
+    Chat.agent_name,
+    Chat.title,
+    Chat.archived,
+    Chat.expires_at,
+    Chat.keep_alive,
+    Chat.active_channel_id,
+    Chat.created_at,
+    Chat.updated_at,
+)
 
 
 def encode_chat_cursor(updated_at: datetime, chat_id: uuid.UUID) -> str:
@@ -1143,7 +1158,9 @@ async def list_chats(
         le=CHATS_PAGE_MAX,
         description=(
             f"Page size (1-{CHATS_PAGE_MAX}). Passing `limit` or `cursor` turns on pagination; "
-            "without either, every matching chat is returned, as before."
+            "without either, every matching chat is returned, as before, up to "
+            "CHATS_UNPAGINATED_MAX (default 10000): past that the response is truncated, "
+            "says so in `X-Truncated: true`, and carries the cursor for the rest."
         ),
     ),
     cursor: Optional[str] = Query(
@@ -1165,12 +1182,20 @@ async def list_chats(
     Pages are keyset-based on (updated_at, id): chats created or updated
     while a client pages move to the front, so later pages neither repeat
     nor skip the other chats; the moved ones show on a fresh first page.
+
+    Unpaginated, the response holds at most CHATS_UNPAGINATED_MAX chats (one
+    response of a user's every chat could exhaust the backend's memory).
+    Past that it is the first CHATS_UNPAGINATED_MAX, with `X-Truncated: true`
+    and the same `X-Next-Cursor`/`Link` headers a page carries; `Link` asks
+    for pages of CHATS_PAGE_MAX.
     """
     user_id, permissions = current_user_data
     # No permission check needed - always filtered by user_id below
 
     paginated = limit is not None or cursor is not None
-    page_size = limit or CHATS_PAGE_DEFAULT
+    # Unpaginated callers get every chat up to the cap: one more is fetched to
+    # tell whether there were more.
+    page_size = (limit or CHATS_PAGE_DEFAULT) if paginated else settings.chats_unpaginated_max
 
     filters = [Chat.user_id == user_id]
     if not include_archived:
@@ -1184,47 +1209,45 @@ async def list_chats(
     # Select the page of chats first (ix_chats_user_id_updated_at_id), then
     # look up each one's last message on ix_messages_chat_id_created_at: one
     # index probe per returned chat instead of aggregating every message.
-    page_query = select(Chat).where(*filters).order_by(Chat.updated_at.desc(), Chat.id.desc())
-    if paginated:
-        page_query = page_query.limit(page_size + 1)
-    page = aliased(Chat, page_query.subquery("page"))
+    # Only the columns the response carries (_CHAT_LIST_COLUMNS), as plain
+    # rows: no ORM entities to track.
+    page = (
+        select(*_CHAT_LIST_COLUMNS)
+        .where(*filters)
+        .order_by(Chat.updated_at.desc(), Chat.id.desc())
+        .limit(page_size + 1)
+        .subquery("page")
+    )
     last_message_at = (
-        select(func.max(Message.created_at)).where(Message.chat_id == page.id).scalar_subquery()
+        select(func.max(Message.created_at)).where(Message.chat_id == page.c.id).scalar_subquery()
     )
     result = await db.execute(
-        select(page, User.email, last_message_at)
-        .join(User, page.user_id == User.id)
-        .order_by(page.updated_at.desc(), page.id.desc())
+        select(page, User.email.label("user_email"), last_message_at.label("last_message_at"))
+        .join(User, page.c.user_id == User.id)
+        .order_by(page.c.updated_at.desc(), page.c.id.desc())
     )
-    rows = result.all()
+    rows = result.mappings().all()
 
-    if paginated and len(rows) > page_size:
+    if len(rows) > page_size:
         rows = rows[:page_size]
-        last = rows[-1][0]
-        next_cursor = encode_chat_cursor(last.updated_at, last.id)
-        next_url = request.url.include_query_params(cursor=next_cursor, limit=page_size)
+        last = rows[-1]
+        next_cursor = encode_chat_cursor(last["updated_at"], last["id"])
+        next_url = request.url.include_query_params(
+            cursor=next_cursor, limit=page_size if paginated else CHATS_PAGE_MAX
+        )
         response.headers["X-Next-Cursor"] = next_cursor
         response.headers["Link"] = f'<{next_url.path}?{next_url.query}>; rel="next"'
+        if not paginated:
+            response.headers["X-Truncated"] = "true"
+            logger.warning(
+                "GET /chats without limit or cursor for user %s: more than %d chats, "
+                "returned the first %d with X-Truncated (the client should page)",
+                user_id,
+                page_size,
+                page_size,
+            )
 
-    return [
-        ChatResponse(
-            id=chat.id,
-            user_id=chat.user_id,
-            user_email=email,
-            agent_id=chat.agent_id,
-            agent_namespace=chat.agent_namespace,
-            agent_name=chat.agent_name,
-            title=chat.title,
-            archived=chat.archived,
-            expires_at=chat.expires_at,
-            keep_alive=chat.keep_alive,
-            active_channel_id=chat.active_channel_id,
-            created_at=chat.created_at,
-            updated_at=chat.updated_at,
-            last_message_at=last_message_at,
-        )
-        for chat, email, last_message_at in rows
-    ]
+    return [ChatResponse(**row) for row in rows]
 
 
 @router.get("/chats/{chat_id}", response_model=ChatWithMessages)
