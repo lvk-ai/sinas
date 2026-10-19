@@ -10,6 +10,9 @@ NC='\033[0m' # No Color
 
 REPO="sinas-platform/sinas"
 INSTALL_DIR="${SINAS_DIR:-/opt/sinas}"
+# Absolute from here on: the installer changes into it later, and reads its
+# .env both before and after.
+case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/${INSTALL_DIR#./}" ;; esac
 
 # What to install. Plain runs install main's files with :latest images.
 #   SINAS_VERSION=0.5.0-rc.1   a release or release candidate: that tag's files
