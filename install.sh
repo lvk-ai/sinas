@@ -17,6 +17,8 @@ INSTALL_DIR="${SINAS_DIR:-/opt/sinas}"
 #   SINAS_BRANCH=dev           a branch's files; images :dev for dev, :latest for
 #                              main, otherwise set SINAS_IMAGE_TAG as well
 #   SINAS_IMAGE_TAG=...        the image tag to run, overriding the above
+# The choice is saved in .env (SINAS_SOURCE, IMAGE_TAG): a later run without
+# any of these reuses it, so an update keeps files and images together.
 # Non-interactive installs (CI, agents): SINAS_NONINTERACTIVE=1 plus the
 # answers as SINAS_* variables; see https://docs.sinas.co/getting-started/deployment
 die() {
@@ -24,12 +26,35 @@ die() {
     exit 1
 }
 
+# A value from an existing install's .env (empty if none).
+saved() {
+    [ -f "${INSTALL_DIR}/.env" ] || return 0
+    grep "^$1=" "${INSTALL_DIR}/.env" | tail -n 1 | cut -d= -f2-
+}
+
+SOURCE_EXPLICIT=false
+SOURCE_REUSED=""
+if [ -n "$SINAS_VERSION" ] || [ -n "$SINAS_BRANCH" ] || [ -n "$SINAS_IMAGE_TAG" ]; then
+    SOURCE_EXPLICIT=true
+else
+    SAVED_SOURCE=$(saved SINAS_SOURCE)
+    case "$SAVED_SOURCE" in
+        version:?*) SINAS_VERSION="${SAVED_SOURCE#version:}" ;;
+        branch:?*) SINAS_BRANCH="${SAVED_SOURCE#branch:}" ;;
+    esac
+    if [ -n "$SAVED_SOURCE" ]; then
+        SINAS_IMAGE_TAG=$(saved IMAGE_TAG)
+        SOURCE_REUSED="$SAVED_SOURCE"
+    fi
+fi
+
 SINAS_VERSION="${SINAS_VERSION#v}"
 if [ -n "$SINAS_VERSION" ] && [ -n "$SINAS_BRANCH" ]; then
     die "Set SINAS_VERSION or SINAS_BRANCH, not both"
 fi
 if [ -n "$SINAS_VERSION" ]; then
     REF="$SINAS_VERSION"
+    SOURCE="version:${REF}"
     IMAGE_TAG="${SINAS_IMAGE_TAG:-$SINAS_VERSION}"
 else
     REF="${SINAS_BRANCH:-main}"
@@ -41,8 +66,20 @@ else
             [ -n "$IMAGE_TAG" ] || die "SINAS_BRANCH=${REF} has no images of its own: set SINAS_IMAGE_TAG too (or use SINAS_VERSION for a release)"
             ;;
     esac
+    SOURCE="branch:${REF}"
 fi
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${REF}"
+
+# The settings that select this source, to repeat in an update command.
+if [ -n "$SINAS_VERSION" ]; then
+    SOURCE_ENV="SINAS_VERSION=${REF}"
+    [ "$IMAGE_TAG" = "$REF" ] || SOURCE_ENV="${SOURCE_ENV} SINAS_IMAGE_TAG=${IMAGE_TAG}"
+else
+    SOURCE_ENV="SINAS_BRANCH=${REF}"
+    if [ -n "$IMAGE_TAG" ] && ! { [ "$REF" = dev ] && [ "$IMAGE_TAG" = dev ]; }; then
+        SOURCE_ENV="${SOURCE_ENV} SINAS_IMAGE_TAG=${IMAGE_TAG}"
+    fi
+fi
 
 NONINTERACTIVE=false
 case "${SINAS_NONINTERACTIVE:-}" in
@@ -55,6 +92,9 @@ echo "║     SINAS Core Platform Installer      ║"
 echo "╚════════════════════════════════════════╝"
 echo -e "${NC}"
 echo -e "${BLUE}Installing: ${REF} (images: ${IMAGE_TAG:-latest})${NC}"
+if [ -n "$SOURCE_REUSED" ]; then
+    echo -e "${YELLOW}  As this install was set up (SINAS_SOURCE=${SOURCE_REUSED} in .env). Set SINAS_VERSION or SINAS_BRANCH to change it.${NC}"
+fi
 
 # Detect OS
 OS_TYPE="unknown"
@@ -190,13 +230,16 @@ SERVICES_STARTED=false
 if [ -f .env ]; then
     echo -e "${GREEN}✓ Existing .env file found — using current configuration${NC}"
     echo -e "${YELLOW}  (Delete .env and re-run to reconfigure)${NC}"
-    # An update: pin the images to what was asked for, or say what .env pins.
-    ENV_IMAGE_TAG=$(grep "^IMAGE_TAG=" .env 2>/dev/null | tail -n 1 | cut -d= -f2)
-    if [ -n "$IMAGE_TAG" ] && [ "$IMAGE_TAG" != "$ENV_IMAGE_TAG" ]; then
-        (umask 077; { grep -v "^IMAGE_TAG=" .env || true; echo "IMAGE_TAG=$IMAGE_TAG"; } > .env.new)
-        cat .env.new > .env && rm -f .env.new
-        echo -e "${GREEN}✓ IMAGE_TAG=${IMAGE_TAG} written to .env${NC}"
-    elif [ -z "$IMAGE_TAG" ] && [ -n "$ENV_IMAGE_TAG" ]; then
+    # An update. An explicit choice is written to .env (an empty IMAGE_TAG
+    # means latest); without one, .env's own choice was reused above.
+    ENV_IMAGE_TAG=$(saved IMAGE_TAG)
+    if [ "$SOURCE_EXPLICIT" = true ]; then
+        if [ "$(saved SINAS_SOURCE)" != "$SOURCE" ] || [ "$ENV_IMAGE_TAG" != "$IMAGE_TAG" ]; then
+            (umask 077; { grep -v -e "^IMAGE_TAG=" -e "^SINAS_SOURCE=" .env || true; echo "SINAS_SOURCE=$SOURCE"; echo "IMAGE_TAG=$IMAGE_TAG"; } > .env.new)
+            cat .env.new > .env && rm -f .env.new
+            echo -e "${GREEN}✓ SINAS_SOURCE=${SOURCE}, IMAGE_TAG=${IMAGE_TAG:-(latest)} written to .env${NC}"
+        fi
+    elif [ -z "$SOURCE_REUSED" ] && [ -n "$ENV_IMAGE_TAG" ]; then
         echo -e "${YELLOW}⚠ .env pins IMAGE_TAG=${ENV_IMAGE_TAG}, but these files are ${REF}'s."
         echo -e "  To install a version's files and images together, set SINAS_VERSION (e.g. SINAS_VERSION=${ENV_IMAGE_TAG}).${NC}"
     fi
@@ -352,7 +395,9 @@ SUPERADMIN_PASSWORD=$SUPERADMIN_PASSWORD
 DOMAIN=$DOMAIN
 ACME_EMAIL=$ACME_EMAIL
 
-# Images (empty = latest)
+# What this install runs: where its files come from, and its images
+# (empty = latest). A plain re-run of the installer reuses both.
+SINAS_SOURCE=$SOURCE
 IMAGE_TAG=$IMAGE_TAG
 
 # Function Execution
@@ -413,7 +458,9 @@ else
     START_SERVICES=${START_SERVICES:-Y}
 fi
 
+STARTED=false
 if [[ "$START_SERVICES" =~ ^[Yy]$ ]]; then
+    STARTED=true
     if ! docker info &> /dev/null; then
         echo -e "${RED}Error: Docker daemon is not running${NC}"
         exit 1
@@ -429,11 +476,11 @@ if [[ "$START_SERVICES" =~ ^[Yy]$ ]]; then
     echo -e "${YELLOW}Waiting for services to be ready...${NC}"
     sleep 10
 
-    if docker ps | grep -q sinas; then
+    if docker compose ps --status running --services 2>/dev/null | grep -qx backend; then
         echo -e "${GREEN}✓ Services started successfully${NC}"
         SERVICES_STARTED=true
     else
-        echo -e "${RED}⚠ Services may have failed. Check: docker compose logs${NC}"
+        echo -e "${RED}⚠ The backend is not running. Check: docker compose ps; docker compose logs backend${NC}"
     fi
 fi
 
@@ -449,7 +496,7 @@ WANTS_SETUP_LINK=false
 if [ "$FRESH_INSTALL" = true ] && [[ "$AUTH_MODE" == *"password"* ]] && [ -z "$SUPERADMIN_PASSWORD" ]; then
     WANTS_SETUP_LINK=true
 fi
-if [ "$WANTS_SETUP_LINK" = true ] && [ "$SERVICES_STARTED" = true ]; then
+if [ "$WANTS_SETUP_LINK" = true ] && [ "$STARTED" = true ]; then
     echo -e "${YELLOW}Creating the superadmin's one-time setup link...${NC}"
     for _ in $(seq 1 36); do
         # 0: the command exists; 3: it does not; anything else: backend not up yet
@@ -507,10 +554,12 @@ elif [ "$SETUP_LINK_UNSUPPORTED" = true ]; then
     echo -e "   in the backend logs instead:${NC}"
     echo "   cd ${INSTALL_DIR} && docker compose logs backend | grep -A8 'SUPERADMIN SETUP'"
     echo "   Or set SUPERADMIN_PASSWORD in .env and run: docker compose up -d"
-elif [ "$WANTS_SETUP_LINK" = true ] && [ "$SERVICES_STARTED" = true ]; then
+elif [ "$WANTS_SETUP_LINK" = true ] && [ "$STARTED" = true ]; then
     echo ""
-    echo -e "   ${YELLOW}The setup link could not be created yet (the backend was not ready)."
-    echo -e "   Once it is up, run:${NC}"
+    echo -e "   ${RED}No setup link: the backend did not become ready. See why with:${NC}"
+    echo "   cd ${INSTALL_DIR} && docker compose ps && docker compose logs --tail 100 backend"
+    echo "   curl -s http://localhost:${BACKEND_PORT:-8000}/health"
+    echo "   Once it is healthy, get the link with:"
     echo "   cd ${INSTALL_DIR} && ${SETUP_LINK_CMD}"
 elif [ "$WANTS_SETUP_LINK" = true ]; then
     echo ""
@@ -519,20 +568,26 @@ elif [ "$WANTS_SETUP_LINK" = true ]; then
     echo "   cd ${INSTALL_DIR} && ${SETUP_LINK_CMD}"
 fi
 echo ""
-echo "5. Update:"
+echo "5. Update (same source: ${SOURCE}, images: ${IMAGE_TAG:-latest}):"
+echo "   curl -fsSL ${RAW_URL}/install.sh -o /tmp/sinas-install.sh \\"
+echo "     && sudo ${SOURCE_ENV} bash /tmp/sinas-install.sh"
 if [ -n "$SINAS_VERSION" ]; then
     echo "   To another version: curl -fsSL https://raw.githubusercontent.com/${REPO}/<version>/install.sh -o /tmp/sinas-install.sh \\"
     echo "     && sudo SINAS_VERSION=<version> bash /tmp/sinas-install.sh"
-else
-    echo "   curl -fsSL ${RAW_URL}/install.sh -o /tmp/sinas-install.sh && sudo bash /tmp/sinas-install.sh"
 fi
 echo ""
 echo "6. Logs:"
 echo "   cd ${INSTALL_DIR} && docker compose logs -f"
 echo ""
 
-# A password-mode install whose superadmin cannot get a setup link from this
-# script did not finish: say so in the exit status too (CI, agents).
-if [ "$SETUP_LINK_UNSUPPORTED" = true ]; then
+# Say so in the exit status too (CI, agents) when the install did not
+# finish: services were to start and did not, or a password-mode
+# superadmin got no setup link. SINAS_START=n (configuration only) succeeds.
+if [ "$STARTED" = true ] && ! docker compose ps --status running --services 2>/dev/null | grep -qx backend; then
+    echo -e "${RED}The backend is not running. Check: cd ${INSTALL_DIR} && docker compose ps && docker compose logs --tail 100 backend${NC}" >&2
+    exit 1
+fi
+if [ "$WANTS_SETUP_LINK" = true ] && [ "$STARTED" = true ] && [ -z "$SETUP_LINK" ]; then
+    echo -e "${RED}Install incomplete: no setup link for the superadmin (see step 4 above).${NC}" >&2
     exit 1
 fi

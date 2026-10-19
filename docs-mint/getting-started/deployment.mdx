@@ -35,7 +35,9 @@ sudo curl -fsSL https://raw.githubusercontent.com/sinas-platform/sinas/$V/instal
   && sudo SINAS_VERSION=$V bash /tmp/sinas-install.sh
 ```
 
-This downloads that tag's `docker-compose.yml` and writes `IMAGE_TAG=$V` to `.env`, so files and images match. Running it again with another `SINAS_VERSION` moves an existing install to that version. `SINAS_BRANCH=dev` installs `dev`'s files with the `:dev` images; for any other branch, also set `SINAS_IMAGE_TAG`.
+This downloads that tag's `docker-compose.yml` and writes `IMAGE_TAG=$V` to `.env`, so files and images match. `SINAS_BRANCH=dev` installs `dev`'s files with the `:dev` images; for any other branch, also set `SINAS_IMAGE_TAG`.
+
+The choice is saved in `.env` as `SINAS_SOURCE` (for example `version:0.5.0-rc.2` or `branch:dev`) next to `IMAGE_TAG`. A later run without `SINAS_VERSION`, `SINAS_BRANCH` or `SINAS_IMAGE_TAG` reuses it and says so, so an update keeps files and images together. Running it with another `SINAS_VERSION` or `SINAS_BRANCH` moves the install there. The update command printed at the end of an install repeats the settings it used.
 
 ### Non-interactive install
 
@@ -59,7 +61,7 @@ sudo SINAS_NONINTERACTIVE=1 SINAS_VERSION=0.5.0-rc.2 \
   bash /tmp/sinas-install.sh
 ```
 
-A missing or invalid answer stops the installer with an error before `.env` is written. An existing `.env` is kept, as in interactive runs. The setup link is printed on a line of its own under step 4 of the summary. If the installed backend has no setup-link command (versions before 0.5.0), the installer says where to find the link instead and exits non-zero.
+A missing or invalid answer stops the installer with an error before `.env` is written. An existing `.env` is kept, as in interactive runs. The setup link is printed on a line of its own under step 4 of the summary. The installer exits non-zero when the install did not finish: Sinas was to start and the backend is not running, or a password-mode superadmin got no setup link (the backend did not become ready, or it is a version before 0.5.0 without the setup-link command). It says where to look in each case. `SINAS_START=n` (configuration only) exits zero.
 
 ## Update
 
