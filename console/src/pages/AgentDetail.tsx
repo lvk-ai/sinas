@@ -2,7 +2,7 @@ import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient, API_BASE_URL } from '../lib/api';
 import { useState, useEffect } from 'react';
-import { ArrowLeft, Save, Trash2, Loader2, Bot } from 'lucide-react';
+import { ArrowLeft, Save, Trash2, Loader2, Bot, ArrowUp, ArrowDown, Plus, X } from 'lucide-react';
 import type { AgentUpdate, EffortLevel } from '../types';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { ApiUsage } from '../components/ApiUsage';
@@ -15,6 +15,14 @@ import {
   retentionMode,
   type RetentionMode,
 } from '../lib/retention';
+import {
+  moveRule,
+  toolApprovalsDraft,
+  toolApprovalsError,
+  toolApprovalsPayload,
+  type ToolApprovalAction,
+  type ToolApprovals,
+} from '../lib/toolApprovals';
 
 export function AgentDetail() {
   const { namespace, name } = useParams<{ namespace: string; name: string }>();
@@ -173,6 +181,7 @@ export function AgentDetail() {
         default_keep_alive: agent.default_keep_alive,
         retention_days: agent.retention_days ?? null,
         system_tools: agent.system_tools || [],
+        tool_approvals: agent.tool_approvals ? toolApprovalsDraft(agent.tool_approvals) : undefined,
       });
       setRetentionChoice(retentionMode(agent.retention_days));
       setRetentionText(agent.retention_days ? String(agent.retention_days) : '');
@@ -189,6 +198,11 @@ export function AgentDetail() {
     staleTime: 60_000,
     refetchOnWindowFocus: false,
   });
+
+  // Permission mode (tool_approvals): edited as a draft, normalized on save.
+  const approvalsDraft = toolApprovalsDraft(formData.tool_approvals ?? agent?.tool_approvals);
+  const approvalsError = toolApprovalsError(approvalsDraft);
+  const setApprovals = (next: ToolApprovals) => setFormData((prev) => ({ ...prev, tool_approvals: next }));
 
   const chooseRetention = (mode: RetentionMode, text: string) => {
     setRetentionChoice(mode);
@@ -220,7 +234,7 @@ export function AgentDetail() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (retentionInvalid) return;
+    if (retentionInvalid || approvalsError) return;
     // Enter can submit before an MCP pattern field blurs: fold any typed
     // drafts into the submitted bindings so nothing the user typed is lost.
     let submitted = formData;
@@ -232,6 +246,9 @@ export function AgentDetail() {
       }
       submitted = { ...formData, enabled_mcp_servers: merged };
     }
+    // Normalized, or left out (undefined is not serialized) when there is
+    // nothing to say: an agent without a setting saves without one.
+    submitted = { ...submitted, tool_approvals: toolApprovalsPayload(approvalsDraft, agent?.tool_approvals) };
     updateMutation.mutate(submitted);
   };
 
@@ -2187,6 +2204,9 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                       { key: 'configIntrospection', label: 'Config Introspection', desc: 'Read-only access to inspect the current configuration: list resource types, browse agents/queries/functions, read full details.' },
                       { key: 'packageManagement', label: 'Package Management', desc: 'Validate, preview, install/uninstall Sinas packages. Requires approval for writes.' },
                       { key: 'artifacts', label: 'Artifacts', desc: 'Create and update artifacts: small interactive pages shown in the chat, which the user can keep and share. Limited to the queries, functions and stores this agent has enabled.' },
+                      { key: 'workbench', label: 'Workbench', desc: "A private file tree per chat: the agent reads, writes and versions files there, checks files out of collections and promotes results back. With Code Execution, runs work on the workbench's files." },
+                      { key: 'askUser', label: 'Ask User', desc: 'Lets the agent stop and ask the user a question, optionally with suggested answers. The conversation waits until the user answers in the chat.' },
+                      { key: 'background', label: 'Background Work', desc: 'Run code in the background, schedule wakeups and create watch URLs; results and events are delivered back into the chat when they arrive.' },
                     ];
 
                     return (
@@ -2297,6 +2317,130 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
           </div>
         </div>
 
+        <div className="card">
+          <h2 className="text-lg font-semibold text-gray-100 mb-1">Tool Approvals</h2>
+          <p className="text-xs text-gray-500 mb-4">
+            Which tool calls stop and wait for the user to approve them in the chat. For each call, the first of
+            these that applies decides: an &ldquo;always allow&rdquo; the user gave earlier in the chat, then the
+            first rule below whose pattern matches the tool name, then the tool&rsquo;s own &ldquo;requires
+            approval&rdquo; setting, then the default. A rule set to Run overrides a function&rsquo;s own approval
+            requirement.
+          </p>
+
+          <div className="space-y-4">
+            <div>
+              <label htmlFor="tool_approvals_default" className="block text-sm font-medium text-gray-300 mb-2">
+                Default
+              </label>
+              <select
+                id="tool_approvals_default"
+                value={approvalsDraft.default}
+                onChange={(e) => setApprovals({ ...approvalsDraft, default: e.target.value as ToolApprovalAction })}
+                className="input max-w-72"
+              >
+                <option value="auto">Run without asking</option>
+                <option value="ask">Ask for approval</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                For tools that no rule matches and that don&rsquo;t require approval themselves.
+              </p>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="block text-sm font-medium text-gray-300">Rules</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setApprovals({ ...approvalsDraft, rules: [...approvalsDraft.rules, { match: '', action: 'ask' }] })
+                  }
+                  className="btn btn-secondary flex items-center text-xs px-2.5 py-1"
+                >
+                  <Plus className="w-3.5 h-3.5 mr-1" />
+                  Add rule
+                </button>
+              </div>
+              {approvalsDraft.rules.length === 0 ? (
+                <div className="bg-surface-0 rounded-lg p-3 border border-line-soft">
+                  <p className="text-sm text-gray-500">
+                    No rules: every tool follows its own setting, then the default.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2 border border-line-soft rounded-lg p-3">
+                  {approvalsDraft.rules.map((rule, idx) => {
+                    const setRules = (rules: typeof approvalsDraft.rules) => setApprovals({ ...approvalsDraft, rules });
+                    const updateRule = (patch: Partial<typeof rule>) =>
+                      setRules(approvalsDraft.rules.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+                    return (
+                      <div key={idx} className="flex items-center gap-2">
+                        <span className="shrink-0 w-6 text-right text-xs text-gray-500">{idx + 1}.</span>
+                        <input
+                          type="text"
+                          value={rule.match}
+                          onChange={(e) => updateRule({ match: e.target.value })}
+                          placeholder="Tool name or glob, e.g. sinas_package_*"
+                          aria-label={`Rule ${idx + 1} tool name pattern`}
+                          aria-invalid={!rule.match.trim()}
+                          className="input flex-1 min-w-0 font-mono text-sm"
+                        />
+                        {/* .input is width: 100%; the wrapper sets the width */}
+                        <div className="w-28 shrink-0">
+                          <select
+                            value={rule.action}
+                            onChange={(e) => updateRule({ action: e.target.value as ToolApprovalAction })}
+                            aria-label={`Rule ${idx + 1} action`}
+                            className="input"
+                          >
+                            <option value="ask">Ask</option>
+                            <option value="auto">Run</option>
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          title="Move up"
+                          aria-label={`Move rule ${idx + 1} up`}
+                          disabled={idx === 0}
+                          onClick={() => setRules(moveRule(approvalsDraft.rules, idx, -1))}
+                          className="p-1.5 rounded text-gray-400 hover:text-gray-100 hover:bg-hover disabled:opacity-30 disabled:pointer-events-none"
+                        >
+                          <ArrowUp className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          title="Move down"
+                          aria-label={`Move rule ${idx + 1} down`}
+                          disabled={idx === approvalsDraft.rules.length - 1}
+                          onClick={() => setRules(moveRule(approvalsDraft.rules, idx, 1))}
+                          className="p-1.5 rounded text-gray-400 hover:text-gray-100 hover:bg-hover disabled:opacity-30 disabled:pointer-events-none"
+                        >
+                          <ArrowDown className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          title="Remove rule"
+                          aria-label={`Remove rule ${idx + 1}`}
+                          onClick={() => setRules(approvalsDraft.rules.filter((_, i) => i !== idx))}
+                          className="p-1.5 rounded text-gray-400 hover:text-red-400 hover:bg-hover"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {approvalsError && <p className="text-xs text-red-400 mt-1">{approvalsError}</p>}
+              <p className="text-xs text-gray-500 mt-1">
+                A pattern is a glob over the tool name the model calls (<code className="text-xs bg-surface-1 px-1 rounded">*</code>{' '}
+                matches anything), e.g. <code className="text-xs bg-surface-1 px-1 rounded">workbench_promote</code> or{' '}
+                <code className="text-xs bg-surface-1 px-1 rounded">mcp_*</code>. The first matching rule wins: use the
+                arrows to order them.
+              </p>
+            </div>
+          </div>
+        </div>
+
         <div className="card bg-surface-0">
           <h2 className="text-lg font-semibold text-gray-100 mb-4">Metadata</h2>
           <dl className="grid grid-cols-2 gap-4 text-sm">
@@ -2326,7 +2470,8 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
           </Link>
           <button
             type="submit"
-            disabled={updateMutation.isPending}
+            disabled={updateMutation.isPending || !!approvalsError}
+            title={approvalsError ?? undefined}
             className="btn btn-primary flex items-center"
           >
             {updateMutation.isPending ? (
