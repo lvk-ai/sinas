@@ -544,8 +544,9 @@ async def start_background_job(
         job_id=job_id, chat_id=chat_id, user_id=user_id, code=code, description=description,
         tool_call_id=tool_call_id, pending_completion_id=pending_completion_id,
         api_key_id=current_api_key_id(), trace_context=inject_trace_context(),
+        # Timed by the function's own arq timeout (WorkerSettings): arq's
+        # enqueue_job takes no per-job timeout.
         _job_id=job_id, _queue_name=BACKGROUND_QUEUE,
-        _job_timeout=settings.code_execution_timeout + settings.background_job_grace_seconds,
     )
     out = {"job_id": job_id, "status": "queued", "description": description}
     if pending_completion_id is None:

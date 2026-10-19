@@ -7,6 +7,8 @@ import time
 import uuid
 from typing import Any
 
+from arq import func
+from arq.cron import cron
 from arq.worker import Retry
 
 from app.core.config import settings
@@ -498,10 +500,20 @@ async def execute_background_code_job(ctx: dict, **kwargs: Any) -> None:
         )
 
 
+def _background_job_timeout() -> int:
+    return settings.code_execution_timeout + settings.background_job_grace_seconds
+
+
 class WorkerSettings:
     """arq worker settings for function execution."""
 
-    functions = [execute_function_job, execute_background_code_job]
+    functions = [
+        execute_function_job,
+        # arq times jobs per function (enqueue_job takes no timeout): a
+        # background run gets code_execution_timeout plus the grace a waiting
+        # round allows it, not the queue default.
+        func(execute_background_code_job, timeout=_background_job_timeout()),
+    ]
     on_startup = function_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
@@ -524,10 +536,8 @@ class WorkerSettings:
 
 
 # Import agent jobs for combined worker
-from arq import func
-from arq.cron import cron
-
 from app.queue.agent_jobs import (
+    agent_function_timeout,
     execute_agent_delegate_resume_job,
     execute_agent_message_job,
     execute_agent_resume_job,
@@ -597,10 +607,13 @@ def _retention_job_timeout() -> int:
 class AgentWorkerSettings:
     """arq worker settings for agent message processing."""
 
+    # Each agent job enforces its own job_timeout (the chat's or agent's,
+    # else AGENT_JOB_TIMEOUT; arq has no per-job timeout); arq's, per
+    # function, is only the backstop above the longest one allowed.
     functions = [
-        execute_agent_message_job,
-        execute_agent_resume_job,
-        execute_agent_delegate_resume_job,
+        func(execute_agent_message_job, timeout=agent_function_timeout()),
+        func(execute_agent_resume_job, timeout=agent_function_timeout()),
+        func(execute_agent_delegate_resume_job, timeout=agent_function_timeout()),
         func(chat_retention_run_job, timeout=_retention_job_timeout(), max_tries=1),
     ]
     # Deferred-round expiry sweep: minutely, deduplicated across workers
@@ -636,7 +649,7 @@ class AgentWorkerSettings:
     queue_name = "sinas:queue:agents"
     poll_delay = settings.queue_poll_delay
     max_jobs = settings.queue_agent_concurrency
-    job_timeout = settings.agent_job_timeout  # Default timeout, can be overridden per-job
+    job_timeout = settings.agent_job_timeout  # the cron jobs'; agent jobs time themselves (above)
     max_tries = 1  # No retry for agent conversations (side effects)
 
 
@@ -670,9 +683,9 @@ class SubAgentWorkerSettings:
     """
 
     functions = [
-        execute_agent_message_job,
-        execute_agent_resume_job,
-        execute_agent_delegate_resume_job,
+        func(execute_agent_message_job, timeout=agent_function_timeout()),
+        func(execute_agent_resume_job, timeout=agent_function_timeout()),
+        func(execute_agent_delegate_resume_job, timeout=agent_function_timeout()),
     ]
     on_startup = agent_worker_startup
     on_shutdown = shutdown

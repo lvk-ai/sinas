@@ -66,8 +66,9 @@ def test_all_agent_jobs_registered_on_both_workers():
         execute_agent_resume_job,
         execute_agent_delegate_resume_job,
     ):
-        assert job in AgentWorkerSettings.functions
-        assert job in SubAgentWorkerSettings.functions
+        for worker_settings in (AgentWorkerSettings, SubAgentWorkerSettings):
+            registered = [getattr(f, "coroutine", f) for f in worker_settings.functions]
+            assert job in registered, (job.__name__, worker_settings.__name__)
 
 
 def test_delegate_mode_defaults_to_block():
