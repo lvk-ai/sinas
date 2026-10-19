@@ -922,15 +922,15 @@ async def execute_single_tool(
                     }
 
             elif tool_name == "ask_user":
-                # Deferred tool: in queued/streamed chats the round suspends
-                # on it before execution (message_service splits it off), so
-                # reaching this branch means a synchronous path with no
-                # stream channel — there is nobody to wait for.
+                # Deferred tool: every chat tool round splits it off and
+                # suspends on it before execution (message_service), queued
+                # or inline. Only a caller outside a chat tool round gets
+                # here, and it has no conversation to pause.
                 result = {
                     "error": (
-                        "ask_user is unavailable in this synchronous context "
-                        "— there is no live conversation to pause. Answer "
-                        "with the information you have."
+                        "ask_user can only be used in a chat turn, where the "
+                        "conversation can wait for the answer. Answer with "
+                        "the information you have."
                     )
                 }
             elif tool_name == "continue_execution":

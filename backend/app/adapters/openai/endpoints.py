@@ -1,15 +1,17 @@
 """OpenAI SDK-compatible adapter endpoints."""
+import asyncio
 import json
 import logging
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user_with_permissions, set_permission_used
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.permissions import check_permission
 from app.models.agent import Agent
@@ -17,6 +19,8 @@ from app.models.chat import Chat
 from app.models.llm_provider import LLMProvider
 from app.models.user import User
 from app.providers import create_provider
+from app.services import sync_turns
+from app.services.deferred_completions import ROUND_SUSPENDED
 from app.services.message_service import MessageService
 from app.services.stream_thinking import ThinkingFilter
 
@@ -167,30 +171,95 @@ async def _agent_mode(
 
     chat_id_str = str(chat.id)
     message_service = MessageService(db)
+    budget = float(agent.default_job_timeout or settings.function_timeout or 300)
+
+    # A chat parked on ask_user questions: the OpenAI wire format has no way
+    # to answer one but a message, so the message answers the oldest.
+    question = None
+    if chat_id:
+        open_questions = await sync_turns.open_questions(db, chat_id_str)
+        question = open_questions[0] if open_questions else None
 
     if request.stream:
         return await _agent_stream(
             message_service, chat_id_str, user_id, user_token,
             last_user_msg, model_name, chat_id_str, request.include_thinking,
+            db=db, budget=budget, answering=question,
         )
-    else:
-        response_message = await message_service.send_message(
-            chat_id=chat_id_str,
-            user_id=user_id,
-            user_token=user_token,
-            content=last_user_msg,
-        )
-        content = response_message.content or ""
-        resp = ChatCompletionResponse(
-            model=model_name,
-            choices=[Choice(message=ChoiceMessage(content=content))],
-        )
-        from fastapi.responses import JSONResponse
 
-        return JSONResponse(
-            content=resp.model_dump(),
-            headers={"X-Chat-ID": chat_id_str},
+    started = asyncio.get_running_loop().time()
+    try:
+        if question is not None:
+            answered = await _answer(db, chat_id_str, question, last_user_msg, user_token)
+            outcome = await sync_turns.settle_answer(db, chat_id_str, answered, budget=budget)
+        else:
+            turn = await message_service.run_turn(
+                chat_id=chat_id_str,
+                user_id=user_id,
+                user_token=user_token,
+                content=last_user_msg,
+            )
+            outcome = await sync_turns.settle_turn(
+                db,
+                chat_id_str,
+                status=turn.status,
+                message=turn.message,
+                channel_id=turn.channel_id,
+                usage_parts=[],
+                budget=budget - (asyncio.get_running_loop().time() - started),
+            )
+    except sync_turns.TurnFailed as e:
+        raise HTTPException(502, f"The agent's turn failed: {e}")
+
+    resp = ChatCompletionResponse(
+        model=model_name,
+        choices=[Choice(message=ChoiceMessage(content=_render_outcome(outcome)))],
+    )
+    return JSONResponse(
+        content=resp.model_dump(),
+        headers={"X-Chat-ID": chat_id_str, "X-Sinas-Turn-Status": outcome.status},
+    )
+
+
+async def _answer(db, chat_id: str, question: dict, answer: str, user_token: str):
+    try:
+        return await sync_turns.answer_question(
+            db, chat_id, question["tool_call_id"], answer, user_token=user_token
         )
+    except (sync_turns.AnswerNotFound, sync_turns.AnswerConflict):
+        raise HTTPException(409, "The question this message answers was resolved meanwhile; send it again")
+
+
+def _render_questions(questions: list[dict]) -> str:
+    """Open ask_user questions as assistant text: the only way an OpenAI
+    client sees them. Its next message in the chat answers the first."""
+    parts = []
+    for q in questions:
+        text = q.get("question") or ""
+        if q.get("options"):
+            text += "\nOptions: " + " / ".join(q["options"])
+        parts.append(text)
+    return "\n\n".join(parts)
+
+
+_STILL_WORKING = (
+    "[The agent is still working on this in the background; the result will be "
+    "in this chat when it is done.]"
+)
+_DELIVERED = "[Your message was passed to the agent's ongoing turn in this chat.]"
+
+
+def _render_outcome(outcome: "sync_turns.TurnOutcome") -> str:
+    """A synchronous turn's outcome as one assistant message."""
+    if outcome.status == "completed":
+        return outcome.reply
+    if outcome.status == "input_required":
+        notice = _render_questions(outcome.pending_inputs)
+    elif outcome.status == "injected":
+        return _DELIVERED
+    else:
+        notice = _STILL_WORKING
+    return f"{outcome.reply}\n\n{notice}" if outcome.reply else notice
 
 
 async def _agent_stream(
@@ -202,9 +271,23 @@ async def _agent_stream(
     model_name: str,
     response_chat_id: str,
     include_thinking: bool = False,
+    *,
+    db: AsyncSession,
+    budget: float,
+    answering: Optional[dict] = None,
 ):
-    """Stream agent response in OpenAI SSE format."""
+    """Stream agent response in OpenAI SSE format.
+
+    A turn whose round parks on ask_user ends with the question(s) as text;
+    one that parks on background work is followed on the round's channel
+    within `budget`. `answering`: the open question this message answers
+    (the chat was parked on it); the resumed turn is streamed instead."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    started = asyncio.get_running_loop().time()
+    # Answered before the stream starts, so a refusal is a plain HTTP error.
+    answered = (
+        await _answer(db, chat_id, answering, content, user_token) if answering is not None else None
+    )
 
     async def generate():
         import time
@@ -212,52 +295,81 @@ async def _agent_stream(
         created = int(time.time())
         show = ThinkingFilter(include_thinking)
 
-        # First chunk with role
-        first_chunk = ChatCompletionChunk(
-            id=chunk_id,
-            created=created,
-            model=model_name,
-            choices=[StreamChoice(delta=DeltaContent(role="assistant"))],
-        )
-        yield f"data: {first_chunk.model_dump_json()}\n\n"
+        def sse(delta: DeltaContent, finish_reason: Optional[str] = None) -> str:
+            data_chunk = ChatCompletionChunk(
+                id=chunk_id,
+                created=created,
+                model=model_name,
+                choices=[StreamChoice(delta=delta, finish_reason=finish_reason)],
+            )
+            return f"data: {data_chunk.model_dump_json()}\n\n"
 
-        async for chunk in message_service.send_message_stream(
-            chat_id=chat_id,
-            user_id=user_id,
-            user_token=user_token,
-            content=content,
-        ):
+        def deltas(chunk: dict):
             chunk = show(chunk)
             if chunk is None:
-                continue
+                return
             thinking = chunk.get("thinking")
             # "" counts: the model has started thinking, text or not.
             if thinking is not None:
-                data_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[StreamChoice(delta=DeltaContent(reasoning_content=thinking))],
-                )
-                yield f"data: {data_chunk.model_dump_json()}\n\n"
+                yield sse(DeltaContent(reasoning_content=thinking))
             text = chunk.get("content", "")
-            if text:
-                data_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[StreamChoice(delta=DeltaContent(content=text))],
-                )
-                yield f"data: {data_chunk.model_dump_json()}\n\n"
+            if text and isinstance(text, str):
+                yield sse(DeltaContent(content=text))
+
+        # First chunk with role
+        yield sse(DeltaContent(role="assistant"))
+
+        questions: list[dict] = []
+        follow: Optional[tuple[str, str]] = None  # (channel, from id)
+        if answered is not None:
+            if answered.resumed or answered.resume_pending or not await sync_turns.open_questions(db, chat_id):
+                follow = (answered.channel_id, answered.follow_from)
+            else:
+                questions = await sync_turns.open_questions(db, chat_id)
+        else:
+            asked = False
+            suspension = None
+            async for chunk in message_service.send_message_stream(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_token=user_token,
+                content=content,
+            ):
+                if not isinstance(chunk, dict):
+                    continue
+                kind = chunk.get("type")
+                if kind == "input_required":
+                    asked = True
+                elif kind == ROUND_SUSPENDED:
+                    suspension = chunk
+                elif kind == "injected":
+                    yield sse(DeltaContent(content=_DELIVERED))
+                    continue
+                for line in deltas(chunk):
+                    yield line
+            if suspension is not None:
+                if asked:
+                    questions = await sync_turns.open_questions(db, chat_id)
+                elif suspension.get("channel_id"):
+                    follow = (suspension["channel_id"], "0")
+
+        if follow is not None and follow[0]:
+            remaining = budget - (asyncio.get_running_loop().time() - started)
+            follower = sync_turns.RoundFollower(follow[0], timeout=remaining, last_id=follow[1])
+            async for event in follower.events():
+                for line in deltas(event):
+                    yield line
+            if follower.status == "input_required":
+                questions = await sync_turns.open_questions(db, chat_id)
+            elif follower.status == "failed":
+                yield sse(DeltaContent(content=f"\n\n[The agent's turn failed: {follower.error}]"))
+            elif follower.status != "completed":
+                yield sse(DeltaContent(content=f"\n\n{_STILL_WORKING}"))
+        if questions:
+            yield sse(DeltaContent(content="\n\n" + _render_questions(questions)))
 
         # Final chunk
-        final_chunk = ChatCompletionChunk(
-            id=chunk_id,
-            created=created,
-            model=model_name,
-            choices=[StreamChoice(delta=DeltaContent(), finish_reason="stop")],
-        )
-        yield f"data: {final_chunk.model_dump_json()}\n\n"
+        yield sse(DeltaContent(), finish_reason="stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

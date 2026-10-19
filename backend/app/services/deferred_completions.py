@@ -55,6 +55,9 @@ ROUND_SUSPENDED = "round_suspended"
 # Event types after which the enclosing agent job must NOT publish "done" /
 # terminate — a resume job owns the rest of the conversation.
 SUSPENSION_EVENT_TYPES = frozenset({ROUND_SUSPENDED, "delegation_pending"})
+# Published on a suspended round's channel when the round resumes on another
+# one ({"type": ROUND_MOVED, "channel_id": <new>}): stream relays follow it.
+ROUND_MOVED = "round_moved"
 
 SUB_AGENT = "sub_agent"
 HUMAN_INPUT = "human_input"
@@ -335,6 +338,20 @@ async def complete(
     except Exception:
         logger.debug("Could not publish deferred tool_end to %s", channel_id)
 
+    if is_last and resume_channel != channel_id:
+        # The round continues on another channel (an answer's fresh one):
+        # tell whoever still reads the round's own channel — a stream kept
+        # open on a round that also waited on background work — to move
+        # over, rather than wait for a reply that will never arrive here.
+        try:
+            from app.services.stream_relay import stream_relay
+
+            await stream_relay.publish(
+                channel_id, {"type": ROUND_MOVED, "channel_id": resume_channel}
+            )
+        except Exception:
+            logger.debug("Could not announce the resume channel on %s", channel_id)
+
     if not is_last:
         return {"status": "completed", "resumed": False}
 
@@ -413,6 +430,9 @@ async def list_pending_inputs(db, chat_id: str) -> list[dict[str, Any]]:
         select(PendingCompletion)
         .where(PendingCompletion.chat_id == chat_id)
         .order_by(PendingCompletion.created_at)
+        # complete() resolves entries in its own session: a row this session
+        # loaded before must be re-read, not served from its identity map.
+        .execution_options(populate_existing=True)
     )
     out: list[dict[str, Any]] = []
     for row in result.scalars().all():

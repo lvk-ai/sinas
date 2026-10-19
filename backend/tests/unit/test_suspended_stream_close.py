@@ -98,3 +98,30 @@ async def test_a_question_expiring_soon_keeps_the_stream_open(client, chat, test
     ]))
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(_read_stream(client, chat, test_user), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_stream_follows_its_round_to_the_channel_it_resumed_on(client, chat, test_user, monkeypatch):
+    """Kept open for a background run, the round's question is answered
+    meanwhile and the round resumes on the answer's fresh channel: the
+    stream moves there instead of idling where nothing more will arrive."""
+    channels = {
+        "chan-1": [
+            {"type": "input_required", "tool_call_id": "a", "question": "Which?"},
+            {"type": "round_suspended", "pending_completion_id": "p", "tool_call_ids": ["a", "bg"]},
+            {"type": "tool_end", "tool_call_id": "bg"},
+            {"type": "round_moved", "channel_id": "chan-2"},
+        ],
+        "chan-2": [{"content": "resumed"}, {"type": "done", "status": "completed"}],
+    }
+
+    async def subscribe(channel_id, last_id="0", timeout=None):
+        for e in channels[channel_id]:
+            yield e
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(stream_relay, "subscribe", subscribe)
+    seen = await asyncio.wait_for(_read_stream(client, chat, test_user), timeout=10)
+    assert [e for e, _ in seen][-2:] == ["message", "done"]
+    assert json.loads(seen[-2][1])["content"] == "resumed"
+    assert "round_moved" not in "".join(d for _, d in seen)

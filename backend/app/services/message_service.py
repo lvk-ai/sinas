@@ -4,6 +4,7 @@ import json
 import uuid
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Optional
 
@@ -27,8 +28,7 @@ from app.services.content_tokens import strip_base64_data, refresh_message_token
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
 from app.services import workbench_refs
-from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
-from app.services import workbench_refs
+from app.services.deferred_completions import ROUND_SUSPENDED, SUSPENSION_EVENT_TYPES
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -73,6 +73,64 @@ def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
         return True
     args = safe_parse_arguments(tool_call.get("function", {}).get("arguments", ""))
     return bool(isinstance(args, dict) and args.get(arg))
+
+
+# How a synchronous (non-streaming) turn ended — TurnResult.status.
+TURN_COMPLETED = "completed"
+TURN_INPUT_REQUIRED = "input_required"
+TURN_IN_PROGRESS = "in_progress"
+TURN_INJECTED = "injected"
+
+
+@dataclass
+class TurnResult:
+    """What a non-streaming turn ended in (MessageService.run_turn).
+
+    - completed: `message` is the final reply.
+    - input_required: a tool round is parked on ask_user question(s) (and
+      possibly other deferred calls); `message` is the assistant message
+      that asked. The questions are the chat's pending inputs; answering the
+      last one resumes the round on a fresh channel.
+    - in_progress: a tool round is parked on work that completes it without
+      a human (a background run the model waits for); the conversation
+      continues by itself and streams on `channel_id`. `message` is the
+      assistant message that made the deferred calls.
+    - injected: the chat was busy — a turn running, or a round parked — so
+      the message was delivered into that run, to be read at its next
+      round boundary; `message` is the stored user message, and
+      `channel_id` the parked round's channel when one is parked.
+    """
+
+    status: str
+    message: Message
+    channel_id: Optional[str] = None
+
+
+@dataclass
+class _RoundEnd:
+    """How a drained tool-round generator ended (see _consume_round)."""
+
+    chunks: int = 0
+    stopped: bool = False  # suspended or interrupted: no follow-through
+    suspension: Optional[dict[str, Any]] = None  # the round_suspended event
+    asked: bool = False  # the suspension includes ask_user questions
+
+
+async def _consume_round(chunks: AsyncIterator[dict[str, Any]]) -> _RoundEnd:
+    """Drain a round's events for a caller that does not stream them."""
+    ended = _RoundEnd()
+    async for chunk in chunks:
+        ended.chunks += 1
+        if not isinstance(chunk, dict):
+            continue
+        kind = chunk.get("type")
+        if kind in ("interrupted", *SUSPENSION_EVENT_TYPES):
+            ended.stopped = True
+        if kind == "input_required":
+            ended.asked = True
+        elif kind == ROUND_SUSPENDED:
+            ended.suspension = chunk
+    return ended
 
 
 class MessageService:
@@ -501,22 +559,37 @@ class MessageService:
     ) -> Message:
         """Send a message and get LLM response (non-streaming).
 
-        One loop per chat: if another loop is already running this chat, the
-        message is injected into it (picked up at the next tool-round
-        boundary) instead of starting a concurrent loop.
+        The message `run_turn` ended on; see there for what it is when the
+        turn did not complete.
+        """
+        return (await self.run_turn(chat_id, user_id, user_token, content)).message
+
+    async def run_turn(
+        self, chat_id: str, user_id: str, user_token: str, content: str
+    ) -> TurnResult:
+        """Send a message and run the turn it starts (non-streaming).
+
+        One loop per chat: if another loop is already running this chat, or
+        a round is parked on it, the message is injected (picked up at the
+        next tool-round boundary) instead of starting a concurrent loop —
+        status "injected". A turn whose tool round suspends on deferred
+        calls (ask_user, a background run it waits for) ends here with the
+        round parked — status "input_required" or "in_progress"; see
+        TurnResult.
         """
         from app.services import chat_steering
 
-        from app.services.chat_wakeups import chat_is_parked
+        from app.services.chat_wakeups import parked_round_channel
 
+        parked_channel = None
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
         if lock_token is not None:
             try:
-                parked = await chat_is_parked(self.db, chat_id)
+                parked_channel = await parked_round_channel(self.db, chat_id)
             except BaseException:
                 await chat_steering.release_chat_lock(chat_id, lock_token)
                 raise
-            if parked:
+            if parked_channel is not None:
                 # A round is parked (on ask_user, a background run, a
                 # sub-agent, an approval): it holds no lock but owns the
                 # chat. The message waits for it like for a running loop.
@@ -526,16 +599,34 @@ class MessageService:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
                 raise ValueError("Message blocked by hook")
-            return injected
+            return TurnResult(TURN_INJECTED, injected, channel_id=parked_channel)
         try:
             await chat_steering.clear_interrupt(chat_id)
             return await self._send_message_locked(chat_id, user_id, user_token, content)
         finally:
             await chat_steering.release_chat_lock(chat_id, lock_token)
 
+    async def _parked_turn(self, chat_id: str, ended: _RoundEnd) -> TurnResult:
+        """The result of a turn whose round suspended: its reply comes later
+        (on the answer, or when the awaited work lands). What it has so far
+        is the assistant message that made the deferred calls."""
+        asking_msg = (
+            await self.db.execute(
+                select(Message)
+                .where(Message.chat_id == chat_id, Message.role == "assistant")
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        return TurnResult(
+            TURN_INPUT_REQUIRED if ended.asked else TURN_IN_PROGRESS,
+            asking_msg,
+            channel_id=(ended.suspension or {}).get("channel_id"),
+        )
+
     async def _send_message_locked(
         self, chat_id: str, user_id: str, user_token: str, content: str
-    ) -> Message:
+    ) -> TurnResult:
         prep = await self._prepare_message_context(
             chat_id=chat_id,
             user_id=user_id,
@@ -550,7 +641,7 @@ class MessageService:
 
         # User hook blocked the pipeline
         if prep.get("blocked"):
-            return prep["block_message"]
+            return TurnResult(TURN_COMPLETED, prep["block_message"])
 
         # Metering leaf: one agent invocation per (unblocked) user message
         from app.services import metering
@@ -619,8 +710,7 @@ class MessageService:
                         "Please use streaming mode to handle approval flow."
                     )
 
-            suspended = False
-            async for chunk in self._handle_tool_calls(
+            ended = await _consume_round(self._handle_tool_calls(
                 chat_id=chat_id,
                 user_id=user_id,
                 user_token=user_token,
@@ -632,17 +722,19 @@ class MessageService:
                 max_tokens=prep["final_max_tokens"],
                 tools=prep["tools"],
                 agent_label=agent_label,
-            ):
-                if isinstance(chunk, dict) and chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
-                    suspended = True  # parked or stopped: no follow-through
-            if not suspended:
-                async for _ in self.answer_pending_injections(
+            ))
+            if not ended.stopped:
+                ended = await _consume_round(self.answer_pending_injections(
                     chat_id=chat_id, user_id=user_id, user_token=user_token,
                     provider=prep["provider_name"], model=prep["final_model"],
                     temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
                     tools=prep["tools"], agent_label=agent_label,
-                ):
-                    pass
+                ))
+            if ended.suspension is not None:
+                parked = await self._parked_turn(chat_id, ended)
+                _llm_span.set_attribute(otel_attr("output"), (parked.message.content or "")[:10000])
+                _llm_span.end()
+                return parked
 
             result = await self.db.execute(
                 select(Message)
@@ -653,7 +745,7 @@ class MessageService:
             final_msg = result.scalar_one()
             _llm_span.set_attribute(otel_attr("output"), (final_msg.content or "")[:10000])
             _llm_span.end()
-            return final_msg
+            return TurnResult(TURN_COMPLETED, final_msg)
 
         assistant_content = response.get("content", "")
 
@@ -690,20 +782,20 @@ class MessageService:
 
         # A message injected while this reply streamed has no boundary left
         # to be read at: answer it now, still under the lock.
-        answered = False
-        async for _ in self.answer_pending_injections(
+        ended = await _consume_round(self.answer_pending_injections(
             chat_id=chat_id, user_id=user_id, user_token=user_token,
             provider=prep["provider_name"], model=prep["final_model"],
             temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
             tools=prep["tools"], agent_label=agent_label,
-        ):
-            answered = True
-        if answered:
+        ))
+        if ended.suspension is not None:
+            return await self._parked_turn(chat_id, ended)
+        if ended.chunks:
             result = await self.db.execute(
                 select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
             )
-            return result.scalar_one()
-        return assistant_message
+            return TurnResult(TURN_COMPLETED, result.scalar_one())
+        return TurnResult(TURN_COMPLETED, assistant_message)
 
     async def send_message_stream(
         self,
@@ -1145,41 +1237,47 @@ class MessageService:
 
         # Deferred calls are split off — they don't execute (and block) here.
         # After the regular tools finish, this generator suspends the round
-        # (deferred_completions checkpoint) and ends, freeing the worker
-        # slot; a resume job continues the conversation when the last
-        # completion lands. Requires a job channel (current_channel_id).
-        # Two kinds today:
-        # - agent delegation in "suspend" mode (issue #90) — completed by
-        #   the child job's terminal handler;
+        # (deferred_completions checkpoint) and ends; a resume job continues
+        # the conversation when the last completion lands. Three kinds:
         # - ask_user (human_input) — completed by the user's answer over
-        #   the API. Always deferred when a channel exists; the
-        #   direct/synchronous path returns an error result instead (see
-        #   execute_single_tool).
+        #   the API;
+        # - run_in_background with wait=true (background_job) — completed
+        #   by the background run;
+        # - agent delegation in "suspend" mode (issue #90) — completed by
+        #   the child job's terminal handler.
+        # The first two always defer, in a queued turn (a job channel) and
+        # in an inline one (a request running the turn itself) alike: their
+        # result arrives from outside the turn, so there is nothing to wait
+        # for here. The inline round's continuation gets a channel of its
+        # own (see the suspend block below). Delegations defer only in a
+        # queued turn: suspend mode exists to free the worker slot a waiting
+        # parent would hold, and an inline turn holds none — it keeps
+        # waiting for the child's reply, so a synchronous caller still gets
+        # one (ADR 2026-10-20-deferred-rounds-in-inline-turns).
         from app.services.delegation import current_channel_id
 
+        job_channel = current_channel_id.get()
         delegate_calls: list[dict[str, Any]] = []
         ask_user_calls: list[dict[str, Any]] = []
         background_calls: list[dict[str, Any]] = []
-        _meta_by_name: dict[str, dict[str, Any]] = {}
-        if current_channel_id.get() is not None:
-            _meta_by_name = (
-                {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools}
-                if tools
-                else {}
-            )
-            suspend_delegates = settings.agent_delegate_mode == "suspend"
-            executable_calls = []
-            for tc in valid_tool_calls:
-                meta = _meta_by_name.get(tc["function"]["name"], {})
-                if suspend_delegates and meta.get("agent_id"):
-                    delegate_calls.append(tc)
-                elif meta.get("deferred_completer") == "human_input":
-                    ask_user_calls.append(tc)
-                elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
-                    background_calls.append(tc)
-                else:
-                    executable_calls.append(tc)
-            valid_tool_calls = executable_calls
+        _meta_by_name: dict[str, dict[str, Any]] = (
+            {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools}
+            if tools
+            else {}
+        )
+        suspend_delegates = job_channel is not None and settings.agent_delegate_mode == "suspend"
+        executable_calls = []
+        for tc in valid_tool_calls:
+            meta = _meta_by_name.get(tc["function"]["name"], {})
+            if suspend_delegates and meta.get("agent_id"):
+                delegate_calls.append(tc)
+            elif meta.get("deferred_completer") == "human_input":
+                ask_user_calls.append(tc)
+            elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
+                background_calls.append(tc)
+            else:
+                executable_calls.append(tc)
+        valid_tool_calls = executable_calls
 
         parallel_calls = []
         sequential_calls = []
@@ -1496,11 +1594,17 @@ class MessageService:
                 background_jobs.append((tc["id"], job_id, code, description))
 
             if entries:
+                # The channel the round's continuation streams on when it
+                # resumes on its own (a background run finishing, a question
+                # expiring, a sub-agent reporting): a queued turn's own job
+                # channel; for an inline turn, which has none, a fresh one —
+                # recorded as the chat's reconnect channel below.
+                round_channel = job_channel or str(uuid.uuid4())
                 row = await deferred_completions.suspend_round(
                     self.db,
                     chat_id=chat_id,
                     user_id=user_id,
-                    channel_id=current_channel_id.get(),
+                    channel_id=round_channel,
                     entries=entries,
                     conversation_context={
                         "provider": provider,
@@ -1523,6 +1627,13 @@ class MessageService:
                         **current_job_meta.get(),
                     },
                 )
+                if job_channel is None:
+                    await self.db.execute(
+                        update(Chat)
+                        .where(Chat.id == uuid.UUID(str(chat_id)))
+                        .values(active_channel_id=round_channel)
+                    )
+                    await self.db.commit()
                 # Children only after the checkpoint exists — a fast child
                 # must never report against a row that isn't there yet.
                 if prepared:
@@ -1580,6 +1691,7 @@ class MessageService:
                     "type": deferred_completions.ROUND_SUSPENDED,
                     "pending_completion_id": str(row.id),
                     "tool_call_ids": list(entries),
+                    "channel_id": round_channel,
                 }
                 return
             # Every deferred call failed before suspending — fall through to

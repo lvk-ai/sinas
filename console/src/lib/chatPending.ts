@@ -31,10 +31,9 @@ export function toPendingInputs(raw: unknown): PendingInput[] {
 }
 
 /**
- * The question an SSE chunk announces, or null. A queued (keep-alive) turn
- * and a reconnected stream send it as its own `input_required` event; an
- * inline turn sends it as a `message` event whose data has
- * type "input_required". Both are handled.
+ * The question an SSE chunk announces, or null. Streams send it as its own
+ * `input_required` event; backends before 0.5 sent an inline turn's as a
+ * `message` event whose data has type "input_required". Both are handled.
  */
 export function inputRequiredFromChunk(chunk: { event: string; data: string }): PendingInput | null {
   if (chunk.event !== 'input_required' && chunk.event !== 'message') return null;

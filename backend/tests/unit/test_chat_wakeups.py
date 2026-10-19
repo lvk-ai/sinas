@@ -722,9 +722,11 @@ async def test_cancelled_job_still_reports_back(committed_chat, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inline_wait_is_refused_with_guidance(db, chat, test_user):
+async def test_wait_outside_a_tool_round_is_refused_with_guidance(db, chat, test_user):
+    """Chat tool rounds suspend on a waited-on run, inline or queued; only a
+    caller outside one reaches the executor with wait=true."""
     out = await chat_wakeups.execute_background_tool(db, chat, str(test_user.id), "run_in_background", {"code": "1", "description": "d", "wait": True})
-    assert "keep_alive" in out["error"]
+    assert "wait=false" in out["error"]
 
 
 @pytest.mark.asyncio

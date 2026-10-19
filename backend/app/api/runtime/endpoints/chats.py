@@ -40,12 +40,14 @@ from app.schemas.chat import (
     MessageSendResponse,
     PendingApprovalResponse,
     PendingInputAnswer,
+    PendingInputAnswerAccepted,
+    PendingInputAnswerResult,
     PendingInputResponse,
     ToolApprovalRequest,
     ToolApprovalResponse,
     TurnUsage,
 )
-from app.services import batch_service
+from app.services import batch_service, sync_turns
 from app.core.callback import CallbackURLError, validate_callback_url
 from app.services.message_service import MessageService, refresh_message_tokens
 from app.services.queue_service import queue_service
@@ -60,14 +62,49 @@ router = APIRouter()
 HEARTBEAT_INTERVAL = 15  # seconds between SSE heartbeat pings
 
 
-async def _turn_usage(collector: UsageCollector) -> Optional[TurnUsage]:
+async def _collected_usage(collector: UsageCollector) -> Optional[dict]:
     """The LLM usage collected for one request, once its llm_usage rows are
     committed. None (with a logged error) only if it can't be totalled."""
     try:
-        return TurnUsage(**await collector.totals())
+        return await collector.totals()
     except Exception:
         logger.exception("Failed to total the LLM usage of this request")
         return None
+
+
+def _wait_budget(chat: Chat) -> float:
+    """How long a synchronous request follows its chat's turn: as long as
+    one agent job of that chat may run."""
+    return float(chat.job_timeout or settings.agent_job_timeout)
+
+
+async def _settle(
+    db: AsyncSession, chat_id: str, turn, collector: UsageCollector, *, budget: float
+) -> sync_turns.TurnOutcome:
+    """A non-streaming turn's outcome: a round parked on background work is
+    followed for the rest of `budget` (see sync_turns), and the request's
+    usage is added to that of the continuation it waited for."""
+    try:
+        return await sync_turns.settle_turn(
+            db,
+            chat_id,
+            status=turn.status,
+            message=turn.message,
+            channel_id=turn.channel_id,
+            usage_parts=[await _collected_usage(collector)],
+            budget=budget,
+        )
+    except sync_turns.TurnFailed as e:
+        raise HTTPException(502, f"The agent's turn failed: {e}")
+
+
+def _turn_state(outcome: sync_turns.TurnOutcome) -> dict:
+    """The TurnState fields of a response."""
+    return {
+        "status": outcome.status,
+        "pending_inputs": [PendingInputResponse(**p) for p in outcome.pending_inputs],
+        "channel_id": outcome.channel_id,
+    }
 
 
 async def with_heartbeat(aiter, interval: int = HEARTBEAT_INTERVAL):
@@ -126,6 +163,67 @@ def round_waits_only_on_user(event: dict, asked: dict[str, Optional[str]]) -> bo
             except ValueError:
                 return False
     return True
+
+
+# Stream events relayed under their own SSE event name; anything else is a
+# `message` event.
+TYPED_EVENTS = ("approval_required", "tool_start", "tool_end", "input_required", "round_suspended")
+
+
+async def _relay_channel(
+    channel_id: str, last_id: str, show: ThinkingFilter, asked: dict[str, Optional[str]]
+):
+    """Relay a stream channel as SSE until it ends: `done`, `error`, or a
+    round parked on the user alone (see round_waits_only_on_user). `asked`
+    holds the questions seen so far (tool_call_id → expires_at), including
+    any the caller relayed before handing over to the channel. When the
+    round moves to another channel (its question answered while this stream
+    stayed open for its other work), the relay follows it there."""
+    while channel_id:
+        moved_to = None
+        async for sse in _relay_one_channel(channel_id, last_id, show, asked):
+            if isinstance(sse, str):
+                moved_to = sse  # the inner relay ends right after it
+                continue
+            yield sse
+        channel_id, last_id = moved_to, "0"
+
+
+async def _relay_one_channel(
+    channel_id: str, last_id: str, show: ThinkingFilter, asked: dict[str, Optional[str]]
+):
+    """_relay_channel for one channel; yields the new channel's id (a str)
+    when the round moves."""
+    from app.services.deferred_completions import ROUND_MOVED
+
+    async for event in stream_relay.subscribe(channel_id, last_id=last_id):
+        event_type = event.get("type", "message")
+        if event_type == ROUND_MOVED:
+            if event.get("channel_id"):
+                yield event["channel_id"]
+                return
+            continue
+        if event_type not in ("ping", "done", "error"):
+            event = show(event)
+            if event is None:
+                continue
+        if event_type == "ping":
+            yield {"event": "ping", "data": ""}
+        elif event_type == "done":
+            yield {"event": "done", "data": json.dumps({"status": "completed"})}
+            return
+        elif event_type == "error":
+            yield {"event": "error", "data": json.dumps({"error": event.get("error", "An error occurred")})}
+            return
+        elif event_type in TYPED_EVENTS:
+            yield {"event": event_type, "data": json.dumps(event)}
+            if event_type == "input_required":
+                asked[event.get("tool_call_id")] = event.get("expires_at")
+            elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
+                yield SUSPENDED_DONE
+                return
+        else:
+            yield {"event": "message", "data": json.dumps(event)}
 
 
 @router.get("/agents/default", response_model=AgentResponse)
@@ -370,11 +468,12 @@ async def invoke_agent(
 
     # Every LLM call made in this context (the reply, its tool rounds) is
     # collected for the response's usage; see app/providers/tracking.py.
+    timeout = agent.default_job_timeout or settings.function_timeout or 300
+    started = asyncio.get_running_loop().time()
     with collect_usage() as usage_collector:
         try:
-            timeout = agent.default_job_timeout or settings.function_timeout or 300
-            response_message = await asyncio.wait_for(
-                message_service.send_message(
+            turn = await asyncio.wait_for(
+                message_service.run_turn(
                     chat_id=str(chat.id),
                     user_id=user_id,
                     user_token=user_token,
@@ -385,14 +484,21 @@ async def invoke_agent(
         except asyncio.TimeoutError:
             raise HTTPException(504, "Agent execution timed out")
 
-    # 6. Return response
-    reply = response_message.content or ""
-
+    # 6. Return response — following a round that waits on background work
+    # for the rest of the time budget (sync_turns).
+    outcome = await _settle(
+        db,
+        str(chat.id),
+        turn,
+        usage_collector,
+        budget=timeout - (asyncio.get_running_loop().time() - started),
+    )
     return InvokeResponse(
-        reply=reply,
+        reply=outcome.reply,
         chat_id=chat.id,
         session_key=request.session_key,
-        usage=await _turn_usage(usage_collector),
+        usage=outcome.usage and TurnUsage(**outcome.usage),
+        **_turn_state(outcome),
     )
 
 
@@ -511,13 +617,23 @@ async def send_message(
         else json.dumps([part.model_dump(exclude_none=True) for part in request.content])
     )
 
+    started = asyncio.get_running_loop().time()
     with collect_usage() as usage_collector:
-        response_message = await message_service.send_message(
+        turn = await message_service.run_turn(
             chat_id=str(chat.id), user_id=user_id, user_token=user_token, content=content_str
         )
 
-    response = MessageSendResponse.model_validate(response_message)
-    response.usage = await _turn_usage(usage_collector)
+    outcome = await _settle(
+        db,
+        str(chat.id),
+        turn,
+        usage_collector,
+        budget=_wait_budget(chat) - (asyncio.get_running_loop().time() - started),
+    )
+    response = MessageSendResponse.model_validate(outcome.message or turn.message)
+    response.usage = outcome.usage and TurnUsage(**outcome.usage)
+    for name, value in _turn_state(outcome).items():
+        setattr(response, name, value)
     return response
 
 
@@ -597,38 +713,10 @@ async def stream_message(
         )
 
         async def keep_alive_generator():
-            asked: dict[str, Optional[str]] = {}
             show = ThinkingFilter(request.include_thinking)
             try:
-                async for event in stream_relay.subscribe(channel_id, last_id="0"):
-                    event_type = event.get("type", "message")
-                    if event_type not in ("ping", "done", "error"):
-                        event = show(event)
-                        if event is None:
-                            continue
-                    if event_type == "ping":
-                        yield {"event": "ping", "data": ""}
-                    elif event_type == "done":
-                        yield {"event": "done", "data": json.dumps({"status": "completed"})}
-                        return
-                    elif event_type == "error":
-                        yield {"event": "error", "data": json.dumps({"error": event.get("error", "An error occurred")})}
-                        return
-                    elif event_type in (
-                        "approval_required",
-                        "tool_start",
-                        "tool_end",
-                        "input_required",
-                        "round_suspended",
-                    ):
-                        yield {"event": event_type, "data": json.dumps(event)}
-                        if event_type == "input_required":
-                            asked[event.get("tool_call_id")] = event.get("expires_at")
-                        elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
-                            yield SUSPENDED_DONE
-                            return
-                    else:
-                        yield {"event": "message", "data": json.dumps(event)}
+                async for sse in _relay_channel(channel_id, "0", show, {}):
+                    yield sse
             except asyncio.CancelledError:
                 return  # Client disconnected — worker keeps running
 
@@ -644,6 +732,8 @@ async def stream_message(
 
     async def event_generator():
         show = ThinkingFilter(request.include_thinking)
+        asked: dict[str, Optional[str]] = {}
+        suspended: Optional[dict] = None
         try:
             async for chunk in message_service.send_message_stream(
                 chat_id=str(chat.id), user_id=user_id, user_token=user_token, content=content_str
@@ -661,8 +751,12 @@ async def stream_message(
                         chunk = {"content": str(chunk)}
                     # Route special event types to their own SSE event names
                     chunk_type = chunk.get("type")
-                    if chunk_type in ("approval_required", "tool_start", "tool_end"):
+                    if chunk_type in TYPED_EVENTS:
                         yield {"event": chunk_type, "data": json.dumps(chunk)}
+                        if chunk_type == "input_required":
+                            asked[chunk.get("tool_call_id")] = chunk.get("expires_at")
+                        elif chunk_type == "round_suspended":
+                            suspended = chunk
                     else:
                         yield {"event": "message", "data": json.dumps(chunk)}
                 except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
@@ -680,6 +774,23 @@ async def stream_message(
                         except Exception as save_error:
                             logger.error(f"Failed to save partial message: {save_error}")
                     return
+
+            # The turn above is over and stored what it said: nothing left
+            # for a disconnect to save as a partial reply.
+            accumulated_content["content"] = ""
+            if suspended is not None:
+                # The round parked (the turn above has ended and let go of
+                # the chat). Parked on the user alone: done, the answer
+                # resumes on the channel the answer endpoint returns.
+                # Otherwise its continuation — a background run landing, a
+                # question expiring — streams on the round's channel: relay
+                # it here, as a keep-alive stream would.
+                if round_waits_only_on_user(suspended, asked) or not suspended.get("channel_id"):
+                    yield SUSPENDED_DONE
+                    return
+                async for sse in _relay_channel(suspended["channel_id"], "0", show, asked):
+                    yield sse
+                return
 
             yield {"event": "done", "data": json.dumps({"status": "completed"})}
 
@@ -765,42 +876,10 @@ async def reconnect_stream(
     async def event_generator():
         # Reconnecting past the input_required events leaves `asked` short:
         # the stream then stays open, as before, rather than ending early.
-        asked: dict[str, Optional[str]] = {}
         show = ThinkingFilter(include_thinking)
         try:
-            async for event in stream_relay.subscribe(channel_id, last_id=last_id):
-                event_type = event.get("type", "message")
-                if event_type not in ("ping", "done", "error"):
-                    event = show(event)
-                    if event is None:
-                        continue
-
-                if event_type == "ping":
-                    yield {"event": "ping", "data": ""}
-                elif event_type == "done":
-                    yield {"event": "done", "data": json.dumps({"status": "completed"})}
-                    return
-                elif event_type == "error":
-                    yield {
-                        "event": "error",
-                        "data": json.dumps({"error": event.get("error", "An error occurred")}),
-                    }
-                    return
-                elif event_type in (
-                    "approval_required",
-                    "tool_start",
-                    "tool_end",
-                    "input_required",
-                    "round_suspended",
-                ):
-                    yield {"event": event_type, "data": json.dumps(event)}
-                    if event_type == "input_required":
-                        asked[event.get("tool_call_id")] = event.get("expires_at")
-                    elif event_type == "round_suspended" and round_waits_only_on_user(event, asked):
-                        yield SUSPENDED_DONE
-                        return
-                else:
-                    yield {"event": "message", "data": json.dumps(event)}
+            async for sse in _relay_channel(channel_id, last_id, show, {}):
+                yield sse
         except asyncio.CancelledError:
             return
 
@@ -1014,7 +1093,17 @@ async def list_pending_input(
     ]
 
 
-@router.post("/chats/{chat_id}/pending-input/{tool_call_id}")
+@router.post(
+    "/chats/{chat_id}/pending-input/{tool_call_id}",
+    status_code=202,
+    response_model=PendingInputAnswerAccepted,
+    responses={
+        200: {
+            "model": PendingInputAnswerResult,
+            "description": "With `wait: true`: the resumed turn's result.",
+        },
+    },
+)
 async def answer_pending_input(
     chat_id: str,
     tool_call_id: str,
@@ -1029,37 +1118,53 @@ async def answer_pending_input(
     it is the round's last outstanding completion, a resume job continues
     the conversation on a fresh stream channel (returned as `channel_id` —
     same reconnect contract as tool approval); otherwise the round keeps
-    waiting for its other completions and `resumed` is false.
+    waiting for its other completions and `resumed` is false. This works
+    the same whichever way the turn was started (queued, inline stream,
+    non-streaming send, invoke).
+
+    With `wait: true` the request instead waits for the resumed turn and
+    returns its result (200, PendingInputAnswerResult): the final reply,
+    the next questions if the agent asks again, or `in_progress` with the
+    channel when the turn outlasts the chat's job timeout.
     """
-    from app.services import deferred_completions
-
-    user_id, _ = current_user_data
-    await _authorize_chat_access(db, http_request, chat_id, current_user_data)
-
-    pending = await deferred_completions.list_pending_inputs(db, chat_id)
-    match = next((p for p in pending if p["tool_call_id"] == tool_call_id), None)
-    if not match:
-        raise HTTPException(404, "Pending input not found or already answered")
-
+    chat = await _authorize_chat_access(db, http_request, chat_id, current_user_data)
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
-    channel_id = str(uuid.uuid4())
+    started = asyncio.get_running_loop().time()
 
-    outcome = await deferred_completions.complete(
-        match["pending_completion_id"],
-        tool_call_id,
-        json.dumps({"answer": request.answer}),
-        user_token=user_token,
-        resume_channel_id=channel_id,
-    )
-    if outcome["status"] != "completed":
+    try:
+        answered = await sync_turns.answer_question(
+            db, chat_id, tool_call_id, request.answer, user_token=user_token
+        )
+    except sync_turns.AnswerNotFound:
+        raise HTTPException(404, "Pending input not found or already answered")
+    except sync_turns.AnswerConflict:
         # Raced another completion of the same entry (double submit, expiry).
         raise HTTPException(409, "Pending input was already resolved")
 
-    resumed = outcome.get("resumed", False)
-    pending = outcome.get("resume_pending", False)
+    if request.wait:
+        try:
+            outcome = await sync_turns.settle_answer(
+                db,
+                chat_id,
+                answered,
+                budget=_wait_budget(chat) - (asyncio.get_running_loop().time() - started),
+            )
+        except sync_turns.TurnFailed as e:
+            raise HTTPException(502, f"The agent's turn failed: {e}")
+        result = PendingInputAnswerResult(
+            tool_call_id=tool_call_id,
+            chat_id=chat.id,
+            reply=outcome.reply,
+            message=MessageResponse.model_validate(outcome.message) if outcome.message else None,
+            usage=outcome.usage and TurnUsage(**outcome.usage),
+            **_turn_state(outcome),
+        )
+        return JSONResponse(status_code=200, content=result.model_dump(mode="json"))
+
+    resumed, pending = answered.resumed, answered.resume_pending
     # The channel the conversation actually resumes on (a delegated child
     # keeps its original one, which its parent is waiting on).
-    channel_id = outcome.get("channel_id") or channel_id
+    channel_id = answered.channel_id
     if resumed:
         message = f"Resume job enqueued. Connect to /chats/{chat_id}/stream/{channel_id} for results."
     elif pending:

@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -224,12 +225,17 @@ async def _execute_agent_webhook(
         )
         return JSONResponse({"chat_id": chat_id, "job_id": job_id}, status_code=202)
 
-    # Sync mode: run inline and wait for the reply (same as agent invoke)
+    # Sync mode: run inline and wait for the reply (same as agent invoke,
+    # including following a round that waits on background work and
+    # reporting a turn that waits on the user).
+    from app.services import sync_turns
+
     message_service = MessageService(db)
     timeout = agent.default_job_timeout or settings.function_timeout or 300
+    started = asyncio.get_running_loop().time()
     try:
-        response_message = await asyncio.wait_for(
-            message_service.send_message(
+        turn = await asyncio.wait_for(
+            message_service.run_turn(
                 chat_id=chat_id,
                 user_id=user_id,
                 user_token=token,
@@ -239,12 +245,31 @@ async def _execute_agent_webhook(
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Agent execution timed out")
+    try:
+        outcome = await sync_turns.settle_turn(
+            db,
+            chat_id,
+            status=turn.status,
+            message=turn.message,
+            channel_id=turn.channel_id,
+            usage_parts=[],
+            budget=timeout - (asyncio.get_running_loop().time() - started),
+        )
+    except sync_turns.TurnFailed as e:
+        raise HTTPException(status_code=502, detail=f"The agent's turn failed: {e}")
 
     response = {
         "success": True,
         "chat_id": chat_id,
-        "reply": response_message.content or "",
+        "reply": outcome.reply,
+        "status": outcome.status,
     }
+    if outcome.status != "completed":
+        # The turn waits on the chat owner (ask_user), goes on in the
+        # background, or the message joined a busy turn: say so, and how
+        # to follow it, rather than pass off an empty reply as the answer.
+        response["pending_inputs"] = jsonable_encoder(outcome.pending_inputs)
+        response["channel_id"] = outcome.channel_id
 
     # Cache result for dedup
     if webhook.dedup:

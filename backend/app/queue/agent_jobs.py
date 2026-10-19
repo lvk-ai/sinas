@@ -15,6 +15,8 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.telemetry import attached, extract_trace_context, otel_attr
 from app.models.execution import Execution, ExecutionStatus
+from app.providers.tracking import collect_usage
+from app.services.deferred_completions import ROUND_SUSPENDED
 from app.services.queue_service import JOB_STATUS_PREFIX, JOB_TTL
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,15 @@ def _is_suspension_chunk(chunk: dict) -> bool:
     from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
 
     return chunk.get("type") in SUSPENSION_EVENT_TYPES
+
+
+async def _usage_totals(collector) -> Optional[dict[str, Any]]:
+    """The LLM usage a job collected, or None (logged) if it can't be totalled."""
+    try:
+        return await collector.totals()
+    except Exception:
+        logger.exception("Failed to total the LLM usage of this job")
+        return None
 
 
 def _in_enqueued_context(
@@ -859,26 +870,42 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                 completed = True
                 return
             message_service = MessageService(db)
-            async for chunk in message_service._stream_followup_after_tools(
-                chat_id=chat_id,
-                user_id=user_id,
-                user_token=user_token,
-                provider=context.get("provider"),
-                model=context.get("model"),
-                temperature=context.get("temperature", 0.7),
-                max_tokens=context.get("max_tokens"),
-                tools=context.get("tools", []),
-                status_templates=context.get("status_templates", {}),
-                depth=context.get("tool_iteration_depth", 0),
-                agent_label=context.get("agent_label"),
-                tool_summary="delegated sub-agent results",
-            ):
-                if isinstance(chunk, dict):
-                    if chunk.get("content"):
-                        _output_parts.append(chunk["content"])
-                    if _is_suspension_chunk(chunk):
-                        _suspended = True
-                    await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            # The LLM usage of this continuation rides on the event that ends
+            # it here (done, or round_suspended), for a caller following the
+            # channel synchronously (a waited answer, an inline turn waiting
+            # on a background run) to add to its own `usage`. round_suspended
+            # is the round's last event: it is held back until the round is
+            # over so it can carry the total.
+            held_suspension = None
+            with collect_usage() as usage_collector:
+                async for chunk in message_service._stream_followup_after_tools(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    provider=context.get("provider"),
+                    model=context.get("model"),
+                    temperature=context.get("temperature", 0.7),
+                    max_tokens=context.get("max_tokens"),
+                    tools=context.get("tools", []),
+                    status_templates=context.get("status_templates", {}),
+                    depth=context.get("tool_iteration_depth", 0),
+                    agent_label=context.get("agent_label"),
+                    tool_summary="delegated sub-agent results",
+                ):
+                    if isinstance(chunk, dict):
+                        if chunk.get("content"):
+                            _output_parts.append(chunk["content"])
+                        if _is_suspension_chunk(chunk):
+                            _suspended = True
+                        if chunk.get("type") == ROUND_SUSPENDED:
+                            held_suspension = chunk
+                            continue
+                        await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            run_usage = await _usage_totals(usage_collector)
+            if held_suspension is not None:
+                await stream_relay.publish(
+                    channel_id, {**held_suspension, "usage": run_usage}, ttl=stream_ttl
+                )
 
         if _suspended:
             # Suspended again on a further round of pending completions —
@@ -892,7 +919,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
             logger.info(f"Delegate-resume job {job_id} suspended again on delegation")
             return
 
-        await stream_relay.publish_done(channel_id)
+        await stream_relay.publish_done(channel_id, usage=run_usage)
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
             json.dumps({**base_fields, "status": "completed"}),

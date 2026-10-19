@@ -271,6 +271,18 @@ async def _execute_agent_step(
     final_content = ""
     got_terminal = False
     async for event in stream_relay.subscribe(channel_id, timeout=agent_timeout):
+        if event.get("type") == "input_required":
+            # A pipeline step runs unattended: nobody is there to answer, and
+            # the answer would resume the chat on a channel this step does
+            # not follow. Fail now with the question rather than time out.
+            # (A round parked on a background run resumes on this channel,
+            # so that one is simply waited for.)
+            raise StepError(
+                f"Agent {namespace}/{name} asked the user a question (ask_user), which an "
+                f"unattended pipeline step cannot answer: {event.get('question')!r}. The chat "
+                f"{chat_id} stays open for an answer; to run this agent in a pipeline, give it "
+                "everything it needs in the step's message or remove askUser from its system tools."
+            )
         if event.get("content"):
             final_content += event["content"]
         if event.get("type") in ("done", "error"):
