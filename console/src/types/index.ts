@@ -1,4 +1,5 @@
 import type { AuthUser } from '@sinas/sdk';
+import type { ToolApprovals } from '../lib/toolApprovals';
 
 /**
  * Per-agent provider behaviour overrides. Absent key = inherit the provider's
@@ -244,11 +245,36 @@ export interface ChatWithMessages extends Chat {
 // Tool Approvals
 export interface ToolApprovalRequest {
   approved: boolean;
+  /** Approve, and don't ask again for this tool in this chat (session grant). */
+  always_allow?: boolean;
 }
 
 export interface ToolApprovalResponse {
   status: string;  // "approved" | "rejected"
   tool_call_id: string;
+  channel_id?: string | null;
+  /** "waiting" until the round's last asked call is decided, then "queued". */
+  resume?: 'waiting' | 'queued';
+  message?: string;
+}
+
+/** An ask_user question the conversation is suspended on. */
+export interface PendingInputResponse {
+  tool_call_id: string;
+  question: string;
+  options?: string[] | null;
+  expires_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface PendingInputAnswerResponse {
+  status: string;  // "answered"
+  tool_call_id: string;
+  /** The answer was the round's last outstanding completion: it resumes on channel_id. */
+  resumed: boolean;
+  /** The resume could not be queued yet; it is retried on channel_id. */
+  resume_pending: boolean;
+  channel_id: string | null;
   message?: string;
 }
 
@@ -328,6 +354,8 @@ export interface Agent {
   /** Chat retention override in days: null = the deployment default, 0 = keep forever. */
   retention_days: number | null;
   system_tools: Array<string | { name: string; connections?: string[] }>;
+  /** Permission mode: which tool calls stop for approval. null = unset (run everything). */
+  tool_approvals?: ToolApprovals | null;
   created_at: string;
   updated_at: string;
 }
@@ -401,6 +429,8 @@ export interface AgentUpdate {
   /** null = the deployment default (on update: back to it), 0 = keep forever. */
   retention_days?: number | null;
   system_tools?: Array<string | { name: string; connections?: string[] }>;
+  /** Left out = unchanged (the API ignores null). */
+  tool_approvals?: ToolApprovals;
 }
 
 // Roles & Users

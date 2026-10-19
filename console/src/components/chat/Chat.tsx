@@ -1,11 +1,13 @@
 import React from 'react';
-import { useChat, useClient } from '@sinas/sdk';
+import { useClient } from '@sinas/sdk';
 import type { ChatSessionMessage, MessageContent } from '@sinas/sdk';
 
 import { v, tokens, injectBaseStyles } from './tokens';
 import { injectMarkdownStyles } from './markdownStyles';
 import { ChatMessage } from './ChatMessage';
 import { ApprovalCard } from './ApprovalCard';
+import { PendingInputCard } from './PendingInputCard';
+import { useConsoleChat } from './useConsoleChat';
 import { ChatInput } from './ChatInput';
 
 export interface ChatProps {
@@ -77,13 +79,15 @@ export function Chat({
     streaming,
     error,
     pendingApprovals,
+    pendingInputs,
     toolStatus,
     send,
     approve,
     reject,
+    answer,
     stop,
     clearError,
-  } = useChat(agent, { chatId: initialChatId, input });
+  } = useConsoleChat(agent, { chatId: initialChatId, input });
 
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const prevChatIdRef = React.useRef<string | null>(null);
@@ -130,7 +134,7 @@ export function Chat({
   // Auto-scroll to bottom on new messages or streaming
   React.useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, pendingApprovals, toolStatus]);
+  }, [messages, pendingApprovals, pendingInputs, toolStatus]);
 
   const client = useClient();
 
@@ -383,8 +387,8 @@ export function Chat({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Pending approvals — pinned above input */}
-      {pendingApprovals.length > 0 && (
+      {/* Pending approvals and ask_user questions — pinned above input */}
+      {(pendingApprovals.length > 0 || pendingInputs.length > 0) && (
         <div
           style={{
             display: 'flex',
@@ -405,7 +409,17 @@ export function Chat({
               functionNamespace={approval.functionNamespace}
               arguments={approval.arguments}
               onApprove={() => approve(approval.toolCallId)}
+              onAlwaysAllow={() => approve(approval.toolCallId, { alwaysAllow: true })}
               onReject={() => reject(approval.toolCallId)}
+            />
+          ))}
+          {pendingInputs.map((pending) => (
+            <PendingInputCard
+              key={pending.toolCallId}
+              question={pending.question}
+              options={pending.options}
+              expiresAt={pending.expiresAt}
+              onAnswer={(text) => answer(pending.toolCallId, text)}
             />
           ))}
         </div>

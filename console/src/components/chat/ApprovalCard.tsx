@@ -1,11 +1,14 @@
 import React from 'react';
 import { v, tokens } from './tokens';
+import { approvalSubject } from '../../lib/chatPending';
 
 export interface ApprovalCardProps {
   functionName: string;
   functionNamespace: string;
   arguments: Record<string, unknown>;
   onApprove: () => void;
+  /** Approve, and don't ask again for this tool for the rest of the chat. */
+  onAlwaysAllow?: () => void;
   onReject: () => void;
 }
 
@@ -41,9 +44,12 @@ export function ApprovalCard({
   functionNamespace,
   arguments: args,
   onApprove,
+  onAlwaysAllow,
   onReject,
 }: ApprovalCardProps) {
   const [expanded, setExpanded] = React.useState(false);
+  // Rule-gated tools (workbench, MCP, connectors…) ask too: name the kind.
+  const subject = approvalSubject(functionNamespace, functionName);
 
   return (
     <div
@@ -67,7 +73,7 @@ export function ApprovalCard({
         }}
       >
         <WarningIcon />
-        <span>Function Approval Required</span>
+        <span>Approval required: {subject.name}</span>
       </div>
 
       {/* Function name */}
@@ -83,7 +89,7 @@ export function ApprovalCard({
             fontSize: '12px',
           }}
         >
-          {functionNamespace}/{functionName}
+          {subject.kind}
         </span>
       </div>
 
@@ -136,6 +142,7 @@ export function ApprovalCard({
       <div
         style={{
           display: 'flex',
+          flexWrap: 'wrap',
           gap: '8px',
           padding: '10px 14px',
           borderTop: '1px solid rgba(234, 179, 8, 0.12)',
@@ -158,6 +165,27 @@ export function ApprovalCard({
         >
           Approve
         </button>
+        {onAlwaysAllow && (
+          <button
+            onClick={onAlwaysAllow}
+            title={`Approve, and run ${subject.name} without asking for the rest of this chat`}
+            style={{
+              flex: 1,
+              padding: '7px 14px',
+              borderRadius: v(tokens.radiusSm),
+              border: '1px solid rgba(34, 197, 94, 0.3)',
+              backgroundColor: 'transparent',
+              color: 'var(--green-400)',
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              fontSize: '13px',
+              fontWeight: 500,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Always allow in this chat
+          </button>
+        )}
         <button
           onClick={onReject}
           style={{

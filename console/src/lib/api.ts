@@ -26,6 +26,10 @@ import type {
   ChatWithMessages,
   Message,
   MessageSendRequest,
+  PendingInputAnswerResponse,
+  PendingInputResponse,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
   Agent,
   AgentCreate,
   AgentUpdate,
@@ -436,6 +440,39 @@ class APIClient {
   /** Stop the chat's running agent loop at its next step (cooperative). */
   async interruptChat(chatId: string): Promise<{ interrupted: boolean; was_running: boolean }> {
     const response = await this.runtimeClient.post(`/chats/${chatId}/interrupt`);
+    return response.data;
+  }
+
+  /** Decide an asked tool call. `resume` is "waiting" until the round's last
+   *  decision; the resuming one returns the stream channel to follow. */
+  async approveToolCall(
+    chatId: string,
+    toolCallId: string,
+    data: ToolApprovalRequest,
+  ): Promise<ToolApprovalResponse> {
+    const response = await this.runtimeClient.post(
+      `/chats/${chatId}/approve-tool/${encodeURIComponent(toolCallId)}`,
+      data,
+    );
+    return response.data;
+  }
+
+  /** The ask_user questions the chat is suspended on. */
+  async listPendingInputs(chatId: string): Promise<PendingInputResponse[]> {
+    const response = await this.runtimeClient.get(`/chats/${chatId}/pending-input`);
+    return response.data;
+  }
+
+  /** Answer an ask_user question; the answer becomes the call's tool result. */
+  async answerPendingInput(
+    chatId: string,
+    toolCallId: string,
+    answer: string,
+  ): Promise<PendingInputAnswerResponse> {
+    const response = await this.runtimeClient.post(
+      `/chats/${chatId}/pending-input/${encodeURIComponent(toolCallId)}`,
+      { answer },
+    );
     return response.data;
   }
 
