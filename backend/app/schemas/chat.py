@@ -200,13 +200,57 @@ class InvokeRequest(BaseModel):
     )
 
 
+class TurnUsage(BaseModel):
+    """LLM usage of one request: every LLM call made while answering it.
+
+    Covers the reply and its tool rounds. Not included: earlier turns of the
+    same chat, calls made by delegated sub-agents (they run as separate
+    jobs, under their own chats), and background compaction. Field names
+    match the `/api/v1/usage/summary` metrics; each call is also an
+    `llm_usage` row, committed before the response is returned.
+    """
+
+    calls: int = Field(description="LLM calls made")
+    prompt_tokens: int = Field(description="Input tokens, cache reads and writes included")
+    completion_tokens: int = Field(description="Output tokens")
+    total_tokens: int = Field(description="prompt_tokens + completion_tokens")
+    cache_read_tokens: int = Field(description="Part of prompt_tokens read from the prompt cache")
+    cache_write_tokens: int = Field(description="Part of prompt_tokens written to the prompt cache")
+    cost_usd: Optional[float] = Field(
+        description=(
+            "Cost of the priced calls in USD. Null when calls were made but none "
+            "could be priced; when unpriced_calls > 0 it covers the priced calls only."
+        )
+    )
+    unpriced_calls: int = Field(description="Calls without a known price, not in cost_usd")
+    errors: int = Field(description="Calls that failed")
+
+
 class InvokeResponse(BaseModel):
     """Response from synchronous agent invoke."""
 
     reply: str
     chat_id: uuid.UUID
     session_key: Optional[str] = None
-    usage: Optional[dict[str, Any]] = None
+    usage: Optional[TurnUsage] = Field(
+        None,
+        description=(
+            "LLM usage of this invoke only (not of earlier invokes in the same "
+            "session). Null only if it could not be determined."
+        ),
+    )
+
+
+class MessageSendResponse(MessageResponse):
+    """The reply to a non-streaming message send, with the turn's LLM usage."""
+
+    usage: Optional[TurnUsage] = Field(
+        None,
+        description=(
+            "LLM usage of this send only (not of earlier turns). "
+            "Null only if it could not be determined."
+        ),
+    )
 
 
 class ToolApprovalRequest(BaseModel):

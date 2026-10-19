@@ -7,11 +7,19 @@ that apply at that moment — see app/services/llm_pricing.py). Recording is
 fire-and-forget on a dedicated DB session: a failed insert never blocks or
 fails the call, and it is isolated from whatever transaction state the
 caller's session is in.
+
+A request that reports the usage of the calls it caused (the synchronous
+agent invoke) opens a :func:`collect_usage` scope: every call recorded in
+that async context is also handed to the scope's :class:`UsageCollector`,
+which waits for the rows to commit and totals them.
 """
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from decimal import Decimal
 from typing import Any, Optional
 
 from .base import BaseLLMProvider
@@ -35,6 +43,99 @@ async def _insert_usage(values: dict[str, Any]) -> None:
             await session.commit()
     except Exception as e:
         logger.warning(f"Failed to record LLM usage: {e}")
+
+
+# How long UsageCollector.totals() waits for outstanding usage inserts.
+_SETTLE_TIMEOUT_SECONDS = 10.0
+
+_TOKEN_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+class UsageCollector:
+    """The llm_usage rows recorded in one async context, e.g. one invoke.
+
+    Attribution is by context, not by chat or time window: a call counts
+    when it was recorded by code running in the scope's context — the
+    request's own task and every task it spawned (tool rounds, parallel tool
+    calls). Calls made in another process (sub-agents run by queue workers)
+    or by work that detached itself (background compaction) don't count.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[dict[str, Any], asyncio.Task]] = []
+        self._closed = False
+
+    def add(self, values: dict[str, Any], task: asyncio.Task) -> None:
+        # A straggler that inherited the context and records after the
+        # totals were taken is not part of them.
+        if not self._closed:
+            self._entries.append((values, task))
+
+    async def totals(self, timeout: float = _SETTLE_TIMEOUT_SECONDS) -> dict[str, Any]:
+        """Wait for the collected rows to be priced and committed, then total
+        them. Field names match the /usage/summary metrics.
+
+        `cost_usd` adds up the priced calls and is None when calls were made
+        but none was priced. A call whose recording hadn't finished within
+        `timeout` counts as unpriced, so a slow insert shows in
+        `unpriced_calls` rather than as a silently lower cost.
+        """
+        self._closed = True
+        entries = list(self._entries)
+        pending: set[asyncio.Task] = set()
+        if entries:
+            _, pending = await asyncio.wait([task for _, task in entries], timeout=timeout)
+            if pending:
+                logger.warning(
+                    f"{len(pending)} LLM usage record(s) not committed after {timeout}s; "
+                    "reporting them as unpriced"
+                )
+        result: dict[str, Any] = {field: 0 for field in _TOKEN_FIELDS}
+        result.update(calls=len(entries), unpriced_calls=0, errors=0)
+        cost: Optional[Decimal] = None
+        for values, task in entries:
+            for field in _TOKEN_FIELDS:
+                result[field] += int(values.get(field) or 0)
+            if values.get("error") is not None:
+                result["errors"] += 1
+            call_cost = None if task in pending else values.get("cost_usd")
+            if call_cost is None:
+                result["unpriced_calls"] += 1
+            else:
+                cost = (cost or Decimal(0)) + Decimal(call_cost)
+        if cost is not None:
+            result["cost_usd"] = float(cost)
+        else:
+            result["cost_usd"] = None if entries else 0.0
+        return result
+
+
+_collector: ContextVar[Optional[UsageCollector]] = ContextVar("llm_usage_collector", default=None)
+
+
+@contextmanager
+def collect_usage() -> Iterator[UsageCollector]:
+    """Collect the usage of every LLM call recorded in this context, and in
+    the tasks it spawns, until the block exits."""
+    collector = UsageCollector()
+    token = _collector.set(collector)
+    try:
+        yield collector
+    finally:
+        _collector.reset(token)
+
+
+def detach_usage_collector() -> None:
+    """Keep the calling task's LLM calls out of an enclosing collect_usage()
+    scope. For fire-and-forget work that merely inherited the request's
+    context; it only changes the calling task's own context."""
+    _collector.set(None)
 
 
 class UsageTrackingProvider(BaseLLMProvider):
@@ -80,7 +181,10 @@ class UsageTrackingProvider(BaseLLMProvider):
             if self._context.get(key) is not None:
                 values[key] = self._context[key]
         try:
-            asyncio.get_running_loop().create_task(_insert_usage(values))
+            task = asyncio.get_running_loop().create_task(_insert_usage(values))
+            collector = _collector.get()
+            if collector is not None:
+                collector.add(values, task)
         except Exception as e:
             logger.warning(f"Failed to schedule LLM usage recording: {e}")
 

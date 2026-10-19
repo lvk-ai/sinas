@@ -26,6 +26,7 @@ from app.models.chat import Chat
 from app.models.pending_approval import PendingToolApproval
 from app.models.user import User
 from app.providers.factory import create_provider
+from app.providers.tracking import UsageCollector, collect_usage
 from app.schemas.agent import AgentResponse
 from app.schemas.batch import AgentBatchRequest, AgentBatchResponse
 from app.schemas.chat import (
@@ -37,11 +38,13 @@ from app.schemas.chat import (
     InvokeResponse,
     MessageResponse,
     MessageSendRequest,
+    MessageSendResponse,
     PendingApprovalResponse,
     PendingInputAnswer,
     PendingInputResponse,
     ToolApprovalRequest,
     ToolApprovalResponse,
+    TurnUsage,
 )
 from app.services import batch_service
 from app.core.callback import CallbackURLError, validate_callback_url
@@ -56,6 +59,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 HEARTBEAT_INTERVAL = 15  # seconds between SSE heartbeat pings
+
+
+async def _turn_usage(collector: UsageCollector) -> Optional[TurnUsage]:
+    """The LLM usage collected for one request, once its llm_usage rows are
+    committed. None (with a logged error) only if it can't be totalled."""
+    try:
+        return TurnUsage(**await collector.totals())
+    except Exception:
+        logger.exception("Failed to total the LLM usage of this request")
+        return None
 
 
 async def with_heartbeat(aiter, interval: int = HEARTBEAT_INTERVAL):
@@ -260,6 +273,11 @@ async def invoke_agent(
 
     Combines chat creation + message send into one request/response.
     Supports session keys for conversation continuity across calls.
+
+    `usage` totals the LLM calls made for this invoke — the reply and its
+    tool rounds — not earlier invokes of the same session. Calls made by
+    delegated sub-agents (separate jobs, under their own chats) and
+    background compaction are not included.
     """
     user_id, permissions = current_user_data
 
@@ -351,19 +369,22 @@ async def invoke_agent(
     user_token = http_request.headers.get("authorization", "").replace("Bearer ", "")
     message_service = MessageService(db)
 
-    try:
-        timeout = agent.default_job_timeout or settings.function_timeout or 300
-        response_message = await asyncio.wait_for(
-            message_service.send_message(
-                chat_id=str(chat.id),
-                user_id=user_id,
-                user_token=user_token,
-                content=content_str,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Agent execution timed out")
+    # Every LLM call made in this context (the reply, its tool rounds) is
+    # collected for the response's usage; see app/providers/tracking.py.
+    with collect_usage() as usage_collector:
+        try:
+            timeout = agent.default_job_timeout or settings.function_timeout or 300
+            response_message = await asyncio.wait_for(
+                message_service.send_message(
+                    chat_id=str(chat.id),
+                    user_id=user_id,
+                    user_token=user_token,
+                    content=content_str,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "Agent execution timed out")
 
     # 6. Return response
     reply = response_message.content or ""
@@ -372,6 +393,7 @@ async def invoke_agent(
         reply=reply,
         chat_id=chat.id,
         session_key=request.session_key,
+        usage=await _turn_usage(usage_collector),
     )
 
 
@@ -433,7 +455,7 @@ async def submit_agent_batch(
     return AgentBatchResponse(**result)
 
 
-@router.post("/chats/{chat_id}/messages", response_model=MessageResponse)
+@router.post("/chats/{chat_id}/messages", response_model=MessageSendResponse)
 async def send_message(
     chat_id: str,
     request: MessageSendRequest,
@@ -450,6 +472,8 @@ async def send_message(
     - Loads chat by ID
     - Verifies ownership (only chat owner can send messages)
     - Sends message using MessageService
+    - Returns the reply with `usage`: the LLM calls made for this send only
+      (same scope as the invoke endpoint's `usage`)
     """
     user_id, permissions = current_user_data
 
@@ -488,11 +512,14 @@ async def send_message(
         else json.dumps([part.model_dump(exclude_none=True) for part in request.content])
     )
 
-    response_message = await message_service.send_message(
-        chat_id=str(chat.id), user_id=user_id, user_token=user_token, content=content_str
-    )
+    with collect_usage() as usage_collector:
+        response_message = await message_service.send_message(
+            chat_id=str(chat.id), user_id=user_id, user_token=user_token, content=content_str
+        )
 
-    return MessageResponse.model_validate(response_message)
+    response = MessageSendResponse.model_validate(response_message)
+    response.usage = await _turn_usage(usage_collector)
+    return response
 
 
 @router.post("/chats/{chat_id}/messages/stream")
