@@ -208,7 +208,9 @@ curl -X POST https://yourdomain.com/agents/default/default/chats \
 | `limit` | — | Page size, 1–200. Passing `limit` or `cursor` turns on pagination |
 | `cursor` | — | The `X-Next-Cursor` value of the previous page. Pages hold 50 chats unless `limit` says otherwise |
 
-The body is a JSON array of chats either way. Without `limit` or `cursor`, every matching chat is returned in one response, as in earlier versions. That stays supported, but it is slow for accounts with many chats, so new clients should page. When paging, a response that has more chats after it carries the cursor for the next page in the `X-Next-Cursor` header, and the same next page as a relative URL in a `Link: <...>; rel="next"` header. The last page has neither header. Treat the cursor as opaque, and pass the same filters with it. An invalid cursor returns `400`.
+The body is a JSON array of chats either way. Without `limit` or `cursor`, every matching chat is returned in one response, as in earlier versions, up to `CHATS_UNPAGINATED_MAX` (default 10,000). That stays supported, but it is slow for accounts with many chats, so new clients should page. When paging, a response that has more chats after it carries the cursor for the next page in the `X-Next-Cursor` header, and the same next page as a relative URL in a `Link: <...>; rel="next"` header. The last page has neither header. Treat the cursor as opaque, and pass the same filters with it. An invalid cursor returns `400`.
+
+An account with more than `CHATS_UNPAGINATED_MAX` chats gets only the most recently updated that many from an unpaginated request. The response then says so with `X-Truncated: true` and carries the same `X-Next-Cursor` and `Link` headers a page does, and the backend logs a warning. Continue from that cursor as you would from any page; the `Link` URL asks for pages of 200. A response without `X-Truncated` is the complete list.
 
 ```bash
 # First page of 50

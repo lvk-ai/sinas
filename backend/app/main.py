@@ -156,7 +156,7 @@ app.add_middleware(
     allow_headers=["*"],
     # Pagination headers (GET /chats) must be readable by browser clients
     # on another origin, such as the console's dev server.
-    expose_headers=["X-Next-Cursor", "Link"],
+    expose_headers=["X-Next-Cursor", "Link", "X-Truncated"],
 )
 
 # Add request logging middleware

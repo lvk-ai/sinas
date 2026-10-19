@@ -304,6 +304,18 @@ class Settings(BaseSettings):
     pipeline_job_timeout: int = 1800  # hard ceiling for one queued run (incl. agent steps)
     pipeline_run_retention_days: int = 30  # pipeline_runs rows older than this are pruned
 
+    # GET /chats without limit or cursor returns at most this many chats;
+    # past it the response is truncated (X-Truncated: true) and carries the
+    # cursor for the rest. Bounds the memory one request can take.
+    chats_unpaginated_max: int = 10000
+
+    @field_validator("chats_unpaginated_max")
+    @classmethod
+    def _validate_chats_unpaginated_max(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"CHATS_UNPAGINATED_MAX must be positive, got {v}")
+        return v
+
     # Chat retention (docs/design/chat-retention.md). Off unless enabled:
     # nothing is archived or deleted on a deployment that hasn't opted in.
     chat_retention_enabled: bool = False
