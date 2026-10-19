@@ -72,8 +72,16 @@ def _within_job_timeout(
 
     @functools.wraps(job)
     async def run(ctx: dict[str, Any], **kwargs: Any) -> Any:
-        async with asyncio.timeout(agent_job_timeout(kwargs.get("job_timeout"))):
-            return await job(ctx, **kwargs)
+        from app.services import chat_steering
+
+        seconds = agent_job_timeout(kwargs.get("job_timeout"))
+        # The chat lock the job takes lives as long as the job may run.
+        token = chat_steering.current_job_timeout.set(seconds)
+        try:
+            async with asyncio.timeout(seconds):
+                return await job(ctx, **kwargs)
+        finally:
+            chat_steering.current_job_timeout.reset(token)
 
     return run
 
