@@ -49,10 +49,10 @@ def upgrade() -> None:
         op.execute(_MARK)
         return
 
-    conn = op.get_bind()
     marked = 0
     lower = None
     with op.get_context().autocommit_block():
+        conn = op.get_bind()  # in autocommit: each statement commits itself
         while True:
             # The id that closes the next range of BATCH_ROWS rows (in primary
             # key order), or None when fewer than that are left.
