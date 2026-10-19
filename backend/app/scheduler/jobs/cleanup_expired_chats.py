@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 100
 
 
+def expired_stmt(now: datetime):
+    """The chats whose expires_at has passed."""
+    return select(Chat.id).where(Chat.expires_at.isnot(None), Chat.expires_at < now)
+
+
 async def _delete_one(chat_id) -> bool:
     """Delete one chat in its own transaction, unless another holds its
     row. True if it was deleted."""
@@ -42,7 +47,7 @@ async def cleanup_expired_chats() -> None:
     passed_over: set = set()  # failed, or held by another transaction: for a later run
     while True:
         async with AsyncSessionLocal() as db:
-            stmt = select(Chat.id).where(Chat.expires_at.isnot(None), Chat.expires_at < now)
+            stmt = expired_stmt(now)
             if passed_over:
                 stmt = stmt.where(Chat.id.notin_(passed_over))
             ids = (

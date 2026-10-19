@@ -111,6 +111,15 @@ async def world(monkeypatch):
     await w.setup()
     # The job's own sessions, on this test's event loop.
     monkeypatch.setattr(cleanup_module, "AsyncSessionLocal", w.sessions)
+    # Runs see only this test's user's chats: the database is shared with
+    # every other test, and expired chats another test left behind are not
+    # ours to delete (nor to count against the batches).
+    real = cleanup_module.expired_stmt
+
+    def scoped(now):
+        return real(now).where(Chat.user_id == w.user_id)
+
+    monkeypatch.setattr(cleanup_module, "expired_stmt", scoped)
     try:
         yield w
     finally:
@@ -245,3 +254,22 @@ async def test_a_locked_chat_is_skipped_not_waited_for(world):
         await holder.rollback()
     await cleanup_module.cleanup_expired_chats()
     assert not await world.exists(busy)
+
+
+async def test_these_tests_leave_other_users_expired_chats_alone(world):
+    """The fixture scopes runs to its own user (the database is shared)."""
+    async with world.sessions() as db:
+        other = User(email=f"expire-other-{uuid.uuid4().hex[:10]}@example.com")
+        db.add(other)
+        await db.flush()
+        foreign = Chat(user_id=other.id, title="not ours", expires_at=NOW - timedelta(hours=1))
+        db.add(foreign)
+        await db.commit()
+    try:
+        await cleanup_module.cleanup_expired_chats()
+        assert await world.exists(foreign.id)
+    finally:
+        async with world.sessions() as db:
+            await db.execute(delete(Chat).where(Chat.id == foreign.id))
+            await db.execute(delete(User).where(User.id == other.id))
+            await db.commit()
