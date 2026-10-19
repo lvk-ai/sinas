@@ -158,6 +158,8 @@ curl -H "Authorization: Bearer $KEY" \
   "$SINAS/api/v1/usage/summary?chat_id=$CHAT_1&chat_id=$CHAT_2"
 ```
 
+For the cost of one request, you don't need a report: the synchronous [agent invoke](/build-resources/agents) and the non-streaming `POST /chats/{id}/messages` return a `usage` object with these metrics for the calls that request made.
+
 ### Backfill
 
 Calls recorded before a price was known keep `cost_usd: null`. Once you've added the price, an admin can price them at the prices that apply **now**:

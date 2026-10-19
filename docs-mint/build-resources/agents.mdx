@@ -134,6 +134,37 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 - `reset: true`: Archives the existing session and starts a new conversation.
 - `input`: Agent input variables, only used when creating a new chat.
 - Streams internally, returns assembled reply as a single JSON payload.
+- `usage`: the LLM usage of this invoke (see below).
+
+**Usage per invoke.** The response's `usage` totals the LLM calls made to answer this invoke: the reply and every tool round before it. It doesn't include earlier invokes in the same `session_key` chat, so you can add it up per request without double counting.
+
+```json
+{
+  "reply": "Your order is on its way...",
+  "chat_id": "…",
+  "session_key": "slack:U09ABC123",
+  "usage": {
+    "calls": 3,
+    "prompt_tokens": 4100,
+    "completion_tokens": 90,
+    "total_tokens": 4190,
+    "cache_read_tokens": 1500,
+    "cache_write_tokens": 1500,
+    "cost_usd": 0.0061,
+    "unpriced_calls": 0,
+    "errors": 0
+  }
+}
+```
+
+- The fields are the same as the metrics of [`/api/v1/usage/summary`](/admin/usage-cost#api). `prompt_tokens` includes the cache reads and writes.
+- `cost_usd` adds up the calls that have a price. It's `null` when no call could be priced. When `unpriced_calls` is above 0, the cost covers only the priced calls. See [Usage & Cost](/admin/usage-cost) for setting prices.
+- Each call is also an `llm_usage` row, saved before the response is sent, so `/api/v1/usage` reports agree with it right away. `cost_usd` only includes calls whose row was saved. If a row fails to save, or takes more than 10 seconds, that call still counts in `calls` and the token totals (it was made, and the provider bills it), but as unpriced, without its cost. In that rare case the tokens are higher than what `/api/v1/usage` has on record.
+- Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
+- `usage` is `null` only if it couldn't be worked out.
+- If the session's chat is already busy with another request, the message is queued into that run and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
+
+`POST /chats/{id}/messages` (non-streaming) returns the same `usage` with the reply message.
 
 **How chat works:**
 

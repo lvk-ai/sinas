@@ -95,6 +95,11 @@ def maybe_schedule_compaction(chat_id: str) -> None:
 
 async def _guarded_run(chat_id: str) -> None:
     from app.core.redis import get_redis
+    from app.providers.tracking import detach_usage_collector
+
+    # Background chat upkeep, not part of the turn that scheduled it: keep
+    # its LLM call out of that turn's usage (the invoke response's `usage`).
+    detach_usage_collector()
 
     try:
         redis = await get_redis()
