@@ -17,6 +17,17 @@ import {
   toPendingInputs,
   type PendingInput,
 } from '../../lib/chatPending';
+import {
+  TRAILING_POLLS_MS,
+  addApproval,
+  applyTextDelta,
+  applyToolEnd,
+  applyToolStart,
+  approvalFromEvent,
+  createLatestGate,
+  nextPendingPollMs,
+  textFromMessageChunk,
+} from '../../lib/chatStream';
 
 /**
  * The console's chat session: @sinas/sdk's useChat (0.7), plus what the
@@ -25,6 +36,7 @@ import {
  * decision, and ask_user questions (live and on reload) with answers that
  * resume the conversation. Streaming uses the SDK's own stream functions;
  * the approval and pending-input calls go through the console's API client.
+ * State transitions live in lib/chatStream.ts and lib/chatPending.ts.
  */
 export interface ConsoleChatResult {
   chatId: string | null;
@@ -58,31 +70,55 @@ export function useConsoleChat(
   const [pendingApprovals, setPendingApprovals] = React.useState<ApprovalRequest[]>([]);
   const [pendingInputs, setPendingInputs] = React.useState<PendingInput[]>([]);
   const [toolStatus, setToolStatus] = React.useState<ToolStatus[]>([]);
+  // Index into TRAILING_POLLS_MS while re-reading a chat whose question
+  // went away server-side; its length means "not trailing".
+  const [trailingPoll, setTrailingPoll] = React.useState(TRAILING_POLLS_MS.length);
+  // Bumped after each poll so the next one is scheduled even when the poll's
+  // refresh was superseded (and so changed nothing).
+  const [pollTick, setPollTick] = React.useState(0);
 
   const abortRef = React.useRef<AbortController | null>(null);
   const chatIdRef = React.useRef<string | null>(chatId);
   chatIdRef.current = chatId;
+  // Only the newest refresh (or turn) may write the server's state.
+  const [gate] = React.useState(createLatestGate);
 
-  // The questions the chat is suspended on. Best-effort: the chat itself
-  // still works without them.
-  const loadPendingInputs = React.useCallback(async (id: string) => {
-    try {
-      setPendingInputs(toPendingInputs(await apiClient.listPendingInputs(id)));
-    } catch {
-      // keep what is shown
-    }
-  }, []);
+  /**
+   * Re-read the server's state: messages, approvals, questions. Resolves
+   * to the questions shown, or null when a newer refresh or turn
+   * superseded this one (its result is then dropped).
+   */
+  const refresh = React.useCallback(
+    async (id: string): Promise<PendingInput[] | null> => {
+      const ticket = gate.next();
+      const [detail, inputs] = await Promise.allSettled([getChat(client, id), apiClient.listPendingInputs(id)]);
+      if (!gate.isCurrent(ticket)) return null;
+      // Best-effort: what is already shown stays when a read fails.
+      if (detail.status === 'fulfilled') {
+        setMessages(detail.value.messages);
+        setPendingApprovals(detail.value.pendingApprovals ?? []);
+      }
+      if (inputs.status === 'fulfilled') {
+        const next = toPendingInputs(inputs.value);
+        setPendingInputs(next);
+        return next;
+      }
+      return null;
+    },
+    [client, gate],
+  );
 
   // Load an existing chat on mount
   React.useEffect(() => {
     if (!options?.chatId) return;
     let cancelled = false;
     const id = options.chatId;
+    const ticket = gate.next();
 
     setLoading(true);
     getChat(client, id)
       .then((detail) => {
-        if (cancelled) return;
+        if (cancelled || !gate.isCurrent(ticket)) return;
         setChatId(detail.id);
         setMessages(detail.messages);
         setPendingApprovals(detail.pendingApprovals ?? []);
@@ -93,20 +129,42 @@ export function useConsoleChat(
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    // The questions the chat is suspended on. Best-effort: the chat itself
+    // works without them.
     apiClient
       .listPendingInputs(id)
       .then((items) => {
-        if (!cancelled) setPendingInputs(toPendingInputs(items));
+        if (!cancelled && gate.isCurrent(ticket)) setPendingInputs(toPendingInputs(items));
       })
       .catch(() => {});
 
     return () => {
       cancelled = true;
     };
-  }, [client, options?.chatId]);
+  }, [client, gate, options?.chatId]);
 
   // Cleanup on unmount
   React.useEffect(() => () => abortRef.current?.abort(), []);
+
+  // While questions wait with no stream open, nothing announces that one
+  // expired (the round then resumes server-side) or was answered elsewhere:
+  // re-read the chat periodically and just after the earliest deadline,
+  // then a few more times once a question went away, to show the reply.
+  React.useEffect(() => {
+    if (streaming || !chatId) return;
+    let delay: number | null = null;
+    if (pendingInputs.length > 0) delay = nextPendingPollMs(pendingInputs, Date.now());
+    else if (trailingPoll < TRAILING_POLLS_MS.length) delay = TRAILING_POLLS_MS[trailingPoll];
+    if (delay === null) return;
+    const waiting = pendingInputs.map((p) => p.toolCallId);
+    const timer = setTimeout(async () => {
+      const now = await refresh(chatId);
+      if (waiting.length === 0) setTrailingPoll((i) => i + 1);
+      else if (now && waiting.some((id) => !now.some((p) => p.toolCallId === id))) setTrailingPoll(0);
+      setPollTick((t) => t + 1);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [chatId, streaming, pendingInputs, trailingPoll, pollTick, refresh]);
 
   const handleStreamChunk = React.useCallback((chunk: SSEChunk) => {
     // A question: its own event (queued turn, reconnect) or a typed
@@ -116,38 +174,10 @@ export function useConsoleChat(
       setPendingInputs((prev) => mergePendingInputs(prev, [asked]));
       return;
     }
+    const chatIdNow = chatIdRef.current || '';
     if (chunk.event === 'message') {
-      const newContent = (() => {
-        try {
-          const parsed = JSON.parse(chunk.data);
-          return parsed.content || '';
-        } catch {
-          return chunk.data;
-        }
-      })();
-      if (!newContent || typeof newContent !== 'string') return;
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last && last.role === 'assistant' && !last.toolCalls && last.streaming) {
-          const next = [...prev];
-          next[next.length - 1] = { ...last, content: (last.content || '') + newContent };
-          return next;
-        }
-        return [
-          ...prev,
-          {
-            id: `tmp-text-${Date.now()}`,
-            chatId: chatIdRef.current || '',
-            role: 'assistant' as const,
-            content: newContent,
-            toolCalls: null,
-            toolCallId: null,
-            name: null,
-            createdAt: new Date().toISOString(),
-            streaming: true,
-          },
-        ];
-      });
+      const text = textFromMessageChunk(chunk.data);
+      if (text) setMessages((prev) => applyTextDelta(prev, text, chatIdNow));
     } else if (chunk.event === 'tool_start') {
       try {
         const parsed = JSON.parse(chunk.data);
@@ -155,36 +185,7 @@ export function useConsoleChat(
           ...prev,
           { toolCallId: parsed.tool_call_id, name: parsed.name, description: parsed.description, status: 'running' },
         ]);
-        setMessages((prev) => {
-          if (prev.some((m) => m.toolCalls?.some((tc) => tc.id === parsed.tool_call_id))) return prev;
-          // Freeze the text message before it in place
-          const next = prev.map((m, i) =>
-            i === prev.length - 1 && m.streaming && m.role === 'assistant' && !m.toolCalls
-              ? { ...m, streaming: false }
-              : m,
-          );
-          return [
-            ...next,
-            {
-              id: `tmp-tc-${parsed.tool_call_id}`,
-              chatId: chatIdRef.current || '',
-              role: 'assistant' as const,
-              content: null,
-              toolCalls: [
-                {
-                  id: parsed.tool_call_id,
-                  type: 'function' as const,
-                  function: { name: parsed.name, arguments: parsed.arguments || '{}' },
-                  description: parsed.description,
-                },
-              ],
-              toolCallId: null,
-              name: null,
-              createdAt: new Date().toISOString(),
-              streaming: true,
-            },
-          ];
-        });
+        setMessages((prev) => applyToolStart(prev, parsed, chatIdNow));
       } catch {
         // ignore malformed tool_start events
       }
@@ -194,41 +195,13 @@ export function useConsoleChat(
         setToolStatus((prev) =>
           prev.map((t) => (t.toolCallId === parsed.tool_call_id ? { ...t, status: 'complete' } : t)),
         );
-        if (parsed.result !== undefined) {
-          const resultContent = typeof parsed.result === 'string' ? parsed.result : JSON.stringify(parsed.result);
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.toolCalls?.some((tc) => tc.id === parsed.tool_call_id)
-                ? {
-                    ...m,
-                    toolResults: {
-                      ...m.toolResults,
-                      [parsed.tool_call_id]: { content: resultContent, name: parsed.name },
-                    },
-                  }
-                : m,
-            ),
-          );
-        }
+        setMessages((prev) => applyToolEnd(prev, parsed));
       } catch {
         // ignore malformed tool_end events
       }
     } else if (chunk.event === 'approval_required') {
-      try {
-        const raw = JSON.parse(chunk.data);
-        const parsed: ApprovalRequest = {
-          type: raw.type,
-          toolCallId: raw.tool_call_id,
-          functionNamespace: raw.function_namespace,
-          functionName: raw.function_name,
-          arguments: raw.arguments || {},
-        };
-        setPendingApprovals((prev) =>
-          prev.some((a) => a.toolCallId === parsed.toolCallId) ? prev : [...prev, parsed],
-        );
-      } catch {
-        // ignore malformed approval events
-      }
+      const approval = approvalFromEvent(chunk.data);
+      if (approval) setPendingApprovals((prev) => addApproval(prev, approval));
     } else if (chunk.event === 'error') {
       try {
         const parsed = JSON.parse(chunk.data);
@@ -238,21 +211,6 @@ export function useConsoleChat(
       }
     }
   }, []);
-
-  // The server's state after a stream ends: messages, approvals, questions.
-  const refresh = React.useCallback(
-    async (id: string) => {
-      try {
-        const detail = await getChat(client, id);
-        setMessages(detail.messages);
-        setPendingApprovals(detail.pendingApprovals ?? []);
-      } catch {
-        // Best-effort: streamed content is already visible
-      }
-      await loadPendingInputs(id);
-    },
-    [client, loadPendingInputs],
-  );
 
   const streamCallbacks = React.useCallback(
     (id: string) =>
@@ -275,12 +233,13 @@ export function useConsoleChat(
   const follow = React.useCallback(
     (id: string, channelId: string) => {
       abortRef.current?.abort();
+      gate.next(); // a refresh still in flight is older than this turn
       setStreaming(true);
       setError(null);
       const [onDone, onError] = streamCallbacks(id);
       abortRef.current = streamFromChannel(client, id, channelId, handleStreamChunk, onDone, onError);
     },
-    [client, handleStreamChunk, streamCallbacks],
+    [client, gate, handleStreamChunk, streamCallbacks],
   );
 
   const send = React.useCallback(
@@ -306,6 +265,7 @@ export function useConsoleChat(
         }
 
         abortRef.current?.abort();
+        gate.next(); // a refresh still in flight is older than this turn
         setStreaming(true);
         setError(null);
         setPendingApprovals([]);
@@ -331,13 +291,14 @@ export function useConsoleChat(
         abortRef.current = streamMessage(client, activeChatId, content, handleStreamChunk, onDone, onError);
       })();
     },
-    [client, agentRef, options?.input, handleStreamChunk, streamCallbacks],
+    [client, agentRef, options?.input, gate, handleStreamChunk, streamCallbacks],
   );
 
   const decide = React.useCallback(
     (toolCallId: string, approved: boolean, alwaysAllow: boolean) => {
       const id = chatIdRef.current;
       if (!id) return;
+      gate.next(); // a refresh in flight must not bring the card back
       setPendingApprovals((prev) => prev.filter((a) => a.toolCallId !== toolCallId));
       setError(null);
 
@@ -358,7 +319,7 @@ export function useConsoleChat(
         }
       })();
     },
-    [follow, refresh],
+    [follow, gate, refresh],
   );
 
   const approve = React.useCallback(
@@ -375,6 +336,7 @@ export function useConsoleChat(
       setError(null);
       try {
         const result = await apiClient.answerPendingInput(id, toolCallId, text);
+        gate.next(); // a refresh in flight must not bring the question back
         setPendingInputs((prev) => prev.filter((p) => p.toolCallId !== toolCallId));
         // The last outstanding completion resumes the round on a fresh
         // channel; otherwise the round keeps waiting on the others.
@@ -383,11 +345,11 @@ export function useConsoleChat(
         return true;
       } catch (e) {
         setError(getApiErrorMessage(e, 'Could not send the answer'));
-        loadPendingInputs(id);
+        refresh(id);
         return false;
       }
     },
-    [follow, loadPendingInputs],
+    [follow, gate, refresh],
   );
 
   const stop = React.useCallback(() => {
