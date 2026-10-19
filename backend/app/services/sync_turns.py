@@ -34,7 +34,7 @@ from sqlalchemy import select
 
 from app.models.chat import Message
 from app.services import deferred_completions
-from app.services.deferred_completions import ROUND_SUSPENDED
+from app.services.deferred_completions import ROUND_MOVED, ROUND_SUSPENDED
 from app.services.message_service import (
     TURN_COMPLETED,
     TURN_IN_PROGRESS,
@@ -112,39 +112,58 @@ class RoundFollower:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(self.timeout, 0)
         asked: set[str] = set()
-        stream = stream_relay.subscribe(
-            self.channel_id, last_id=self.last_id, timeout=max(int(self.timeout), 1)
-        ).__aiter__()
-        try:
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    return
-                try:
-                    event = await asyncio.wait_for(stream.__anext__(), remaining)
-                except (StopAsyncIteration, asyncio.TimeoutError):
-                    return  # idle past the budget: still in progress
-                kind = event.get("type")
-                if kind == "ping":
-                    continue
-                yield event
-                if kind == "input_required" and event.get("tool_call_id"):
-                    asked.add(event["tool_call_id"])
-                elif kind == ROUND_SUSPENDED:
-                    self.usages.append(event.get("usage"))
-                    if asked & set(event.get("tool_call_ids") or []):
-                        self.status = TURN_INPUT_REQUIRED
+        # Events seen since the last run that reported its usage: a run cut
+        # off by the budget may have made calls nobody reported yet.
+        unreported = False
+        channel_id, last_id = self.channel_id, self.last_id
+        while channel_id:
+            moved_to = None
+            stream = stream_relay.subscribe(
+                channel_id, last_id=last_id, timeout=max(int(self.timeout), 1)
+            ).__aiter__()
+            try:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        event = await asyncio.wait_for(stream.__anext__(), remaining)
+                    except (StopAsyncIteration, asyncio.TimeoutError):
+                        break  # idle past the budget: still in progress
+                    kind = event.get("type")
+                    if kind == "ping":
+                        continue
+                    if kind == ROUND_MOVED:
+                        # Resumed on another channel: follow it there.
+                        moved_to = event.get("channel_id")
+                        if moved_to:
+                            break
+                        continue
+                    unreported = True
+                    yield event
+                    if kind == "input_required" and event.get("tool_call_id"):
+                        asked.add(event["tool_call_id"])
+                    elif kind == ROUND_SUSPENDED:
+                        self.usages.append(event.get("usage"))
+                        unreported = False
+                        if asked & set(event.get("tool_call_ids") or []):
+                            self.status = TURN_INPUT_REQUIRED
+                            return
+                    elif kind == "done":
+                        self.usages.append(event.get("usage"))
+                        self.status = TURN_COMPLETED
                         return
-                elif kind == "done":
-                    self.usages.append(event.get("usage"))
-                    self.status = TURN_COMPLETED
-                    return
-                elif kind == "error":
-                    self.status = "failed"
-                    self.error = event.get("error") or "The agent's turn failed"
-                    return
-        finally:
-            await stream.aclose()
+                    elif kind == "error":
+                        self.status = "failed"
+                        self.error = event.get("error") or "The agent's turn failed"
+                        return
+            finally:
+                await stream.aclose()
+            channel_id, last_id = moved_to, "0"
+        if unreported:
+            # Still in progress: what the cut-off run spent is unknown, so
+            # the request's total is too (reported as null, not too low).
+            self.usages.append(None)
 
     async def run(self) -> RoundFollower:
         async for _ in self.events():

@@ -165,7 +165,7 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 - Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
 - `usage` is `null` only if it couldn't be worked out.
 - If the session's chat is already busy with another request, the message is queued into that run, `status` is `injected`, `reply` is empty and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
-- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
+- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. If the request ran out of time while that part was still running, `usage` is `null`, because those calls can't be counted yet. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
 
 `POST /chats/{id}/messages` (non-streaming) returns the same `usage` with the reply message.
 
@@ -207,7 +207,7 @@ curl -X POST https://yourdomain.com/chats/$CHAT_ID/pending-input/call_8f2… \
 
 Sending another message to a chat that waits on a question doesn't answer the question. The message is `injected` and read once the turn resumes. The exception is the [OpenAI-compatible endpoint](/platform/api-overview), which can only send messages: there, the next message in the chat is the answer.
 
-On a stream (`POST /chats/{id}/messages/stream`) the question arrives as an `input_required` event, followed by `round_suspended`, and the stream ends with `done` `{"status": "suspended"}`. A round waiting on a background run keeps the stream open and streams the rest of the turn when the run finishes. This is the same for keep-alive and inline chats.
+On a stream (`POST /chats/{id}/messages/stream`) the question arrives as an `input_required` event, followed by `round_suspended`, and the stream ends with `done` `{"status": "suspended"}`. A round waiting on a background run keeps the stream open and streams the rest of the turn when the run finishes. If that round also asked a question and you answer it while the stream is open, the stream follows the turn to the channel the answer resumed it on. This is the same for keep-alive and inline chats.
 
 **How chat works:**
 

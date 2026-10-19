@@ -40,6 +40,7 @@ from app.schemas.chat import (
     MessageSendResponse,
     PendingApprovalResponse,
     PendingInputAnswer,
+    PendingInputAnswerAccepted,
     PendingInputAnswerResult,
     PendingInputResponse,
     ToolApprovalRequest,
@@ -175,9 +176,33 @@ async def _relay_channel(
     """Relay a stream channel as SSE until it ends: `done`, `error`, or a
     round parked on the user alone (see round_waits_only_on_user). `asked`
     holds the questions seen so far (tool_call_id → expires_at), including
-    any the caller relayed before handing over to the channel."""
+    any the caller relayed before handing over to the channel. When the
+    round moves to another channel (its question answered while this stream
+    stayed open for its other work), the relay follows it there."""
+    while channel_id:
+        moved_to = None
+        async for sse in _relay_one_channel(channel_id, last_id, show, asked):
+            if isinstance(sse, str):
+                moved_to = sse  # the inner relay ends right after it
+                continue
+            yield sse
+        channel_id, last_id = moved_to, "0"
+
+
+async def _relay_one_channel(
+    channel_id: str, last_id: str, show: ThinkingFilter, asked: dict[str, Optional[str]]
+):
+    """_relay_channel for one channel; yields the new channel's id (a str)
+    when the round moves."""
+    from app.services.deferred_completions import ROUND_MOVED
+
     async for event in stream_relay.subscribe(channel_id, last_id=last_id):
         event_type = event.get("type", "message")
+        if event_type == ROUND_MOVED:
+            if event.get("channel_id"):
+                yield event["channel_id"]
+                return
+            continue
         if event_type not in ("ping", "done", "error"):
             event = show(event)
             if event is None:
@@ -1068,7 +1093,17 @@ async def list_pending_input(
     ]
 
 
-@router.post("/chats/{chat_id}/pending-input/{tool_call_id}")
+@router.post(
+    "/chats/{chat_id}/pending-input/{tool_call_id}",
+    status_code=202,
+    response_model=PendingInputAnswerAccepted,
+    responses={
+        200: {
+            "model": PendingInputAnswerResult,
+            "description": "With `wait: true`: the resumed turn's result.",
+        },
+    },
+)
 async def answer_pending_input(
     chat_id: str,
     tool_call_id: str,

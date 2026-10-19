@@ -333,6 +333,15 @@ async def _sse(http, method: str, url: str, user, **kw) -> list[tuple[str, Any]]
     return events
 
 
+async def _channel_events(channel_id: str):
+    """What a channel holds so far."""
+    from app.core.redis import get_redis
+    from app.services.stream_relay import STREAM_PREFIX
+
+    for _, fields in await (await get_redis()).xrange(f"{STREAM_PREFIX}{channel_id}"):
+        yield json.loads(fields["data"])
+
+
 async def _transcript(chat_id: str) -> list[Message]:
     async with AsyncSessionLocal() as s:
         return list(
@@ -399,6 +408,10 @@ async def test_inline_stream_parks_on_ask_user_and_ends_cleanly(env, http, worke
         d.get("content") or "" for e, d in followed if e == "message" and isinstance(d, dict)
     )
 
+    # The round's own channel points readers at the one it resumed on.
+    moved = [e async for e in _channel_events(row.channel_id)]
+    assert {"type": "round_moved", "channel_id": body["channel_id"]} in moved
+
     roles = [(m.role, m.name) for m in await _transcript(chat_id)]
     assert roles == [("user", None), ("assistant", None), ("tool", "ask_user"), ("assistant", None)]
     assert (await _transcript(chat_id))[-1].content == "Deploying to eu."
@@ -426,6 +439,41 @@ async def test_inline_stream_relays_a_background_continuation(env, http, worker,
     assert (await _transcript(chat_id))[-1].content == "The answer is 42."
     (job,) = worker.jobs
     assert job["channel_id"] == dict(events)["round_suspended"]["channel_id"]
+
+
+async def test_an_open_stream_follows_its_round_to_the_answers_channel(
+    env, http, worker, background_runs
+):
+    """A round that asks and also waits on a background run keeps its stream
+    open (the run's result lands there). Once the run is in, the answer
+    resumes the round on a fresh channel: the open stream follows it there
+    and ends with the reply instead of idling on the old channel."""
+    user = env["user"]
+    agent = await env["make_agent"](system_tools=("askUser", "background", "codeExecution"))
+    chat_id = await _new_chat(http, user, agent)
+    both = {"content": None, "tool_calls": ask("Which region?")["tool_calls"] + wait_on_background()["tool_calls"]}
+    script(chat_id, both, say("Deploying to eu with 42."))
+
+    reading = asyncio.create_task(
+        _sse(http, "POST", f"/chats/{chat_id}/messages/stream", user, json={"content": "go"})
+    )
+    for _ in range(100):  # until the run has reported back
+        row = await _checkpoint(chat_id)
+        if row is not None and row.remaining == 1:
+            break
+        await asyncio.sleep(0.1)
+    (question_id,) = row.pending
+    resp = await http.post(
+        f"/chats/{chat_id}/pending-input/{question_id}", json={"answer": "eu"}, headers=auth_headers(user),
+    )
+    assert resp.status_code == 202 and resp.json()["resumed"]
+
+    events = await asyncio.wait_for(reading, timeout=30)
+    assert events[-1] == ("done", {"status": "completed"})
+    assert "Deploying to eu with 42." in "".join(
+        d.get("content") or "" for e, d in events if e == "message" and isinstance(d, dict)
+    )
+    assert not any(e == "message" and d.get("type") == "round_moved" for e, d in events)
 
 
 # ---------------------------------------------------------------------------
@@ -748,9 +796,33 @@ async def test_following_reports_a_failed_continuation_and_runs_out_of_time(monk
     f = await sync_turns.RoundFollower("c", timeout=5).run()
     assert (f.status, f.error) == ("failed", "boom")
 
+    # Cut off mid-run: the calls it made so far are unreported, so the
+    # request's usage is unknown rather than too low.
     _fake_channel(monkeypatch, [{"type": "tool_start"}])
     f = await sync_turns.RoundFollower("c", timeout=0.3).run()
-    assert f.status == "in_progress"
+    assert f.status == "in_progress" and f.usages == [None]
+    assert sync_turns.combine_usage([_usage(1), *f.usages]) is None
+
+    # Nothing happened on the channel: nothing unreported.
+    _fake_channel(monkeypatch, [])
+    f = await sync_turns.RoundFollower("c", timeout=0.3).run()
+    assert f.status == "in_progress" and f.usages == []
+
+
+async def test_following_moves_with_the_round(monkeypatch):
+    channels = {
+        "old": [{"type": "tool_end"}, {"type": "round_moved", "channel_id": "new"}],
+        "new": [{"content": "hi"}, {"type": "done", "usage": _usage(1)}],
+    }
+
+    async def subscribe(channel_id, last_id="0", timeout=None):
+        for e in channels[channel_id]:
+            yield e
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(stream_relay, "subscribe", subscribe)
+    f = await sync_turns.RoundFollower("old", timeout=5, last_id="5-0").run()
+    assert f.status == "completed" and f.usages == [_usage(1)]
 
 
 # ---------------------------------------------------------------------------

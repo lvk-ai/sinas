@@ -73,7 +73,12 @@ this is a choice, not a gap.
   A round parked on the user alone ends the stream with `done`
   `{"status": "suspended"}`. A round that waits on anything else keeps the
   stream open and relays the continuation from the round's channel until
-  `done`, which is what a keep-alive stream does.
+  `done`, which is what a keep-alive stream does. When such a round also
+  asked a question and the answer resumes it on a fresh channel,
+  `complete()` publishes `round_moved` `{"channel_id": <fresh>}` on the
+  round's own channel. Relays (keep-alive, reconnect, inline) and
+  synchronous followers move to the new channel instead of idling on the
+  old one. Clients never see `round_moved`.
 - **Non-streaming send, invoke, sync webhook:** a round that waits on work
   that lands by itself is **followed** within the request's time budget,
   so a synchronous caller gets the final reply. The budget is the chat's
@@ -103,7 +108,8 @@ worker), the job collects its own usage and puts it on the event that ends
 it on the channel (`done`, or the held-back `round_suspended`). The
 follower adds those parts to the request's own. If a continuation reports
 nothing (for example a worker from before this change), the total is
-`null`, not an under-count. The calls made after an answer belong to the
+`null`, not an under-count. The same holds when the request's budget runs
+out while a continuation is mid-run. The calls made after an answer belong to the
 answer's request when it waits, and to no request when it doesn't. That is
 the same as a keep-alive stream, which never reported usage.
 

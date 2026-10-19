@@ -310,6 +310,23 @@ class MessageSendResponse(MessageResponse, TurnState):
     )
 
 
+class PendingInputAnswerAccepted(BaseModel):
+    """The answer was recorded (202, without `wait`)."""
+
+    status: Literal["answered"] = "answered"
+    tool_call_id: str
+    resumed: bool = Field(description="The answer was the round's last completion; its resume is queued.")
+    resume_pending: bool = Field(
+        description="The last completion, but the resume could not be queued yet; it is retried shortly."
+    )
+    channel_id: Optional[str] = Field(
+        None,
+        description="Where the resumed turn streams (GET /chats/{chat_id}/stream/{channel_id}), "
+        "when resumed or resume_pending.",
+    )
+    message: str
+
+
 class PendingInputAnswerResult(TurnState):
     """The resumed turn's result, for an answer posted with `wait: true`."""
 
