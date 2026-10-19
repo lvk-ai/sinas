@@ -48,13 +48,25 @@ class StreamRelay:
 
         return entry_id
 
-    async def publish_done(self, channel_id: str) -> None:
-        """Publish a terminal 'done' event."""
-        await self.publish(channel_id, {"type": "done", "status": "completed"})
+    async def publish_done(self, channel_id: str, usage: Optional[dict[str, Any]] = None) -> None:
+        """Publish a terminal 'done' event. `usage`: the LLM usage of the run
+        that ends here, for an internal subscriber that reports it (the SSE
+        relays rebuild their own `done` payload without it)."""
+        event: dict[str, Any] = {"type": "done", "status": "completed"}
+        if usage is not None:
+            event["usage"] = usage
+        await self.publish(channel_id, event)
 
     async def publish_error(self, channel_id: str, error: str) -> None:
         """Publish a terminal 'error' event."""
         await self.publish(channel_id, {"type": "error", "error": error})
+
+    async def last_entry_id(self, channel_id: str) -> str:
+        """The id of the channel's newest event ("0" when it has none): a
+        subscription from here sees only what is published after now."""
+        redis = await get_redis()
+        newest = await redis.xrevrange(f"{STREAM_PREFIX}{channel_id}", count=1)
+        return newest[0][0] if newest else "0"
 
     async def subscribe(
         self, channel_id: str, last_id: str = "0", timeout: Optional[int] = None

@@ -207,9 +207,9 @@ async def test_malformed_question_fails_fast_and_does_not_park_the_round(
 
 
 @pytest.mark.asyncio
-async def test_without_a_stream_channel_ask_user_errors_inline(db, chat, test_user):
-    # Synchronous paths (no job channel) can't park a conversation on a
-    # human — execute_single_tool returns an explanatory error result.
+async def test_ask_user_outside_a_tool_round_errors(db, chat, test_user):
+    # Every chat tool round suspends on ask_user (queued or inline); the
+    # executor itself has no conversation to pause and says so.
     from app.services.tool_execution import execute_single_tool
 
     svc = MessageService(db)

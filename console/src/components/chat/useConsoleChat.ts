@@ -167,8 +167,8 @@ export function useConsoleChat(
   }, [chatId, streaming, pendingInputs, trailingPoll, pollTick, refresh]);
 
   const handleStreamChunk = React.useCallback((chunk: SSEChunk) => {
-    // A question: its own event (queued turn, reconnect) or a typed
-    // message event (inline turn).
+    // A question: its own event, or (older backends, inline turn) a typed
+    // message event.
     const asked = inputRequiredFromChunk(chunk);
     if (asked) {
       setPendingInputs((prev) => mergePendingInputs(prev, [asked]));

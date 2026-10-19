@@ -413,6 +413,9 @@ async def list_pending_inputs(db, chat_id: str) -> list[dict[str, Any]]:
         select(PendingCompletion)
         .where(PendingCompletion.chat_id == chat_id)
         .order_by(PendingCompletion.created_at)
+        # complete() resolves entries in its own session: a row this session
+        # loaded before must be re-read, not served from its identity map.
+        .execution_options(populate_existing=True)
     )
     out: list[dict[str, Any]] = []
     for row in result.scalars().all():

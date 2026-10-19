@@ -175,6 +175,49 @@ class PendingInputAnswer(BaseModel):
     suspended round resumes with."""
 
     answer: str
+    wait: bool = Field(
+        default=False,
+        description=(
+            "Wait for the resumed turn and return its result (200, the same "
+            "status/reply/pending_inputs/usage shape as invoke) instead of "
+            "a channel to stream it from (202)."
+        ),
+    )
+
+
+TurnStatus = Literal["completed", "input_required", "in_progress", "injected"]
+
+
+class TurnState(BaseModel):
+    """How a synchronously answered turn ended, and what to do next."""
+
+    status: TurnStatus = Field(
+        default="completed",
+        description=(
+            "`completed`: the turn's final reply is in this response. "
+            "`input_required`: the agent asked the user (ask_user) and the turn "
+            "waits for the answer: see `pending_inputs`, answer with "
+            "POST /chats/{chat_id}/pending-input/{tool_call_id}. "
+            "`in_progress`: the turn goes on without this request (a background "
+            "run it waits for outlasted the request's time budget); follow it on "
+            "`channel_id` (GET /chats/{chat_id}/stream/{channel_id}) or read the "
+            "chat later. `injected`: the chat was busy (a turn running, or one "
+            "waiting on the user or on background work), so the message was "
+            "delivered into that turn, which reads it at its next step; nothing "
+            "was answered by this request."
+        ),
+    )
+    pending_inputs: list[PendingInputResponse] = Field(
+        default_factory=list,
+        description="The chat's open ask_user questions (input_required, injected).",
+    )
+    channel_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stream channel of the turn still going on (in_progress), or of the "
+            "parked turn an injected message went to."
+        ),
+    )
 
 
 class ChatWithMessages(ChatResponse):
@@ -228,29 +271,59 @@ class TurnUsage(BaseModel):
     errors: int = Field(description="Calls that failed")
 
 
-class InvokeResponse(BaseModel):
+class InvokeResponse(TurnState):
     """Response from synchronous agent invoke."""
 
-    reply: str
+    reply: str = Field(
+        description=(
+            "The agent's final reply (completed). For input_required / "
+            "in_progress, whatever the agent said before it asked or started "
+            "waiting (often empty); for injected, empty."
+        )
+    )
     chat_id: uuid.UUID
     session_key: Optional[str] = None
     usage: Optional[TurnUsage] = Field(
         None,
         description=(
             "LLM usage of this invoke only (not of earlier invokes in the same "
-            "session). Null only if it could not be determined."
+            "session, nor of a later answer's continuation): the calls made "
+            "while this request ran, including a continuation it waited for. "
+            "Null only if it could not be determined."
         ),
     )
 
 
-class MessageSendResponse(MessageResponse):
-    """The reply to a non-streaming message send, with the turn's LLM usage."""
+class MessageSendResponse(MessageResponse, TurnState):
+    """The reply to a non-streaming message send, with the turn's LLM usage.
+
+    The message is the final reply (completed), the assistant message that
+    asked or started waiting (input_required / in_progress), or the user
+    message as stored (injected)."""
 
     usage: Optional[TurnUsage] = Field(
         None,
         description=(
-            "LLM usage of this send only (not of earlier turns). "
-            "Null only if it could not be determined."
+            "LLM usage of this send only (not of earlier turns, nor of a later "
+            "answer's continuation). Null only if it could not be determined."
+        ),
+    )
+
+
+class PendingInputAnswerResult(TurnState):
+    """The resumed turn's result, for an answer posted with `wait: true`."""
+
+    tool_call_id: str
+    chat_id: uuid.UUID
+    reply: str = Field(description="The final reply (completed); see InvokeResponse.reply.")
+    message: Optional[MessageResponse] = Field(
+        None, description="The message `reply` comes from, when there is one."
+    )
+    usage: Optional[TurnUsage] = Field(
+        None,
+        description=(
+            "LLM usage of the continuation this answer resumed, as far as this "
+            "request waited for it. Null only if it could not be determined."
         ),
     )
 

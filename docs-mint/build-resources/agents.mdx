@@ -110,6 +110,8 @@ POST   /chats/{id}/messages                          # Send message
 POST   /chats/{id}/messages/stream                   # Send message (SSE streaming)
 GET    /chats/{id}/stream/{channel_id}               # Reconnect to active stream
 POST   /chats/{id}/approve-tool/{tool_call_id}       # Approve/reject a tool call
+GET    /chats/{id}/pending-input                     # Open ask_user questions
+POST   /chats/{id}/pending-input/{tool_call_id}      # Answer one (add "wait": true for the result)
 ```
 
 **Invoke endpoint:** A synchronous request/response alternative to the two-step chat flow. Intended for integrations (Slack, Telegram, webhooks) that need a simple call-and-response.
@@ -162,9 +164,50 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 - Each call is also an `llm_usage` row, saved before the response is sent, so `/api/v1/usage` reports agree with it right away. `cost_usd` only includes calls whose row was saved. If a row fails to save, or takes more than 10 seconds, that call still counts in `calls` and the token totals (it was made, and the provider bills it), but as unpriced, without its cost. In that rare case the tokens are higher than what `/api/v1/usage` has on record.
 - Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
 - `usage` is `null` only if it couldn't be worked out.
-- If the session's chat is already busy with another request, the message is queued into that run and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
+- If the session's chat is already busy with another request, the message is queued into that run, `status` is `injected`, `reply` is empty and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
+- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
 
 `POST /chats/{id}/messages` (non-streaming) returns the same `usage` with the reply message.
+
+#### When the agent asks or waits
+
+An agent with `askUser` can stop a turn to ask the user a question, and one with `background` can wait for a background run (`run_in_background` with `wait: true`). The turn's tool round then parks until the answer or the result arrives, without holding a worker. This works however the turn was started. Each entry point says what the turn ended in:
+
+| `status` | Meaning | What to do |
+|---|---|---|
+| `completed` | The final reply is in the response | — |
+| `input_required` | The agent asked a question. The turn waits for the answer. `pending_inputs` lists the open questions (`tool_call_id`, `question`, `options`, `expires_at`) | Answer with `POST /chats/{id}/pending-input/{tool_call_id}` |
+| `in_progress` | The turn goes on without this request: background work outlasted the request's time budget | Follow it on `channel_id` (`GET /chats/{id}/stream/{channel_id}`), or read the chat later |
+| `injected` | The chat was busy, so the message was passed to the turn already running there (or parked on a question or background work). Nothing was answered here | `pending_inputs` and `channel_id` say what that turn waits on |
+
+`POST /agents/{ns}/{name}/invoke` and `POST /chats/{id}/messages` carry `status`, `pending_inputs` and `channel_id`. With `input_required` or `in_progress`, `reply` (or the returned message) holds only what the agent said before it asked or started waiting, which is often nothing. A turn that waits on a background run is followed to its reply within the request: the agent's `default_job_timeout` for invoke, and the chat's job timeout for messages. Only a question, or running out of that time, ends the request early.
+
+```json
+{
+  "status": "input_required",
+  "reply": "",
+  "chat_id": "…",
+  "session_key": "slack:U09ABC123",
+  "pending_inputs": [
+    {"tool_call_id": "call_8f2…", "question": "Which order number?", "options": null, "expires_at": "…"}
+  ],
+  "channel_id": null,
+  "usage": {"calls": 1, "…": "…"}
+}
+```
+
+**Answering.** `POST /chats/{id}/pending-input/{tool_call_id}` with `{"answer": "…"}` makes the answer the question's tool result. If it was the last thing the turn waited for, the turn resumes on a new stream channel. The response is `202` with that `channel_id`, which you follow with `GET /chats/{id}/stream/{channel_id}`. Add `"wait": true` to get the resumed turn's result in the same response instead. That response is `200` and has the invoke shape above: `status`, `reply`, `message`, `pending_inputs`, `channel_id` and the `usage` of the resumed turn. If the agent asks again, it is `input_required` with the new question. Unanswered questions expire after `ASK_USER_TIMEOUT_SECONDS` (24 hours by default). The turn then resumes without an answer, and the agent is told the user didn't respond.
+
+```bash
+curl -X POST https://yourdomain.com/chats/$CHAT_ID/pending-input/call_8f2… \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"answer": "123", "wait": true}'
+# → {"status": "completed", "reply": "Order 123 shipped yesterday.", …}
+```
+
+Sending another message to a chat that waits on a question doesn't answer the question. The message is `injected` and read once the turn resumes. The exception is the [OpenAI-compatible endpoint](/platform/api-overview), which can only send messages: there, the next message in the chat is the answer.
+
+On a stream (`POST /chats/{id}/messages/stream`) the question arrives as an `input_required` event, followed by `round_suspended`, and the stream ends with `done` `{"status": "suspended"}`. A round waiting on a background run keeps the stream open and streams the rest of the turn when the run finishes. This is the same for keep-alive and inline chats.
 
 **How chat works:**
 
