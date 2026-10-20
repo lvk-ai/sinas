@@ -46,3 +46,27 @@ jobs:
           ! grep -q "name: clickhouse" /tmp/compact.yaml
           # backend must get the explicit-disable signal
           grep -q 'CLICKHOUSE_HOST' /tmp/compact.yaml
+
+      - name: helm template (OpenTelemetry, exporter headers from a Secret)
+        run: |
+          helm template ci charts/sinas \
+            --set domain=ci.example.com \
+            --set secrets.secretKey=ci --set secrets.encryptionKey=ci \
+            --set postgres.password=ci --set clickhouse.password=ci \
+            --set otel.enabled=true \
+            --set 'otel.exporters[0].name=lang-fuse' \
+            --set 'otel.exporters[0].endpoint=https://otel.example.com' \
+            --set 'otel.exporters[0].headersSecret.name=otel-creds' \
+            --set 'otel.exporters[1].name=off' \
+            --set 'otel.exporters[1].endpoint=https://off.example.com' \
+            --set 'otel.exporters[1].enabled=false' \
+            --set 'otel.exporters[1].headersSecret.name=gone' \
+            > /tmp/otel.yaml
+          grep -q 'name: OTEL_EXPORTERS' /tmp/otel.yaml
+          grep -q 'name: OTEL_EXPORTER_LANG_FUSE_HEADERS' /tmp/otel.yaml
+          # a disabled exporter references no Secret (it may be gone)
+          ! grep -q 'OTEL_EXPORTER_OFF_HEADERS' /tmp/otel.yaml
+          # the Secret reference never lands in the exporter JSON
+          ! grep -q 'headersSecret' /tmp/otel.yaml
+          # and nothing OTel is rendered while it is off
+          ! grep -q 'OTEL_' /tmp/compact.yaml

@@ -13,7 +13,7 @@ from opentelemetry import trace
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.telemetry import attached, extract_trace_context, otel_attr
+from app.core.telemetry import attached, extract_trace_context, otel_attr, traced_job
 from app.models.execution import Execution, ExecutionStatus
 from app.providers.tracking import collect_usage
 from app.services.deferred_completions import ROUND_SUSPENDED
@@ -536,6 +536,7 @@ async def _persist_turn_error(chat_id: str, error: Exception) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@traced_job("agent.resume")
 @_within_job_timeout
 async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     """
@@ -771,6 +772,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@traced_job("agent.delegate_resume")
 @_within_job_timeout
 async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     """Continue a parent conversation suspended on sub-agent delegations.

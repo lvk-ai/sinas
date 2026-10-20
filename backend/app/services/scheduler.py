@@ -6,17 +6,20 @@ from typing import Any
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from opentelemetry import trace
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.providers.attribution import new_chat_attribution
 from app.core.database import AsyncSessionLocal
+from app.core.telemetry import record_error, traced
 from app.models.execution import TriggerType
 from app.models.schedule import ScheduledJob
 
 logger = logging.getLogger(__name__)
 
 
+@traced("schedule.function", trace.SpanKind.PRODUCER)
 async def _execute_scheduled_function(
     job_id: str,
     target_namespace: str,
@@ -54,9 +57,11 @@ async def _execute_scheduled_function(
         )
 
     except Exception as e:
+        record_error(trace.get_current_span(), e)
         logger.error(f"Scheduled function {target_namespace}/{target_name} enqueue failed: {e}")
 
 
+@traced("schedule.agent", trace.SpanKind.PRODUCER)
 async def _execute_scheduled_agent(
     job_id: str,
     target_namespace: str,
@@ -142,11 +147,13 @@ async def _execute_scheduled_agent(
         )
 
     except Exception as e:
+        record_error(trace.get_current_span(), e)
         logger.error(
             f"Scheduled agent {target_namespace}/{target_name} enqueue failed: {e}"
         )
 
 
+@traced("schedule.pipeline", trace.SpanKind.PRODUCER)
 async def _execute_scheduled_pipeline(
     job_id: str,
     target_namespace: str,
@@ -170,6 +177,7 @@ async def _execute_scheduled_pipeline(
             trigger_id=job_id,
         )
     except Exception as e:
+        record_error(trace.get_current_span(), e)
         logger.error(
             f"Scheduled pipeline {target_namespace}/{target_name} enqueue failed: {e}"
         )

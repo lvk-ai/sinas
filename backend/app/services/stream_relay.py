@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Optional
 
 from app.core.redis import get_redis
+from app.core.telemetry import untraced
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +39,16 @@ class StreamRelay:
         redis = await get_redis()
         stream_key = f"{STREAM_PREFIX}{channel_id}"
 
-        entry_id = await redis.xadd(
-            stream_key,
-            {"data": json.dumps(event, default=str)},
-        )
+        # Not traced: called per streamed chunk, it would add two Redis
+        # spans per token to the turn's trace.
+        with untraced():
+            entry_id = await redis.xadd(
+                stream_key,
+                {"data": json.dumps(event, default=str)},
+            )
 
-        # Set TTL on stream key (refresh on each write)
-        await redis.expire(stream_key, ttl or STREAM_TTL)
+            # Set TTL on stream key (refresh on each write)
+            await redis.expire(stream_key, ttl or STREAM_TTL)
 
         return entry_id
 
@@ -95,11 +99,13 @@ class StreamRelay:
 
         while True:
             # XREAD blocks for up to 5 seconds waiting for new entries
-            entries = await redis.xread(
-                {stream_key: last_id},
-                count=100,
-                block=5000,
-            )
+            # (not traced: one span per read for as long as a stream lasts).
+            with untraced():
+                entries = await redis.xread(
+                    {stream_key: last_id},
+                    count=100,
+                    block=5000,
+                )
 
             if not entries:
                 idle_time = time.monotonic() - last_data_at

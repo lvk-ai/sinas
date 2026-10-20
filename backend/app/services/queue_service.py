@@ -10,7 +10,7 @@ from typing import Any, Optional
 from app.core.auth import current_api_key_id
 from app.core.config import settings
 from app.core.redis import get_arq_pool, get_redis
-from app.core.telemetry import inject_trace_context
+from app.core.telemetry import inject_job_context
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class QueueService:
         await pool.enqueue_job(
             "execute_function_job",
             **job_kwargs,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             **enqueue_kwargs,
         )
 
@@ -136,7 +136,7 @@ class QueueService:
             trigger_type=trigger_type,
             trigger_id=trigger_id,
             user_id=user_id,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             _job_id=job_id,
             _queue_name=PIPELINE_QUEUE,
         )
@@ -163,7 +163,7 @@ class QueueService:
             run_input=run_input,
             trigger_type=trigger_type,
             trigger_id=trigger_id,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             _job_id=job_id,
             _queue_name=PIPELINE_QUEUE,
         )
@@ -335,7 +335,7 @@ class QueueService:
             depth=depth,
             pending_delegation_id=pending_delegation_id,
             parent_tool_call_id=parent_tool_call_id,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
@@ -420,7 +420,7 @@ class QueueService:
             approved=approved,
             rejected_tool_call_ids=list(rejected_tool_call_ids or []),
             channel_id=channel_id,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
@@ -497,7 +497,7 @@ class QueueService:
             user_token=user_token,
             channel_id=channel_id,
             conversation_context=conversation_context,
-            trace_context=inject_trace_context(),
+            trace_context=inject_job_context(),
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),

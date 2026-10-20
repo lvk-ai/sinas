@@ -83,6 +83,7 @@
               "admin/system",
               "admin/usage-cost",
               "admin/llm-gateway-attribution",
+              "admin/observability",
               "admin/chat-retention",
               "admin/config-manager",
               "admin/icons"

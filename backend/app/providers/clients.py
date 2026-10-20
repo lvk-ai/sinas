@@ -139,6 +139,11 @@ def guard_trace_context(http_client: H) -> H:
 
     The hook goes last, after any the client already has, so that it sees the
     request as it will be sent. Guarding a client twice adds it once.
+
+    The client's requests are also kept out of the HTTP client
+    instrumentation (`telemetry.untraced_http`), which would otherwise add
+    the trace context at the transport, after this hook has run, and record
+    a client span duplicating the `llm.call` span Sinas records.
     """
     hooks = http_client.event_hooks  # type: ignore[attr-defined]
     request_hooks = list(hooks.get("request", []))
@@ -147,6 +152,17 @@ def guard_trace_context(http_client: H) -> H:
             **hooks,
             "request": [*request_hooks, _drop_unrequested_trace_context],
         }
+    send = http_client.send  # type: ignore[attr-defined]
+    if not getattr(send, "_sinas_untraced", False):
+
+        async def untraced_send(*args: Any, **kwargs: Any) -> Any:
+            from app.core.telemetry import untraced_http
+
+            with untraced_http():
+                return await send(*args, **kwargs)
+
+        untraced_send._sinas_untraced = True  # type: ignore[attr-defined]
+        http_client.send = untraced_send  # type: ignore[attr-defined]
     return http_client
 
 
