@@ -1,9 +1,13 @@
 """File storage schemas."""
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# What an upload does when the collection already has a file by that name
+# (one this uploader can see: their own, or a shared one).
+UploadConflictMode = Literal["rename", "return_existing", "new_version", "error"]
 
 
 class CollectionCreate(BaseModel):
@@ -64,7 +68,35 @@ class FileUpload(BaseModel):
     content_type: str = Field(..., min_length=1, max_length=255)
     visibility: str = Field(default="private", pattern=r"^(private|shared)$")
     file_metadata: dict[str, Any] = Field(default_factory=dict)
-    update_existing: bool = Field(default=False, description="If true, update existing file as new version instead of auto-renaming")
+    on_conflict: Optional[UploadConflictMode] = Field(
+        default=None,
+        description=(
+            "When a file with this name already exists: 'rename' (default) stores the upload "
+            "as a new file with a unique suffix; 'return_existing' returns the existing file "
+            "(200) when its current content is identical, 409 when it differs; 'new_version' "
+            "adds the upload as the existing file's next version; 'error' returns 409 with "
+            "the existing file's id"
+        ),
+    )
+    update_existing: bool = Field(
+        default=False,
+        description="Deprecated alias for on_conflict='new_version'",
+    )
+
+    @model_validator(mode="after")
+    def _check_conflict_mode(self) -> "FileUpload":
+        if self.update_existing and self.on_conflict not in (None, "new_version"):
+            raise ValueError(
+                f"update_existing=true means on_conflict='new_version'; "
+                f"it can't be combined with on_conflict='{self.on_conflict}'"
+            )
+        return self
+
+    @property
+    def conflict_mode(self) -> UploadConflictMode:
+        if self.on_conflict:
+            return self.on_conflict
+        return "new_version" if self.update_existing else "rename"
 
 
 class FileResponse(BaseModel):

@@ -62,6 +62,19 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `RATE_LIMIT_SETUP_LINK_IP_MAX` | `10` | Max setup-link exchange (and, separately, complete) requests per IP per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `900` | Rate limit window (15 minutes) |
 
+### Client IP behind a reverse proxy
+
+IP rate limits and request logs use the client's IP address. Behind a proxy, every connection comes from the proxy, so uvicorn runs with `--proxy-headers` and takes the client from `X-Forwarded-For`, but only on connections from the addresses in `FORWARDED_ALLOW_IPS`. It reads the header right to left and stops at the first address it doesn't trust, so a client can't pick its own IP by sending the header itself.
+
+| Variable | Default | Description |
+|---|---|---|
+| `FORWARDED_ALLOW_IPS` | compose: `10.254.253.2` (Caddy); lite: `127.0.0.1`; image: `127.0.0.1` | Comma-separated IPs or CIDRs of the proxies allowed to set `X-Forwarded-For`. Never `*` while port 8000 can be reached directly: uvicorn then believes the leftmost, client-supplied entry. On Kubernetes, set `backend.forwardedAllowIps` instead. |
+| `SINAS_CADDY_IP` | `10.254.253.2` | docker compose: Caddy's fixed address on the `proxy` network, the one address the backend trusts. Keep `FORWARDED_ALLOW_IPS` equal to it. |
+| `SINAS_PROXY_SUBNET` | `10.254.253.0/24` | docker compose: subnet of the `proxy` network that connects Caddy to the backend and console. Change it (with the two variables around it) if it collides with a network of yours. |
+| `SINAS_PROXY_IP_RANGE` | `10.254.253.128/25` | docker compose: part of `SINAS_PROXY_SUBNET` for addresses Docker hands out. Must not contain `SINAS_CADDY_IP`. |
+
+With the lite profile (no Caddy), set `FORWARDED_ALLOW_IPS` to the address your own TLS proxy has as the container sees it, for example the Docker bridge gateway when the proxy runs on the host.
+
 ## Function Execution
 
 | Variable | Default | Description |
@@ -85,7 +98,7 @@ reject explicitly rather than half-working.
 | Variable | Default | Description |
 |---|---|---|
 | `CODE_EXECUTION_ENABLED` | `true` | `false` disables **all** execution of user-supplied code: Functions and the agent `codeExecution` tool. The tool is not advertised to the model, function execution is refused at every trigger (API, webhook, schedule, agent, CDC), and sandbox/shared-worker startup is skipped entirely — no pool, no per-execution pods, no executor image. The single biggest footprint reduction available. |
-| `BUILTIN_DATABASE_ENABLED` | `true` | `false` skips creating the `sinas_data` database and its default Database Connection at startup, for deployments that only use their own connections. Does **not** affect the platform's own PostgreSQL, and an already-created database and record are left untouched (so the toggle is reversible and non-destructive). |
+| `BUILTIN_DATABASE_ENABLED` | `true` | `false` skips creating the `sinas_data` database and its default Database Connection at startup, for deployments that only use their own connections. Does **not** affect the platform's own PostgreSQL, and an already-created database and record are left untouched (so the toggle is reversible and non-destructive). With docker compose, the postgres container also reads it: on a fresh data volume, `false` skips the `CREATE DATABASE sinas_data` in its init script. |
 
 ## Usage Metering (Optional)
 

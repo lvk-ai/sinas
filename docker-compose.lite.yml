@@ -87,6 +87,12 @@ services:
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env file}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env file}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      # The client IP (IP rate limits) is taken from X-Forwarded-For only on
+      # connections from these addresses (IPs/CIDRs, comma-separated). Set it
+      # to your TLS proxy as this container sees it, e.g. the bridge gateway
+      # when the proxy runs on the host. Never "*" while port 8000 is
+      # reachable directly: anyone could then pick their own IP.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     deploy:
       resources:
         limits:

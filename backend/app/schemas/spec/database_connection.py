@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from pydantic import Field, field_validator, model_validator
 
+from app.schemas.database_connection import validate_connection_type
 from app.schemas.spec.base import SpecModel
 
 
@@ -33,6 +34,11 @@ class DatabaseConnectionSpec(SpecModel):
         if isinstance(data, dict) and "annotations" in data:
             data = {k: v for k, v in data.items() if k != "annotations"}
         return data
+
+    @field_validator("connection_type", mode="before")
+    @classmethod
+    def _supported_connection_type(cls, value: Any) -> Any:
+        return validate_connection_type(value)
 
     @field_validator("password", "ssl_mode", mode="before")
     @classmethod

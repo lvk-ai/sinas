@@ -290,4 +290,5 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Trusted proxies come from FORWARDED_ALLOW_IPS, as with the CLI.
+    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True)

@@ -5,12 +5,41 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
+# The connection types Sinas can open. Only PostgreSQL has a driver (asyncpg).
+# Any other type used to be opened with asyncpg all the same, failing oddly or
+# not at all; a new type needs a driver behind DatabasePoolManager first.
+# Enforced by DatabaseConnectionSpec (REST create/update and config apply),
+# the config schema, and the pool for rows stored before that.
+SUPPORTED_CONNECTION_TYPES: tuple[str, ...] = ("postgresql",)
+# Spellings that already worked (the pool never looked at the type): kept
+# working, and stored as the canonical name.
+_CONNECTION_TYPE_ALIASES = {"postgres": "postgresql"}
+
+
+def normalize_connection_type(value: str) -> str:
+    """The canonical name of a connection type (not checked for support)."""
+    value = value.strip().lower()
+    return _CONNECTION_TYPE_ALIASES.get(value, value)
+
+
+def validate_connection_type(value: Any) -> Any:
+    """The canonical connection type; ValueError when Sinas can't open it."""
+    if not isinstance(value, str):
+        return value  # left to the field's own type check
+    normalized = normalize_connection_type(value)
+    if normalized not in SUPPORTED_CONNECTION_TYPES:
+        raise ValueError(
+            f"Unsupported connection type '{value}'. "
+            f"Supported: {', '.join(SUPPORTED_CONNECTION_TYPES)}"
+        )
+    return normalized
+
 
 class DatabaseConnectionCreate(BaseModel):
     """Schema for creating a new database connection."""
 
     name: str
-    connection_type: str  # postgresql, clickhouse, snowflake
+    connection_type: str  # validated by DatabaseConnectionSpec
     host: str
     port: int
     database: str

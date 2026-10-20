@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database_connection import DatabaseConnection
 from app.models.table_annotation import TableAnnotation
+from app.schemas.database_connection import normalize_connection_type
 from app.services.database_pool import DatabasePoolManager
 
 logger = logging.getLogger(__name__)
@@ -219,7 +220,7 @@ async def _resolve_connection(
     conn = await DatabaseConnection.get_by_name(db, connection_name)
     if not conn:
         raise ValueError(f"Database connection '{connection_name}' not found or inactive")
-    return conn, conn.connection_type
+    return conn, normalize_connection_type(conn.connection_type)
 
 
 def _get_sql(connection_type: str, query_name: str) -> str:

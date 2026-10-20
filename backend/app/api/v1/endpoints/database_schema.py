@@ -52,7 +52,7 @@ from app.schemas.database_schema import (
     ViewInfo,
 )
 from app.services.database import get_schema_service
-from app.services.database_pool import DatabasePoolManager
+from app.services.database_pool import DatabasePoolManager, UnsupportedConnectionTypeError
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,10 @@ async def _get_connection_and_pool(
     if not conn:
         raise HTTPException(status_code=404, detail=f"Database connection '{name}' not found")
     pool_mgr = DatabasePoolManager.get_instance()
-    pool = await pool_mgr.get_pool(db, str(conn.id))
+    try:
+        pool = await pool_mgr.get_pool(db, str(conn.id))
+    except UnsupportedConnectionTypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return conn, pool
 
 

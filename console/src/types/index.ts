@@ -1424,6 +1424,8 @@ export interface FileUploadRequest {
   content_type: string;
   visibility?: string;
   file_metadata?: Record<string, any>;
+  /** What to do when the name is taken; the server defaults to 'rename'. */
+  on_conflict?: 'rename' | 'return_existing' | 'new_version' | 'error';
 }
 
 export interface FileDownloadResponse {
