@@ -298,11 +298,14 @@ def test_an_unusable_session_claim_refuses_the_login_rather_than_dropping_the_co
     for claims in (
         {"org_id": "org-2", "cost_center": "café"},  # not header-safe
         {"org_id": ["org-1", "org-2"]},  # several values for one session
+        {"org_id": {"id": "org-2"}},  # an object
+        {"org_id": "x" * 2000},  # overlong
     ):
         with pytest.raises(sso.SsoError):
             sso.session_context(provider, claims)
-    # Absent: no context field, the login goes on.
+    # Absent (or empty): no context field, the login goes on.
     assert sso.session_context(provider, {"org_id": "org-2"}) == {"orgId": "org-2"}
+    assert sso.session_context(provider, {"org_id": "", "cost_center": []}) == {}
 
 
 async def test_a_component_keeps_the_context_it_was_rendered_under(client, db, monkeypatch):
@@ -375,3 +378,50 @@ async def test_an_sso_login_outside_the_memberships_is_refused(client, db, idp, 
 
 
 from tests.unit.test_oidc_sso import idp  # noqa: E402,F401 - the fake IdP fixture
+
+
+async def test_a_queued_job_carries_the_enqueuing_requests_context(db, monkeypatch):
+    """A queued turn (and a resume, a delegate resume) records the request's
+    context at enqueue and binds it in the job; a job delivered from a stored
+    key id alone (a wakeup, a watch) binds the key's stored context."""
+    from app.core.auth import bind_credential_context, reset_credential_context
+    from app.queue import agent_jobs
+    from app.services import queue_service as qs
+
+    captured = []
+
+    class _Pool:
+        async def enqueue_job(self, name, **kwargs):
+            captured.append(kwargs.get("credential_context"))
+
+    async def _pool():
+        return _Pool()
+
+    monkeypatch.setattr(qs, "get_arq_pool", _pool)
+    token = bind_credential_context({"orgId": "org-2"})
+    try:
+        await qs.queue_service.enqueue_agent_message(
+            chat_id=str(uuid.uuid4()), user_id=str(uuid.uuid4()), user_token="t",
+            content="hi", channel_id=str(uuid.uuid4()),
+        )
+    finally:
+        reset_credential_context(token)
+    assert captured == [{"orgId": "org-2"}]
+
+    seen = []
+
+    @agent_jobs._acting_as_job_key
+    async def job(ctx, **kwargs):
+        seen.append(current_credential_context())
+
+    await job({}, credential_context={"orgId": "org-2"})
+    assert seen == [{"orgId": "org-2"}]
+
+    async def stored(api_key_id):
+        return {"orgId": "org-7"}
+
+    monkeypatch.setattr(agent_jobs, "_stored_key_context", stored)
+    await job({}, api_key_id=str(uuid.uuid4()))
+    assert seen[-1] == {"orgId": "org-7"}
+    await job({})
+    assert seen[-1] is None

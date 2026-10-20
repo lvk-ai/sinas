@@ -581,7 +581,14 @@ async def test_a_queued_job_resolves_the_key_it_was_enqueued_with(db, monkeypatc
         provider = await create_provider(row.name, "m", db, usage_context={"user_id": kwargs["user_id"]})
         seen.update(provider._inner.identity_headers)
 
-    await job({}, user_id=str(user.id), api_key_id=str(key.id))
+    from app.core.database import async_engine
+
+    try:
+        await job({}, user_id=str(user.id), api_key_id=str(key.id))
+    finally:
+        # The job reads the key's stored context on the shared engine: drop
+        # its connections, which belong to this test's event loop.
+        await async_engine.dispose()
     assert seen == {"x-run": "run-123", "x-customer-id": "org-42"}
 
 

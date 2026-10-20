@@ -438,6 +438,15 @@ def session_context(provider: IdentityProvider, claims: dict) -> dict[str, Any]:
         if mapping.get("target") != "session" or not mapping.get("claim") or not mapping.get("field"):
             continue
         value = mapped_claim_value(claims, mapping["claim"])
+        found = _lookup(claims, mapping["claim"].split("."))
+        present = found is not _MISSING and not (found is None or (isinstance(found, (str, list)) and not found))
+        if value is None and present:
+            # Sent, but not as a usable value (an object, an overlong string):
+            # refused like an invalid one, never read as absent.
+            raise SsoError(
+                f"{provider.display_name} sent {mapping['claim']}, which says what this session "
+                "is for, in a form Sinas can't use."
+            )
         if isinstance(value, list):
             raise SsoError(
                 f"{provider.display_name} sent several values for {mapping['claim']}, which says "
