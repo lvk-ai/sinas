@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { AlertTriangle, CircleDollarSign, Coins, Hash, RefreshCw, TrendingUp, XCircle } from 'lucide-react';
 import { apiClient } from '../lib/api';
@@ -7,6 +7,16 @@ import { useToast } from '../lib/toast-context';
 import { ErrorDisplay } from '../components/ErrorDisplay';
 import { ModelTable, RatecardSources } from '../components/Ratecard';
 import { RATECARD_QUERY_KEY, useRatecard } from '../lib/ratecard';
+import {
+  CALLS_PAGE_SIZE,
+  callRow,
+  callsPageFor,
+  type CallsPageState,
+  formatTokens,
+  formatUsd,
+  pageRangeLabel,
+  previousOffset,
+} from '../lib/usage';
 import type { UsageDimension, UsageFilters } from '../types';
 
 const RANGES = [
@@ -35,18 +45,6 @@ const CHART_METRICS: Array<{ value: ChartMetric; label: string }> = [
   { value: 'total_tokens', label: 'Tokens' },
 ];
 
-function formatUsd(value: number | null | undefined): string {
-  if (value == null) return '—';
-  if (value > 0 && value < 0.01) return `$${value.toFixed(4)}`;
-  return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return `${n}`;
-}
-
 // datetime-local value (local time) -> ISO
 function localToIso(value: string): string | undefined {
   return value ? new Date(value).toISOString() : undefined;
@@ -66,6 +64,8 @@ export function Usage() {
   const [model, setModel] = useState('');
   const [groupBy, setGroupBy] = useState<UsageDimension>('agent');
   const [chartMetric, setChartMetric] = useState<ChartMetric>('cost_usd');
+  const [unpricedOnly, setUnpricedOnly] = useState(false);
+  const [errorsOnly, setErrorsOnly] = useState(false);
 
   // The window, resolved once: every query and the backfill send exactly
   // these bounds. A blank custom date falls back the way the API would
@@ -114,6 +114,32 @@ export function Usage() {
     retry: false,
   });
 
+  // The calls drill-down pages through the same filters; any change to them
+  // (or to its own switches) starts it again at the first page.
+  const callsScope = JSON.stringify([filters, unpricedOnly, errorsOnly]);
+  const [callsPage, setCallsPage] = useState<CallsPageState>({ scope: callsScope, offset: 0 });
+  const currentCallsPage = callsPageFor(callsPage, callsScope);
+  // Adjusting state while rendering (React's documented pattern): the stored
+  // page follows the filters, so returning to earlier ones can't bring back
+  // the page that was open under them.
+  if (currentCallsPage !== callsPage) setCallsPage(currentCallsPage);
+  const callsOffset = currentCallsPage.offset;
+  const calls = useQuery({
+    queryKey: ['usage-calls', filters, unpricedOnly, errorsOnly, callsOffset],
+    queryFn: () => apiClient.getUsageCalls(filters, { offset: callsOffset, unpricedOnly, errorsOnly }),
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+  const callRows = (calls.data?.items || []).map((c) => callRow(c));
+
+  // read:own sees only its own calls (the API limits every query to them),
+  // so the user column is for those who can see everyone's.
+  const canReadAll = useQuery({
+    queryKey: ['usage-can-read-all'],
+    queryFn: () => apiClient.hasPermissions(['sinas.usage.read:all']),
+    retry: false,
+  }).data === true;
+
   // Fetching the URL and pricing past calls need sinas.usage.update:all; a
   // reader without it gets no buttons that would only answer 403.
   const canUpdate = useQuery({
@@ -128,6 +154,7 @@ export function Usage() {
   const invalidateUsage = () => {
     queryClient.invalidateQueries({ queryKey: ['usage-summary'] });
     queryClient.invalidateQueries({ queryKey: ['usage-timeseries'] });
+    queryClient.invalidateQueries({ queryKey: ['usage-calls'] });
     queryClient.invalidateQueries({ queryKey: RATECARD_QUERY_KEY });
   };
 
@@ -436,6 +463,143 @@ export function Usage() {
           <p className="px-6 py-3 text-xs text-gray-500 border-t border-line-soft">
             Showing the {groups.length} largest groups.
           </p>
+        )}
+      </div>
+
+      {/* Calls */}
+      <div className="bg-surface-1 rounded-lg border border-line-soft overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-line-soft">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-100">Calls</h3>
+            <p className="text-sm text-gray-400 mt-1">
+              Every LLM call in the range, newest first{canReadAll ? '' : ' (your own calls only)'}.
+            </p>
+          </div>
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input type="checkbox" checked={unpricedOnly} onChange={(e) => setUnpricedOnly(e.target.checked)} />
+              Unpriced only
+            </label>
+            <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <input type="checkbox" checked={errorsOnly} onChange={(e) => setErrorsOnly(e.target.checked)} />
+              Errors only
+            </label>
+          </div>
+        </div>
+        {calls.isError ? (
+          <div className="p-6">
+            <ErrorDisplay error={calls.error} title="Failed to load calls" />
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-white/[0.06]">
+              <thead className="bg-surface-0">
+                <tr>
+                  {[
+                    { h: 'Time', right: false },
+                    { h: 'Agent', right: false },
+                    { h: 'Provider / model', right: false },
+                    ...(canReadAll ? [{ h: 'User', right: false }] : []),
+                    { h: 'Input', right: true },
+                    { h: 'Output', right: true },
+                    { h: 'Cached', right: true },
+                    { h: 'Cost', right: true },
+                    { h: 'Status', right: false },
+                  ].map(({ h, right }) => (
+                    <th
+                      key={h}
+                      className={`px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider whitespace-nowrap ${right ? 'text-right' : 'text-left'}`}
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className={`bg-surface-1 divide-y divide-white/[0.06] ${calls.isPlaceholderData ? 'opacity-60' : ''}`}>
+                {callRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={canReadAll ? 9 : 8} className="px-6 py-8 text-center text-sm text-gray-500">
+                      {calls.isLoading
+                        ? 'Loading…'
+                        : unpricedOnly || errorsOnly
+                          ? 'No matching calls in this range'
+                          : 'No LLM calls in this range'}
+                    </td>
+                  </tr>
+                ) : (
+                  callRows.map((r) => (
+                    <tr key={r.id} className="hover:bg-hover align-top">
+                      <td className="px-4 py-2.5 text-sm text-gray-300 whitespace-nowrap" title={r.timeTitle}>
+                        {r.time}
+                      </td>
+                      <td className="px-4 py-2.5 text-sm max-w-[14rem]">
+                        <div className="font-mono text-gray-100 truncate" title={r.agent}>{r.agent}</div>
+                        {(r.source || r.batch) && (
+                          <div className="text-xs text-gray-500 truncate">
+                            {[r.source, r.batch ? 'batch' : ''].filter(Boolean).join(' · ')}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-2.5 text-sm max-w-[16rem]">
+                        <div className="font-mono text-gray-100 truncate" title={r.model}>{r.model}</div>
+                        <div className="text-xs text-gray-500 truncate">
+                          {[r.provider, r.latency].filter(Boolean).join(' · ')}
+                        </div>
+                      </td>
+                      {canReadAll && (
+                        <td className="px-4 py-2.5 text-sm text-gray-300 max-w-[14rem] truncate" title={r.user}>
+                          {r.user}
+                        </td>
+                      )}
+                      <td className="px-4 py-2.5 text-sm text-gray-300 text-right">{r.input}</td>
+                      <td className="px-4 py-2.5 text-sm text-gray-300 text-right">{r.output}</td>
+                      <td className="px-4 py-2.5 text-sm text-gray-300 text-right" title={r.cachedTitle}>
+                        {r.cached || <span className="text-gray-500">—</span>}
+                      </td>
+                      <td className={`px-4 py-2.5 text-sm text-right whitespace-nowrap ${r.unpriced ? 'text-yellow-400' : 'font-semibold text-gray-100'}`}>
+                        {r.cost}
+                      </td>
+                      <td className="px-4 py-2.5 text-sm max-w-xs">
+                        {r.status === 'error' ? (
+                          <div className="flex items-start gap-2 min-w-0">
+                            <span className="px-2 py-0.5 rounded text-xs font-semibold bg-red-900/30 text-red-300 flex-shrink-0">
+                              Error
+                            </span>
+                            <span className="text-xs text-red-300 truncate" title={r.error}>{r.error}</span>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-gray-500">OK</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {(callsOffset > 0 || calls.data?.has_more) && (
+          <div className="flex items-center justify-between px-6 py-3 border-t border-line-soft">
+            <span className="text-xs text-gray-500">
+              {callRows.length > 0 ? `Calls ${pageRangeLabel(callsOffset, callRows.length)}` : ''}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCallsPage({ scope: callsScope, offset: previousOffset(callsOffset) })}
+                disabled={callsOffset === 0 || calls.isFetching}
+                className="btn btn-secondary btn-sm"
+              >
+                Newer
+              </button>
+              <button
+                onClick={() => setCallsPage({ scope: callsScope, offset: callsOffset + CALLS_PAGE_SIZE })}
+                disabled={!calls.data?.has_more || calls.isFetching}
+                className="btn btn-secondary btn-sm"
+              >
+                Older
+              </button>
+            </div>
+          </div>
         )}
       </div>
 
