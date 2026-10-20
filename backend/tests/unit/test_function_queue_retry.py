@@ -578,10 +578,26 @@ class TestDeadLetterQueueApi:
 
         redis = await get_redis()
         pool = await create_pool(get_redis_settings())
-        monkeypatch.setattr("app.services.queue_service.get_arq_pool", lambda: _ret(pool))
         try:
             entry = {**_kwargs(fn, row, test_user), "error": "x", "error_type": "infrastructure"}
             await redis.lpush(DLQ_KEY, json.dumps(entry))
+
+            # Enqueueing fails: execution and batch are put back as they were
+            async def redis_down():
+                raise ConnectionError("redis down")
+
+            monkeypatch.setattr("app.services.queue_service.get_arq_pool", redis_down)
+            from app.services.queue_service import queue_service
+
+            with pytest.raises(ConnectionError):
+                await queue_service.retry_dlq_job(row.execution_id)
+            await db.refresh(batch)
+            await db.refresh(row)
+            assert batch.status == BatchStatus.FAILED and batch.finished_at is not None
+            assert row.status == ExecutionStatus.FAILED
+            assert len(await redis.lrange(DLQ_KEY, 0, -1)) == 1  # kept for another try
+
+            monkeypatch.setattr("app.services.queue_service.get_arq_pool", lambda: _ret(pool))
             r = await client.post(
                 f"/api/v1/queue/dlq/{row.execution_id}/retry", headers=auth_headers(admin_user)
             )

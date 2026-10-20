@@ -652,6 +652,10 @@ async def on_execution_terminated(
     if batch_id is None:
         return
 
+    # Count under the batch's row lock: a DLQ requeue reopens a finished
+    # batch under the same lock, so a late call can't finish the reopened
+    # batch from counts taken before the requeued child went PENDING.
+    await db.execute(select(Batch.id).where(Batch.id == batch_id).with_for_update())
     pending = await _count_pending(db, batch_id)
     if pending > 0:
         # Bump batch.status to RUNNING the first time we see any non-queued state.
