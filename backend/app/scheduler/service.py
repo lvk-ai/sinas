@@ -424,6 +424,9 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [scheduler] %(levelname)s %(name)s: %(message)s",
     )
+    from app.core.telemetry import flush_telemetry, init_telemetry
+
+    init_telemetry("scheduler")
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -432,6 +435,7 @@ async def main() -> None:
         await run(stop_event)
     finally:
         await close_redis()
+        flush_telemetry()
 
 
 if __name__ == "__main__":

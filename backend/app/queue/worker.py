@@ -13,6 +13,7 @@ from arq.worker import Retry
 
 from app.core.config import settings
 from app.core.redis import get_redis_settings
+from app.core.telemetry import traced_job
 from app.services.shared_admission import SharedPoolSaturated
 from app.services.queue_service import (
     DLQ_KEY,
@@ -65,7 +66,10 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
     # Restore trace context from the enqueue side
-    from app.core.telemetry import extract_trace_context, get_tracer, otel_attr
+    from opentelemetry import context as otel_context
+    from opentelemetry import trace as otel_trace
+
+    from app.core.telemetry import extract_trace_context, get_tracer, record_error
     parent_ctx = extract_trace_context(kwargs.get("trace_context", {}))
     _tracer = get_tracer()
 
@@ -108,12 +112,16 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     _fn_span = _tracer.start_span(
         "function.job",
         **_span_ctx,
+        kind=otel_trace.SpanKind.CONSUMER,
         attributes={
             "function.name": f"{function_namespace}/{function_name}",
             "job.id": job_id,
             "job.queue": "functions",
         },
     )
+    # Current for the job, so what the execution does (queries, HTTP calls,
+    # the function's own spans) is recorded under it.
+    _fn_token = otel_context.attach(otel_trace.set_span_in_context(_fn_span, parent_ctx))
     try:
         from app.services.execution_engine import executor
 
@@ -190,6 +198,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
 
         # Window exhausted — now it IS a failure. The engine skipped its
         # failure bookkeeping for saturation, so do it here.
+        record_error(_fn_span, e)
         logger.error(
             f"Function job {job_id} failed: pool saturated for {elapsed:.0f}s "
             f"(window {window}s)"
@@ -224,6 +233,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
         raise
 
     except Exception as e:
+        record_error(_fn_span, e)
         logger.error(f"Function job {job_id} failed: {e}")
 
         # Update status to failed
@@ -272,6 +282,9 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
         # Ensure job status is always updated so it doesn't stay "running" forever.
         if not completed:
             logger.warning(f"Function job {job_id} cancelled/timed out")
+            from app.core.telemetry import mark_error
+
+            mark_error(_fn_span, "Job cancelled or timed out", "cancelled")
             try:
                 await redis.set(
                     f"{JOB_STATUS_PREFIX}{job_id}",
@@ -284,6 +297,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
                 )
             except Exception:
                 logger.error(f"Failed to update status for cancelled job {job_id}")
+        otel_context.detach(_fn_token)
         _fn_span.end()
 
 
@@ -296,7 +310,7 @@ async def function_worker_startup(ctx: dict) -> None:
     from redis.asyncio import Redis
 
     from app.core.telemetry import init_telemetry
-    init_telemetry()
+    init_telemetry("queue-worker")
 
     ctx["redis"] = Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -343,15 +357,23 @@ async def function_worker_startup(ctx: dict) -> None:
 
 
 async def agent_worker_startup(ctx: dict) -> None:
-    """arq startup hook for agent workers.
+    """arq startup hook for agent workers."""
+    await _agent_worker_startup(ctx, "queue-agent")
 
-    Initializes Redis and eagerly imports app modules to avoid cold-start
+
+async def subagent_worker_startup(ctx: dict) -> None:
+    """arq startup hook for the sub-agent (delegated) workers."""
+    await _agent_worker_startup(ctx, "queue-agent-sub")
+
+
+async def _agent_worker_startup(ctx: dict, process: str) -> None:
+    """Initializes Redis and eagerly imports app modules to avoid cold-start
     latency on the first job.
     """
     from redis.asyncio import Redis
 
     from app.core.telemetry import init_telemetry
-    init_telemetry()
+    init_telemetry(process)
 
     ctx["redis"] = Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -384,6 +406,7 @@ async def agent_worker_startup(ctx: dict) -> None:
     logger.info(f"Agent worker started (id={worker_id})")
 
 
+@traced_job("pipeline.run")
 async def execute_pipeline_run_job(ctx: dict, **kwargs: Any) -> Any:
     """Execute one pipeline run (one user scope) in the pipeline worker."""
     from app.services import pipeline_runner
@@ -408,6 +431,7 @@ async def execute_pipeline_run_job(ctx: dict, **kwargs: Any) -> Any:
     )
 
 
+@traced_job("pipeline.fire")
 async def execute_pipeline_fire_job(ctx: dict, **kwargs: Any) -> Any:
     """Expand a trigger firing into per-scope run jobs (perUser fan-out)."""
     from app.services import pipeline_runner
@@ -432,7 +456,7 @@ async def pipeline_worker_startup(ctx: dict) -> None:
     from redis.asyncio import Redis
 
     from app.core.telemetry import init_telemetry
-    init_telemetry()
+    init_telemetry("queue-pipeline")
 
     ctx["redis"] = Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -482,22 +506,26 @@ async def shutdown(ctx: dict) -> None:
 
     await close_shared_clients()
 
+    from app.core.telemetry import flush_telemetry
+
+    flush_telemetry()
+
     logger.info("Worker stopped")
 
 
+@traced_job("code.background")
 async def execute_background_code_job(ctx: dict, **kwargs: Any) -> None:
     """A run_in_background sandbox run: executes, then either completes the
-    suspended round (wait=true) or delivers the result into the chat."""
-    from app.core.telemetry import attached, extract_trace_context
+    suspended round (wait=true) or delivers the result into the chat. Runs in
+    the trace context it was enqueued with (`traced_job`)."""
     from app.services.chat_wakeups import run_background_code_job
 
-    with attached(extract_trace_context(kwargs.get("trace_context") or {})):
-        await run_background_code_job(
-            job_id=kwargs["job_id"], chat_id=kwargs["chat_id"], user_id=kwargs["user_id"],
-            code=kwargs["code"], description=kwargs.get("description") or "background run",
-            tool_call_id=kwargs.get("tool_call_id"), pending_completion_id=kwargs.get("pending_completion_id"),
-            api_key_id=kwargs.get("api_key_id"),
-        )
+    await run_background_code_job(
+        job_id=kwargs["job_id"], chat_id=kwargs["chat_id"], user_id=kwargs["user_id"],
+        code=kwargs["code"], description=kwargs.get("description") or "background run",
+        tool_call_id=kwargs.get("tool_call_id"), pending_completion_id=kwargs.get("pending_completion_id"),
+        api_key_id=kwargs.get("api_key_id"),
+    )
 
 
 def _background_job_timeout() -> int:
@@ -590,6 +618,7 @@ async def chat_retention_tick_job(ctx: dict) -> bool:
     return await scheduled_tick() is not None
 
 
+@traced_job("retention.run")
 async def chat_retention_run_job(ctx: dict, run_id: str) -> str:
     """A run queued by POST /retention/run ("Run now")."""
     import uuid as _uuid
@@ -687,7 +716,7 @@ class SubAgentWorkerSettings:
         func(execute_agent_resume_job, timeout=agent_function_timeout()),
         func(execute_agent_delegate_resume_job, timeout=agent_function_timeout()),
     ]
-    on_startup = agent_worker_startup
+    on_startup = subagent_worker_startup
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     queue_name = "sinas:queue:agents:sub"

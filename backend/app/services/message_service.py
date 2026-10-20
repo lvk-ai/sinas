@@ -53,11 +53,34 @@ from app.services.tool_execution import (
     accumulate_tool_call_delta,
     validate_tool_calls,
 )
+import time
+
 from opentelemetry import trace
-from app.core.telemetry import get_tracer, otel_attr
+from app.core.telemetry import ending_on_error, get_tracer, otel_attr, record_error
 
 logger = logging.getLogger(__name__)
 _tracer = get_tracer()
+
+
+def _record_llm_span(
+    start_ns: int,
+    attributes: dict[str, Any],
+    usage: Optional[dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    """An `llm.call` span for a streamed call, recorded once the stream has
+    ended (or failed): from `start_ns`, when the request was made, to now.
+    Never affects the flow."""
+    try:
+        span = get_tracer().start_span("llm.call", start_time=start_ns, attributes=attributes)
+        if usage and usage.get("total_tokens"):
+            span.set_attribute("gen_ai.usage.input_tokens", usage.get("prompt_tokens", 0))
+            span.set_attribute("gen_ai.usage.output_tokens", usage.get("completion_tokens", 0))
+        if error is not None:
+            record_error(span, error)
+        span.end()
+    except Exception:
+        pass
 
 # Tool results for calls of a round that never ran: refused at the approval
 # gate, or stopped by an operator interrupt before execution.
@@ -659,143 +682,147 @@ class MessageService:
             otel_attr("user_id"): user_id,
             otel_attr("labels"): _labels,
         })
+        # Current for the turn (the provider call, tools and queries made for it
+        # are recorded under it); a failure records the exception and ends it.
+        with ending_on_error(_llm_span), trace.use_span(
+            _llm_span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+        ):
+            start_time = datetime.now(UTC)
 
-        start_time = datetime.now(UTC)
+            llm_kwargs = {}
+            if prep["response_format"]:
+                llm_kwargs["response_format"] = prep["response_format"]
 
-        llm_kwargs = {}
-        if prep["response_format"]:
-            llm_kwargs["response_format"] = prep["response_format"]
+            clean_tools = strip_tool_metadata(prep["tools"])
 
-        clean_tools = strip_tool_metadata(prep["tools"])
-
-        response = await prep["llm_provider"].complete(
-            messages=prep["messages"],
-            model=prep["final_model"],
-            tools=clean_tools,
-            temperature=prep["final_temperature"],
-            max_tokens=prep["final_max_tokens"],
-            **llm_kwargs,
-        )
-        end_time = datetime.now(UTC)
-
-        _usage = response.get("usage") or {}
-        if _usage.get("total_tokens"):
-            _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
-            _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
-
-        await self._log_request(
-            user_id=user_id,
-            chat_id=str(chat_id),
-            message_id=str(prep["user_message"].id),
-            provider=prep["provider_name"],
-            model=prep["final_model"],
-            messages=prep["messages"],
-            response=response,
-            latency_ms=int((end_time - start_time).total_seconds() * 1000),
-        )
-
-        if response.get("tool_calls"):
-            # The same decision the streaming path makes (agent rules and
-            # session grants over the intrinsic flags): a call the rules
-            # would ask about cannot be parked here, so it is refused; one
-            # they allow runs, even if its function is flagged.
-            actions = await resolve_tool_approval_actions(
-                self.db, response["tool_calls"], chat_id, prep.get("tools")
-            )
-            for tool_call in response["tool_calls"]:
-                if actions.get(tool_call["id"]) == "ask":
-                    _llm_span.end()
-                    raise ValueError(
-                        f"Tool {tool_call['function']['name']} requires user approval. "
-                        "Please use streaming mode to handle approval flow."
-                    )
-
-            ended = await _consume_round(self._handle_tool_calls(
-                chat_id=chat_id,
-                user_id=user_id,
-                user_token=user_token,
+            response = await prep["llm_provider"].complete(
                 messages=prep["messages"],
-                tool_calls=response["tool_calls"],
-                provider=prep["provider_name"],
                 model=prep["final_model"],
+                tools=clean_tools,
                 temperature=prep["final_temperature"],
                 max_tokens=prep["final_max_tokens"],
-                tools=prep["tools"],
-                agent_label=agent_label,
-            ))
-            if not ended.stopped:
-                ended = await _consume_round(self.answer_pending_injections(
-                    chat_id=chat_id, user_id=user_id, user_token=user_token,
-                    provider=prep["provider_name"], model=prep["final_model"],
-                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
-                    tools=prep["tools"], agent_label=agent_label,
-                ))
-            if ended.suspension is not None:
-                parked = await self._parked_turn(chat_id, ended)
-                _llm_span.set_attribute(otel_attr("output"), (parked.message.content or "")[:10000])
-                _llm_span.end()
-                return parked
-
-            result = await self.db.execute(
-                select(Message)
-                .where(Message.chat_id == chat_id)
-                .order_by(Message.created_at.desc())
-                .limit(1)
+                **llm_kwargs,
             )
-            final_msg = result.scalar_one()
-            _llm_span.set_attribute(otel_attr("output"), (final_msg.content or "")[:10000])
-            _llm_span.end()
-            return TurnResult(TURN_COMPLETED, final_msg)
+            end_time = datetime.now(UTC)
 
-        assistant_content = response.get("content", "")
+            _usage = response.get("usage") or {}
+            if _usage.get("total_tokens"):
+                _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
+                _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
 
-        # Run assistant message hooks
-        agent = None
-        if prep["chat"].agent_id:
-            agent = await self.db.get(Agent, prep["chat"].agent_id)
-
-        if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
-            hook_result = await run_hooks(
-                hooks=agent.hooks["on_assistant_message"],
-                message_content=assistant_content,
-                message_role="assistant",
-                chat_id=chat_id,
-                agent_namespace=agent.namespace,
-                agent_name=agent.name,
+            await self._log_request(
                 user_id=user_id,
-                session_key=getattr(prep["chat"], "session_key", None),
+                chat_id=str(chat_id),
+                message_id=str(prep["user_message"].id),
+                provider=prep["provider_name"],
+                model=prep["final_model"],
+                messages=prep["messages"],
+                response=response,
+                latency_ms=int((end_time - start_time).total_seconds() * 1000),
             )
-            if hook_result.blocked:
-                assistant_content = hook_result.reply or "Response blocked by hook"
-            elif hook_result.mutated_content:
-                assistant_content = hook_result.mutated_content
 
-        assistant_message = Message(
-            chat_id=chat_id, role="assistant", content=assistant_content
-        )
-        self.db.add(assistant_message)
-        await self.db.commit()
-        await self.db.refresh(assistant_message)
+            if response.get("tool_calls"):
+                # The same decision the streaming path makes (agent rules and
+                # session grants over the intrinsic flags): a call the rules
+                # would ask about cannot be parked here, so it is refused; one
+                # they allow runs, even if its function is flagged.
+                actions = await resolve_tool_approval_actions(
+                    self.db, response["tool_calls"], chat_id, prep.get("tools")
+                )
+                for tool_call in response["tool_calls"]:
+                    if actions.get(tool_call["id"]) == "ask":
+                        _llm_span.end()
+                        raise ValueError(
+                            f"Tool {tool_call['function']['name']} requires user approval. "
+                            "Please use streaming mode to handle approval flow."
+                        )
 
-        _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
-        _llm_span.end()
+                ended = await _consume_round(self._handle_tool_calls(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    messages=prep["messages"],
+                    tool_calls=response["tool_calls"],
+                    provider=prep["provider_name"],
+                    model=prep["final_model"],
+                    temperature=prep["final_temperature"],
+                    max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"],
+                    agent_label=agent_label,
+                ))
+                if not ended.stopped:
+                    ended = await _consume_round(self.answer_pending_injections(
+                        chat_id=chat_id, user_id=user_id, user_token=user_token,
+                        provider=prep["provider_name"], model=prep["final_model"],
+                        temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                        tools=prep["tools"], agent_label=agent_label,
+                    ))
+                if ended.suspension is not None:
+                    parked = await self._parked_turn(chat_id, ended)
+                    _llm_span.set_attribute(otel_attr("output"), (parked.message.content or "")[:10000])
+                    _llm_span.end()
+                    return parked
 
-        # A message injected while this reply streamed has no boundary left
-        # to be read at: answer it now, still under the lock.
-        ended = await _consume_round(self.answer_pending_injections(
-            chat_id=chat_id, user_id=user_id, user_token=user_token,
-            provider=prep["provider_name"], model=prep["final_model"],
-            temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
-            tools=prep["tools"], agent_label=agent_label,
-        ))
-        if ended.suspension is not None:
-            return await self._parked_turn(chat_id, ended)
-        if ended.chunks:
-            result = await self.db.execute(
-                select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+                result = await self.db.execute(
+                    select(Message)
+                    .where(Message.chat_id == chat_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(1)
+                )
+                final_msg = result.scalar_one()
+                _llm_span.set_attribute(otel_attr("output"), (final_msg.content or "")[:10000])
+                _llm_span.end()
+                return TurnResult(TURN_COMPLETED, final_msg)
+
+            assistant_content = response.get("content", "")
+
+            # Run assistant message hooks
+            agent = None
+            if prep["chat"].agent_id:
+                agent = await self.db.get(Agent, prep["chat"].agent_id)
+
+            if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
+                hook_result = await run_hooks(
+                    hooks=agent.hooks["on_assistant_message"],
+                    message_content=assistant_content,
+                    message_role="assistant",
+                    chat_id=chat_id,
+                    agent_namespace=agent.namespace,
+                    agent_name=agent.name,
+                    user_id=user_id,
+                    session_key=getattr(prep["chat"], "session_key", None),
+                )
+                if hook_result.blocked:
+                    assistant_content = hook_result.reply or "Response blocked by hook"
+                elif hook_result.mutated_content:
+                    assistant_content = hook_result.mutated_content
+
+            assistant_message = Message(
+                chat_id=chat_id, role="assistant", content=assistant_content
             )
-            return TurnResult(TURN_COMPLETED, result.scalar_one())
-        return TurnResult(TURN_COMPLETED, assistant_message)
+            self.db.add(assistant_message)
+            await self.db.commit()
+            await self.db.refresh(assistant_message)
+
+            _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
+            _llm_span.end()
+
+            # A message injected while this reply streamed has no boundary left
+            # to be read at: answer it now, still under the lock.
+            ended = await _consume_round(self.answer_pending_injections(
+                chat_id=chat_id, user_id=user_id, user_token=user_token,
+                provider=prep["provider_name"], model=prep["final_model"],
+                temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                tools=prep["tools"], agent_label=agent_label,
+            ))
+            if ended.suspension is not None:
+                return await self._parked_turn(chat_id, ended)
+            if ended.chunks:
+                result = await self.db.execute(
+                    select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+                )
+                return TurnResult(TURN_COMPLETED, result.scalar_one())
+            return TurnResult(TURN_COMPLETED, assistant_message)
 
     async def send_message_stream(
         self,
@@ -970,7 +997,7 @@ class MessageService:
                     yield chunk
         except Exception as e:
             print(f"❌ Error during message streaming: {e}", flush=True)
-            turn_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
+            record_error(turn_span, e)
             error_content = f"An error occurred while processing your message. Please try again.\n\nError: {str(e)[:300]}"
             # Save error as assistant message so chat history stays valid
             error_message = Message(chat_id=chat_id, role="assistant", content=error_content)
@@ -1005,35 +1032,11 @@ class MessageService:
 
         clean_tools = strip_tool_metadata(tools)
 
-        async for chunk in llm_provider.stream(
-            messages=messages,
-            model=final_model,
-            tools=clean_tools,
-            temperature=final_temperature,
-            max_tokens=max_tokens,
-        ):
-            if chunk.get("usage"):
-                stream_usage = chunk["usage"]
-
-            if chunk.get("content"):
-                if isinstance(chunk["content"], str):
-                    full_content += chunk["content"]
-                else:
-                    chunk["content"] = None
-
-            if chunk.get("tool_calls"):
-                for tc in chunk["tool_calls"]:
-                    accumulate_tool_call_delta(tool_calls_list, tc)
-
-            yield chunk
-
-        # Record LLM call as a span (after streaming completes, never affects the flow)
-        try:
-            # Capture input: last user message (up to 10k for NER/extraction use cases)
+        def _llm_attributes() -> dict[str, Any]:
+            # Input: the last user message (up to 10k for NER/extraction use cases)
             _last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
             _input_summary = _last_user[:10000] if isinstance(_last_user, str) else json.dumps(_last_user, default=str)[:10000]
-            _labels = json.dumps([f"agent:{agent_label}"]) if agent_label else "[]"
-            _s = _tracer.start_span("llm.call", attributes={
+            return {
                 "gen_ai.request.model": final_model or "",
                 "gen_ai.system": provider_name or "",
                 otel_attr("span_type"): "llm",
@@ -1041,14 +1044,38 @@ class MessageService:
                 otel_attr("output"): full_content if full_content else "",
                 otel_attr("thread_id"): chat_id,
                 otel_attr("user_id"): user_id,
-                otel_attr("labels"): _labels,
-            })
-            if stream_usage and stream_usage.get("total_tokens"):
-                _s.set_attribute("gen_ai.usage.input_tokens", stream_usage.get("prompt_tokens", 0))
-                _s.set_attribute("gen_ai.usage.output_tokens", stream_usage.get("completion_tokens", 0))
-            _s.end()
-        except Exception:
-            pass
+                otel_attr("labels"): json.dumps([f"agent:{agent_label}"]) if agent_label else "[]",
+            }
+
+        _llm_start = time.time_ns()
+        try:
+            async for chunk in llm_provider.stream(
+                messages=messages,
+                model=final_model,
+                tools=clean_tools,
+                temperature=final_temperature,
+                max_tokens=max_tokens,
+            ):
+                if chunk.get("usage"):
+                    stream_usage = chunk["usage"]
+
+                if chunk.get("content"):
+                    if isinstance(chunk["content"], str):
+                        full_content += chunk["content"]
+                    else:
+                        chunk["content"] = None
+
+                if chunk.get("tool_calls"):
+                    for tc in chunk["tool_calls"]:
+                        accumulate_tool_call_delta(tool_calls_list, tc)
+
+                yield chunk
+        except Exception as exc:
+            _record_llm_span(_llm_start, _llm_attributes(), stream_usage, error=exc)
+            raise
+
+        # Record the LLM call as a span (after streaming completes, never affects the flow)
+        _record_llm_span(_llm_start, _llm_attributes(), stream_usage)
 
         tool_calls = tool_calls_list if tool_calls_list else []
 
@@ -1819,43 +1846,49 @@ class MessageService:
         full_content = ""
         tool_calls_list = []
 
-        async for chunk in llm_provider.stream(
-            messages=updated_messages,
-            model=model,
-            tools=clean_tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        ):
-            if chunk.get("content"):
-                if isinstance(chunk["content"], str):
-                    full_content += chunk["content"]
-                else:
-                    chunk["content"] = None
-
-            if chunk.get("tool_calls"):
-                for tc in chunk["tool_calls"]:
-                    accumulate_tool_call_delta(tool_calls_list, tc)
-
-            yield chunk
-
-        # Record follow-up LLM call as a span
-        try:
-            # Summarize: tool results that were fed back to the LLM
-            _tool_summary = tool_summary
-            _labels = json.dumps([f"agent:{agent_label}"]) if agent_label else "[]"
-            _s2 = _tracer.start_span("llm.call", attributes={
+        def _followup_attributes() -> dict[str, Any]:
+            # Input: a summary of the tool results fed back to the LLM
+            return {
                 "gen_ai.request.model": model or "",
                 "gen_ai.system": provider or "",
                 otel_attr("span_type"): "llm",
-                otel_attr("input"): f"Follow-up after tools: {_tool_summary}",
+                otel_attr("input"): f"Follow-up after tools: {tool_summary}",
                 otel_attr("output"): full_content if full_content else "",
                 otel_attr("thread_id"): chat_id,
                 otel_attr("user_id"): user_id,
-                otel_attr("labels"): _labels,
-            })
-            _s2.end()
-        except Exception:
-            pass
+                otel_attr("labels"): json.dumps([f"agent:{agent_label}"]) if agent_label else "[]",
+            }
+
+        _llm_start = time.time_ns()
+        _followup_usage = None
+        try:
+            async for chunk in llm_provider.stream(
+                messages=updated_messages,
+                model=model,
+                tools=clean_tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ):
+                if chunk.get("usage"):
+                    _followup_usage = chunk["usage"]
+
+                if chunk.get("content"):
+                    if isinstance(chunk["content"], str):
+                        full_content += chunk["content"]
+                    else:
+                        chunk["content"] = None
+
+                if chunk.get("tool_calls"):
+                    for tc in chunk["tool_calls"]:
+                        accumulate_tool_call_delta(tool_calls_list, tc)
+
+                yield chunk
+        except Exception as exc:
+            _record_llm_span(_llm_start, _followup_attributes(), _followup_usage, error=exc)
+            raise
+
+        # Record the follow-up LLM call as a span
+        _record_llm_span(_llm_start, _followup_attributes(), _followup_usage)
 
         final_tool_calls = tool_calls_list if tool_calls_list else None
 

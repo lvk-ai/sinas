@@ -616,12 +616,42 @@ class Settings(BaseSettings):
     metering_push_minutes: int = 15  # heartbeat cadence (jittered per instance)
 
 
-    # OpenTelemetry (opt-in observability — e.g. Langwatch)
+    # OpenTelemetry (opt-in, vendor-neutral; docs-mint/admin/observability.mdx).
+    # Off: nothing is installed, no span is recorded. On: traces (and, with
+    # otel_logs_enabled, logs) go to every exporter configured below and/or
+    # by the standard OTEL_EXPORTER_OTLP_* variables, which the OpenTelemetry
+    # SDK reads itself (as are OTEL_TRACES_SAMPLER, OTEL_RESOURCE_ATTRIBUTES).
     otel_enabled: bool = False
-    otel_exporter_endpoint: Optional[str] = None  # e.g. https://app.langwatch.ai/api/otel/v1/traces
-    otel_exporter_headers: Optional[str] = None  # e.g. X-Auth-Token=lw_xxx
-    otel_service_name: str = "sinas"
-    otel_vendor: str = "langwatch"  # Vendor preset: "langwatch", "langfuse", "generic_otel"
+    # JSON list of named exporters, e.g.
+    # [{"name": "langfuse", "endpoint": "https://cloud.langfuse.com/api/public/otel", "preset": "langfuse"},
+    #  {"name": "apm", "endpoint": "http://otel-collector:4318", "preset": "none"}]
+    # Secret headers: OTEL_EXPORTER_<NAME>_HEADERS=k=v,... (merged per entry).
+    otel_exporters: Optional[str] = None
+    # Attribute preset of the exporter the standard OTEL_EXPORTER_OTLP_*
+    # variables configure: genai | langfuse | langwatch | none (no content).
+    otel_preset: str = "genai"
+    # service.name; "{process}" is replaced by the process (backend,
+    # queue-agent, scheduler...). Unset: OTEL_RESOURCE_ATTRIBUTES' service.name,
+    # else "sinas". Every process also carries sinas.process.
+    otel_service_name: Optional[str] = None
+    # Python logging -> OTLP logs, to the exporters with the "logs" signal.
+    otel_logs_enabled: bool = False
+    otel_logs_level: str = "INFO"
+    # Trace context on outgoing HTTP calls Sinas makes (webhooks, connectors,
+    # MCP servers, OAuth...): none | tracecontext (traceparent, tracestate) |
+    # all (+ baggage). LLM provider calls are governed by each provider's own
+    # propagate_context, never by this.
+    otel_http_client_propagation: str = "none"
+    # Request paths not traced: comma-separated, "*" suffix for a prefix.
+    otel_excluded_paths: str = "/health,/api/v1/system/health,/ui/*"
+    # FastAPI's per-request operation spans (dependencies, endpoint,
+    # serialization) under each request span.
+    otel_fastapi_operation_spans: bool = True
+    # Deprecated (0.5.0): one exporter. Still honoured, as an exporter named
+    # "legacy" that receives Sinas's own spans in the OTEL_VENDOR preset.
+    otel_exporter_endpoint: Optional[str] = None  # full OTLP/HTTP traces URL
+    otel_exporter_headers: Optional[str] = None  # k=v,k2=v2
+    otel_vendor: str = "langwatch"  # langwatch | langfuse | generic_otel | genai | none
 
     # Declarative Configuration
     config_file: Optional[str] = None  # Path to YAML config file
