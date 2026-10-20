@@ -726,8 +726,14 @@ async def execute_agent_tool(
                         "error": event.get("error", "Sub-agent failed"),
                         "chat_id": str(sub_chat.id),
                     }
-                    if event.get("code"):  # a refused LLM call: budget_exceeded, ...
+                    if event.get("code"):
+                        # The error envelope (budget_exceeded, rate_limited,
+                        # provider_unavailable, ...): lets the parent model
+                        # tell a retryable failure from a final one.
                         failure["error_code"] = event["code"]
+                        for key in ("retryable", "upstream_status"):
+                            if event.get(key) is not None:
+                                failure[key] = event[key]
                     return failure
                 break
 
@@ -778,6 +784,15 @@ def _tool_error(result_content: Any) -> Optional[str]:
     if isinstance(parsed, dict) and parsed.get("error"):
         return str(parsed["error"])
     return None
+
+
+async def _chat_agent_list(db: AsyncSession, chat: Optional[Chat], field: str) -> list[Any]:
+    """One of the chat agent's enabled_* lists as of now ([] without an
+    agent: nothing is enabled), to check a call against."""
+    if chat is None or not chat.agent_id:
+        return []
+    agent = await db.get(Agent, chat.agent_id)
+    return list(getattr(agent, field, None) or []) if agent else []
 
 
 async def execute_single_tool(
@@ -1189,12 +1204,16 @@ async def _execute_single_tool(
                     user_token=user_token,
                     locked_params=tool_metadata.get("locked_params", {}),
                     user_id=user_id,
+                    # The agent's CURRENT list decides, wildcards as discovery
+                    # resolves them (not the tool list a resumed round saved).
+                    enabled_connectors=await _chat_agent_list(db, chat, "enabled_connectors"),
                 )
                 logger.debug(f"Connector tool completed in {time.time() - start_time:.3f}s: {tool_name}")
             elif tool_name.startswith("show_component_"):
                 start_time = time.time()
                 result = await component_converter.handle_component_tool_call(
-                    db=db, tool_name=tool_name, arguments=arguments, user_id=user_id
+                    db=db, tool_name=tool_name, arguments=arguments, user_id=user_id,
+                    enabled_components=await _chat_agent_list(db, chat, "enabled_components"),
                 )
                 if result is None:
                     result = {"error": f"Component not found for tool: {tool_name}"}
@@ -1202,7 +1221,8 @@ async def _execute_single_tool(
             elif tool_name.startswith("get_skill_"):
                 start_time = time.time()
                 result = await skill_converter.handle_skill_tool_call(
-                    db=db, tool_name=tool_name, arguments=arguments
+                    db=db, tool_name=tool_name, arguments=arguments,
+                    enabled_skills=await _chat_agent_list(db, chat, "enabled_skills"),
                 )
                 if result is None:
                     result = {"error": f"Skill not found for tool: {tool_name}"}

@@ -74,6 +74,7 @@ class CollectionToolConverter:
         db: AsyncSession,
         user_id: str,
         enabled_collections: list,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """
         Get collection tools in OpenAI format.
@@ -89,49 +90,23 @@ class CollectionToolConverter:
         """
         tools = []
 
-        # Expand wildcards in enabled_collections
-        expanded_entries: list[tuple[str, str, Collection]] = []  # (ref, access, model)
-        seen_ids = set()
+        # Expand wildcards in enabled_collections, as stores expand theirs: a
+        # wildcard entry's access mode applies to every collection it matches
+        # that the user may download from (read-write only where they may
+        # also upload: the checks execute_tool applies), and the most
+        # specific entry decides a collection's mode.
+        from app.core.auth import get_effective_permissions
+        from app.services.resource_resolver import resolve_access_entries, user_has
 
-        for entry in enabled_collections:
-            if isinstance(entry, str):
-                coll_ref = entry
-                access = "readonly"
-            elif isinstance(entry, dict):
-                coll_ref = entry.get("collection", "")
-                access = entry.get("access", "readonly")
-            else:
-                logger.warning(f"Invalid collection entry: {entry}")
-                continue
-
-            if "/" not in coll_ref:
-                logger.warning(f"Invalid collection reference format: {coll_ref}")
-                continue
-
-            if coll_ref == "*/*":
-                result = await db.execute(select(Collection).where(Collection.kind == "collection"))
-                for c in result.scalars().all():
-                    if c.id not in seen_ids:
-                        seen_ids.add(c.id)
-                        expanded_entries.append((f"{c.namespace}/{c.name}", access, c))
-            elif coll_ref.endswith("/*"):
-                ns = coll_ref[:-2]
-                result = await db.execute(
-                    select(Collection).where(Collection.namespace == ns, Collection.kind == "collection")
-                )
-                for c in result.scalars().all():
-                    if c.id not in seen_ids:
-                        seen_ids.add(c.id)
-                        expanded_entries.append((f"{c.namespace}/{c.name}", access, c))
-            else:
-                namespace, name = coll_ref.split("/", 1)
-                collection = await Collection.get_by_name(db, namespace, name)
-                if not collection:
-                    logger.warning(f"Collection {coll_ref} not found")
-                    continue
-                if collection.id not in seen_ids:
-                    seen_ids.add(collection.id)
-                    expanded_entries.append((coll_ref, access, collection))
+        if permissions is None:
+            permissions = await get_effective_permissions(db, user_id)
+        expanded_entries = await resolve_access_entries(
+            db, enabled_collections, Collection, "collection",
+            can_read=user_has(user_id, permissions, "collections", "download"),
+            can_write=user_has(user_id, permissions, "collections", "upload"),
+            # Workbenches are never reachable by name (Collection.get_by_name)
+            scope=Collection.kind == "collection",
+        )
 
         for coll_ref, access, collection in expanded_entries:
             namespace, name = coll_ref.split("/", 1)

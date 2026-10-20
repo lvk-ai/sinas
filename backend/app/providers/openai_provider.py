@@ -335,6 +335,7 @@ class OpenAIProvider(BaseLLMProvider):
                     choices = body.get("choices") or []
                     if choices:
                         item["content"] = (choices[0].get("message") or {}).get("content")
+                        item["finish_reason"] = choices[0].get("finish_reason")
                     usage = body.get("usage") or {}
                     # Gemini's batch output reports usage in camelCase
                     # (promptTokens); OpenAI uses snake_case. Accept both.

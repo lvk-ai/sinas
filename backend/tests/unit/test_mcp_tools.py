@@ -1053,6 +1053,76 @@ class TestReviewFollowUps:
         assert not result.success and "tools/none-such" in result.errors[0]
 
 
+class TestWildcardBindings:
+    """"namespace/*" and "*/*" bind every server they match that the chat's
+    user may read (#174); an exact binding decides for its own server."""
+
+    @pytest.mark.asyncio
+    async def test_a_wildcard_binds_the_servers_the_user_may_read(self, db, fake_mcp, test_user, admin_user):
+        ns = f"w{_uid()}"
+        mine, other_mine, theirs = _server(test_user, namespace=ns), _server(test_user, namespace=ns), _server(admin_user, namespace=ns)
+        elsewhere = _server(test_user, namespace=f"w{_uid()}")
+        db.add_all([mine, other_mine, theirs, elsewhere])
+        await db.flush()
+
+        def servers(tools):
+            return {t["function"]["_metadata"]["server_name"] for t in tools}
+
+        conv = McpToolConverter()
+        tools = await conv.get_available_tools(db, [{"server": f"{ns}/*", "tools": ["echo"]}], str(test_user.id))
+        assert servers(tools) == {mine.name, other_mine.name}  # not another owner's, not another namespace
+        assert {t["function"]["_metadata"]["mcp_tool"] for t in tools} == {"echo"}
+        # An exact binding decides for its own server (here: "add" instead of "echo").
+        tools = await conv.get_available_tools(
+            db, [{"server": f"{ns}/*", "tools": ["echo"]}, {"server": f"{ns}/{mine.name}", "tools": ["add"]}],
+            str(test_user.id),
+        )
+        offered = sorted((t["function"]["_metadata"]["server_name"], t["function"]["_metadata"]["mcp_tool"]) for t in tools)
+        assert offered == sorted([(mine.name, "add"), (other_mine.name, "echo")])
+        # The owner of "theirs" (who may read every server) gets it too.
+        admin_tools = await conv.get_available_tools(db, [{"server": f"{ns}/*", "tools": ["echo"]}], str(admin_user.id))
+        assert theirs.name in servers(admin_tools)
+
+    @pytest.mark.asyncio
+    async def test_a_wildcard_binding_gates_execution_as_discovery_does(self, db, fake_mcp, test_user, admin_user):
+        from app.models.agent import Agent
+        from app.models.chat import Chat
+
+        ns = f"w{_uid()}"
+        mine, theirs = _server(test_user, namespace=ns), _server(admin_user, namespace=ns)
+        db.add_all([mine, theirs])
+        agent = Agent(user_id=test_user.id, namespace=f"ns{_uid()}", name="w",
+                      enabled_mcp_servers=[{"server": f"{ns}/*", "tools": ["echo"]}])
+        db.add(agent)
+        await db.flush()
+        chat = Chat(user_id=test_user.id, agent_id=agent.id, title="t")
+        db.add(chat)
+        await db.flush()
+
+        async def call(server, tool, args):
+            return await McpToolConverter().execute_tool(
+                db, "mcp_x", args, str(test_user.id), _tool_def(server, tool)["function"]["_metadata"], chat=chat,
+            )
+
+        assert await call(mine, "echo", {"text": "hi"}) == {"text": "hi"}
+        assert "outside this agent's tool patterns" in (await call(mine, "add", {"a": 1, "b": 2}))["error"]
+        assert "not authorized" in (await call(theirs, "echo", {"text": "hi"}))["error"]
+
+    @pytest.mark.asyncio
+    async def test_bindings_accept_wildcards_and_refuse_other_patterns(self, client, db, test_user):
+        headers = auth_headers(test_user)
+        ns = f"ns{_uid()}"
+
+        def body(name, ref):
+            return {"namespace": ns, "name": name, "system_prompt": "x", "enabled_mcp_servers": [{"server": ref}]}
+
+        response = await client.post("/api/v1/agents", json=body("a", "tools/*"), headers=headers)
+        assert response.status_code == 201, response.text
+        response = await client.post("/api/v1/agents", json=body("b", "tools/fake-*"), headers=headers)
+        assert response.status_code == 400, response.text
+        assert "not a supported pattern" in response.json()["detail"]
+
+
 class TestRequestLogRedaction:
     def test_mcp_server_writes_are_stored_without_credentials(self):
         from app.middleware.request_logger import redact_body

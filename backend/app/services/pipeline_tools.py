@@ -29,14 +29,20 @@ class PipelineToolConverter:
         db: AsyncSession,
         user_id: str,
         enabled_pipelines: Optional[list[str]] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """Build tool definitions for enabled asTool pipelines."""
         if not enabled_pipelines:
             return []
 
-        from app.services.resource_resolver import resolve_resource_refs
+        from app.services.resource_resolver import resolve_resource_refs, user_has
 
-        resolved = await resolve_resource_refs(db, enabled_pipelines, Pipeline)
+        if permissions is None:
+            permissions = await get_effective_permissions(db, user_id)
+        # A wildcard offers only what the user may run (execute_pipeline_tool's check)
+        resolved = await resolve_resource_refs(
+            db, enabled_pipelines, Pipeline, can_access=user_has(user_id, permissions, "pipelines", "run")
+        )
 
         tools = []
         for ref, pipeline in resolved:

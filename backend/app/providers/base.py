@@ -216,7 +216,8 @@ class BaseLLMProvider(ABC):
     #    "temperature": float, "max_tokens": Optional[int]}
     # Result item shape (output of fetch_batch_results):
     #   {"custom_id": str, "status": "succeeded"|"errored"|"cancelled"|"expired",
-    #    "content": Optional[str], "usage": Optional[dict], "error": Optional[str]}
+    #    "content": Optional[str], "usage": Optional[dict], "error": Optional[str],
+    #    "finish_reason": Optional[str]}  (the provider's own; when it reports one)
 
     async def submit_batch(self, requests: list[dict[str, Any]]) -> str:
         """Submit requests to the provider's batch API; returns the provider batch id."""

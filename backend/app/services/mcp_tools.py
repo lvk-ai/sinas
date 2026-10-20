@@ -96,20 +96,28 @@ async def _current_binding_problem(
     if agent is None:
         return None
     ref = f"{namespace}/{name}"
-    bound = False
-    # Discovery unions every binding for a server; so does this check — a
-    # tool one binding allows must not be refused because another lists it
-    # under a different pattern.
-    for entry in agent.enabled_mcp_servers or []:
-        entry_ref, patterns = _normalize_entry(entry)
-        if entry_ref != ref:
-            continue
-        bound = True
-        if binding_allows(patterns, mcp_tool):
-            return None
-    if bound:
-        return f"Tool '{mcp_tool}' on MCP server '{ref}' is outside this agent's tool patterns"
-    return f"MCP server '{ref}' is no longer enabled for this agent"
+    # Discovery unions the deciding bindings for a server; so does this
+    # check — a tool one binding allows must not be refused because another
+    # lists it under a different pattern. (Access to the server itself, the
+    # boundary a wildcard binding relies on, is checked by the caller.)
+    bindings = _deciding_bindings(ref, agent.enabled_mcp_servers or [])
+    if not bindings:
+        return f"MCP server '{ref}' is no longer enabled for this agent"
+    if any(binding_allows(patterns, mcp_tool) for patterns in bindings):
+        return None
+    return f"Tool '{mcp_tool}' on MCP server '{ref}' is outside this agent's tool patterns"
+
+
+def _deciding_bindings(ref: str, entries: list[Any]) -> list[list[str]]:
+    """The tool patterns of the bindings that decide what the agent gets
+    from server `ref`: the most specific ones matching it (an exact binding
+    over "namespace/*" over "*/*", so an exact binding narrows or widens
+    what a wildcard gives one server). Several equally specific bindings
+    are one binding with the union of their patterns."""
+    from app.services.resource_resolver import matching_entries
+
+    _, matched = matching_entries(ref, entries, "server")
+    return [_normalize_entry(entry)[1] for entry in matched]
 
 
 def _normalize_entry(entry: Any) -> tuple[str, list[str]]:
@@ -144,10 +152,28 @@ class McpToolConverter:
         # bindings' patterns: each remote tool is offered once (an approval
         # rule matching its name then covers every call to it), and the
         # names never depend on how many bindings there are.
+        # A wildcard binding ("namespace/*", "*/*") binds every active server
+        # it matches that the user may read (the access check below applies
+        # to every server alike); its tool patterns apply to each.
+        from app.services.resource_resolver import EXACT, ref_specificity, resolve_resource_refs, user_can
+
+        entries = list(enabled_mcp_servers or [])
+        refs: list[str] = []
+        for entry in entries:
+            ref, _ = _normalize_entry(entry)
+            if ref_specificity(ref) in (None, EXACT):
+                refs.append(ref)  # exact (or invalid: reported below), as always
+                continue
+            if permissions is None and user_id:
+                permissions = await get_effective_permissions(db, user_id)
+            matched = await resolve_resource_refs(
+                db, [ref], McpServer, can_access=user_can(user_id, permissions, "read")
+            )
+            refs += [matched_ref for matched_ref, _ in matched]
         combined: dict[str, list[list[str]]] = {}
-        for entry in enabled_mcp_servers or []:
-            ref, patterns = _normalize_entry(entry)
-            combined.setdefault(ref, []).append(patterns)
+        for ref in refs:
+            if ref not in combined:
+                combined[ref] = _deciding_bindings(ref, entries)
         for ref, bindings in combined.items():
             parts = ref.split("/", 1)
             if len(parts) != 2:

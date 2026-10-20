@@ -260,6 +260,16 @@ class Settings(BaseSettings):
     compaction_summary_max_tokens: int = 800
     max_tool_iterations: int = 25  # Max consecutive tool-call rounds before stopping
 
+    # Sinas's own retry of an agent turn's LLM calls (app/services/llm_retry.py),
+    # on top of the SDK's: a call refused as rate_limited, or failing as
+    # provider_unavailable, before it streamed anything is made again after
+    # the wait the provider asked for (Retry-After, Gemini's retryDelay) or a
+    # backoff. At most llm_retry_max_attempts calls (1 turns it off) and
+    # llm_retry_max_wait_seconds of waiting per call, and never past the
+    # agent job's timeout. budget_exceeded is never retried.
+    llm_retry_max_attempts: int = 3
+    llm_retry_max_wait_seconds: float = 90.0
+
     # Tool result store
     tool_result_retention_days: int = int(os.getenv("TOOL_RESULT_RETENTION_DAYS", "30"))
     tool_result_max_inline: int = int(os.getenv("TOOL_RESULT_MAX_INLINE", "5"))  # Last N results kept inline

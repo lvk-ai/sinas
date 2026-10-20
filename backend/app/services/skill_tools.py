@@ -45,6 +45,9 @@ class SkillToolConverter:
             if skill_ref:
                 on_demand_refs.append(skill_ref)
 
+        # Wildcards expand to every matching skill, without the user's own
+        # skill permissions: an enabled skill is the agent author's grant
+        # (instructions, no data or credentials), named or through a pattern.
         resolved = await resolve_resource_refs(db, on_demand_refs, Skill)
 
         for skill_ref, skill in resolved:
@@ -120,7 +123,11 @@ class SkillToolConverter:
         }
 
     async def handle_skill_tool_call(
-        self, db: AsyncSession, tool_name: str, arguments: dict[str, Any]
+        self,
+        db: AsyncSession,
+        tool_name: str,
+        arguments: dict[str, Any],
+        enabled_skills: Optional[list[Any]] = None,
     ) -> Optional[str]:
         """
         Handle a skill tool call by returning the skill's content.
@@ -129,6 +136,10 @@ class SkillToolConverter:
             db: Database session
             tool_name: Name of the tool (e.g., "get_skill_default_web_research")
             arguments: Tool arguments (empty for skills)
+            enabled_skills: The chat agent's enabled skills: when given, only a
+                skill on that list (by name or through a wildcard) is returned.
+                A skill enabled for an agent is the author's grant, wildcard
+                or not: the user's own skill permissions don't apply.
 
         Returns:
             Skill content (markdown) or None if skill not found
@@ -158,6 +169,14 @@ class SkillToolConverter:
         if not skill or not skill.is_active:
             logger.warning(f"Skill {namespace}/{name} not found or inactive")
             return None
+
+        if enabled_skills is not None:
+            from app.services.resource_resolver import matches_ref_pattern
+
+            ref = f"{skill.namespace}/{skill.name}"
+            if not matches_ref_pattern(ref, enabled_skills):
+                logger.warning(f"Security: skill '{ref}' is not enabled for this agent")
+                return None
 
         # Return the skill content (markdown instructions)
         return skill.content

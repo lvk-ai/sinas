@@ -118,7 +118,7 @@ PERMISSION_REGISTRY: list[dict[str, Any]] = [
     {
         "resource": "api_keys",
         "description": "API key management",
-        "actions": ["create", "read", "delete"],
+        "actions": ["create", "read", "update", "delete"],
     },
     {
         "resource": "auth",

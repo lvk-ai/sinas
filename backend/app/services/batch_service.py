@@ -400,14 +400,15 @@ async def submit_agent_batch(
                 "max_tokens": agent.max_tokens,
             })
 
-        from app.providers.errors import LLMRefusalError
+        from app.providers.errors import LLMError
 
         try:
             provider_batch_id = await provider.submit_batch(requests)
         except BatchError:
             raise
-        except LLMRefusalError:
-            # budget_exceeded / rate_limited: answered as such (402 / 429).
+        except LLMError:
+            # budget_exceeded / rate_limited / provider_auth_failed / ...:
+            # answered with its own status and the error envelope.
             await db.rollback()
             raise
         except Exception as e:
