@@ -28,6 +28,8 @@ from app.services.user_identity import (
     link_user_identity,
 )
 
+from app.providers.attribution import memberships
+
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ async def _user_with_roles_response(db: AsyncSession, user: User) -> UserWithRol
         roles=list(roles_result.scalars().all()),
         custom_fields=user.custom_fields,
         identities=_identity_responses(list(identities_result.scalars().all())),
+        memberships=memberships(user.custom_fields),
     )
 
 
@@ -117,6 +120,7 @@ async def list_users(
             roles=roles_by_user.get(u.id, []),
             custom_fields=u.custom_fields,
             identities=_identity_responses(u.identities),
+            memberships=memberships(u.custom_fields),
         )
         for u in users
     ]

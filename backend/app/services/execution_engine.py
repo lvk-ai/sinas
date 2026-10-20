@@ -296,8 +296,13 @@ class FunctionExecutor:
                     settings.max_execution_token_seconds,
                 )
             )
+            # It carries the caller's attribution context: chats the function
+            # starts through Sinas are attributed as the caller's would be.
+            from app.core.auth import current_credential_context
+
             access_token = create_access_token(
-                user_id, user_email, expires_delta=token_ttl, execution_depth=depth
+                user_id, user_email, expires_delta=token_ttl, execution_depth=depth,
+                context=current_credential_context(),
             )
 
             # Check if execution already exists (e.g. created by enqueue_function)

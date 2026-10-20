@@ -31,6 +31,14 @@ test('the draft starts as the key, detached from it', () => {
   assert.deepEqual(m.draftFromKey({ name: 'bare', permissions: {} }), { name: 'bare', permissions: {}, role_ids: [] });
 });
 
+test("a key's attribution context is never part of the body", () => {
+  const withContext = { ...key, context: { orgId: 'org-2' } };
+  const draft = m.draftFromKey(withContext);
+  assert.equal('context' in draft, false);
+  const payload = m.apiKeyUpdatePayload(withContext, { ...draft, name: 'renamed', context: { orgId: 'x' } });
+  assert.deepEqual(payload, { name: 'renamed' });
+});
+
 test('nothing changed: an empty body', () => {
   const payload = m.apiKeyUpdatePayload(key, m.draftFromKey(key));
   assert.deepEqual(payload, {});

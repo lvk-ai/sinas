@@ -5,7 +5,7 @@ with the same shape; the aliases on SpecModel translate.
 """
 
 import re
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
@@ -90,10 +90,22 @@ class ClaimMappingSpec(SpecModel):
     `claim` is a dotted path into the verified ID token claims (filled in
     from userinfo), like emailClaim: `org_id`, `organization.id`, or a key
     holding dots as is (`https://example.com/org_id`). `field` is the
-    users.custom_fields key it lands in, an identifier."""
+    users.custom_fields key it lands in, an identifier.
+
+    `target: session` puts the value in the login's session context instead
+    (the tokens it issues carry it; app/providers/attribution.py), for a
+    claim that says what this session is for (the organization chosen at
+    sign-in) rather than who the user is. Left out (or `user`): a custom
+    field."""
 
     claim: str = Field(min_length=1, max_length=512)
     field: str = Field(min_length=1, max_length=64)
+    target: Optional[Literal["user", "session"]] = None
+
+    @field_validator("target")
+    @classmethod
+    def _target(cls, value: Optional[str]) -> Optional[str]:
+        return None if value == "user" else value  # the default, left out
 
     @field_validator("claim")
     @classmethod

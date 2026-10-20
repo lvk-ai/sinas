@@ -6,6 +6,7 @@ import logging
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
@@ -73,16 +74,22 @@ from app.services.user_identity import (
 _DUMMY_PASSWORD_HASH = hash_password("enumeration-resistant-dummy")
 
 
-async def _issue_tokens(db: AsyncSession, user: User, **refresh_options) -> tuple[str, str, AuthUserResponse]:
+async def _issue_tokens(
+    db: AsyncSession, user: User, *, context: Optional[dict] = None, **refresh_options
+) -> tuple[str, str, AuthUserResponse]:
     """Mint an access + refresh token pair and build the user response.
     `refresh_options` go to create_refresh_token (an SSO session's cap,
-    which the access token never outlives either)."""
+    which the access token never outlives either). `context`: the session's
+    attribution context, carried by both (and by every refresh)."""
     cap = refresh_options.get("max_lifetime")
     usual = timedelta(minutes=settings.access_token_expire_minutes)
     access_token = create_access_token(
-        user_id=str(user.id), email=user.email, expires_delta=cap if cap is not None and cap < usual else None
+        user_id=str(user.id), email=user.email, expires_delta=cap if cap is not None and cap < usual else None,
+        context=context or None,
     )
-    refresh_token_plain, _ = await create_refresh_token(db, str(user.id), **refresh_options)
+    refresh_token_plain, _ = await create_refresh_token(
+        db, str(user.id), context=context or None, **refresh_options
+    )
 
     roles_result = await db.execute(
         select(Role.name)
@@ -256,12 +263,29 @@ async def token_exchange(
 
     set_permission_used(request, "sinas.auth.exchange:all")
 
+    # Only this trusted caller can set a session context (an API key or an
+    # SSO login can't choose one): checked here, and against the user's
+    # memberships once their fields are merged below.
+    from app.providers.attribution import membership_problem, validate_context
+
+    try:
+        context = validate_context(exchange.context)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
     provisioned = False
     user = await get_user_by_identity(db, exchange.provider, exchange.subject)
 
     # Fallback: link the identity to an existing user matched by email
     if not user and exchange.email:
         user = await get_user_by_email(db, exchange.email)
+
+    # The context must be one the user is a member for, with the fields this
+    # exchange gives them; checked before anything is written.
+    fields_after = {**((user.custom_fields or {}) if user else {}), **(exchange.custom_fields or {})}
+    problem = membership_problem(context, fields_after)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=problem)
 
     if not user:
         if not exchange.auto_provision:
@@ -299,7 +323,7 @@ async def token_exchange(
 
     user.last_login_at = datetime.now(UTC)
 
-    access_token, refresh_token, user_resp = await _issue_tokens(db, user)
+    access_token, refresh_token, user_resp = await _issue_tokens(db, user, context=context)
 
     return TokenExchangeResponse(
         access_token=access_token,
@@ -335,9 +359,24 @@ async def refresh_access_token(request: RefreshRequest, db: AsyncSession = Depen
     if blocked:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=blocked)
 
+    # The session keeps its context: a refresh can't change it, and it ends
+    # once the user is no longer a member for it.
+    from app.providers.attribution import context_or_none, membership_problem
+
+    context = context_or_none(session.context) if session else None
+    if context:
+        user = await db.get(User, user_id)
+        if membership_problem(context, user.custom_fields if user else None):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This session's context is no longer one you're a member for; sign in again",
+            )
+
     # Create new access token; an SSO session's never outlives the session.
     lifetime = sso_service.access_token_lifetime(session)
-    access_token = create_access_token(user_id=user_id, email=email, expires_delta=lifetime)
+    access_token = create_access_token(
+        user_id=user_id, email=email, expires_delta=lifetime, context=context
+    )
 
     return RefreshResponse(
         access_token=access_token,

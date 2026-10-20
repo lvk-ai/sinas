@@ -170,7 +170,8 @@ async def render_component(
             raise HTTPException(status_code=400, detail="Invalid JSON in 'input' query parameter")
 
     access_token = generate_component_access_token(
-        payload["sub"], namespace, name, api_key_id=payload.get("api_key_id")
+        payload["sub"], namespace, name, api_key_id=payload.get("api_key_id"),
+        context=payload.get("context"),
     )
     return _html_response(_build_html_shell(component, input_vars, access_token, theme))
 
@@ -199,7 +200,7 @@ async def renew_component_access_token(
         "token": generate_component_access_token(
             user_id, scope.namespace, scope.name,
             session_start=scope.session_start, share_id=scope.share_id,
-            api_key_id=scope.api_key_id,
+            api_key_id=scope.api_key_id, context=scope.context,
         ),
         "expires_in": TOKEN_TTL_SECONDS,
     }

@@ -133,7 +133,8 @@ export function IdentityProviders() {
                     <ul className="text-xs text-gray-400 space-y-0.5">
                       {(provider.claim_mappings ?? []).map((m, i) => (
                         <li key={i}>
-                          Claim <span className="font-mono">{m.claim}</span> → custom field{' '}
+                          Claim <span className="font-mono">{m.claim}</span> →{' '}
+                          {m.target === 'session' ? 'session context' : 'custom field'}{' '}
                           <span className="font-mono">{m.field}</span>
                         </li>
                       ))}
@@ -246,7 +247,11 @@ function ProviderModal({
   }));
   const [rules, setRules] = useState<RuleRow[]>(() => toRows(provider?.role_mappings ?? []));
   const [claims, setClaims] = useState<ClaimMappingRow[]>(() =>
-    (provider?.claim_mappings ?? []).map((m) => ({ claim: m.claim, field: m.field })),
+    (provider?.claim_mappings ?? []).map((m) => ({
+      claim: m.claim,
+      field: m.field,
+      target: m.target === 'session' ? ('session' as const) : ('user' as const),
+    })),
   );
   const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
 
@@ -270,7 +275,11 @@ function ProviderModal({
         role_mappings: rules
           .map((r) => (r.kind === 'group' ? { group: r.value.trim(), roles: r.roles } : { email_domain: r.value.trim(), roles: r.roles })),
         // Complete too (claimProblems blocks saving otherwise).
-        claim_mappings: claims.map((c) => ({ claim: c.claim.trim(), field: c.field.trim() })),
+        claim_mappings: claims.map((c) => ({
+          claim: c.claim.trim(),
+          field: c.field.trim(),
+          ...(c.target === 'session' ? { target: 'session' as const } : {}),
+        })),
         allowed_domains: splitList(form.allowed_domains),
         enforce_for_domains: splitList(form.enforce_for_domains),
         auto_provision: form.auto_provision,
@@ -499,7 +508,7 @@ function ProviderModal({
               <h3 className="text-sm font-medium text-gray-300">Claim mappings</h3>
               <button
                 type="button"
-                onClick={() => setClaims((cs) => [...cs, { claim: '', field: '' }])}
+                onClick={() => setClaims((cs) => [...cs, { claim: '', field: '', target: 'user' }])}
                 className="btn btn-secondary text-xs flex items-center"
               >
                 <Plus className="w-3 h-3 mr-1" />
@@ -509,7 +518,9 @@ function ProviderModal({
             <p className="text-xs text-gray-500 mb-3">
               At each sign-in a claim is copied into the user's custom field, and the field is removed when the claim
               is gone. Fields no mapping names are never touched. E.g. <span className="font-mono">org_id</span> →{' '}
-              <span className="font-mono">orgId</span>, for attribution and usage per customer.
+              <span className="font-mono">orgId</span>, for attribution and usage per customer. A{' '}
+              <em>session</em> mapping puts the value in that login's session context instead (the organization
+              chosen at sign-in), which the chats it starts are attributed by.
             </p>
             <div className="space-y-2">
               {claims.map((c, i) => (
@@ -525,7 +536,22 @@ function ProviderModal({
                       />
                     </div>
                     <span className="text-xs text-gray-500">→</span>
-                    <div className="w-48 flex-shrink-0">
+                    <div className="w-36 flex-shrink-0">
+                      <select
+                        value={c.target ?? 'user'}
+                        onChange={(e) =>
+                          setClaims((cs) =>
+                            cs.map((x, j) => (j === i ? { ...x, target: e.target.value as 'user' | 'session' } : x)),
+                          )
+                        }
+                        className="input"
+                        aria-label="Target"
+                      >
+                        <option value="user">custom field</option>
+                        <option value="session">session context</option>
+                      </select>
+                    </div>
+                    <div className="w-40 flex-shrink-0">
                       <input
                         value={c.field}
                         onChange={(e) => setClaims((cs) => cs.map((x, j) => (j === i ? { ...x, field: e.target.value } : x)))}

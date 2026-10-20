@@ -17,6 +17,8 @@ class RoleMapping(BaseModel):
 class ClaimMapping(BaseModel):
     claim: str  # a dotted path in the ID token / userinfo claims
     field: str  # the users.custom_fields key it is copied to
+    # "session": into the login's session context instead of a custom field
+    target: Optional[str] = None
 
 
 class IdentityProviderCreate(BaseModel):

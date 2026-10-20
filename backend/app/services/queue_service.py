@@ -7,7 +7,7 @@ from datetime import timedelta
 import uuid
 from typing import Any, Optional
 
-from app.core.auth import current_api_key_id
+from app.core.auth import current_api_key_id, current_credential_context
 from app.core.config import settings
 from app.core.redis import get_arq_pool, get_redis
 from app.core.telemetry import inject_job_context
@@ -88,6 +88,10 @@ class QueueService:
             "chat_id": chat_id,
             "callback_url": callback_url,
             "depth": depth,
+            # The enqueuing request's attribution context: the function's
+            # access token carries it, so what it starts through Sinas is
+            # attributed as the request's would be.
+            "credential_context": current_credential_context(),
         }
 
         # Enqueue with optional delay
@@ -339,6 +343,8 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            # And its attribution context (the job binds it, _acting_as_job_key).
+            credential_context=current_credential_context(),
             # The job enforces it (agent_jobs._within_job_timeout): arq's
             # enqueue_job takes no per-job timeout.
             job_timeout=job_timeout,
@@ -424,6 +430,8 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            # And its attribution context (the job binds it, _acting_as_job_key).
+            credential_context=current_credential_context(),
             attempt=attempt,
             enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
             # The job enforces it (agent_jobs._within_job_timeout): arq's
@@ -501,6 +509,8 @@ class QueueService:
             # The API key the run acts through: its tools check the key's
             # permissions, not the owner's (core/auth get_effective_permissions).
             api_key_id=current_api_key_id(),
+            # And its attribution context (the job binds it, _acting_as_job_key).
+            credential_context=current_credential_context(),
             attempt=attempt,
             enqueued_at=enqueued_at if enqueued_at is not None else time.time(),
             # The job enforces it (agent_jobs._within_job_timeout): arq's

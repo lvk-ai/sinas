@@ -45,20 +45,48 @@ def _timed_out_error():
 
 def _acting_as_job_key(job):
     """Run an agent job through the API key its request came in on (if any):
-    its tools then check the key's permissions, as in the request itself."""
+    its tools then check the key's permissions, as in the request itself.
+    The job also carries that request's attribution context (chats, pipeline
+    runs and component pages it starts are attributed as the request's
+    would be): the one it was enqueued with, else the key's own."""
     import functools
 
-    from app.core.auth import bind_api_key, reset_api_key
+    from app.core.auth import (
+        bind_api_key,
+        bind_credential_context,
+        reset_api_key,
+        reset_credential_context,
+    )
 
     @functools.wraps(job)
     async def wrapper(ctx: dict, **kwargs: Any) -> None:
         token = bind_api_key(kwargs.get("api_key_id"))
+        context = kwargs.get("credential_context")
+        if context is None and kwargs.get("api_key_id"):
+            context = await _stored_key_context(kwargs["api_key_id"])
+        context_token = bind_credential_context(context)
         try:
             return await job(ctx, **kwargs)
         finally:
+            reset_credential_context(context_token)
             reset_api_key(token)
 
     return wrapper
+
+
+async def _stored_key_context(api_key_id: str) -> Optional[dict[str, Any]]:
+    """An API key's stored attribution context, for a job enqueued without
+    one (a wakeup, a watch, an MCP task delivered from a stored key id)."""
+    from app.core.database import AsyncSessionLocal
+    from app.models.user import APIKey
+
+    try:
+        async with AsyncSessionLocal() as db:
+            key = await db.get(APIKey, uuid_lib.UUID(str(api_key_id)))
+            return key.context if key is not None else None
+    except Exception as e:
+        logger.warning(f"Could not read the context of API key {api_key_id}: {e}")
+        return None
 
 
 def agent_job_timeout_ceiling() -> int:

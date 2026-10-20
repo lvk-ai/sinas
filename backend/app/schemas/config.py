@@ -658,6 +658,7 @@ class ClaimMappingConfig(BaseModel):
 
     claim: str
     field: str
+    target: Optional[str] = None  # "user" (default) or "session"
 
 
 class IdentityProviderConfig(BaseModel):
