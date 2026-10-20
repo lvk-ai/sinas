@@ -287,6 +287,69 @@ def test_session_claim_mappings_make_the_logins_context():
     assert user.custom_fields == {"plan": "pro"}  # the session claim isn't stored on the user
 
 
+def test_an_unusable_session_claim_refuses_the_login_rather_than_dropping_the_context():
+    from app.models.identity_provider import IdentityProvider
+    from app.services import sso
+
+    provider = IdentityProvider(name="idp", display_name="IdP", claim_mappings=[
+        {"claim": "org_id", "field": "orgId", "target": "session"},
+        {"claim": "cost_center", "field": "costCenter", "target": "session"},
+    ])
+    for claims in (
+        {"org_id": "org-2", "cost_center": "café"},  # not header-safe
+        {"org_id": ["org-1", "org-2"]},  # several values for one session
+    ):
+        with pytest.raises(sso.SsoError):
+            sso.session_context(provider, claims)
+    # Absent: no context field, the login goes on.
+    assert sso.session_context(provider, {"org_id": "org-2"}) == {"orgId": "org-2"}
+
+
+async def test_a_component_keeps_the_context_it_was_rendered_under(client, db, monkeypatch):
+    """A component page rendered in an org-2 session (or for an org-2 key)
+    makes its requests, and the chats it starts, in org-2."""
+    from fastapi import Request
+
+    from app.core.auth import _verify_component_token, bind_credential_context, reset_credential_context
+    from app.models.component import Component
+    from app.services.component_access import component_token_claims, generate_component_access_token
+    from app.services.content_tokens import generate_component_render_token
+
+    user = await _user_with(db, "sinas.api_keys.create:own")
+    component = Component(namespace="ctx", name=f"c-{_uid()}", user_id=user.id, is_active=True, source_code="x")
+    db.add(component)
+    await db.flush()
+
+    token = bind_credential_context({"orgId": "org-2"})
+    try:
+        render = generate_component_render_token(component.namespace, component.name, str(user.id))
+    finally:
+        reset_credential_context(token)
+    assert _claims(render)["context"] == {"orgId": "org-2"}
+
+    access = generate_component_access_token(
+        str(user.id), component.namespace, component.name, context=_claims(render)["context"]
+    )
+    request = Request({"type": "http", "path_params": {}, "headers": [],
+                       "route": type("R", (), {"path": "/components/{ns}/{name}/access-token"})()})
+    monkeypatch.setattr("app.services.component_access.route_allowed", lambda *a, **k: True)
+    bind_credential_context(None)
+    await _verify_component_token(component_token_claims(access), request, db)
+    assert current_credential_context() == {"orgId": "org-2"}
+    assert request.state.component_scope.context == {"orgId": "org-2"}
+
+    # Rendered for an API key: the key's own stored context.
+    key = APIKey(user_id=user.id, name="k", key_hash=_uid() * 8, key_prefix="sk-x", permissions={},
+                 is_active=True, context={"orgId": "org-7"})
+    db.add(key)
+    await db.flush()
+    access = generate_component_access_token(
+        str(user.id), component.namespace, component.name, api_key_id=str(key.id), context={"orgId": "forged"}
+    )
+    await _verify_component_token(component_token_claims(access), request, db)
+    assert current_credential_context() == {"orgId": "org-7"}
+
+
 async def test_an_sso_login_carries_its_session_context(client, db, idp, memberships_on):
     from tests.unit.test_oidc_sso import _claims as oidc_claims, _login, _provider
 

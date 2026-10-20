@@ -431,16 +431,26 @@ def session_context(provider: IdentityProvider, claims: dict) -> dict[str, Any]:
     """The session context this login's `target: session` claim mappings
     give: each mapped claim's value (a string, number or boolean; a one-item
     list as its item), for the tokens of this login only."""
-    from app.providers.attribution import context_or_none
+    from app.providers.attribution import validate_context
 
     context: dict[str, Any] = {}
     for mapping in provider.claim_mappings or []:
         if mapping.get("target") != "session" or not mapping.get("claim") or not mapping.get("field"):
             continue
         value = mapped_claim_value(claims, mapping["claim"])
-        if value is not None and not isinstance(value, list):
+        if isinstance(value, list):
+            raise SsoError(
+                f"{provider.display_name} sent several values for {mapping['claim']}, which says "
+                "what this session is for; it must be one."
+            )
+        if value is not None:
             context[mapping["field"]] = value
-    return context_or_none(context) or {}
+    # A value that can't be a context is refused, never dropped: dropping it
+    # would sign the session in for no organization, or another one.
+    try:
+        return validate_context(context)
+    except ValueError as e:
+        raise SsoError(f"{provider.display_name} sent a session claim Sinas can't use: {e}")
 
 
 def sync_custom_fields(

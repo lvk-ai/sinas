@@ -985,15 +985,31 @@ async def _verify_component_token(
             share_id=str(share.id), read_only=read_only,
         )
 
+    # The render's attribution context; for a page rendered for an API key,
+    # the key's own (stored, immutable) context.
+    from app.providers.attribution import context_or_none
+
+    context = context_or_none(claims.get("context"))
     if claims.get("api_key_id"):
         # Rendered for an API key: the page acts through that key, capped by
         # its (live) permissions rather than its owner's.
         bind_api_key(claims["api_key_id"])
+        try:
+            key = await db.get(APIKey, uuid_lib.UUID(str(claims["api_key_id"])))
+        except ValueError:
+            key = None
+        context = context_or_none(key.context) if key is not None else None
         scope = ComponentScope(
             scope.namespace, scope.name, scope.session_start,
             share_id=scope.share_id, read_only=scope.read_only,
             api_key_id=str(claims["api_key_id"]),
         )
+    bind_credential_context(context)
+    scope = ComponentScope(
+        scope.namespace, scope.name, scope.session_start,
+        share_id=scope.share_id, read_only=scope.read_only,
+        api_key_id=scope.api_key_id, context=context,
+    )
 
     permissions = scoped_permissions(
         component, await get_effective_permissions(db, str(user.id)), read_only
