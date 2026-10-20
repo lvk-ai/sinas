@@ -55,6 +55,108 @@ def _unique_filename(name: str) -> str:
     return f"{name}_{suffix}"
 
 
+async def _find_name_conflict(
+    db: AsyncSession,
+    collection_id: uuid_lib.UUID,
+    name: str,
+    user_id: str,
+    visibility: str,
+    lock: bool = False,
+) -> Optional[File]:
+    """The existing file an upload named `name` collides with, if any.
+
+    A private upload collides with the uploader's own file or a shared one
+    (own first); a shared upload with a shared one.
+    """
+    query = select(File).where(and_(File.collection_id == collection_id, File.name == name))
+    if visibility == "private":
+        query = query.where(or_(File.user_id == user_id, File.visibility == "shared")).order_by(
+            (File.user_id == user_id).desc()
+        )
+    else:
+        query = query.where(File.visibility == "shared")
+    query = query.limit(1)
+    if lock:
+        # populate_existing: the row's current_version as of the lock, not a
+        # copy this session may have loaded earlier
+        query = query.with_for_update().execution_options(populate_existing=True)
+    return (await db.execute(query)).scalar_one_or_none()
+
+
+async def _resolve_name_conflict(
+    db: AsyncSession,
+    existing: File,
+    mode: str,
+    upload_hash: str,
+    namespace: str,
+    response: Response,
+) -> FileResponse:
+    """Answer an upload whose name is taken, in return_existing / error mode.
+
+    Nothing is stored either way. 409 details carry the existing file's id so
+    a client can tell "already there" from a real refusal.
+    """
+    current = (
+        await db.execute(
+            select(FileVersion).where(
+                FileVersion.file_id == existing.id,
+                FileVersion.version_number == existing.current_version,
+            )
+        )
+    ).scalar_one_or_none()
+    # The stored hash, or the hash of what was sent when a content filter
+    # rewrote it on the way in
+    content_matches = current is not None and upload_hash in (
+        current.hash_sha256,
+        current.source_hash_sha256,
+    )
+    conflict = {
+        "file_id": str(existing.id),
+        "name": existing.name,
+        "current_version": existing.current_version,
+        "content_matches": content_matches,
+    }
+    if mode == "error":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_exists",
+                "message": f"A file named '{existing.name}' already exists in this collection",
+                **conflict,
+            },
+        )
+    if not content_matches:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_content_mismatch",
+                "message": (
+                    f"A file named '{existing.name}' already exists in this collection "
+                    "with different content"
+                ),
+                **conflict,
+            },
+        )
+    response.status_code = status.HTTP_200_OK
+    return _file_response(existing, namespace)
+
+
+def _file_response(file_record: File, namespace: str) -> FileResponse:
+    return FileResponse(
+        id=file_record.id,
+        namespace=namespace,
+        name=file_record.name,
+        user_id=file_record.user_id,
+        content_type=file_record.content_type,
+        current_version=file_record.current_version,
+        file_metadata=file_record.file_metadata,
+        visibility=file_record.visibility,
+        url=generate_file_url(str(file_record.id), file_record.current_version),
+        created_at=file_record.created_at,
+        updated_at=file_record.updated_at,
+    )
+
+
 def _parse_etags(header: str) -> set[str]:
     """Parse an If-None-Match header into a set of ETag values (unquoted)."""
     etags: set[str] = set()
@@ -227,6 +329,7 @@ async def upload_file(
     collection: str,
     file_data: FileUpload,
     http_request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user_data: tuple = Depends(get_current_user_with_permissions),
 ):
@@ -234,10 +337,14 @@ async def upload_file(
     Upload a file to a collection.
 
     If the collection doesn't exist, it will be auto-created with defaults.
-    If a file with the same name exists, a new version is created.
+    If a file with the same name exists, `on_conflict` decides what happens
+    (default `rename`: the upload is stored under a unique suffixed name).
+    `return_existing` makes retries idempotent: it answers 200 with the
+    existing file when its content matches, without storing anything.
     """
     user_id, permissions = current_user_data
     storage: FileStorage = get_storage()
+    mode = file_data.conflict_mode
 
     # Check upload permission
     perm = f"sinas.collections/{namespace}/{collection}.upload:own"
@@ -300,6 +407,17 @@ async def upload_file(
             detail=f"File size {file_size_mb:.2f}MB exceeds collection limit {coll.max_file_size_mb}MB"
         )
 
+    # Hash of the bytes as sent: what a retried upload is recognised by
+    upload_hash = storage.calculate_hash(file_content)
+
+    # return_existing / error never store anything when the name is taken, so
+    # answer before spending quota or running the content filter. A file that
+    # appears while the filter runs is caught again at insert time below.
+    if mode in ("return_existing", "error"):
+        existing_file = await _find_name_conflict(db, coll.id, file_data.name, user_id, file_data.visibility)
+        if existing_file:
+            return await _resolve_name_conflict(db, existing_file, mode, upload_hash, namespace, response)
+
     # Check total storage quota
     total_size_result = await db.execute(
         select(func.coalesce(func.sum(FileVersion.size_bytes), 0))
@@ -315,8 +433,7 @@ async def upload_file(
             detail=f"Collection storage quota exceeded ({current_gb:.2f}GB / {coll.max_total_size_gb}GB)"
         )
 
-    # Calculate hash
-    file_hash = storage.calculate_hash(file_content)
+    file_hash = upload_hash
 
     # Run content filter if configured
     approved_content = file_content
@@ -414,71 +531,61 @@ async def upload_file(
                 detail=f"Content filter execution failed: {str(e)}"
             )
 
-    # Check if file name already exists
-    existing_query = select(File).where(
-        and_(
-            File.collection_id == coll.id,
-            File.name == file_data.name,
+    # Claim the name, or a version of the existing file. The partial unique
+    # indexes on files (collection, name[, user]) are the arbiter between
+    # concurrent uploads: the loser's insert fails, and a second pass sees
+    # the winner's committed row and resolves against it like any conflict.
+    for _attempt in range(2):
+        existing_file = await _find_name_conflict(
+            db, coll.id, file_data.name, user_id, file_data.visibility,
+            # Serialize version bumps on the same file
+            lock=mode == "new_version",
         )
-    )
-    # Scope to files this user can see
-    if file_data.visibility == "private":
-        existing_query = existing_query.where(
-            or_(File.user_id == user_id, File.visibility == "shared")
-        )
-    else:
-        existing_query = existing_query.where(File.visibility == "shared")
+        if existing_file and mode in ("return_existing", "error"):
+            return await _resolve_name_conflict(db, existing_file, mode, upload_hash, namespace, response)
+        if existing_file and mode == "new_version":
+            # Same rule as editing a file's metadata: your own, or upload:all
+            if str(existing_file.user_id) != user_id and not check_permission(
+                permissions, f"sinas.collections/{namespace}/{collection}.upload:all"
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Not authorized to add a version to '{existing_file.name}'",
+                )
 
-    existing_query = existing_query.with_for_update()
-    result = await db.execute(existing_query)
-    existing_file = result.scalars().first()
+        savepoint = await db.begin_nested()
+        if existing_file and mode == "new_version":
+            file_record = existing_file
+            file_record.current_version += 1
+            file_record.content_type = file_data.content_type
+            file_record.file_metadata = approved_metadata
+        else:
+            # rename: a taken name gets a unique suffix
+            final_name = _unique_filename(file_data.name) if existing_file else file_data.name
+            file_record = File(
+                collection_id=coll.id,
+                name=final_name,
+                user_id=user_id,
+                content_type=file_data.content_type,
+                current_version=1,
+                file_metadata=approved_metadata,
+                visibility=file_data.visibility,
+            )
+            db.add(file_record)
 
-    if existing_file and file_data.update_existing:
-        # Explicit version update
-        file_record = existing_file
-        file_record.current_version += 1
-        file_record.content_type = file_data.content_type
-        file_record.file_metadata = approved_metadata
-    else:
-        # Create new file — auto-rename if name is taken
-        final_name = _unique_filename(file_data.name) if existing_file else file_data.name
-        file_record = File(
-            collection_id=coll.id,
-            name=final_name,
-            user_id=user_id,
-            content_type=file_data.content_type,
-            current_version=1,
-            file_metadata=approved_metadata,
-            visibility=file_data.visibility,
-        )
-        db.add(file_record)
-
-    # Flush to get file_record.id — retry with unique name on race condition
-    try:
-        await db.flush()
-    except IntegrityError:
-        await db.rollback()
-        # Race condition: another concurrent upload grabbed this name.
-        # Retry once with a unique name.
-        final_name = _unique_filename(file_data.name)
-        file_record = File(
-            collection_id=coll.id,
-            name=final_name,
-            user_id=user_id,
-            content_type=file_data.content_type,
-            current_version=1,
-            file_metadata=approved_metadata,
-            visibility=file_data.visibility,
-        )
-        db.add(file_record)
         try:
             await db.flush()
         except IntegrityError:
-            await db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail=f"Could not create file '{file_data.name}' — concurrent conflict",
-            )
+            # A concurrent upload took the name between the lookup and here
+            await savepoint.rollback()
+            continue
+        await savepoint.commit()
+        break
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Could not create file '{file_data.name}' — concurrent conflict",
+        )
 
     # Determine storage path (always unique per version)
     storage_path = f"{namespace}/{collection}/{file_record.id}/v{file_record.current_version}"
@@ -500,6 +607,7 @@ async def upload_file(
         storage_path=storage_path,
         size_bytes=len(approved_content),
         hash_sha256=file_hash,
+        source_hash_sha256=upload_hash,
         uploaded_by=user_id,
     )
     db.add(version)
@@ -565,21 +673,7 @@ async def upload_file(
                 # Don't fail upload if post-upload trigger fails
                 pass
 
-    url = generate_file_url(str(file_record.id), file_record.current_version)
-
-    return FileResponse(
-        id=file_record.id,
-        namespace=namespace,
-        name=file_record.name,
-        user_id=file_record.user_id,
-        content_type=file_record.content_type,
-        current_version=file_record.current_version,
-        file_metadata=file_record.file_metadata,
-        visibility=file_record.visibility,
-        url=url,
-        created_at=file_record.created_at,
-        updated_at=file_record.updated_at,
-    )
+    return _file_response(file_record, namespace)
 
 
 @router.get("/{namespace}/{collection}/{filename}", response_model=FileDownloadResponse)

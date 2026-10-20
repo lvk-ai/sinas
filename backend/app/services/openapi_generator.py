@@ -187,7 +187,7 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Filename (must be unique within collection)",
+                    "description": "Filename; on_conflict decides what happens when it is taken",
                 },
                 "content_base64": {
                     "type": "string",
@@ -207,6 +207,17 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
                     **metadata_schema,
                     "description": "File metadata (validated against collection schema)",
                 },
+                "on_conflict": {
+                    "type": "string",
+                    "enum": ["rename", "return_existing", "new_version", "error"],
+                    "default": "rename",
+                    "description": (
+                        "When the name is taken: 'rename' stores the upload under a unique "
+                        "suffixed name; 'return_existing' returns the existing file (200) if "
+                        "its content is identical, else 409; 'new_version' adds a version to "
+                        "the existing file; 'error' returns 409 with the existing file's id"
+                    ),
+                },
             },
         }
 
@@ -224,6 +235,9 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
                     "content": {"application/json": {"schema": upload_schema}},
                 },
                 "responses": {
+                    "200": {
+                        "description": "on_conflict=return_existing: the existing, identical file (nothing stored)",
+                    },
                     "201": {
                         "description": "File uploaded successfully",
                         "content": {
@@ -247,6 +261,12 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
                     },
                     "400": {"description": "Validation failed (metadata, content filter)"},
                     "403": {"description": "Not authorized"},
+                    "409": {
+                        "description": (
+                            "Name taken (on_conflict=error), or taken with different content "
+                            "(on_conflict=return_existing); detail carries the existing file_id"
+                        ),
+                    },
                     "413": {"description": "File too large or storage quota exceeded"},
                 },
                 "security": [{"BearerAuth": []}, {"ApiKeyAuth": []}],
