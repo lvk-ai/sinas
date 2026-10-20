@@ -2,7 +2,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { X } from 'lucide-react';
 import { useState } from 'react';
 import { apiClient } from '../lib/api';
-import { apiKeyUpdatePayload, draftFromKey, isEmptyUpdate, type APIKeyDraft } from '../lib/apiKeyEdit';
+import {
+  apiKeyUpdatePayload,
+  draftFromKey,
+  isEmptyUpdate,
+  rolesForPicker,
+  type APIKeyDraft,
+} from '../lib/apiKeyEdit';
 import { useToast } from '../lib/toast-context';
 import type { APIKey } from '../types';
 import { APIKeyRolePicker } from './APIKeyRolePicker';
@@ -32,12 +38,15 @@ export function EditAPIKeyModal({ apiKey, isOwnKey, onClose }: EditAPIKeyModalPr
   const [draft, setDraft] = useState<APIKeyDraft>(() => draftFromKey(apiKey));
 
   // Non-admins may lack roles.read: the linked roles are then shown, not edited.
-  const { data: roles } = useQuery({
+  const { data: listedRoles } = useQuery({
     queryKey: ['roles'],
     queryFn: () => apiClient.listRoles(),
     retry: false,
   });
 
+  // Linked roles the list leaves out (it holds only the caller's own roles
+  // without roles.read:all) are still offered, so they can be unlinked.
+  const roles = listedRoles ? rolesForPicker(listedRoles, apiKey.roles) : undefined;
   const payload = apiKeyUpdatePayload(apiKey, draft);
   const capHint = isOwnKey ? 'your own' : "the owner's";
 

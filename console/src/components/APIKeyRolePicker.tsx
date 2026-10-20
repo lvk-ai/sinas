@@ -1,7 +1,7 @@
-import type { Role } from '../types';
+import type { PickerRole } from '../lib/apiKeyEdit';
 
 interface APIKeyRolePickerProps {
-  roles: Role[];
+  roles: PickerRole[];
   value: string[];
   onChange: (roleIds: string[]) => void;
   /** Whose live permissions cap the key: the creator's own, or the key owner's. */

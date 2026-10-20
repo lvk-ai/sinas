@@ -94,3 +94,13 @@ test('Edit is offered as PATCH would allow it', () => {
   assert.equal(m.canEditAPIKey(own, { ...ownOnly, userId: null }), false);
   assert.equal(m.canEditAPIKey(own, { ...all, userId: undefined }), true);
 });
+
+test('linked roles the list leaves out are still offered', () => {
+  const listed = [{ id: 'r1', name: 'Deployers', description: 'CI' }];
+  assert.deepEqual(m.rolesForPicker(listed, key.roles), [
+    { id: 'r1', name: 'Deployers', description: 'CI' },
+    { id: 'r2', name: 'Readers', description: null },
+  ]);
+  assert.deepEqual(m.rolesForPicker(listed, undefined), listed);
+  assert.deepEqual(m.rolesForPicker([], key.roles).map((r) => r.id), ['r1', 'r2']);
+});

@@ -93,3 +93,23 @@ export function canEditAPIKey(
   if (access.updateAll) return true;
   return access.updateOwn && !!access.userId && key.user_id === access.userId;
 }
+
+/** A role as the picker shows it. */
+export interface PickerRole {
+  id: string;
+  name: string;
+  description?: string | null;
+}
+
+/**
+ * The roles to offer: those the caller can list, plus every role the key is
+ * linked to that the list leaves out. GET /roles returns only the caller's
+ * own memberships without roles.read:all, and at most one page, so a linked
+ * role can be missing from it; it must still show, ticked, so it can be
+ * unlinked.
+ */
+export function rolesForPicker(listed: PickerRole[], linked: PickerRole[] = []): PickerRole[] {
+  const seen = new Set(listed.map((role) => role.id));
+  const missing = linked.filter((role) => !seen.has(role.id));
+  return [...listed, ...missing.map((role) => ({ id: role.id, name: role.name, description: null }))];
+}
