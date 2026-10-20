@@ -88,6 +88,10 @@ class QueueService:
             "chat_id": chat_id,
             "callback_url": callback_url,
             "depth": depth,
+            # The enqueuing request's attribution context: the function's
+            # access token carries it, so what it starts through Sinas is
+            # attributed as the request's would be.
+            "credential_context": current_credential_context(),
         }
 
         # Enqueue with optional delay

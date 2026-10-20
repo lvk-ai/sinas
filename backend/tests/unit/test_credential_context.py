@@ -446,3 +446,60 @@ async def test_a_queued_job_carries_the_enqueuing_requests_context(db, monkeypat
     assert seen[-1] == {"orgId": "org-7"}
     await job({})
     assert seen[-1] is None
+
+
+async def test_a_function_job_carries_the_requests_context(monkeypatch):
+    """A function enqueued from an org-2 request runs with org-2 bound: the
+    job binds the context it was enqueued with, and the executor mints the
+    function's access token with the bound context (so chats the function
+    starts through Sinas are attributed to org-2)."""
+    from app.core.auth import bind_credential_context, reset_credential_context
+    from app.queue import worker
+    from app.services import execution_engine
+    from app.services import queue_service as qs
+
+    captured = {}
+
+    class _Pool:
+        async def enqueue_job(self, name, **kwargs):
+            captured.update(kwargs)
+
+    class _Redis:
+        async def set(self, *a, **k):
+            pass
+
+        async def get(self, *a, **k):
+            return None
+
+    async def _pool():
+        return _Pool()
+
+    async def _redis():
+        return _Redis()
+
+    monkeypatch.setattr(qs, "get_arq_pool", _pool)
+    monkeypatch.setattr(qs, "get_redis", _redis)
+    token = bind_credential_context({"orgId": "org-2"})
+    try:
+        await qs.queue_service.enqueue_function("ns", "fn", {}, str(uuid.uuid4()), "api", "t", str(uuid.uuid4()))
+    finally:
+        reset_credential_context(token)
+    assert captured["credential_context"] == {"orgId": "org-2"}
+
+    class _Stop(Exception):
+        pass
+
+    seen = []
+
+    async def execute_function(*args, **kwargs):
+        seen.append(current_credential_context())
+        raise _Stop
+
+    monkeypatch.setattr(execution_engine.executor, "execute_function", execute_function)
+    job_kwargs = {k: v for k, v in captured.items() if not k.startswith("_")}
+    try:
+        await worker.execute_function_job({"redis": _Redis()}, **job_kwargs)
+    except Exception:
+        pass
+    assert seen == [{"orgId": "org-2"}]
+
