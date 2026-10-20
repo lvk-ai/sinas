@@ -509,6 +509,11 @@ class Settings(BaseSettings):
     # it). Recorded on each llm_usage row as `customer`, and offered by the
     # usage API as the `customer` dimension and filter. Unset: none recorded.
     usage_customer_field: Optional[str] = None
+    # Membership checks on a credential's session context (comma-separated
+    # `contextField:listingField` pairs, e.g. "orgId:orgs"): a session context
+    # value for orgId must be one the user's custom field `orgs` lists, or the
+    # token exchange, sign-in or refresh that would carry it is refused.
+    attribution_memberships: Optional[str] = None
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data

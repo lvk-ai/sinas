@@ -274,28 +274,118 @@ def attribution_keys() -> list[str]:
     return keys[:MAX_SNAPSHOT_KEYS]
 
 
-def snapshot_from_fields(custom_fields: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def snapshot_from_fields(
+    custom_fields: Optional[dict[str, Any]], context: Optional[dict[str, Any]] = None
+) -> Optional[dict[str, Any]]:
     """The attribution snapshot of these custom fields: each configured key
-    with a header-safe value. None when no attribution field is configured
-    (nothing to take); {} when none of them is set."""
+    with a header-safe value, the credential's session context winning key
+    by key (an organization chosen for this session over the one the user's
+    fields hold). None when no attribution field is configured (nothing to
+    take); {} when none of them is set."""
     keys = attribution_keys()
     if not keys:
         return None
     fields = custom_fields if isinstance(custom_fields, dict) else {}
+    session = context if isinstance(context, dict) else {}
     snapshot: dict[str, Any] = {}
     for key in keys:
-        value = fields.get(key)
+        value = session.get(key) if key in session else fields.get(key)
         if clean_value(value) is not None:
             snapshot[key] = value
     return snapshot
+
+
+# ── Session context ────────────────────────────────────────────────────────
+#
+# A credential can carry a context: a small dict (`{"orgId": "org-2"}`) on a
+# Sinas access and refresh token (set by token exchange, or by an identity
+# provider's session claim mappings at sign-in) and on an API key (copied
+# from the session that created it, or set by an admin). It is bound per
+# request (app/core/auth.py) and wins over the user's fields when a chat
+# takes its attribution snapshot, so one user can work for several
+# organizations at once, one session (or key) each.
+
+MAX_CONTEXT_KEYS = 20
+MAX_CONTEXT_VALUE_LENGTH = 255
+
+
+def validate_context(value: Any) -> dict[str, Any]:
+    """A credential context, checked: identifier keys, header-safe scalar
+    values. Raises ValueError naming the first problem; {} for none."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("context must be an object of field name to value")
+    if len(value) > MAX_CONTEXT_KEYS:
+        raise ValueError(f"context holds at most {MAX_CONTEXT_KEYS} fields")
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not FIELD_KEY.match(key):
+            raise ValueError(f"context field {key!r} is not a field name (letters, digits and _)")
+        if isinstance(item, (dict, list)) or clean_value(item, max_length=MAX_CONTEXT_VALUE_LENGTH) is None:
+            raise ValueError(
+                f"context field '{key}' must be a non-empty string, number or boolean of printable "
+                f"ASCII without quotes or backslashes, at most {MAX_CONTEXT_VALUE_LENGTH} characters"
+            )
+        out[key] = item.strip() if isinstance(item, str) else item
+    return out
+
+
+def context_or_none(value: Any) -> Optional[dict[str, Any]]:
+    """A stored or claimed context as a dict, or None when it is empty or
+    invalid (a token or key written before a rule existed carries none)."""
+    try:
+        return validate_context(value) or None
+    except ValueError:
+        return None
+
+
+def membership_fields() -> dict[str, str]:
+    """ATTRIBUTION_MEMBERSHIPS: context field -> the user custom field that
+    lists the values the user may hold it at (`orgId:orgs`)."""
+    from app.core.config import settings
+
+    pairs: dict[str, str] = {}
+    for item in (settings.attribution_memberships or "").split(","):
+        key, _, field = item.partition(":")
+        key, field = key.strip(), field.strip()
+        if FIELD_KEY.match(key) and FIELD_KEY.match(field):
+            pairs[key] = field
+    return pairs
+
+
+def memberships(custom_fields: Optional[dict[str, Any]]) -> dict[str, list[Any]]:
+    """The values each membership-checked context field may take for a user
+    with these custom fields."""
+    fields = custom_fields if isinstance(custom_fields, dict) else {}
+    out: dict[str, list[Any]] = {}
+    for key, field in membership_fields().items():
+        listed = fields.get(field)
+        values = listed if isinstance(listed, list) else ([] if listed is None else [listed])
+        out[key] = [v for v in values if isinstance(v, (str, int, float, bool))]
+    return out
+
+
+def membership_problem(context: Optional[dict[str, Any]], custom_fields: Optional[dict[str, Any]]) -> Optional[str]:
+    """Why a context isn't one the user may hold, or None. Only the fields
+    ATTRIBUTION_MEMBERSHIPS names are checked; a user without the listing
+    field may hold none of their values."""
+    if not context:
+        return None
+    allowed = memberships(custom_fields)
+    for key, value in context.items():
+        if key in allowed and value not in allowed[key]:
+            return f"The user isn't a member for {key} '{value}'"
+    return None
 
 
 async def new_chat_attribution(
     db: Any, user_id: Any, *, parent_chat_id: Optional[Any] = None
 ) -> Optional[dict[str, Any]]:
     """The snapshot a new chat takes: its parent chat's (a sub-agent's chat),
-    else the user's attribution fields now. Never raises (None: taken at the
-    chat's first LLM call instead)."""
+    else the requesting credential's context over the user's attribution
+    fields now. Never raises (None: taken at the chat's first LLM call
+    instead)."""
     try:
         if parent_chat_id:
             from app.models.chat import Chat
@@ -305,10 +395,13 @@ async def new_chat_attribution(
                 return dict(parent.attribution)
         if not attribution_keys() or not user_id:
             return None
+        from app.core.auth import current_credential_context
         from app.models.user import User
 
         user = await db.get(User, uuid.UUID(str(user_id)))
-        return snapshot_from_fields(user.custom_fields if user is not None else None)
+        return snapshot_from_fields(
+            user.custom_fields if user is not None else None, current_credential_context()
+        )
     except Exception as e:
         logger.warning(f"Taking a chat's attribution snapshot failed: {e}")
         return None
@@ -395,7 +488,9 @@ async def resolve_attribution(
             if chat_id:
                 snapshot = await _chat_snapshot(db, chat_id, user)
             elif user is not None:
-                snapshot = snapshot_from_fields(user.custom_fields)
+                from app.core.auth import current_credential_context
+
+                snapshot = snapshot_from_fields(user.custom_fields, current_credential_context())
         variables["attribution"] = dict(snapshot or {})
 
         if user_id and _uses(templates, "api_key."):

@@ -198,6 +198,11 @@ class TokenExchangeRequest(BaseModel):
     custom_fields: Optional[dict[str, Any]] = None
     # Create the user (with the configured default role) if unknown
     auto_provision: bool = False
+    # The session's attribution context, e.g. {"orgId": "org-2"}: carried by
+    # the tokens issued (and every refresh of them), and taken by the chats
+    # they start (app/providers/attribution.py). Checked against the user's
+    # memberships when ATTRIBUTION_MEMBERSHIPS is set.
+    context: Optional[dict[str, Any]] = None
 
 
 class TokenExchangeResponse(BaseModel):

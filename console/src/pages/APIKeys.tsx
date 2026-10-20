@@ -158,6 +158,19 @@ export function APIKeys() {
                         </>
                       )}
                     </div>
+                    {key.context && Object.keys(key.context).length > 0 && (
+                      <div
+                        className="mt-2 flex flex-wrap items-center gap-1"
+                        title="Attribution context: chats started with this key are attributed by it"
+                      >
+                        <span className="text-xs text-gray-500">Context:</span>
+                        {Object.entries(key.context).map(([field, value]) => (
+                          <span key={field} className="px-2 py-0.5 bg-surface-2 text-gray-300 text-xs rounded font-mono">
+                            {field}={String(value)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {key.roles && key.roles.length > 0 && (
                       <div className="mt-2 flex flex-wrap items-center gap-1">
                         <span className="text-xs text-gray-500">Roles:</span>

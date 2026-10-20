@@ -113,6 +113,8 @@ export function headerProblem(config: Record<string, unknown> | null | undefined
 export interface ClaimMappingRow {
   claim: string;
   field: string;
+  /** 'session': the value goes into the login's session context. */
+  target?: 'user' | 'session';
 }
 
 /** One problem per claim mapping (or null), as the backend would refuse it. */

@@ -120,6 +120,8 @@ export interface APIKey {
   last_used_at: string | null;
   expires_at: string | null;
   created_at: string;
+  /** Attribution context the key's requests carry (copied from the creating session, or set by an admin). */
+  context?: Record<string, string | number | boolean> | null;
 }
 
 export interface APIKeyCreate {
@@ -897,6 +899,8 @@ export interface RoleMapping {
 export interface ClaimMapping {
   claim: string;
   field: string;
+  /** 'session': into the login's session context instead of a custom field. */
+  target?: 'user' | 'session' | null;
 }
 
 export interface IdentityProvider {

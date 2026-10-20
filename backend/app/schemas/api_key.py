@@ -1,7 +1,7 @@
 """API Key schemas."""
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,14 @@ class APIKeyCreate(BaseModel):
         ),
     )
     expires_at: Optional[datetime] = Field(None, description="Optional expiration date")
+    context: Optional[dict[str, Any]] = Field(
+        None,
+        description=(
+            "Attribution context for the key (e.g. {\"orgId\": \"org-2\"}); needs "
+            "sinas.api_keys.assign_context:all. Left out, the key takes the context of the "
+            "session (or key) creating it. Immutable once created."
+        ),
+    )
 
 
 class APIKeyUpdate(BaseModel):
@@ -67,6 +75,8 @@ class APIKeyResponse(BaseModel):
     expires_at: Optional[datetime]
     created_at: datetime
     revoked_at: Optional[datetime]
+    # Attribution context the key's requests carry (None: none)
+    context: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -83,6 +93,7 @@ class APIKeyCreated(BaseModel):
     roles: list[APIKeyRoleRef] = Field(default_factory=list)
     expires_at: Optional[datetime]
     created_at: datetime
+    context: Optional[dict[str, Any]] = None
 
     class Config:
         from_attributes = True

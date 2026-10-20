@@ -197,6 +197,7 @@ async def sso_callback(
         session_hours=provider.session_hours,
         console_challenge=flow.console_challenge,
         return_to=flow.return_to,
+        context=outcome.context,
     )
     response = _to_console(code=one_time)
     response.delete_cookie(sso.BIND_COOKIE_NAME, path=sso.BIND_COOKIE_PATH)
@@ -220,6 +221,7 @@ async def exchange_sso_code(body: SsoExchangeRequest, db: AsyncSession = Depends
     session = timedelta(hours=int(payload["session_hours"]))
     access_token, refresh_token, user_resp = await _issue_tokens(
         db, user, max_lifetime=session, identity_provider=payload["provider"],
+        context=payload.get("context") or None,
     )
     return SsoExchangeResponse(
         access_token=access_token,

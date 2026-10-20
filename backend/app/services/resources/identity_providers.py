@@ -69,7 +69,10 @@ class IdentityProviderApplier(ResourceApplier[IdentityProviderSpec]):
                 for rule in row.role_mappings or []
             ],
             claim_mappings=[
-                ClaimMappingSpec.model_construct(claim=m.get("claim"), field=m.get("field"))
+                ClaimMappingSpec.model_construct(
+                    claim=m.get("claim"), field=m.get("field"),
+                    target=m.get("target") if m.get("target") == "session" else None,
+                )
                 for m in row.claim_mappings or []
             ],
             allowed_domains=list(row.allowed_domains or []),
@@ -94,7 +97,7 @@ class IdentityProviderApplier(ResourceApplier[IdentityProviderSpec]):
         row.email_claim = spec.email_claim
         row.groups_claim = spec.groups_claim
         row.role_mappings = [rule.model_dump(mode="json") for rule in spec.role_mappings]
-        row.claim_mappings = [m.model_dump(mode="json") for m in spec.claim_mappings]
+        row.claim_mappings = [m.model_dump(mode="json", exclude_none=True) for m in spec.claim_mappings]
         row.allowed_domains = list(spec.allowed_domains)
         row.auto_provision = spec.auto_provision
         row.default_role = spec.default_role

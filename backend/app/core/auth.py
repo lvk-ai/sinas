@@ -7,7 +7,7 @@ import string
 import uuid as uuid_lib
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import bcrypt
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -417,6 +417,7 @@ def create_access_token(
     email: str,
     expires_delta: Optional[timedelta] = None,
     execution_depth: Optional[int] = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     Create JWT access token (short-lived, no permissions in payload).
@@ -451,6 +452,10 @@ def create_access_token(
         # its own depth and is rejected past settings.max_execution_depth.
         # Absent on real user/app tokens (treated as top-level callers).
         to_encode["execution_depth"] = execution_depth
+    if context:
+        # The session's attribution context (app/providers/attribution.py):
+        # set by token exchange or an SSO session claim, kept by refresh.
+        to_encode["context"] = context
 
     ctx = get_signing_context()
     headers = None
@@ -495,6 +500,7 @@ async def create_refresh_token(
     *,
     max_lifetime: Optional[timedelta] = None,
     identity_provider: Optional[str] = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> tuple[str, "RefreshToken"]:
     """
     Create a refresh token and store it in the database.
@@ -532,6 +538,8 @@ async def create_refresh_token(
         is_revoked=False,
         expires_at=expires_at,
         identity_provider=identity_provider,
+        # Every access token it mints carries it; it never changes.
+        context=context or None,
     )
 
     db.add(refresh_token)
@@ -833,6 +841,31 @@ def reset_api_key(token) -> None:
     _acting_api_key.reset(token)
 
 
+# The attribution context of the credential the current request came in on:
+# an access token's `context` claim, or an API key's stored context. Bound
+# where the credential authenticates (verify_jwt_or_api_key); read when a
+# chat takes its attribution snapshot (app/providers/attribution.py).
+_credential_context: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "sinas_credential_context", default=None
+)
+
+
+def current_credential_context() -> Optional[dict[str, Any]]:
+    return _credential_context.get()
+
+
+def bind_credential_context(context: Optional[dict[str, Any]]):
+    """Attribute this task's new chats by this context (None: none).
+    Returns a token for reset_credential_context."""
+    from app.providers.attribution import context_or_none
+
+    return _credential_context.set(context_or_none(context))
+
+
+def reset_credential_context(token) -> None:
+    _credential_context.reset(token)
+
+
 async def get_effective_permissions(db: AsyncSession, user_id: str) -> dict[str, bool]:
     """The permissions to check a call against: the user's, or — when the run
     acts through an API key — the key's live ones (revoked, expired or
@@ -888,8 +921,9 @@ async def validate_api_key(db: AsyncSession, key: str) -> Optional[tuple[User, d
     api_key, user = found
     await _refresh_usage_stamps(db, datetime.now(UTC), api_key=api_key, user=user)
     # Everything this request does — agent runs and their tools included —
-    # acts through the key.
+    # acts through the key, and new chats are attributed by its context.
     bind_api_key(str(api_key.id))
+    bind_credential_context(api_key.context)
     return user, await resolve_api_key_permissions(db, api_key, user)
 
 
@@ -1031,6 +1065,9 @@ async def verify_jwt_or_api_key(
         if not user or not user.is_active:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
+        # The session's attribution context, signed into the token (none on
+        # tokens from before it existed, or that never had one).
+        bind_credential_context(payload.get("context"))
         return str(user_id), email, permissions
 
     except JWTError:

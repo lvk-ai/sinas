@@ -427,6 +427,22 @@ def _scalar(value: Any) -> Any:
     return value
 
 
+def session_context(provider: IdentityProvider, claims: dict) -> dict[str, Any]:
+    """The session context this login's `target: session` claim mappings
+    give: each mapped claim's value (a string, number or boolean; a one-item
+    list as its item), for the tokens of this login only."""
+    from app.providers.attribution import context_or_none
+
+    context: dict[str, Any] = {}
+    for mapping in provider.claim_mappings or []:
+        if mapping.get("target") != "session" or not mapping.get("claim") or not mapping.get("field"):
+            continue
+        value = mapped_claim_value(claims, mapping["claim"])
+        if value is not None and not isinstance(value, list):
+            context[mapping["field"]] = value
+    return context_or_none(context) or {}
+
+
 def sync_custom_fields(
     user: User, provider: IdentityProvider, claims: dict, previous: Optional[dict] = None
 ) -> dict[str, Any]:
@@ -439,7 +455,10 @@ def sync_custom_fields(
     login (`previous`, kept on the identity) whose mapping was removed since
     is removed too, unless its value changed since (then someone else owns
     it now). Returns what this login set, to keep as the next `previous`."""
-    mappings = [m for m in provider.claim_mappings or [] if m.get("claim") and m.get("field")]
+    mappings = [
+        m for m in provider.claim_mappings or []
+        if m.get("claim") and m.get("field") and m.get("target") != "session"
+    ]
     if not mappings and not previous:
         return {}
     current = dict(user.custom_fields or {})
@@ -472,6 +491,8 @@ class SignIn:
     linked_by_email: bool = False
     roles_added: list[str] = field(default_factory=list)
     roles_removed: list[str] = field(default_factory=list)
+    # The session context of this login (session claim mappings).
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 def is_superadmin(email: Optional[str]) -> bool:
@@ -586,9 +607,17 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
     )
     groups = set(claim_values(claims, provider.groups_claim) or [])
     added, removed = await sync_roles(db, user, provider, groups, trusted_domain)
+
+    from app.providers.attribution import membership_problem
+
+    context = session_context(provider, claims)
+    problem = membership_problem(context, user.custom_fields)
+    if problem:
+        raise SsoError(f"{problem}, so {name} can't sign you in for it.")
+
     user.last_login_at = datetime.now(UTC)
     await db.flush()
-    return SignIn(user, provisioned, linked_by_email, added, removed)
+    return SignIn(user, provisioned, linked_by_email, added, removed, context)
 
 
 def mapped_role_names(provider: IdentityProvider, groups: set[str], email_domain: Optional[str]) -> set[str]:
@@ -693,16 +722,19 @@ class RefreshSession:
 
     identity_provider: Optional[str]  # the SSO login that issued it, if any
     expires_at: datetime  # for an SSO session: its hard end
+    context: Optional[dict] = None  # the session's attribution context
 
 
 async def refresh_session(db: AsyncSession, plain_token: str) -> Optional[RefreshSession]:
     token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
     row = (
         await db.execute(
-            select(RefreshToken.identity_provider, RefreshToken.expires_at).where(RefreshToken.token_hash == token_hash)
+            select(RefreshToken.identity_provider, RefreshToken.expires_at, RefreshToken.context).where(
+                RefreshToken.token_hash == token_hash
+            )
         )
     ).first()
-    return RefreshSession(row[0], row[1]) if row else None
+    return RefreshSession(row[0], row[1], row[2]) if row else None
 
 
 async def refresh_blocked(db: AsyncSession, email: str, session: Optional[RefreshSession]) -> Optional[str]:
@@ -760,13 +792,18 @@ async def consume_state(key: str) -> Optional[LoginState]:
         return None
 
 
-async def store_code(*, user_id: str, provider: str, session_hours: int, console_challenge: str, return_to: str) -> str:
+async def store_code(
+    *, user_id: str, provider: str, session_hours: int, console_challenge: str, return_to: str,
+    context: Optional[dict] = None,
+) -> str:
     """The one-time code the console trades for tokens. Only who signed in
-    is kept; the tokens are minted at the exchange."""
+    (and the session context of the login) is kept; the tokens are minted at
+    the exchange."""
     code = secrets.token_urlsafe(32)
     payload = {
         "user_id": user_id, "provider": provider, "session_hours": session_hours,
         "console_challenge": console_challenge, "return_to": return_to,
+        "context": context or None,
     }
     await (await get_redis()).set(_CODE_PREFIX + code, json.dumps(payload), ex=CODE_TTL_SECONDS)
     return code

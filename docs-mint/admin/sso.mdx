@@ -75,6 +75,16 @@ identityProviders:
 
 - **claim** is a path into the verified ID token's claims, filled in from the userinfo response when the ID token lacks one: `org_id`, `organization.id` (inside `organization`), or a namespaced claim like `https://example.com/org_id`, found as one key.
 - **field** is the custom field name: letters, digits and `_`, not starting with a digit. One mapping per field.
+- **target** is `user` (the default: a custom field, as described here) or `session`: the value goes into this login's [session context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context) instead, carried by the tokens of this login only. Use it for a claim that says what the session is for, such as the organization chosen at sign-in (WorkOS `org_id`, Auth0 `org_id`), and a `user` mapping for the list of organizations the user belongs to, for the membership check:
+
+```yaml
+    claimMappings:
+      - claim: org_id
+        field: orgId
+        target: session      # this login's organization
+      - claim: organizations
+        field: orgs          # all of the user's, for ATTRIBUTION_MEMBERSHIPS=orgId:orgs
+```
 - A string, number or boolean is copied as it is; a list of them as a list, except a one-item list, which is copied as its item (a single organization in a list claim reads as that organization). Objects, empty values and strings longer than 1024 characters aren't copied.
 
 A mapped field belongs to the provider: it is set at every sign-in, and **removed when the claim is absent**, so a value the provider stopped sending doesn't linger. Fields no mapping names, set by an administrator or by token exchange, are never touched. When you remove a mapping, the field it set is cleared at the user's next sign-in, unless someone changed its value since.
