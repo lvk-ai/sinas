@@ -149,6 +149,8 @@ POST /api/v1/usage/ratecard/refresh                 # fetch MODEL_PRICES_URL now
 POST /api/v1/usage/backfill                         # price calls recorded without a cost
 ```
 
+`/calls` also takes `unpriced_only=true` and `errors_only=true`, and pages with `limit` (up to 500) and `offset` (`has_more` says whether there's another page). Each call has its tokens, `cost_usd` (`null` when unpriced), `price_source`, `latency_ms`, `error`, and the `user_id` and `user_email` of who made it.
+
 `group_by` takes any of `agent`, `provider`, `model`, `user`, `source`, `chat`, `batch`, and `day` or `hour`. Every total and group has `calls`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `unpriced_calls` and `errors`. `cost_usd` adds up the priced calls only.
 
 The cost of a set of chats, for example to enforce a budget per run:
@@ -184,7 +186,7 @@ Admins have all three through `sinas.*:all`.
 
 ## Console
 
-**Admin › Usage** shows totals and cost for a date range, a chart over time (cost, calls or tokens per hour or day), and a breakdown table by agent, provider, model, user, source, batch, chat or day. Admins also see the ratecard: which deployment sources are set, the models called in the last 30 days that have no price, and the prices in use with where each comes from. From there they can fetch the URL ratecard now and price the unpriced calls in the selected range.
+**Admin › Usage** shows totals and cost for a date range, a chart over time (cost, calls or tokens per hour or day), a breakdown table by agent, provider, model, user, source, batch, chat or day, and the individual calls (newest first, with their tokens, cost or "unpriced", and error), which can be narrowed to the unpriced calls or the errors. Admins also see the ratecard: which deployment sources are set, the models called in the last 30 days that have no price, and the prices in use with where each comes from. From there they can fetch the URL ratecard now and price the unpriced calls in the selected range.
 
 Per-provider pricing (model prices, aliases, the discount and **Price models as**, the `pricingProvider`) is edited in the **Pricing** section of the LLM provider's form. **Price models as** offers the families of the deployment ratecard with their model counts, or any other family typed in.
 

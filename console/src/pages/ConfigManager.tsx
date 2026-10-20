@@ -1,7 +1,17 @@
 import { useState, useRef } from 'react';
 import type { ChangeEvent } from 'react';
+import { Link } from 'react-router-dom';
 import { apiClient } from '../lib/api';
 import { useToast } from '../lib/toast-context';
+import {
+  blockedByPrune,
+  keptByPrune,
+  pluralResources,
+  removalCount,
+  removalsByKind,
+  type ConfigApplyResponse,
+  type ConfigApplySummary,
+} from '../lib/configApply';
 
 interface ValidationError {
   location?: string[];
@@ -15,30 +25,6 @@ interface ConfigValidateResponse {
   warnings?: ValidationError[];
 }
 
-interface ConfigApplySummary {
-  created: { [key: string]: number };
-  updated: { [key: string]: number };
-  unchanged: { [key: string]: number };
-  skipped?: { [key: string]: number };
-  deleted: { [key: string]: number };
-}
-
-interface ResourceChange {
-  resourceType: string;
-  resourceName: string;
-  action: string;
-  details?: string | null;
-  changes?: any;
-}
-
-interface ConfigApplyResponse {
-  success: boolean;
-  summary: ConfigApplySummary;
-  changes: ResourceChange[];
-  errors?: string[];
-  warnings?: string[];
-}
-
 type Step = 'edit' | 'validating' | 'dryrun' | 'confirm' | 'applying' | 'complete';
 
 export function ConfigManager() {
@@ -47,6 +33,10 @@ export function ConfigManager() {
   const [validationResult, setValidationResult] = useState<ConfigValidateResponse | null>(null);
   const [dryRunResult, setDryRunResult] = useState<ConfigApplyResponse | null>(null);
   const [applyResult, setApplyResult] = useState<ConfigApplyResponse | null>(null);
+  // Also remove what this config file applied earlier but no longer
+  // declares. Only changeable while editing, and changing it starts over, so
+  // the dry run and the apply always run with the same setting.
+  const [prune, setPrune] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { showToast } = useToast();
 
@@ -94,7 +84,7 @@ export function ConfigManager() {
       // Step 2: Dry run
       setCurrentStep('dryrun');
 
-      const dryRun = await apiClient.applyConfig(yamlContent, true);
+      const dryRun = await apiClient.applyConfig(yamlContent, { dryRun: true, prune });
       setDryRunResult(dryRun);
 
       if (!dryRun.success) {
@@ -116,14 +106,14 @@ export function ConfigManager() {
     setCurrentStep('applying');
 
     try {
-      const result = await apiClient.applyConfig(yamlContent, false);
+      const result = await apiClient.applyConfig(yamlContent, { prune });
       setApplyResult(result);
 
       if (result.success) {
         showToast('Configuration applied successfully', 'success');
         setCurrentStep('complete');
       } else {
-        showToast('Configuration applied with errors', 'error');
+        showToast('Apply failed: nothing was changed', 'error');
         setCurrentStep('edit');
       }
     } catch (error: any) {
@@ -153,7 +143,7 @@ export function ConfigManager() {
       { title: 'Updated', data: summary.updated, color: 'text-blue-600' },
       { title: 'Unchanged', data: summary.unchanged, color: 'text-gray-400' },
       { title: 'Skipped', data: summary.skipped ?? {}, color: 'text-yellow-500' },
-      { title: 'Deleted', data: summary.deleted, color: 'text-red-600' },
+      { title: 'Removed', data: summary.deleted ?? {}, color: 'text-red-600' },
     ];
 
     return (
@@ -179,6 +169,69 @@ export function ConfigManager() {
       </div>
     );
   };
+
+  // What a prune removed or, in a dry run, would remove: listed by name, so
+  // the consequence of the checkbox is visible before anything is confirmed.
+  const renderRemovals = (result: ConfigApplyResponse, dryRun: boolean) => {
+    const groups = removalsByKind(result.changes);
+    const count = removalCount(result.changes);
+    const kept = keptByPrune(result.warnings);
+    const blocked = blockedByPrune(result.errors);
+    return (
+      <div className="mb-4 rounded-lg border border-red-800/40 bg-red-900/10 p-4">
+        <h3 className="font-semibold text-red-400">
+          {dryRun ? 'Would be removed' : 'Removed'} ({pluralResources(count)})
+        </h3>
+        {count === 0 ? (
+          <p className="text-sm text-gray-400 mt-1">
+            {blocked.length > 0
+              ? 'Nothing else to remove.'
+              : 'Nothing to remove: this file still declares everything it applied earlier.'}
+          </p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {groups.map(({ kind, names }) => (
+              <div key={kind}>
+                <div className="text-xs font-semibold uppercase tracking-wider text-gray-400">{kind}</div>
+                <ul className="mt-1 flex flex-wrap gap-1.5">
+                  {names.map((name) => (
+                    <li key={name} className="px-2 py-0.5 rounded bg-red-900/30 text-red-300 text-xs font-mono">
+                      {name}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )}
+        {blocked.length > 0 && (
+          <div className="mt-3">
+            <div className="text-xs font-semibold uppercase tracking-wider text-gray-400">Can't be removed</div>
+            <ul className="mt-1 space-y-1 text-sm text-red-300">
+              {blocked.map((e, i) => <li key={i}>{e}</li>)}
+            </ul>
+          </div>
+        )}
+        {kept.length > 0 && (
+          <div className="mt-3">
+            <div className="text-xs font-semibold uppercase tracking-wider text-gray-400">Kept</div>
+            <ul className="mt-1 space-y-1 text-sm text-yellow-300">
+              {kept.map((w, i) => <li key={i}>{w}</li>)}
+            </ul>
+          </div>
+        )}
+        {count > 0 && (
+          <p className="text-xs text-gray-400 mt-3">
+            {dryRun ? 'Removals are' : 'These removals are'} recorded in{' '}
+            <Link to="/history" className="text-blue-500 hover:text-blue-400 underline">Change History</Link>
+            {' '}and can be restored from there.
+          </p>
+        )}
+      </div>
+    );
+  };
+
+  const pendingRemovals = dryRunResult ? removalCount(dryRunResult.changes) : 0;
 
   return (
     <div className="space-y-6">
@@ -215,8 +268,7 @@ export function ConfigManager() {
               <button
                 onClick={() => {
                   setYamlContent('');
-                  setValidationResult(null);
-                  setDryRunResult(null);
+                  resetWorkflow();
                 }}
                 className="px-3 py-1.5 border border-line rounded-lg text-sm font-medium text-gray-300 bg-surface-1 hover:bg-hover"
               >
@@ -259,6 +311,39 @@ export function ConfigManager() {
             </div>
           </div>
 
+          {/* Prune */}
+          <div className="rounded-lg border border-line-soft bg-surface-0 p-3">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={prune}
+                onChange={(e) => {
+                  setPrune(e.target.checked);
+                  resetWorkflow();
+                }}
+                disabled={currentStep !== 'edit'}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="text-sm font-medium text-gray-200">Remove resources this file no longer declares</span>
+                <span className="block text-xs text-gray-400 mt-1">
+                  Deletes what this config file (same <code className="font-mono">metadata.name</code>) applied
+                  earlier and has since dropped. Off by default, since a file may be partial. It never touches
+                  another config file's or a package's resources, nor anything edited by hand since it was applied,
+                  and never removes secrets, LLM providers, database connections or dependencies. Collections with
+                  files and stores with saved state are kept (with a warning), and something another resource still
+                  uses can't be removed.
+                </span>
+              </span>
+            </label>
+            {prune && currentStep === 'edit' && (
+              <p className="mt-2 ml-6 text-xs text-yellow-400">
+                Review the dry run before confirming: it lists everything that would be removed, and nothing is
+                removed until you confirm.
+              </p>
+            )}
+          </div>
+
           <div className="flex gap-3">
             {currentStep === 'edit' && (
               <button
@@ -283,9 +368,13 @@ export function ConfigManager() {
               <>
                 <button
                   onClick={handleConfirm}
-                  className="px-6 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700"
+                  className={`px-6 py-2 text-white rounded-lg text-sm font-medium ${
+                    pendingRemovals > 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'
+                  }`}
                 >
-                  Confirm & Apply
+                  {pendingRemovals > 0
+                    ? `Confirm & Apply (removes ${pluralResources(pendingRemovals)})`
+                    : 'Confirm & Apply'}
                 </button>
                 <button
                   onClick={handleReject}
@@ -357,11 +446,15 @@ export function ConfigManager() {
       )}
 
       {/* Dry Run Results */}
-      {dryRunResult && currentStep === 'confirm' && (
+      {dryRunResult && (currentStep === 'confirm' || (currentStep === 'edit' && !dryRunResult.success)) && (
         <div className={`bg-surface-1 rounded-lg border border-line-soft p-6 ${dryRunResult.success ? 'border-blue-800/40' : 'border-red-800/40'}`}>
-          <h2 className="text-lg font-semibold mb-4">Dry Run Results - Review Changes</h2>
+          <h2 className="text-lg font-semibold mb-4">
+            {dryRunResult.success ? 'Dry Run Results - Review Changes' : '✗ Dry Run Failed - Nothing Was Applied'}
+          </h2>
 
           {renderSummary(dryRunResult.summary)}
+
+          {prune && renderRemovals(dryRunResult, true)}
 
           {dryRunResult.errors && dryRunResult.errors.length > 0 && (
             <div className="mb-4">
@@ -439,13 +532,15 @@ export function ConfigManager() {
       )}
 
       {/* Apply Results */}
-      {applyResult && currentStep === 'complete' && (
+      {applyResult && (currentStep === 'complete' || (currentStep === 'edit' && !applyResult.success)) && (
         <div className={`bg-surface-1 rounded-lg border border-line-soft p-6 ${applyResult.success ? 'border-green-800/40' : 'border-red-800/40'}`}>
           <h2 className="text-lg font-semibold mb-4">
-            {applyResult.success ? '✓ Configuration Applied Successfully' : '✗ Configuration Applied with Errors'}
+            {applyResult.success ? '✓ Configuration Applied Successfully' : '✗ Apply Failed - Nothing Was Changed'}
           </h2>
 
           {renderSummary(applyResult.summary)}
+
+          {prune && renderRemovals(applyResult, !applyResult.success)}
 
           {applyResult.errors && applyResult.errors.length > 0 && (
             <div className="mb-4">

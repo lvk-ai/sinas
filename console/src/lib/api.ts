@@ -1,5 +1,7 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { chatListParams, type ChatListFilter, type ChatListPage } from './chatPages';
+import { configApplyBody, type ConfigApplyOptions, type ConfigApplyResponse } from './configApply';
+import { usageCallsParams, type UsageCallsOptions } from './usage';
 import type {
   AdminCreateResetLinkResponse,
   RetentionPreview,
@@ -110,6 +112,7 @@ import type {
   SsoProvider,
   SsoExchangeResponse,
   PackageCatalogEntry,
+  UsageCallsPage,
   UsageDimension,
   UsageFilters,
   UsageSummary,
@@ -1324,8 +1327,8 @@ class APIClient {
     return response.data;
   }
 
-  async applyConfig(config: string, dryRun: boolean = false, force: boolean = false): Promise<any> {
-    const response = await this.configClient.post('/config/apply', { config, dryRun, force });
+  async applyConfig(config: string, options: ConfigApplyOptions = {}): Promise<ConfigApplyResponse> {
+    const response = await this.configClient.post('/config/apply', configApplyBody(config, options));
     return response.data;
   }
 
@@ -1600,6 +1603,15 @@ class APIClient {
   async getUsageTimeseries(filters: UsageFilters, interval: 'hour' | 'day'): Promise<UsageTimeseries> {
     const response = await this.configClient.get('/usage/timeseries', {
       params: { ...filters, interval },
+      paramsSerializer: { indexes: null },
+    });
+    return response.data;
+  }
+
+  // Individual calls, newest first. read:own callers get only their own.
+  async getUsageCalls(filters: UsageFilters, options: UsageCallsOptions = {}): Promise<UsageCallsPage> {
+    const response = await this.configClient.get('/usage/calls', {
+      params: usageCallsParams(filters, options),
       paramsSerializer: { indexes: null },
     });
     return response.data;

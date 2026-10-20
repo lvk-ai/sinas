@@ -1077,6 +1077,39 @@ export interface UsageTimeseries {
   points: Array<UsageMetrics & { bucket: string }>;
 }
 
+// One LLM call (GET /usage/calls), as recorded
+export interface UsageCall {
+  id: string;
+  created_at: string | null;
+  user_id: string | null;
+  user_email?: string | null;
+  chat_id: string | null;
+  message_id: string | null;
+  agent: string | null;
+  source: string | null;
+  provider_name: string | null;
+  provider_type: string | null;
+  model: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number | null;
+  price_source: string | null;
+  batch: boolean | null;
+  streamed: boolean | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
+export interface UsageCallsPage {
+  items: UsageCall[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
 export interface RatecardSource {
   source: 'json' | 'file' | 'url';
   configured: boolean;

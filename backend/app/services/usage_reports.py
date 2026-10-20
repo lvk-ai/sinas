@@ -274,11 +274,14 @@ async def calls(
             .limit(limit + 1)
         )
     ).scalars().all()
+    # Who made each call, as the summary's user groups name them.
+    emails = await _user_emails(db, {str(r.user_id) for r in rows[:limit] if r.user_id})
     items = [
         {
             "id": str(r.id),
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "user_id": str(r.user_id) if r.user_id else None,
+            "user_email": emails.get(str(r.user_id)) if r.user_id else None,
             "chat_id": str(r.chat_id) if r.chat_id else None,
             "message_id": str(r.message_id) if r.message_id else None,
             "agent": r.agent,
