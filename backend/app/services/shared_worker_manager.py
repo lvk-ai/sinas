@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.executor.base import ExecutorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -706,10 +707,8 @@ class SharedWorkerManager:
                 # attempt re-discovery before giving up.
                 await self._discover_existing_workers()
             if not self.workers:
-                return {
-                    "status": "failed",
-                    "error": "No workers available. Please scale workers up first.",
-                }
+                # Nothing ran: the queue may retry this (ExecutorUnavailable).
+                raise ExecutorUnavailable("No workers available. Please scale workers up first.")
 
             # Round-robin load balancing
             worker_ids = list(self.workers.keys())
@@ -727,7 +726,7 @@ class SharedWorkerManager:
                 logger.warning(f"Worker {container_name} not running (status={container.status}), removing")
                 async with self._lock:
                     self.workers.pop(worker_id, None)
-                return {"status": "failed", "error": f"Worker {container_name} not running"}
+                raise ExecutorUnavailable(f"Worker {container_name} not running")
 
             # Fetch function code from database
             from app.models.function import Function
@@ -873,6 +872,8 @@ sys.exit(1)
                 error_msg = stderr_str or stdout_str or f"Function execution failed with exit code {exec_result.exit_code}"
                 return {"status": "failed", "error": error_msg}
 
+        except ExecutorUnavailable:
+            raise
         except Exception as e:
             return {"status": "failed", "error": f"Worker execution failed: {str(e)}"}
 

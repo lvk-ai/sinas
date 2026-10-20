@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,11 @@ class K8sPodSandboxExecutor:
             },
         }
 
-        name, namespace = await create_sandbox_pod(db, execution_id=execution_id)
+        try:
+            name, namespace = await create_sandbox_pod(db, execution_id=execution_id)
+        except Exception as e:
+            # The pod never came up, so the code never ran.
+            raise ExecutorUnavailable(f"Sandbox pod failed to start: {e}") from e
         try:
             wire = await run_payload_in_pod(
                 name, namespace, payload, effective_timeout

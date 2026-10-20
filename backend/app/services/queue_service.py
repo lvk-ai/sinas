@@ -24,6 +24,10 @@ PIPELINE_QUEUE = "sinas:queue:pipelines"
 JOB_RESULT_PREFIX = "sinas:job:result:"
 JOB_DONE_CHANNEL_PREFIX = "sinas:job:done:"
 DLQ_KEY = "sinas:queue:dlq"
+# How many runs of a function job failed so far. Kept apart from arq's
+# job_try, which shared-pool deferrals advance too: a deferral is not a
+# failure and must never use up a job's retries.
+JOB_FAILURES_PREFIX = "sinas:job:failures:"
 JOB_TTL = 86400  # 24 hours
 
 
@@ -95,12 +99,16 @@ class QueueService:
         if delay:
             enqueue_kwargs["_defer_by"] = delay
 
-        await pool.enqueue_job(
+        job = await pool.enqueue_job(
             "execute_function_job",
             **job_kwargs,
             trace_context=inject_job_context(),
             **enqueue_kwargs,
         )
+        if job is None:
+            # arq refuses a job id that is still queued, running, or has a
+            # stored result; the job would silently never run.
+            raise RuntimeError(f"Function job {job_id} is already queued or still has a result")
 
         logger.info(
             f"Enqueued function job: {function_namespace}/{function_name} "
@@ -620,8 +628,13 @@ class QueueService:
                     "job_id": entry.get("job_id"),
                     "function": entry.get("function"),
                     "execution_id": entry.get("execution_id"),
+                    "trigger_type": entry.get("trigger_type"),
                     "error": entry.get("error"),
+                    # infrastructure | function | saturation (absent on
+                    # entries written before issue #135)
+                    "error_type": entry.get("error_type"),
                     "attempts": entry.get("attempts"),
+                    "failed_at": entry.get("failed_at"),
                 })
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -657,23 +670,58 @@ class QueueService:
                 "Job was enqueued before retry support was added."
             )
 
-        # Remove from DLQ
-        await redis.lrem(DLQ_KEY, 1, target_raw)
+        execution_id = target_entry["execution_id"]
 
-        # Re-enqueue with a new job ID
+        # The job id is the execution id, so the requeued job reuses it. arq
+        # keeps a failed job's result for an hour and refuses to enqueue an
+        # id that still has one; the failure count must start over too.
+        from arq.constants import result_key_prefix
+
+        await redis.delete(
+            f"{result_key_prefix}{execution_id}", f"{JOB_FAILURES_PREFIX}{execution_id}"
+        )
+        await self._reset_execution_for_requeue(execution_id)
+
         new_job_id = await self.enqueue_function(
             function_namespace=target_entry["function_namespace"],
             function_name=target_entry["function_name"],
             input_data=target_entry["input_data"],
-            execution_id=target_entry["execution_id"],
+            execution_id=execution_id,
             trigger_type=target_entry["trigger_type"],
             trigger_id=target_entry["trigger_id"],
             user_id=target_entry["user_id"],
             chat_id=target_entry.get("chat_id"),
+            callback_url=target_entry.get("callback_url"),
+            depth=target_entry.get("depth") or 0,
         )
 
-        logger.info(f"Retried DLQ job {job_id} as new job {new_job_id}")
+        # Only once it is queued again: a failed requeue keeps the entry.
+        await redis.lrem(DLQ_KEY, 1, target_raw)
+
+        logger.info(f"Requeued DLQ job {job_id} as job {new_job_id}")
         return {"old_job_id": job_id, "new_job_id": new_job_id}
+
+    async def _reset_execution_for_requeue(self, execution_id: str) -> None:
+        """Put a dead-lettered execution back to PENDING, so its record shows
+        it queued again rather than failed."""
+        from sqlalchemy import select
+
+        from app.core.database import AsyncSessionLocal
+        from app.models.execution import Execution, ExecutionStatus
+
+        async with AsyncSessionLocal() as db:
+            execution = (
+                await db.execute(select(Execution).where(Execution.execution_id == execution_id))
+            ).scalar_one_or_none()
+            if execution is None:
+                return  # the engine creates it when the job runs
+            execution.status = ExecutionStatus.PENDING
+            execution.error = None
+            execution.traceback = None
+            execution.output_data = None
+            execution.completed_at = None
+            execution.duration_ms = None
+            await db.commit()
 
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         """

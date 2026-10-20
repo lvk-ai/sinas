@@ -162,6 +162,8 @@ class FunctionConfig(BaseModel):
     outputSchema: Optional[dict[str, Any]] = None
     icon: Optional[str] = None
     timeout: Optional[int] = None
+    # Queued runs: retries of the function's own failures (0 = never).
+    maxRetries: Optional[int] = None
     # Unset: a new function gets the default, an existing one keeps its value.
     sharedPool: Optional[bool] = None
     requiresApproval: Optional[bool] = None

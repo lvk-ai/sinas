@@ -55,6 +55,8 @@ Content-Type: application/json
 
 Poll execution state via `GET /executions/{execution_id}` (returns the current `status`, `output_data`, `error`, etc.).
 
+A failed run is retried only when the infrastructure failed before the function's code ran, or when the function opts in with `max_retries`; between attempts the execution stays `PENDING`. The callback fires once, when the execution terminates after its last attempt. See [Failures and retries](/build-resources/functions#failures-and-retries).
+
 ## Callbacks
 
 If `callback_url` is set, Sinas fires a **single** HTTP POST to that URL when the execution terminates (success, failure, or timeout). Fire-and-forget — no retries.

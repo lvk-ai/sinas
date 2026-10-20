@@ -29,6 +29,17 @@ from typing import Any, Protocol, runtime_checkable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
+class ExecutorUnavailable(Exception):
+    """The executor could not start the function: no worker to run it on, or
+    the container/pod for it failed to come up.
+
+    Raised only where the function's code has certainly not run yet, which
+    is what makes the failure safe to retry: the function queue retries it
+    with backoff (`QUEUE_MAX_RETRIES`) instead of failing the job. Anything
+    that may have happened after the code started is an ordinary failure.
+    """
+
+
 class ResultStatus(str, Enum):
     """Outcome of an execute()/resume() call.
 

@@ -32,6 +32,7 @@ async def _saturated(depth, execution_id):
 class _FakeRedis:
     def __init__(self):
         self.store: dict = {}
+        self.lists: dict = {}
         self.published: list = []
 
     async def get(self, key):
@@ -40,8 +41,26 @@ class _FakeRedis:
     async def set(self, key, value, ex=None):
         self.store[key] = value
 
+    async def delete(self, *keys):
+        for key in keys:
+            self.store.pop(key, None)
+
     async def publish(self, channel, payload):
         self.published.append((channel, payload))
+
+    async def lpush(self, key, value):
+        self.lists.setdefault(key, []).insert(0, value)
+
+
+@pytest.fixture(autouse=True)
+def _not_cancelled(monkeypatch):
+    """Re-runs (job_try > 1) check the Execution row for a cancellation;
+    these jobs have none."""
+
+    async def not_cancelled(execution_id):
+        return False
+
+    monkeypatch.setattr("app.queue.worker._execution_cancelled", not_cancelled)
 
 
 @pytest.fixture
@@ -204,6 +223,13 @@ class TestWorkerDefersOnSaturation:
             assert row.status == ExecutionStatus.FAILED
             assert "saturated" in (row.error or "").lower() or "4/4" in (row.error or "")
             assert len(redis.published) == 1  # failure IS signalled now
+            # ...and the job is dead-lettered: the code never ran, so it can
+            # be requeued once the pool is healthy again (issue #135).
+            from app.services.queue_service import DLQ_KEY
+
+            (entry,) = [json.loads(e) for e in redis.lists[DLQ_KEY]]
+            assert entry["error_type"] == "saturation" and "4/4" in entry["error"]
+            assert "dead-letter queue" in row.error
         finally:
             await db.delete(row)
             await db.commit()

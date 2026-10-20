@@ -35,7 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult, ResultStatus
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable, ResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -285,11 +285,13 @@ class K8sSharedTrustedExecutor:
         names = _pod_names()
         start = next(_rr)
         last_error: Exception | None = None
+        dispatched = False
         for i in range(len(names)):
             name = names[(start + i) % len(names)]
             try:
                 if not await asyncio.to_thread(_pod_ready_blocking, name, namespace):
                     await _ensure_pod(db, name, namespace)
+                dispatched = True
                 wire = await run_payload_in_pod(
                     name, namespace, payload, effective_timeout
                 )
@@ -309,6 +311,10 @@ class K8sSharedTrustedExecutor:
                     name,
                     e,
                 )
+        if not dispatched:
+            # No pod ever got the payload (none ready, recreate failed), so
+            # the code never ran: the queue may retry it.
+            raise ExecutorUnavailable(f"No trusted worker pod available: {last_error}")
         return ExecutionResult.failed(
             f"All trusted worker pods failed: {last_error}"
         )

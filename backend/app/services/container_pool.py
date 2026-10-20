@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.executor.base import ExecutorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -454,9 +455,13 @@ class ContainerPool:
                 "error": f"Function {function_namespace}/{function_name} not found",
             }
 
-        # Acquire a container
+        # Acquire a container. Failing here means the code never ran, so the
+        # queue may retry it (ExecutorUnavailable).
         acquire_start = time.time()
-        pc = await self.acquire()
+        try:
+            pc = await self.acquire()
+        except TimeoutError as e:
+            raise ExecutorUnavailable(str(e)) from e
         acquire_elapsed = time.time() - acquire_start
         logger.info(
             f"Acquired sandbox container {pc.name} in {acquire_elapsed:.3f}s "

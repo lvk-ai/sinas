@@ -35,6 +35,12 @@ class Function(Base, PermissionMixin):
     timeout: Mapped[Optional[int]] = mapped_column(
         Integer
     )  # Per-function timeout in seconds (null = use global default)
+    # Queued runs only: how many times a failure of the function's own code
+    # is retried (with backoff) before the job is dead-lettered. 0 = never —
+    # functions may have side effects, so retrying them is an opt-in that
+    # declares the function safe to run again. Infrastructure failures (the
+    # code never started) are retried regardless; see QUEUE_MAX_RETRIES.
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[created_at]
     updated_at: Mapped[updated_at]
 

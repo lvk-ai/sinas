@@ -24,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +73,13 @@ class DockerEphemeralSandboxExecutor:
             )
 
         effective_timeout = timeout or settings.function_timeout
-        client, container, name = await create_ephemeral_container(
-            db, execution_id=execution_id
-        )
+        try:
+            client, container, name = await create_ephemeral_container(
+                db, execution_id=execution_id
+            )
+        except Exception as e:
+            # The container never came up, so the code never ran.
+            raise ExecutorUnavailable(f"Sandbox container failed to start: {e}") from e
         try:
             payload = {
                 "action": "execute_inline",

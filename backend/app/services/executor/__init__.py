@@ -17,13 +17,14 @@ is resolved by `executor.factory.get_sandbox_executor` /
 `get_trusted_executor`.
 """
 
-from app.services.executor.base import SandboxExecutor, TrustedExecutor
+from app.services.executor.base import ExecutorUnavailable, SandboxExecutor, TrustedExecutor
 from app.services.executor.factory import (
     get_sandbox_executor,
     get_trusted_executor,
 )
 
 __all__ = [
+    "ExecutorUnavailable",
     "SandboxExecutor",
     "TrustedExecutor",
     "get_sandbox_executor",

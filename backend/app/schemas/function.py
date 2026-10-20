@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, validator
 
+from app.schemas.spec.function import MAX_FUNCTION_RETRIES
+
 
 class FunctionCreate(BaseModel):
     namespace: str = Field(
@@ -26,6 +28,16 @@ class FunctionCreate(BaseModel):
     )
     timeout: Optional[int] = Field(
         default=None, description="Per-function timeout in seconds (null = use global default)"
+    )
+    max_retries: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_FUNCTION_RETRIES,
+        description=(
+            "Queued runs only: how often a failure of the function's own code is "
+            "retried, with backoff, before the job is dead-lettered. 0 = never. "
+            "Only opt in for functions that are safe to run again."
+        ),
     )
 
     @validator("code")
@@ -66,6 +78,7 @@ class FunctionUpdate(BaseModel):
     shared_pool: Optional[bool] = None
     requires_approval: Optional[bool] = None
     timeout: Optional[int] = None
+    max_retries: Optional[int] = Field(None, ge=0, le=MAX_FUNCTION_RETRIES)
     is_active: Optional[bool] = None
 
     @validator("code")
@@ -104,6 +117,7 @@ class FunctionResponse(BaseModel):
     shared_pool: bool
     requires_approval: bool
     timeout: Optional[int] = None
+    max_retries: int = 0
     is_active: bool
     created_at: datetime
     updated_at: datetime
