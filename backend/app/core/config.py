@@ -293,6 +293,11 @@ class Settings(BaseSettings):
     queue_agent_concurrency: int = 5
     queue_agent_sub_concurrency: int = 5  # concurrency of the sub-agent queue worker
     queue_default_timeout: int = 300
+    # Function jobs: how often a run that failed because the infrastructure
+    # could not start the code (no worker, container/pod start failure, the
+    # database unreachable) is retried, with backoff, before the job goes to
+    # the dead-letter queue. Failures of the function's own code are retried
+    # only when the function opts in (Function.max_retries). Issue #135.
     queue_max_retries: int = 3
     # Saturation backpressure: how long a function job may wait in the queue
     # (deferred retries, backoff capped at 30s) for a shared-pool slot before
@@ -301,6 +306,8 @@ class Settings(BaseSettings):
     # hours. The bound exists only so a permanently wedged pool eventually
     # fails loudly instead of spinning forever. 0 = wait forever.
     queue_saturation_timeout_seconds: int = 21600  # 6 hours
+    # First retry delay (seconds) of a failed function job; doubles per
+    # failed attempt, capped at 5 minutes, plus jitter.
     queue_retry_delay: int = 10
     # How often an idle worker checks its queue for new jobs (seconds). arq's
     # default, 0.5, added up to half a second before a queued job started: an

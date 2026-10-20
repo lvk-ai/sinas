@@ -463,6 +463,7 @@ async def test_a_function_job_carries_the_requests_context(monkeypatch):
     class _Pool:
         async def enqueue_job(self, name, **kwargs):
             captured.update(kwargs)
+            return object()  # arq returns a Job (None when the id is taken)
 
     class _Redis:
         async def set(self, *a, **k):

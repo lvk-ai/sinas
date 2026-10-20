@@ -24,6 +24,12 @@ PIPELINE_QUEUE = "sinas:queue:pipelines"
 JOB_RESULT_PREFIX = "sinas:job:result:"
 JOB_DONE_CHANNEL_PREFIX = "sinas:job:done:"
 DLQ_KEY = "sinas:queue:dlq"
+# How many runs of a function job failed so far. Kept apart from arq's
+# job_try, which shared-pool deferrals advance too: a deferral is not a
+# failure and must never use up a job's retries.
+JOB_FAILURES_PREFIX = "sinas:job:failures:"
+# Held while a dead-lettered job is being requeued (one requeue at a time).
+DLQ_REQUEUE_LOCK_PREFIX = "sinas:queue:dlq:requeue:"
 JOB_TTL = 86400  # 24 hours
 
 
@@ -99,12 +105,16 @@ class QueueService:
         if delay:
             enqueue_kwargs["_defer_by"] = delay
 
-        await pool.enqueue_job(
+        job = await pool.enqueue_job(
             "execute_function_job",
             **job_kwargs,
             trace_context=inject_job_context(),
             **enqueue_kwargs,
         )
+        if job is None:
+            # arq refuses a job id that is still queued, running, or has a
+            # stored result; the job would silently never run.
+            raise RuntimeError(f"Function job {job_id} is already queued or still has a result")
 
         logger.info(
             f"Enqueued function job: {function_namespace}/{function_name} "
@@ -630,16 +640,36 @@ class QueueService:
                     "job_id": entry.get("job_id"),
                     "function": entry.get("function"),
                     "execution_id": entry.get("execution_id"),
+                    "trigger_type": entry.get("trigger_type"),
                     "error": entry.get("error"),
+                    # infrastructure | function | saturation (absent on
+                    # entries written before issue #135)
+                    "error_type": entry.get("error_type"),
                     "attempts": entry.get("attempts"),
+                    "failed_at": entry.get("failed_at"),
                 })
             except (json.JSONDecodeError, TypeError):
                 pass
         return entries
 
     async def retry_dlq_job(self, job_id: str) -> dict[str, Any]:
-        """Remove a job from the DLQ and re-enqueue it."""
+        """Re-enqueue a dead-lettered job and remove it from the DLQ.
+
+        The job id is the execution id, so the requeued job reuses it: its
+        failure count starts over and its execution goes back to PENDING (a
+        finished batch it belongs to is reopened). One requeue per job at a
+        time; while arq still has the job queued or running, nothing is
+        touched (RuntimeError, 409)."""
         redis = await get_redis()
+        lock_key = f"{DLQ_REQUEUE_LOCK_PREFIX}{job_id}"
+        if not await redis.set(lock_key, "1", nx=True, ex=60):
+            raise RuntimeError(f"Job {job_id} is already being requeued")
+        try:
+            return await self._requeue_locked(redis, job_id)
+        finally:
+            await redis.delete(lock_key)
+
+    async def _requeue_locked(self, redis, job_id: str) -> dict[str, Any]:
         raw_entries = await redis.lrange(DLQ_KEY, 0, -1)
 
         target_entry = None
@@ -667,23 +697,190 @@ class QueueService:
                 "Job was enqueued before retry support was added."
             )
 
-        # Remove from DLQ
+        execution_id = target_entry["execution_id"]
+
+        from arq.constants import in_progress_key_prefix, job_key_prefix, result_key_prefix
+
+        if await redis.exists(f"{job_key_prefix}{execution_id}", f"{in_progress_key_prefix}{execution_id}"):
+            raise RuntimeError(f"Function job {execution_id} is already queued or running")
+
+        old_status = await redis.get(f"{JOB_STATUS_PREFIX}{execution_id}")
+        snapshot = await self._reset_execution_for_requeue(execution_id)
+        # Enqueue under the original request's attribution context, not the
+        # requeueing admin's (enqueue_function reads it from the context).
+        from app.core.auth import bind_credential_context, reset_credential_context
+
+        context_token = bind_credential_context(target_entry.get("credential_context"))
+        try:
+            # arq keeps a failed job's result for an hour and refuses to
+            # enqueue an id that still has one.
+            await redis.delete(
+                f"{result_key_prefix}{execution_id}", f"{JOB_FAILURES_PREFIX}{execution_id}"
+            )
+            new_job_id = await self.enqueue_function(
+                function_namespace=target_entry["function_namespace"],
+                function_name=target_entry["function_name"],
+                input_data=target_entry["input_data"],
+                execution_id=execution_id,
+                trigger_type=target_entry["trigger_type"],
+                trigger_id=target_entry["trigger_id"],
+                user_id=target_entry["user_id"],
+                chat_id=target_entry.get("chat_id"),
+                callback_url=target_entry.get("callback_url"),
+                depth=target_entry.get("depth") or 0,
+            )
+        except Exception:
+            # Not queued: put the execution, its batch and the job status
+            # back as they were, so nothing claims a run that never comes.
+            # The entry stays in the DLQ for another try.
+            await self._restore_after_failed_requeue(execution_id, snapshot)
+            try:
+                if old_status is not None:
+                    await redis.set(f"{JOB_STATUS_PREFIX}{execution_id}", old_status, ex=JOB_TTL)
+                else:
+                    # The old key had expired (DLQ entries outlive it): drop
+                    # the "queued" one enqueue_function wrote.
+                    await redis.delete(f"{JOB_STATUS_PREFIX}{execution_id}")
+            except Exception:
+                logger.warning(f"Could not restore the job status of {execution_id}", exc_info=True)
+            raise
+        finally:
+            reset_credential_context(context_token)
+
+        # Only once it is queued again: a failed requeue keeps the entry.
         await redis.lrem(DLQ_KEY, 1, target_raw)
 
-        # Re-enqueue with a new job ID
-        new_job_id = await self.enqueue_function(
-            function_namespace=target_entry["function_namespace"],
-            function_name=target_entry["function_name"],
-            input_data=target_entry["input_data"],
-            execution_id=target_entry["execution_id"],
-            trigger_type=target_entry["trigger_type"],
-            trigger_id=target_entry["trigger_id"],
-            user_id=target_entry["user_id"],
-            chat_id=target_entry.get("chat_id"),
-        )
-
-        logger.info(f"Retried DLQ job {job_id} as new job {new_job_id}")
+        logger.info(f"Requeued DLQ job {job_id} as job {new_job_id}")
         return {"old_job_id": job_id, "new_job_id": new_job_id}
+
+    async def _reset_execution_for_requeue(self, execution_id: str) -> Optional[dict[str, Any]]:
+        """Put a dead-lettered execution back to PENDING, so its record shows
+        it queued again rather than failed, and reopen a finished batch it
+        belongs to (its terminal status and callback follow the new outcome).
+        Refuses (RuntimeError) an execution that completed or is waiting for
+        input, or whose batch was cancelled.
+
+        Returns what it changed, for `_restore_after_failed_requeue` (None:
+        there was no row). The batch is locked as `on_execution_terminated`
+        locks it, so a late child termination can't re-finish the reopened
+        batch from stale counts."""
+        from sqlalchemy import select
+
+        from app.core.database import AsyncSessionLocal
+        from app.models.batch import Batch, BatchStatus
+        from app.models.execution import Execution, ExecutionStatus
+
+        async with AsyncSessionLocal() as db:
+            execution = (
+                await db.execute(
+                    select(Execution)
+                    .where(Execution.execution_id == execution_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if execution is None:
+                return None  # the engine creates it when the job runs
+            if execution.status in (ExecutionStatus.COMPLETED, ExecutionStatus.AWAITING_INPUT):
+                raise RuntimeError(
+                    f"Execution {execution_id} is {execution.status.value}; not requeueing it"
+                )
+            snapshot: dict[str, Any] = {
+                "execution": {
+                    field: getattr(execution, field)
+                    for field in (
+                        "status", "error", "traceback", "output_data", "completed_at", "duration_ms",
+                    )
+                },
+                "batch_id": execution.batch_id,
+            }
+            if execution.batch_id is not None:
+                batch = (
+                    await db.execute(
+                        select(Batch).where(Batch.id == execution.batch_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if batch is not None:
+                    if batch.status == BatchStatus.CANCELLED:
+                        raise RuntimeError(
+                            f"Execution {execution_id} belongs to cancelled batch {batch.id}"
+                        )
+                    if batch.finished_at is not None:
+                        snapshot["batch"] = {
+                            "status": batch.status,
+                            "finished_at": batch.finished_at,
+                        }
+                        batch.status = BatchStatus.RUNNING
+                        batch.finished_at = None
+            execution.status = ExecutionStatus.PENDING
+            execution.error = None
+            execution.traceback = None
+            execution.output_data = None
+            execution.completed_at = None
+            execution.duration_ms = None
+            await db.commit()
+            return snapshot
+
+    async def _restore_after_failed_requeue(
+        self, execution_id: str, snapshot: Optional[dict[str, Any]]
+    ) -> None:
+        """Undo `_reset_execution_for_requeue` after the enqueue failed.
+        Best effort: never raises."""
+        if snapshot is None:
+            return
+        from sqlalchemy import select
+
+        from app.core.database import AsyncSessionLocal
+        from app.models.execution import Execution, ExecutionStatus
+
+        try:
+            # Same lock order as the reset: execution, then batch.
+            async with AsyncSessionLocal() as db:
+                execution = (
+                    await db.execute(
+                        select(Execution)
+                        .where(Execution.execution_id == execution_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if execution is not None and execution.status == ExecutionStatus.PENDING:
+                    for field, value in snapshot["execution"].items():
+                        setattr(execution, field, value)
+                await db.commit()
+
+                if snapshot.get("batch") and snapshot.get("batch_id") is not None:
+                    await self._refinish_batch(db, snapshot["batch_id"], snapshot["batch"])
+        except Exception:
+            logger.error(f"Could not restore execution {execution_id} after a failed requeue", exc_info=True)
+
+    async def _refinish_batch(self, db, batch_id, before: dict[str, Any]) -> None:
+        """Close a batch the failed requeue had reopened — judged by its
+        children now, under the batch lock, since other requeues may have
+        changed them meanwhile: still a child in flight → stays open (its
+        termination finishes the batch); the same outcome as before → the
+        old status and finished_at come back, no second callback; a
+        different outcome → finished afresh, callback included."""
+        from sqlalchemy import select
+
+        from app.models.batch import Batch
+        from app.services import batch_service
+
+        batch = (
+            await db.execute(select(Batch).where(Batch.id == batch_id).with_for_update())
+        ).scalar_one_or_none()
+        if batch is None or batch.finished_at is not None:
+            await db.commit()
+            return
+        if await batch_service._count_pending(db, batch_id) > 0:
+            await db.commit()
+            return
+        counts = await batch_service._count_by_status(db, batch_id)
+        if batch_service._derive_terminal_status(counts) == before["status"]:
+            batch.status = before["status"]
+            batch.finished_at = before["finished_at"]
+            await db.commit()
+            return
+        await db.commit()  # release the lock; on_execution_terminated takes it
+        await batch_service.on_execution_terminated(db=db, batch_id=batch_id)
 
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         """

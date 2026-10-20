@@ -41,6 +41,10 @@ def build_wait_script(
     return f"""
 import sys, json, time, os
 if {write_trigger!r}:
+    # A result left by an earlier run of this execution id (a retry, a DLQ
+    # requeue) must not be read back as this run's.
+    if os.path.exists("{result_file}"):
+        os.remove("{result_file}")
     with open("{trigger_file}", "w") as f:
         f.write("1")
 max_wait = {timeout}

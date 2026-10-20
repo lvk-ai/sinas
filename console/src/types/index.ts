@@ -487,6 +487,7 @@ export interface Function {
   shared_pool: boolean;
   requires_approval: boolean;
   timeout: number | null;
+  max_retries: number;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -502,6 +503,7 @@ export interface FunctionCreate {
   icon?: string;
   shared_pool?: boolean;
   requires_approval?: boolean;
+  max_retries?: number;
 }
 
 export interface FunctionUpdate {
@@ -514,6 +516,7 @@ export interface FunctionUpdate {
   icon?: string;
   shared_pool?: boolean;
   requires_approval?: boolean;
+  max_retries?: number;
   is_active?: boolean;
 }
 

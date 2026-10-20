@@ -59,6 +59,7 @@ class FunctionApplier(ResourceApplier[FunctionSpec]):
             output_schema=dict(row.output_schema or {}),
             icon=row.icon or None,
             timeout=row.timeout,
+            max_retries=row.max_retries or 0,
             shared_pool=bool(row.shared_pool),
             requires_approval=bool(row.requires_approval),
             is_active=row.is_active is not False,
@@ -78,6 +79,7 @@ class FunctionApplier(ResourceApplier[FunctionSpec]):
         row.output_schema = dict(spec.output_schema)
         row.icon = spec.icon
         row.timeout = spec.timeout
+        row.max_retries = spec.max_retries
         row.shared_pool = spec.shared_pool
         row.requires_approval = spec.requires_approval
         row.is_active = spec.is_active

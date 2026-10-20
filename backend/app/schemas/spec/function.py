@@ -6,6 +6,10 @@ from pydantic import Field, field_validator
 
 from app.schemas.spec.base import SpecModel
 
+# Upper bound on Function.max_retries (opt-in retries of the function's own
+# failures on the queue). The queue worker sizes arq's try budget from it.
+MAX_FUNCTION_RETRIES = 10
+
 
 class FunctionSpec(SpecModel):
     namespace: str = Field(default="default", min_length=1, max_length=255, pattern=r"^[^/]+$")
@@ -18,6 +22,7 @@ class FunctionSpec(SpecModel):
     output_schema: dict[str, Any] = Field(default_factory=dict)
     icon: Optional[str] = Field(default=None, max_length=512)
     timeout: Optional[int] = None
+    max_retries: int = Field(default=0, ge=0, le=MAX_FUNCTION_RETRIES)
     shared_pool: bool = False
     requires_approval: bool = False
     is_active: bool = True

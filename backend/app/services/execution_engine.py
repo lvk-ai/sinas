@@ -1,5 +1,6 @@
 """Function execution engine with tracking and validation."""
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -17,18 +18,84 @@ from app.core.database import AsyncSessionLocal
 from app.models.execution import Execution, ExecutionStatus
 from app.models.function import Function
 from app.services.clickhouse_logger import clickhouse_logger
-from app.services.executor.base import ExecutionResult, ResultStatus
+from app.services.executor.base import (
+    ExecutionResult,
+    ExecutorUnavailable,
+    ResultStatus,
+    is_transient_infra_error,
+)
 from app.services.shared_admission import SharedPoolSaturated
 
 logger = logging.getLogger(__name__)
 
 
 class FunctionExecutionError(Exception):
-    pass
+    """A function execution failed for good (the Execution row is FAILED).
+
+    The two flags tell the queue worker what kind of failure it was:
+    `transient` — the infrastructure failed before the function's code ran;
+    `dead_letter` — a failure the queue was allowed to retry, which ran out
+    of attempts, so the job belongs in the dead-letter queue.
+    """
+
+    transient = False
+    dead_letter = False
+    # The engine recorded the failure itself (row FAILED, callback, batch).
+    recorded = False
+
+
+# The two kinds of failed attempt, each with its own retry budget.
+INFRASTRUCTURE = "infrastructure"  # the code never ran: QUEUE_MAX_RETRIES
+FUNCTION = "function"  # the function's own failure: Function.max_retries
+
+
+def dead_letter_note(attempts: int) -> str:
+    """Appended to a dead-lettered execution's error."""
+    return (
+        f" (failed {attempts} attempt{'s' if attempts != 1 else ''}; "
+        "moved to the dead-letter queue)"
+    )
+
+
+class ExecutionRetryScheduled(Exception):
+    """A queued execution failed but has attempts left (issue #135).
+
+    The engine put the Execution row back to PENDING with the error noted,
+    and skipped the failure bookkeeping (callback, batch, execution log):
+    nothing has terminated yet. The queue worker re-runs the job after a
+    backoff. `kind` is INFRASTRUCTURE or FUNCTION; `attempt` counts that
+    kind's failures only.
+    """
+
+    def __init__(self, message: str, *, kind: str, attempt: int, max_attempts: int):
+        super().__init__(message)
+        self.kind = kind
+        self.attempt = attempt
+        self.max_attempts = max_attempts
 
 
 class SchemaValidationError(Exception):
     pass
+
+
+async def _save_retry_note(execution_id: str, note: str, error_traceback: str) -> None:
+    """Mark an execution PENDING with its retry note through a fresh session
+    (the caller's failed). Best effort: the retry goes ahead regardless."""
+    from sqlalchemy import update
+
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(Execution)
+                .where(
+                    Execution.execution_id == execution_id,
+                    Execution.status.in_([ExecutionStatus.PENDING, ExecutionStatus.RUNNING]),
+                )
+                .values(status=ExecutionStatus.PENDING, error=note, traceback=error_traceback)
+            )
+            await db.commit()
+    except Exception:
+        logger.warning(f"Could not note the retry of execution {execution_id}", exc_info=True)
 
 
 async def _fire_callback(
@@ -252,12 +319,30 @@ class FunctionExecutor:
         chat_id: str | None = None,
         callback_url: str | None = None,
         depth: int = 0,
+        prior_failures: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Execute a function with input validation and tracking.
 
         `depth` is this execution's nesting depth (0 = top-level). It is
         embedded in the per-execution access token so a nested call can
         compute its own depth and be bounded by settings.max_execution_depth.
+
+        `prior_failures` counts the earlier failed runs of this queue job per
+        kind, {INFRASTRUCTURE: n, FUNCTION: m} (None = not run by the queue:
+        never retried). Each kind has its own budget, so an outage never uses
+        up a function's retries (nor the reverse):
+
+        - the infrastructure failed before the code ran (`ExecutorUnavailable`,
+          or a lost DB/Redis connection before dispatch): up to
+          settings.queue_max_retries times;
+        - the function's own code failed: up to `Function.max_retries` times
+          (default 0 — functions may have side effects, retrying is opt-in);
+        - anything deterministic (input/output schema validation, a disabled
+          executor): never.
+
+        A failure with attempts left raises `ExecutionRetryScheduled` and
+        leaves the row PENDING; otherwise the row is FAILED and the raised
+        `FunctionExecutionError` says whether to dead-letter the job.
         """
         # Single choke point for every trigger type (API, webhook, schedule,
         # agent tool, CDC), so one guard disables user-code execution platform
@@ -272,64 +357,79 @@ class FunctionExecutor:
 
         await metering.record(metering.OperationKind.FUNCTION)
         async with AsyncSessionLocal() as db:
-            # Get user info for context
-            from app.core.auth import create_access_token
-            from app.models.user import User
+            # Nothing has run yet: an unreachable database (or Redis) here
+            # is an infrastructure failure the queue may retry.
+            try:
+                # Get user info for context
+                from app.core.auth import create_access_token
+                from app.models.user import User
 
-            user_result = await db.execute(select(User).where(User.id == user_id))
-            user = user_result.scalar_one_or_none()
-            user_email = user.email if user else "unknown@unknown.com"
-            user_custom_fields = (user.custom_fields or {}) if user else {}
+                user_result = await db.execute(select(User).where(User.id == user_id))
+                user = user_result.scalar_one_or_none()
+                user_email = user.email if user else "unknown@unknown.com"
+                user_custom_fields = (user.custom_fields or {}) if user else {}
 
-            # Load function early so we can size the access-token TTL to its
-            # configured timeout. (load_function is cached, so this is cheap.)
-            function = await self.load_function(db, function_namespace, function_name, user_id)
-            function_timeout = function.timeout or settings.function_timeout
+                # Load function early so we can size the access-token TTL to its
+                # configured timeout. (load_function is cached, so this is cheap.)
+                function = await self.load_function(db, function_namespace, function_name, user_id)
+                function_timeout = function.timeout or settings.function_timeout
 
-            # Per-execution access token. TTL = function timeout + buffer, so
-            # the token outlives the run (incl. downstream calls into apps that
-            # forward it back to Sinas) but not by much. Capped at the global
-            # ceiling. See ADR 2026-05-14-external-app-bulk-enqueue.md §2.2.
-            token_ttl = timedelta(
-                seconds=min(
-                    function_timeout + settings.execution_token_buffer_seconds,
-                    settings.max_execution_token_seconds,
+                # Per-execution access token. TTL = function timeout + buffer, so
+                # the token outlives the run (incl. downstream calls into apps that
+                # forward it back to Sinas) but not by much. Capped at the global
+                # ceiling. See ADR 2026-05-14-external-app-bulk-enqueue.md §2.2.
+                token_ttl = timedelta(
+                    seconds=min(
+                        function_timeout + settings.execution_token_buffer_seconds,
+                        settings.max_execution_token_seconds,
+                    )
                 )
-            )
-            # It carries the caller's attribution context: chats the function
-            # starts through Sinas are attributed as the caller's would be.
-            from app.core.auth import current_credential_context
+                # It carries the caller's attribution context: chats the function
+                # starts through Sinas are attributed as the caller's would be.
+                from app.core.auth import current_credential_context
 
-            access_token = create_access_token(
-                user_id, user_email, expires_delta=token_ttl, execution_depth=depth,
-                context=current_credential_context(),
-            )
-
-            # Check if execution already exists (e.g. created by enqueue_function)
-            result = await db.execute(
-                select(Execution).where(Execution.execution_id == execution_id)
-            )
-            execution = result.scalar_one_or_none()
-
-            if not execution:
-                # Create new execution record
-                execution = Execution(
-                    user_id=user_id,
-                    execution_id=execution_id,
-                    function_name=function_name,
-                    trigger_type=trigger_type,
-                    trigger_id=trigger_id,
-                    chat_id=chat_id,
-                    status=ExecutionStatus.RUNNING,
-                    input_data=input_data,
-                    started_at=datetime.utcnow(),
+                access_token = create_access_token(
+                    user_id, user_email, expires_delta=token_ttl, execution_depth=depth,
+                    context=current_credential_context(),
                 )
-                db.add(execution)
-                await db.commit()
 
-                # Log execution start to Redis
-                await clickhouse_logger.log_execution_start(execution_id, function_name, input_data)
+                # Check if execution already exists (e.g. created by enqueue_function)
+                result = await db.execute(
+                    select(Execution).where(Execution.execution_id == execution_id)
+                )
+                execution = result.scalar_one_or_none()
 
+                if not execution:
+                    # Create new execution record
+                    execution = Execution(
+                        user_id=user_id,
+                        execution_id=execution_id,
+                        function_name=function_name,
+                        trigger_type=trigger_type,
+                        trigger_id=trigger_id,
+                        chat_id=chat_id,
+                        status=ExecutionStatus.RUNNING,
+                        input_data=input_data,
+                        started_at=datetime.utcnow(),
+                    )
+                    db.add(execution)
+                    await db.commit()
+
+                    # Log execution start to Redis
+                    await clickhouse_logger.log_execution_start(execution_id, function_name, input_data)
+            except FunctionExecutionError:
+                raise
+            except Exception as e:
+                if is_transient_infra_error(e):
+                    raise ExecutorUnavailable(f"Could not prepare the execution: {e}") from e
+                raise
+
+            # Set once the code is handed to an executor: a failure before
+            # that is never the function's own.
+            dispatched = False
+            # Set once the code returned a valid result: from then on nothing
+            # is retried (it would run the function a second time).
+            succeeded = False
             try:
                 # `function` and `function_timeout` were loaded above (they
                 # parameterized the access-token TTL).
@@ -362,6 +462,7 @@ class FunctionExecutor:
                     # outer handler resets the row to PENDING and re-raises so
                     # the queue worker can defer-and-retry instead of failing.
                     async with shared_pool_admission(depth, execution_id):
+                        dispatched = self.trusted_executor is not None
                         exec_result = await self._execute_in_shared_pool(
                             function=function,
                             input_data=input_data,
@@ -392,6 +493,7 @@ class FunctionExecutor:
                             f"functions, or enable a sandbox executor."
                         )
                     container_start = time.time()
+                    dispatched = True
                     exec_result = await sandbox.execute(
                         user_id=user_id,
                         user_email=user_email,
@@ -438,39 +540,52 @@ class FunctionExecutor:
                 # Validate output
                 if function.output_schema:
                     await self.validate_schema(result, function.output_schema)
+                succeeded = True
 
                 # Update execution record
                 execution.status = ExecutionStatus.COMPLETED
                 execution.output_data = result
+                # An earlier failed attempt's note ("attempt 1 of 4 failed")
+                execution.error = None
+                execution.traceback = None
                 execution.completed_at = datetime.utcnow()
                 execution.duration_ms = duration_ms
 
                 await db.commit()
 
-                # Log execution completion to Redis
-                await clickhouse_logger.log_execution_end(
-                    execution_id, "completed", result, None, duration_ms
-                )
-
-                if callback_url:
-                    await _fire_callback(
-                        db=db,
-                        execution=execution,
-                        callback_url=callback_url,
-                        user_id=user_id,
-                        user_email=user_email,
-                        status="success",
-                        result=result,
-                        error=None,
-                        trigger_id=trigger_id,
-                        function_namespace=function_namespace,
-                        function_name=function_name,
+                # The run succeeded and is committed: whatever goes wrong in
+                # the bookkeeping below is no reason to fail it, let alone
+                # run the function again.
+                try:
+                    # Log execution completion to Redis
+                    await clickhouse_logger.log_execution_end(
+                        execution_id, "completed", result, None, duration_ms
                     )
 
-                if execution.batch_id is not None:
-                    from app.services import batch_service
-                    await batch_service.on_execution_terminated(
-                        db=db, batch_id=execution.batch_id,
+                    if callback_url:
+                        await _fire_callback(
+                            db=db,
+                            execution=execution,
+                            callback_url=callback_url,
+                            user_id=user_id,
+                            user_email=user_email,
+                            status="success",
+                            result=result,
+                            error=None,
+                            trigger_id=trigger_id,
+                            function_namespace=function_namespace,
+                            function_name=function_name,
+                        )
+
+                    if execution.batch_id is not None:
+                        from app.services import batch_service
+                        await batch_service.on_execution_terminated(
+                            db=db, batch_id=execution.batch_id,
+                        )
+                except Exception:
+                    logger.error(
+                        f"Bookkeeping after the successful execution {execution_id} failed",
+                        exc_info=True,
                     )
 
                 return result
@@ -484,44 +599,123 @@ class FunctionExecutor:
                 await db.commit()
                 raise
             except Exception as e:
-                # Update execution record with error
-                execution.status = ExecutionStatus.FAILED
-                execution.error = str(e)
+                # Infrastructure: the executor said the code never started, or
+                # a connection dropped before dispatch (e.g. the admission
+                # gate's Redis).
+                transient = isinstance(e, ExecutorUnavailable) or (
+                    not dispatched and is_transient_infra_error(e)
+                )
+                if succeeded:
+                    # The code ran to a valid result; only saving it failed.
+                    # Running it again would repeat its side effects.
+                    kind, max_retries = FUNCTION, 0
+                elif transient:
+                    kind, max_retries = INFRASTRUCTURE, settings.queue_max_retries
+                elif dispatched and not isinstance(e, SchemaValidationError):
+                    kind, max_retries = FUNCTION, function.max_retries or 0
+                else:
+                    kind, max_retries = FUNCTION, 0  # deterministic: retrying changes nothing
+                prior = (prior_failures or {}).get(kind, 0)
+                attempt = prior + 1
                 # Prefer the function's real traceback from the container; fall
                 # back to the backend stack for errors raised outside the function
                 # (schema validation, db, container plumbing, etc.).
-                execution.traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
+                error_traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
+                execution.traceback = error_traceback
+
+                if prior_failures is not None and prior < max_retries:
+                    # Not terminal yet: back in the queue, the failure noted.
+                    # The retry must not hinge on this write: the session
+                    # may have lost its connection with the failure itself.
+                    note = f"Attempt {attempt} of {max_retries + 1} failed, retrying: {e}"
+                    execution.status = ExecutionStatus.PENDING
+                    execution.error = note
+                    try:
+                        await db.commit()
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            await db.rollback()
+                        await _save_retry_note(execution_id, note, error_traceback)
+                    raise ExecutionRetryScheduled(
+                        str(e),
+                        kind=kind,
+                        attempt=attempt,
+                        max_attempts=max_retries + 1,
+                    ) from e
+
+                # Retryable, but out of attempts: the queue dead-letters it.
+                dead_letter = prior_failures is not None and (transient or max_retries > 0)
+
+                # Update execution record with error
+                execution_error = str(e)
+                if dead_letter:
+                    execution_error += dead_letter_note(sum(prior_failures.values()) + 1)
+                execution.status = ExecutionStatus.FAILED
+                execution.error = execution_error
                 execution.completed_at = datetime.utcnow()
 
-                await db.commit()
+                err = FunctionExecutionError(f"Function execution failed: {e}")
+                err.transient = transient
+                err.dead_letter = dead_letter
+                err.recorded = True
 
-                # Log execution failure to Redis
-                await clickhouse_logger.log_execution_end(
-                    execution_id, "failed", None, str(e), None
-                )
-
-                if callback_url:
-                    await _fire_callback(
-                        db=db,
-                        execution=execution,
-                        callback_url=callback_url,
+                try:
+                    await db.commit()
+                except Exception:
+                    # The session went down with the failure: record it
+                    # through a fresh one (row, log, callback, batch).
+                    logger.warning(
+                        f"Recording the failure of {execution_id} in a fresh session", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await db.rollback()
+                    await self.record_failure(
+                        execution_id=execution_id,
+                        error=execution_error,
                         user_id=user_id,
-                        user_email=user_email,
-                        status="failure",
-                        result=None,
-                        error=str(e),
                         trigger_id=trigger_id,
                         function_namespace=function_namespace,
                         function_name=function_name,
+                        callback_url=callback_url,
+                    )
+                    raise err from e
+
+                # The failure is committed: an error in the bookkeeping below
+                # must not replace `err`, whose flags tell the queue worker
+                # whether to dead-letter the job.
+                try:
+                    # Log execution failure to Redis
+                    await clickhouse_logger.log_execution_end(
+                        execution_id, "failed", None, str(e), None
                     )
 
-                if execution.batch_id is not None:
-                    from app.services import batch_service
-                    await batch_service.on_execution_terminated(
-                        db=db, batch_id=execution.batch_id,
+                    if callback_url:
+                        await _fire_callback(
+                            db=db,
+                            execution=execution,
+                            callback_url=callback_url,
+                            user_id=user_id,
+                            user_email=user_email,
+                            status="failure",
+                            result=None,
+                            error=str(e),
+                            trigger_id=trigger_id,
+                            function_namespace=function_namespace,
+                            function_name=function_name,
+                        )
+
+                    if execution.batch_id is not None:
+                        from app.services import batch_service
+                        await batch_service.on_execution_terminated(
+                            db=db, batch_id=execution.batch_id,
+                        )
+                except Exception:
+                    logger.error(
+                        f"Bookkeeping after the failed execution {execution_id} failed",
+                        exc_info=True,
                     )
 
-                raise FunctionExecutionError(f"Function execution failed: {e}")
+                raise err
 
     async def resume_execution(
         self,
@@ -666,6 +860,66 @@ class FunctionExecutor:
             "execution_id": execution_id,
             "job_id": job_id,
         }
+
+    async def record_failure(
+        self,
+        *,
+        execution_id: str,
+        error: str,
+        user_id: str,
+        trigger_id: str,
+        function_namespace: str,
+        function_name: str,
+        callback_url: str | None = None,
+    ) -> None:
+        """The failure bookkeeping for a queued execution that failed before
+        or outside `execute_function`'s own (pool saturation that never let
+        up, the database unreachable while preparing, the function gone):
+        row FAILED, execution log, callback, batch. A row that already
+        reached a terminal state is left alone. Best effort: never raises."""
+        try:
+            async with AsyncSessionLocal() as db:
+                execution = (
+                    await db.execute(select(Execution).where(Execution.execution_id == execution_id))
+                ).scalar_one_or_none()
+                if execution is None or execution.status not in (
+                    ExecutionStatus.PENDING,
+                    ExecutionStatus.RUNNING,
+                ):
+                    return
+                execution.status = ExecutionStatus.FAILED
+                execution.error = error
+                execution.completed_at = datetime.utcnow()
+                await db.commit()
+
+                await clickhouse_logger.log_execution_end(execution_id, "failed", None, error, None)
+
+                if callback_url:
+                    from app.models.user import User
+
+                    user = (
+                        await db.execute(select(User).where(User.id == user_id))
+                    ).scalar_one_or_none()
+                    await _fire_callback(
+                        db=db,
+                        execution=execution,
+                        callback_url=callback_url,
+                        user_id=user_id,
+                        user_email=user.email if user else "unknown@unknown.com",
+                        status="failure",
+                        result=None,
+                        error=error,
+                        trigger_id=trigger_id,
+                        function_namespace=function_namespace,
+                        function_name=function_name,
+                    )
+
+                if execution.batch_id is not None:
+                    from app.services import batch_service
+
+                    await batch_service.on_execution_terminated(db=db, batch_id=execution.batch_id)
+        except Exception:
+            logger.error(f"Could not record the failure of execution {execution_id}", exc_info=True)
 
     def clear_cache(self):
         """Clear function cache."""

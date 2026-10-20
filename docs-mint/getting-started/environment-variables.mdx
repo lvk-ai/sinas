@@ -228,7 +228,9 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `QUEUE_FUNCTION_CONCURRENCY` | `10` | Concurrent functions per worker |
 | `QUEUE_AGENT_CONCURRENCY` | `5` | Concurrent agent jobs per worker |
 | `QUEUE_POLL_DELAY` | `0.05` | Seconds between an idle worker's checks for new jobs. Lower starts queued jobs sooner; each check is one Redis command. |
-| `QUEUE_SATURATION_TIMEOUT_SECONDS` | `21600` | How long a queued function job may wait for a shared-pool slot (deferred retries with backoff) before failing. Bulk ingest drains through this window; `0` = wait forever. |
+| `QUEUE_SATURATION_TIMEOUT_SECONDS` | `21600` | How long a queued function job may wait for a shared-pool slot (deferred retries with backoff) before failing (the job is then dead-lettered). Bulk ingest drains through this window; `0` = wait forever. Waiting never counts as a failed attempt. |
+| `QUEUE_MAX_RETRIES` | `3` | Retries of a function job whose infrastructure failed before the code ran (no worker, container/pod start failure, database unreachable), before it is dead-lettered. The function's own failures retry only per `max_retries` on the function. |
+| `QUEUE_RETRY_DELAY` | `10` | First retry delay of a failed function job, in seconds; doubles per failed attempt, capped at 5 minutes, plus jitter. |
 | `WORKER_MEMORY_LIMIT` | `1g` | Memory limit per shared worker container (Docker size string). |
 | `QUEUE_AGENT_SUB_REPLICAS` | `2` | Sub-agent queue worker replicas (delegated agent jobs) |
 | `QUEUE_AGENT_SUB_CONCURRENCY` | `5` | Concurrent jobs per sub-agent worker |
