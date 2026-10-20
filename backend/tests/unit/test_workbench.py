@@ -157,6 +157,40 @@ class TestWorkbenchTools:
         assert result.get("count", len(result.get("files", []))) >= 1
 
     @pytest.mark.asyncio
+    async def test_versions_record_the_acting_agent(self, db, chat, test_user):
+        """An agent writes as the user: uploaded_by stays the person, and the
+        version says it was an agent (and which)."""
+        from app.models.agent import Agent
+
+        agent = Agent(namespace="ns", name="writer", system_prompt="x")
+        db.add(agent)
+        await db.flush()
+        chat.agent_id = agent.id
+        await db.flush()
+
+        tools = WorkbenchTools()
+        uid = str(test_user.id)
+        await tools.execute_tool(db, chat, uid, "workbench_write", {"filename": "a.txt", "content": "one"})
+        await tools.execute_tool(
+            db, chat, uid, "workbench_edit", {"filename": "a.txt", "old_string": "one", "new_string": "two"}
+        )
+
+        versions = (
+            await db.execute(select(FileVersion).order_by(FileVersion.version_number))
+        ).scalars().all()
+        assert [v.actor_type for v in versions] == ["agent", "agent"]
+        assert {v.agent_id for v in versions} == {agent.id}
+        assert {v.uploaded_by for v in versions} == {test_user.id}
+
+    @pytest.mark.asyncio
+    async def test_versions_without_an_agent_are_user_writes(self, db, chat, test_user):
+        await WorkbenchTools().execute_tool(
+            db, chat, str(test_user.id), "workbench_write", {"filename": "a.txt", "content": "one"}
+        )
+        version = (await db.execute(select(FileVersion))).scalar_one()
+        assert version.actor_type == "user" and version.agent_id is None
+
+    @pytest.mark.asyncio
     async def test_path_traversal_rejected(self, db, chat, test_user):
         tools = WorkbenchTools()
         for bad in ("../escape.txt", "/abs.txt", "a//b.txt", "a/../b.txt"):
