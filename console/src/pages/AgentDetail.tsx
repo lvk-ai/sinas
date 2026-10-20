@@ -6,6 +6,8 @@ import { ArrowLeft, Save, Trash2, Loader2, Bot, ArrowUp, ArrowDown, Plus, X } fr
 import type { AgentUpdate, EffortLevel } from '../types';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { ApiUsage } from '../components/ApiUsage';
+import { AccessSetting, JsonObjectSetting, NameListSetting, WildcardPatterns } from '../components/WildcardPatterns';
+import { isWildcardRef } from '../lib/wildcardRefs';
 import { useAuth } from '../lib/auth-context';
 import {
   MAX_RETENTION_DAYS,
@@ -1177,6 +1179,19 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Enable skills that this agent can retrieve for instructions. Mark as "Preload" to inject into system prompt instead of exposing as tool.
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_skills || agent.enabled_skills || []) as any[]}
+                  refKey="skill"
+                  noun="skills"
+                  makeEntry={(ref: string) => ({ skill: ref, preload: false })}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <label className="flex items-center gap-2 text-xs text-gray-400">
+                      <input type="checkbox" checked={!!e.preload} onChange={(ev) => change({ ...e, preload: ev.target.checked })} />
+                      Preload into the system prompt (instead of a tool)
+                    </label>
+                  )}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_skills: updated as any })}
+                />
                 {skills && skills.length > 0 ? (
                   <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-96 overflow-y-auto">
                     {skills.map((skill: any) => {
@@ -1257,6 +1272,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Select which functions this agent can call and configure default parameters
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_functions || agent.enabled_functions || []) as any[]}
+                  noun="functions"
+                  makeEntry={(ref: string) => ref}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_functions: updated as any })}
+                />
                 {functions && functions.length > 0 ? (
                   <div className="space-y-3 border border-line-soft rounded-lg p-3 max-h-[600px] overflow-y-auto">
                     {functions.map((func: any) => {
@@ -1428,6 +1449,17 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   <p className="text-xs text-gray-500 mb-3">
                     Configure which stores this agent can access and the access level for each.
                   </p>
+                  <WildcardPatterns
+                    entries={(formData.enabled_stores || agent.enabled_stores || []) as any[]}
+                    refKey="store"
+                    noun="stores"
+                    withAccess
+                    makeEntry={(ref: string, access: string) => ({ store: ref, access })}
+                    settings={(e: any, change: (next: any) => void) => (
+                    <AccessSetting value={e.access} onChange={(access) => change({ ...e, access })} />
+                  )}
+                    onChange={(updated: any[]) => setFormData({ ...formData, enabled_stores: updated as any })}
+                  />
                   {stores && stores.length > 0 ? (
                     <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-80 overflow-y-auto">
                       {stores.map((store: any) => {
@@ -1491,6 +1523,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Enable SQL queries for this agent to execute against external databases
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_queries || agent.enabled_queries || []) as any[]}
+                  noun="queries"
+                  makeEntry={(ref: string) => ref}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_queries: updated as any })}
+                />
                 {queries && queries.length > 0 ? (
                   <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-64 overflow-y-auto">
                     {queries.map((query: any) => {
@@ -1546,13 +1584,28 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   (named <code className="text-xs bg-surface-1 px-1 rounded">mcp_&lt;namespace&gt;__&lt;server&gt;__&lt;tool&gt;</code>),
                   so approval rules can gate them by name. Optionally narrow to tool name patterns.
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_mcp_servers || agent.enabled_mcp_servers || []) as any[]}
+                  refKey="server"
+                  noun="MCP servers"
+                  makeEntry={(ref: string) => ({ server: ref, tools: [] })}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <NameListSetting
+                      label="Tool patterns on every matching server (comma-separated globs; empty = all)"
+                      value={e.tools}
+                      placeholder="search_*, get_*"
+                      onChange={(tools) => change({ ...e, tools })}
+                    />
+                  )}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_mcp_servers: updated as any })}
+                />
                 {(() => {
                   // Bindings whose server is no longer listed (deleted, inactive, or
                   // unreadable) still have to be shown, or they can never be removed and
                   // every save is refused for them.
                   const enabledNow: any[] = formData.enabled_mcp_servers || agent.enabled_mcp_servers || [];
                   const listedRefs = new Set((mcpServers || []).filter((s: any) => s.is_active).map((s: any) => `${s.namespace}/${s.name}`));
-                  const orphaned = enabledNow.filter((e: any) => !listedRefs.has(e.server));
+                  const orphaned = enabledNow.filter((e: any) => !listedRefs.has(e.server) && !isWildcardRef(e.server));
                   if (orphaned.length === 0) return null;
                   return (
                     <div className="space-y-2 mb-3">
@@ -1639,6 +1692,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   Enable pipelines exposed as tools (asTool) — one semantic tool per pipeline,
                   executed inline within the pipeline's sync timeout
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_pipelines || agent.enabled_pipelines || []) as any[]}
+                  noun="pipelines"
+                  makeEntry={(ref: string) => ref}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_pipelines: updated as any })}
+                />
                 {(() => {
                   const toolPipelines = (pipelines || []).filter((p: any) => p.as_tool);
                   return toolPipelines.length > 0 ? (
@@ -1697,6 +1756,17 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Enable file collections for this agent to search and retrieve files
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_collections || agent.enabled_collections || []) as any[]}
+                  refKey="collection"
+                  noun="collections"
+                  withAccess
+                  makeEntry={(ref: string, access: string) => ({ collection: ref, access })}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <AccessSetting value={e.access} onChange={(access) => change({ ...e, access })} />
+                  )}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_collections: updated as any })}
+                />
                 {collections && collections.length > 0 ? (
                   <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-64 overflow-y-auto">
                     {collections.map((coll: any) => {
@@ -1771,6 +1841,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Enable UI components for this agent to render and interact with
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_components || agent.enabled_components || []) as any[]}
+                  noun="components"
+                  makeEntry={(ref: string) => ref}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_components: updated as any })}
+                />
                 {components && components.length > 0 ? (
                   <div className="space-y-2 border border-line-soft rounded-lg p-3 max-h-64 overflow-y-auto">
                     {components.map((comp: any) => {
@@ -1923,6 +1999,28 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                 <p className="text-xs text-gray-500 mb-3">
                   Enable connector operations as agent tools. Select which operations the agent can call.
                 </p>
+                <WildcardPatterns
+                  entries={(formData.enabled_connectors || agent.enabled_connectors || []) as any[]}
+                  refKey="connector"
+                  noun="connectors"
+                  makeEntry={(ref: string) => ({ connector: ref, operations: [], parameters: {} })}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <div className="space-y-2">
+                      <NameListSetting
+                        label="Operations on every matching connector (comma-separated; empty = all)"
+                        value={e.operations}
+                        placeholder="get_status, list_items"
+                        onChange={(operations) => change({ ...e, operations })}
+                      />
+                      <JsonObjectSetting
+                        label="Locked parameters by operation (JSON; Jinja2 templates allowed)"
+                        value={e.parameters}
+                        onChange={(parameters) => change({ ...e, parameters })}
+                      />
+                    </div>
+                  )}
+                  onChange={(updated: any[]) => setFormData({ ...formData, enabled_connectors: updated as any })}
+                />
                 {connectors && connectors.length > 0 ? (
                   <div className="space-y-3">
                     {connectors.filter((c: any) => c.is_active).map((conn: any) => {

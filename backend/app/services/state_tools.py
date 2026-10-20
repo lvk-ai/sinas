@@ -25,24 +25,70 @@ class StateTools:
     """Provides LLM tools for interacting with state stores."""
 
     @staticmethod
+    async def resolve_stores(
+        db: AsyncSession,
+        user_id: Optional[str],
+        enabled_stores: Optional[list[Any]],
+        permissions: Optional[dict[str, bool]] = None,
+    ) -> list[tuple[str, str, Store]]:
+        """The agent's stores as (ref, access, store), wildcards expanded.
+
+        A wildcard entry ("namespace/*", "*/*") carries its access mode to
+        every store it matches, but only to stores the user may read states
+        in (sinas.stores/<ref>.read_state), and read-write only where they may
+        also write (write_state) — never a store their own permissions would
+        refuse. The most specific entry decides a store's mode, so an exact
+        entry can narrow (or widen) what a wildcard gives one store. Exact
+        entries behave as they always did."""
+        from app.services.resource_resolver import resolve_access_entries, user_has
+
+        if not enabled_stores:
+            return []
+        if user_id and permissions is None:
+            from app.core.auth import get_effective_permissions
+
+            permissions = await get_effective_permissions(db, user_id)
+        return await resolve_access_entries(
+            db, enabled_stores, Store, "store",
+            can_read=user_has(user_id, permissions, "stores", "read_state"),
+            can_write=user_has(user_id, permissions, "stores", "write_state"),
+        )
+
+    @staticmethod
     async def get_tool_definitions(
         db: Optional[AsyncSession] = None,
         user_id: Optional[str] = None,
         enabled_stores: Optional[list[dict[str, str]]] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """
         Get OpenAI-compatible tool definitions for state operations.
 
         Args:
             db: Optional database session for enriching tool descriptions
+                (and for expanding wildcard entries: without one, only exact
+                entries are offered)
             user_id: Optional user ID for personalizing tool descriptions
-            enabled_stores: List of {"store": "namespace/name", "access": "readonly|readwrite"}
+            enabled_stores: List of {"store": "namespace/name" | "namespace/*" | "*/*",
+                "access": "readonly|readwrite"}
+            permissions: The user's effective permissions (looked up if None)
         """
         if not enabled_stores:
             return []
 
-        readonly_stores = [s["store"] for s in enabled_stores if s.get("access") == "readonly"]
-        readwrite_stores = [s["store"] for s in enabled_stores if s.get("access") == "readwrite"]
+        # Load store objects for schema/strict info
+        store_objects: dict[str, Store] = {}
+        if db:
+            resolved = await StateTools.resolve_stores(db, user_id, enabled_stores, permissions)
+            readonly_stores = [ref for ref, access, _ in resolved if access == "readonly"]
+            readwrite_stores = [ref for ref, access, _ in resolved if access == "readwrite"]
+            store_objects = {ref: store for ref, _, store in resolved}
+        else:
+            from app.services.resource_resolver import EXACT, ref_specificity
+
+            exact = [s for s in enabled_stores if isinstance(s, dict) and ref_specificity(s.get("store")) == EXACT]
+            readonly_stores = [s["store"] for s in exact if s.get("access") == "readonly"]
+            readwrite_stores = [s["store"] for s in exact if s.get("access") == "readwrite"]
         all_stores = readonly_stores + readwrite_stores
 
         if not all_stores:
@@ -54,14 +100,6 @@ class StateTools:
             available_keys_info = await StateTools._get_available_keys_description(
                 db, user_id, allowed_stores=all_stores
             )
-
-        # Load store objects for schema/strict info
-        store_objects: dict[str, Store] = {}
-        if db:
-            for store_ref in all_stores:
-                store_obj = await StateTools._resolve_store(db, store_ref)
-                if store_obj:
-                    store_objects[store_ref] = store_obj
 
         # Build store info
         store_info = ""
@@ -345,9 +383,13 @@ class StateTools:
         from app.core.auth import get_effective_permissions
         from app.core.permissions import check_permission
 
-        # Get agent's enabled_stores for validation. Reads without a named
-        # store reach only these (none: nothing), never every store the user
-        # has states in.
+        # The caller's RBAC permissions for store access (the key's, for a
+        # run through an API key).
+        user_permissions = await get_effective_permissions(db, user_id)
+
+        # Get agent's enabled_stores for validation, wildcards expanded as
+        # discovery expands them. Reads without a named store reach only
+        # these (none: nothing), never every store the user has states in.
         write_stores = None
         all_allowed_stores: Optional[list[str]] = []
         if agent_id:
@@ -356,8 +398,11 @@ class StateTools:
             result = await db.execute(select(Agent).where(Agent.id == uuid_lib.UUID(agent_id)))
             agent = result.scalar_one_or_none()
             if agent and agent.enabled_stores:
-                write_stores = [s["store"] for s in agent.enabled_stores if s.get("access") == "readwrite"]
-                all_allowed_stores = [s["store"] for s in agent.enabled_stores]
+                resolved = await StateTools.resolve_stores(
+                    db, user_id, agent.enabled_stores, user_permissions
+                )
+                write_stores = [ref for ref, access, _ in resolved if access == "readwrite"]
+                all_allowed_stores = [ref for ref, _, _ in resolved]
 
         # Check agent's enabled_stores for write operations
         if tool_name in ("save_state", "update_state", "delete_state") and write_stores is not None:
@@ -367,10 +412,6 @@ class StateTools:
                     "error": f"Agent not authorized to write to store '{requested_store}'",
                     "allowed_stores": write_stores,
                 }
-
-        # Check the caller's RBAC permissions for store access (the key's,
-        # for a run through an API key).
-        user_permissions = await get_effective_permissions(db, user_id)
 
         # Reads without a named store (search, overview) cover only the
         # agent's stores the caller may read — they used to reach every store
@@ -839,13 +880,9 @@ class StateTools:
         if not enabled_stores:
             return []
 
-        # Resolve store refs
-        store_refs = [s["store"] for s in enabled_stores]
-        store_ids = []
-        for ref in store_refs:
-            store = await StateTools._resolve_store(db, ref)
-            if store:
-                store_ids.append(store.id)
+        # Resolve store refs (wildcards: only stores the user may read)
+        resolved = await StateTools.resolve_stores(db, user_id, enabled_stores)
+        store_ids = [store.id for _, _, store in resolved]
 
         if not store_ids:
             return []
