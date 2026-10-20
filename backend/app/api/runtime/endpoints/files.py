@@ -89,13 +89,34 @@ async def _resolve_name_conflict(
     mode: str,
     upload_hash: str,
     namespace: str,
+    collection: str,
+    user_id: str,
+    permissions: dict[str, bool],
     response: Response,
 ) -> FileResponse:
     """Answer an upload whose name is taken, in return_existing / error mode.
 
     Nothing is stored either way. 409 details carry the existing file's id so
     a client can tell "already there" from a real refusal.
+
+    The existing file may be someone else's shared file, and uploading takes
+    no read access. Unless the uploader could download it, the answer is a
+    bare 409: no id, metadata or signed URL, and no content comparison to
+    probe it with.
     """
+    can_read = str(existing.user_id) == user_id or check_permission(
+        permissions, f"sinas.collections/{namespace}/{collection}.download:own"
+    )
+    if not can_read:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "file_exists",
+                "message": f"A file named '{existing.name}' already exists in this collection",
+                "name": existing.name,
+            },
+        )
+
     current = (
         await db.execute(
             select(FileVersion).where(
@@ -416,7 +437,9 @@ async def upload_file(
     if mode in ("return_existing", "error"):
         existing_file = await _find_name_conflict(db, coll.id, file_data.name, user_id, file_data.visibility)
         if existing_file:
-            return await _resolve_name_conflict(db, existing_file, mode, upload_hash, namespace, response)
+            return await _resolve_name_conflict(
+                db, existing_file, mode, upload_hash, namespace, collection, user_id, permissions, response
+            )
 
     # Check total storage quota
     total_size_result = await db.execute(
@@ -542,7 +565,9 @@ async def upload_file(
             lock=mode == "new_version",
         )
         if existing_file and mode in ("return_existing", "error"):
-            return await _resolve_name_conflict(db, existing_file, mode, upload_hash, namespace, response)
+            return await _resolve_name_conflict(
+                db, existing_file, mode, upload_hash, namespace, collection, user_id, permissions, response
+            )
         if existing_file and mode == "new_version":
             # Same rule as editing a file's metadata: your own, or upload:all
             if str(existing_file.user_id) != user_id and not check_permission(

@@ -201,6 +201,65 @@ class TestReturnExisting:
         assert retry.json()["visibility"] == "shared"
 
 
+class TestSomeoneElsesSharedFile:
+    """Uploading takes no read access: a file the uploader couldn't download
+    is never handed back (metadata, signed URL) or compared against."""
+
+    @pytest_asyncio.fixture
+    async def theirs(self, client, admin_user, coll):
+        resp = await _upload(
+            client, coll, admin_user, b"their payload", visibility="shared", file_metadata={"secret": 1}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["return_existing", "error"])
+    @pytest.mark.parametrize("content", [b"their payload", b"a guess"])
+    async def test_without_download_access_only_the_name_is_reported(
+        self, db, client, test_user, coll, theirs, mode, content
+    ):
+        resp = await _upload(client, coll, test_user, content, on_conflict=mode)
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == {
+            "code": "file_exists",
+            "message": "A file named 'report.txt' already exists in this collection",
+            "name": "report.txt",
+        }
+        assert len(await _files(db, coll)) == 1
+
+    @pytest.mark.asyncio
+    async def test_with_download_access_it_is_returned(self, db, client, test_user, coll, theirs):
+        await _grant(db, test_user, f"sinas.collections/default/{coll.name}.download:own")
+
+        resp = await _upload(client, coll, test_user, b"their payload", on_conflict="return_existing")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["id"] == theirs["id"]
+        assert resp.json()["file_metadata"] == {"secret": 1}
+
+
+class TestOpenApi:
+    @pytest.mark.asyncio
+    async def test_dynamic_upload_spec_documents_on_conflict(self, db, coll):
+        from app.services.openapi_generator import generate_runtime_openapi
+
+        spec = await generate_runtime_openapi(db)
+        post = spec["paths"][f"/files/default/{coll.name}"]["post"]
+
+        body = post["requestBody"]["content"]["application/json"]["schema"]
+        assert body["properties"]["on_conflict"]["enum"] == [
+            "rename", "return_existing", "new_version", "error",
+        ]
+        responses = post["responses"]
+        assert (
+            responses["200"]["content"]["application/json"]["schema"]
+            == responses["201"]["content"]["application/json"]["schema"]
+        )
+        assert "409" in responses
+
+
 class TestError:
     @pytest.mark.asyncio
     async def test_taken_name_409s_with_the_existing_file(self, db, client, test_user, coll, tmp_path):

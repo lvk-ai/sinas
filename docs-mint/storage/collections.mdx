@@ -76,4 +76,4 @@ A `409` carries the existing file in its `detail`:
 }
 ```
 
-`code` is `file_exists` for `error` and `file_content_mismatch` for `return_existing`. `update_existing: true` is the older spelling of `on_conflict: "new_version"`.
+`code` is `file_exists` for `error` and `file_content_mismatch` for `return_existing`. When the taken name belongs to someone else's shared file and you lack `download:own` on the collection, both modes answer `409` `file_exists` with only the `name`: no id, metadata or link, and no content comparison. `update_existing: true` is the older spelling of `on_conflict: "new_version"`.

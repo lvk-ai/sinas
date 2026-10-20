@@ -221,6 +221,21 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
             },
         }
 
+        file_schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "format": "uuid"},
+                "namespace": {"type": "string"},
+                "name": {"type": "string"},
+                "content_type": {"type": "string"},
+                "current_version": {"type": "integer"},
+                "file_metadata": metadata_schema,
+                "visibility": {"type": "string"},
+                "created_at": {"type": "string", "format": "date-time"},
+                "updated_at": {"type": "string", "format": "date-time"},
+            },
+        }
+
         op_id = f"upload_to_{coll.namespace}_{coll.name}".replace("-", "_").replace(".", "_")
 
         base_spec["paths"][path] = {
@@ -237,27 +252,11 @@ async def generate_runtime_openapi(db: AsyncSession) -> dict[str, Any]:
                 "responses": {
                     "200": {
                         "description": "on_conflict=return_existing: the existing, identical file (nothing stored)",
+                        "content": {"application/json": {"schema": file_schema}},
                     },
                     "201": {
                         "description": "File uploaded successfully",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string", "format": "uuid"},
-                                        "namespace": {"type": "string"},
-                                        "name": {"type": "string"},
-                                        "content_type": {"type": "string"},
-                                        "current_version": {"type": "integer"},
-                                        "file_metadata": metadata_schema,
-                                        "visibility": {"type": "string"},
-                                        "created_at": {"type": "string", "format": "date-time"},
-                                        "updated_at": {"type": "string", "format": "date-time"},
-                                    },
-                                }
-                            }
-                        },
+                        "content": {"application/json": {"schema": file_schema}},
                     },
                     "400": {"description": "Validation failed (metadata, content filter)"},
                     "403": {"description": "Not authorized"},
