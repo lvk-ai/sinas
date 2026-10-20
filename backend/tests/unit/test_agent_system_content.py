@@ -17,7 +17,7 @@ class _FakeSkillConverter:
         self._content = content
         self.calls = []
 
-    async def get_preloaded_skills_content(self, db, enabled_skills):
+    async def get_preloaded_skills_content(self, db, enabled_skills, user_id=None):
         self.calls.append(enabled_skills)
         return self._content
 

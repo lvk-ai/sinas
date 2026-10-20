@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from app.models.agent import Agent
 from app.models.llm_provider import LLMProvider
 from app.schemas.spec.agent import AgentSpec, McpBindingRef
+from app.services.resource_resolver import is_wildcard_ref
 from app.services.resources.base import ApplierError, ApplyContext, ReferenceNotFound, ResourceApplier
 
 _FIELDS = (
@@ -178,6 +179,7 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         checked, so an unchanged agent never fails on a server that went away."""
         from app.core.auth import get_user_permissions
         from app.models.mcp_server import McpServer
+        from app.services.resource_resolver import wildcard_ref_problem
 
         before = {b.server for b in (current.enabled_mcp_servers if current else [])}
         added = [b for b in spec.enabled_mcp_servers if b.server not in before]
@@ -186,6 +188,13 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         actor = ctx.actor_user_id or ctx.owner_user_id
         permissions = await get_user_permissions(ctx.db, str(actor)) if actor else {}
         for binding in added:
+            problem = wildcard_ref_problem(binding.server)
+            if problem:
+                raise InvalidAgentReferences(f"Agent '{spec.key}': MCP server {problem}")
+            if is_wildcard_ref(binding.server):
+                # Binds every server it matches that the chat's user may
+                # read — checked per server, per turn, by the runtime.
+                continue
             parts = binding.server.split("/", 1)
             if len(parts) != 2 or not all(parts):
                 raise ApplierError(f"Invalid MCP server reference '{binding.server}' (use namespace/name)")
@@ -228,24 +237,30 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         this write adds is checked, so an agent holding an older reference to
         something since removed can still be edited. Wildcards ("ns/*") and
         legacy agent ids aren't references to one thing and pass; so does
-        anything the same config declares (it's applied all-or-nothing)."""
+        anything the same config declares (it's applied all-or-nothing).
+
+        A "*" anywhere else than a whole name ("ns/*") or reference ("*/*")
+        is refused, as is any wildcard where one thing must be named (a
+        hook's function, a parameters key): the runtime would silently
+        resolve nothing."""
         if spec.llm_provider_name and (current is None or current.llm_provider_name != spec.llm_provider_name):
             await self.check_references(spec, ctx)
-        # MCP bindings are references too, checked here so a preview (dry
-        # run) reports a missing or unreadable server, not only the apply.
-        await self._check_mcp_bindings(spec, ctx, current)
-        missing: list[str] = []
         # The stored state in the spec's own spelling (e.g. a bare "lookup"
         # stored long ago reads as "default/lookup"), so an unchanged
         # reference never looks added.
         before = _normalized(current)
+        _check_patterns(spec, before)
+        # MCP bindings are references too, checked here so a preview (dry
+        # run) reports a missing or unreadable server, not only the apply.
+        await self._check_mcp_bindings(spec, ctx, current)
+        missing: list[str] = []
         for kind, label, model in _reference_kinds():
             if kind == "mcp_servers":
                 continue  # _check_mcp_bindings above: existence, activity and permission
             added = _refs(spec, kind) - _refs(before, kind)
             wanted = []
             for ref in sorted(added):
-                if "*" in ref or (kind == "agents" and (ref == spec.key or _is_uuid(ref))):
+                if is_wildcard_ref(ref) or (kind == "agents" and (ref == spec.key or _is_uuid(ref))):
                     continue
                 if "/" not in ref:
                     missing.append(f"{label} '{ref}' (name it as namespace/name)")
@@ -283,6 +298,68 @@ async def provider_name(db, provider_id) -> Optional[str]:
 
 class MissingAgentReferences(ApplierError):
     status_code = 400
+
+
+class InvalidAgentReferences(ApplierError):
+    status_code = 400
+
+
+# The enabled_* lists (by _refs kind) and their labels in messages.
+_LIST_LABELS = {
+    "functions": "enabledFunctions", "skills": "enabledSkills", "queries": "enabledQueries",
+    "stores": "enabledStores", "collections": "enabledCollections",
+    "components": "enabledComponents", "connectors": "enabledConnectors",
+    "pipelines": "enabledPipelines", "agents": "enabledAgents",
+}
+
+
+def _check_patterns(spec: AgentSpec, before: Optional[AgentSpec]) -> None:
+    """Refuse what this write adds that no wildcard resolution could serve:
+    a malformed pattern in an enabled_* list ("*/name", "ns/a*"), or a
+    wildcard where exactly one thing is named — a hook runs one function,
+    and parameters are set per function or query. Only additions are
+    checked, as for missing references. (MCP bindings: _check_mcp_bindings.)"""
+    from app.services.resource_resolver import wildcard_ref_problem
+
+    problems: list[str] = []
+    for kind, field in _LIST_LABELS.items():
+        for ref in sorted(_list_refs(spec, kind) - _list_refs(before, kind)):
+            problem = wildcard_ref_problem(ref)
+            if problem:
+                problems.append(f"{field}: {problem}")
+
+    def hook_refs(s: Optional[AgentSpec]) -> set[str]:
+        return {
+            e.get("function") for entries in ((s.hooks or {}) if s else {}).values()
+            for e in entries or [] if isinstance(e, dict) and isinstance(e.get("function"), str)
+        }
+
+    for ref in sorted(hook_refs(spec) - hook_refs(before)):
+        if "*" in ref:
+            problems.append(f"hooks: '{ref}' is a pattern, but a hook runs one function (name it as namespace/name)")
+    for field, label, noun in (
+        ("function_parameters", "functionParameters", "function"),
+        ("query_parameters", "queryParameters", "query"),
+    ):
+        keys = set(getattr(spec, field) or {}) - set((getattr(before, field) or {}) if before else {})
+        for key in sorted(k for k in keys if "*" in k):
+            problems.append(
+                f"{label}: '{key}' is a pattern, but parameters are set per {noun} "
+                "(name it as namespace/name; a wildcard belongs in the enabled list)"
+            )
+    if problems:
+        raise InvalidAgentReferences(
+            f"Agent '{spec.key}' has references that can't be resolved: {'; '.join(problems)}"
+        )
+
+
+def _list_refs(spec: Optional[AgentSpec], kind: str) -> set[str]:
+    """The refs of one enabled_* list (hooks left out: _refs adds them to functions)."""
+    if spec is None:
+        return set()
+    if kind == "functions":
+        return set(spec.enabled_functions)
+    return _refs(spec, kind)
 
 
 class McpServerNotUsable(ApplierError):

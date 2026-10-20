@@ -27,8 +27,10 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `enabled_queries` | Database queries available as tools. Supports wildcards. |
 | `query_parameters` | Default query parameter values |
 | `enabled_collections` | File collections the agent can access. Plain string (readonly) or `{"collection": "namespace/name", "access": "readonly\|readwrite"}`. Supports wildcards. Readwrite enables write/edit/delete file tools. |
-| `enabled_stores` | Stores the agent can access. List of `{"store": "namespace/name", "access": "readonly"}` or `{"store": "namespace/name", "access": "readwrite"}` |
-| `enabled_connectors` | Connectors available as tools. List of `{"connector": "namespace/name", "operations": [...], "parameters": {"op_name": {"param": "value"}}}`. Parameters support Jinja2 templates and are locked (hidden from LLM). |
+| `enabled_stores` | Stores the agent can access. List of `{"store": "namespace/name", "access": "readonly"}` or `{"store": "namespace/name", "access": "readwrite"}`. Supports wildcards: the entry's access mode applies to every store it matches. |
+| `enabled_components` | Components the agent can show in the chat (one `show_component_*` tool each). Supports wildcards. |
+| `enabled_connectors` | Connectors available as tools. List of `{"connector": "namespace/name", "operations": [...], "parameters": {"op_name": {"param": "value"}}}`. Parameters support Jinja2 templates and are locked (hidden from LLM). Supports wildcards: the entry's operations and parameters apply to every connector it matches. |
+| `enabled_mcp_servers` | [MCP servers](/build-resources/mcp-servers) whose tools the agent gets. `"namespace/name"` or `{"server": "namespace/name", "tools": ["glob", ...]}`. Supports wildcards: the entry's tool globs apply to every server it matches. |
 | `enabled_pipelines` | [Pipelines](/build-resources/pipelines) available as tools — only those marked `asTool`. Supports wildcards. Each becomes one semantic tool whose parameters are the pipeline's `inputSchema`. |
 | `hooks` | Message lifecycle hooks. `{"on_user_message": [...], "on_assistant_message": [...]}` |
 | `system_tools` | Platform capabilities. List of strings or config objects. See [System Tools](#system-tools). |
@@ -36,13 +38,32 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `retention_days` | How long chats with this agent are kept after their last activity before they are archived and deleted: `null` = the deployment default, `0` = keep forever (`"never"` in config), `N` = N days. Only applies when the operator has switched [chat retention](/admin/chat-retention) on. Changing it takes `sinas.retention.update:all`. Config key: `retentionDays`. |
 | `icon` | Icon reference (see [Icons](#icons)) |
 
-**Wildcard patterns** for `enabled_*` fields:
+**Wildcard patterns** work in every `enabled_*` field:
 
 | Pattern | Matches |
 |---|---|
 | `namespace/name` | Exact resource |
 | `namespace/*` | All active resources in that namespace |
 | `*/*` | All active resources |
+
+Only a whole name is a wildcard. Anything else with a `*` in it (`*/name`, `sales/send_*`) is refused when the agent is saved, through the API or config apply, as is a `*` where exactly one thing must be named: a hook's `function`, or a key of `function_parameters` / `query_parameters`.
+
+A named resource (`namespace/name`) is the agent author's grant and is offered to every user of the agent. A wildcard is a blanket that also sweeps in resources created later, by anyone, so it only ever expands to the resources **the chat's user may use themselves**:
+
+| Field | A wildcard reaches the resources the user has |
+|---|---|
+| `enabled_functions` | `sinas.functions/{ns}/{name}.execute` (`:own` for their own functions) |
+| `enabled_queries` | `sinas.queries/{ns}/{name}.execute:own` |
+| `enabled_pipelines` | `sinas.pipelines/{ns}/{name}.run:own` |
+| `enabled_agents` | `sinas.agents/{ns}/{name}.read:own` (as named agents) |
+| `enabled_skills` | read access to the skill |
+| `enabled_components` | read access to the component (own, shared or public with `:own`) |
+| `enabled_connectors` | read access to the connector (what running an operation through the API takes) |
+| `enabled_mcp_servers` | read access to the server (as named servers) |
+| `enabled_stores` | `sinas.stores/{ns}/{name}.read_state:own`; read-write only with `.write_state:own` too |
+| `enabled_collections` | `sinas.collections/{ns}/{name}.download:own`; read-write only with `.upload:own` too |
+
+Entries that carry settings carry them to every resource a wildcard matches: a store or collection entry's `access`, a connector entry's `operations` and `parameters`, an MCP binding's `tools`. When several entries match one resource, the most specific decides (`namespace/name` over `namespace/*` over `*/*`), so a named entry can narrow what a wildcard gives one resource; equally specific entries combine (read-write if any says so; the union of operations or tool globs).
 
 ```yaml
 enabledFunctions:
@@ -59,9 +80,19 @@ enabledMcpServers:
 enabledCollections:
   - collection: "docs/*"
     access: readonly
+enabledComponents:
+  - ui/*             # every component in ui the user may read
+enabledConnectors:
+  - connector: "apis/*"
+    operations: [get_status]   # this operation, on every matching connector
+enabledStores:
+  - store: "crm/*"
+    access: readwrite          # read-write where the user may write states
+  - store: crm/archive
+    access: readonly           # the named entry decides for this store
 ```
 
-Wildcards expand at tool discovery time. The resolved tools are validated against user permissions at execution time.
+Wildcards expand at tool discovery time, and every call is checked again at execution time against the agent's current list and the user's permissions, so a call can't reach anything discovery would not have offered.
 
 **Message hooks:** Functions that run before/after agent messages. Each hook has:
 - `function`: reference to a function (`namespace/name`)

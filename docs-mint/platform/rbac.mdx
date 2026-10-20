@@ -130,7 +130,7 @@ Agents define which tools are available (via `enabled_*` fields), but the user's
 1. **Agent declares the tool** — the resource is in the agent's `enabledFunctions`, `enabledQueries`, `enabledStores`, `enabledCollections`, or `enabledAgents`
 2. **User has the permission** — checked when the tool is actually called
 
-If the user lacks permission, the tool call returns an error that the LLM can explain to the user. Tools are still visible to the LLM regardless — the check happens at execution, not discovery.
+If the user lacks permission, the tool call returns an error that the LLM can explain to the user. Tools the agent names exactly are still visible to the LLM regardless — the check happens at execution, not discovery. A wildcard entry (`sales/*`, `*/*`) is different: it only expands to resources the user may use, so it never offers a tool the user's own permissions would refuse (see [wildcard patterns](/build-resources/agents)).
 
 | Resource | Agent config | Permission checked at execution |
 |---|---|---|
