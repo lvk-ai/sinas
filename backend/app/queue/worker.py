@@ -189,22 +189,27 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     await redis.set(f"{JOB_STATUS_PREFIX}{job_id}", json.dumps(running), ex=JOB_TTL)
 
     async def schedule_retry(error: str, kind: str, attempt: int, max_attempts: int) -> None:
-        """Count the failed attempt and re-run the job after a backoff."""
-        await redis.set(failures_key, json.dumps({**failures, kind: attempt}), ex=JOB_TTL)
+        """Count the failed attempt and re-run the job after a backoff. The
+        re-run never hinges on these writes: Redis may be what just failed
+        (a lost count only means an extra attempt, bounded by arq's cap)."""
         defer = _retry_backoff(attempt)
         detail = (
             f"attempt {attempt} of {max_attempts} failed, retrying in {defer:.0f}s: {error}"
         )
-        await redis.set(
-            f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({
-                **base_fields,
-                "status": "queued",
-                "attempt": failed_attempts + 1,
-                "detail": detail,
-            }),
-            ex=JOB_TTL,
-        )
+        try:
+            await redis.set(failures_key, json.dumps({**failures, kind: attempt}), ex=JOB_TTL)
+            await redis.set(
+                f"{JOB_STATUS_PREFIX}{job_id}",
+                json.dumps({
+                    **base_fields,
+                    "status": "queued",
+                    "attempt": failed_attempts + 1,
+                    "detail": detail,
+                }),
+                ex=JOB_TTL,
+            )
+        except Exception:
+            logger.warning(f"Could not record the retry of job {job_id}", exc_info=True)
         logger.warning(f"Function job {job_id}: {detail}")
         raise Retry(defer=defer)
 
@@ -692,15 +697,17 @@ class WorkerSettings:
     # window, the failure count). arq's cap is only a backstop and must
     # never fire first, or a job dies without its failure bookkeeping:
     # the worst-case deferral count (≈ window / 30s backoff cap) plus the
-    # most failed attempts any job may make. For window=0 (wait forever),
-    # an effectively unlimited budget.
+    # most failed attempts any job may make — both budgets, since a job can
+    # use up its infrastructure retries and its function retries — plus the
+    # final run. For window=0 (wait forever), an effectively unlimited budget.
     max_tries = (
         (
             settings.queue_saturation_timeout_seconds // 30 + 10
             if settings.queue_saturation_timeout_seconds > 0
             else 1_000_000
         )
-        + max(settings.queue_max_retries, MAX_FUNCTION_RETRIES)
+        + settings.queue_max_retries
+        + MAX_FUNCTION_RETRIES
         + 1
     )
 

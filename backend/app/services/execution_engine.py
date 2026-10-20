@@ -422,6 +422,9 @@ class FunctionExecutor:
             # Set once the code is handed to an executor: a failure before
             # that is never the function's own.
             dispatched = False
+            # Set once the code returned a valid result: from then on nothing
+            # is retried (it would run the function a second time).
+            succeeded = False
             try:
                 # `function` and `function_timeout` were loaded above (they
                 # parameterized the access-token TTL).
@@ -532,6 +535,7 @@ class FunctionExecutor:
                 # Validate output
                 if function.output_schema:
                     await self.validate_schema(result, function.output_schema)
+                succeeded = True
 
                 # Update execution record
                 execution.status = ExecutionStatus.COMPLETED
@@ -544,30 +548,39 @@ class FunctionExecutor:
 
                 await db.commit()
 
-                # Log execution completion to Redis
-                await clickhouse_logger.log_execution_end(
-                    execution_id, "completed", result, None, duration_ms
-                )
-
-                if callback_url:
-                    await _fire_callback(
-                        db=db,
-                        execution=execution,
-                        callback_url=callback_url,
-                        user_id=user_id,
-                        user_email=user_email,
-                        status="success",
-                        result=result,
-                        error=None,
-                        trigger_id=trigger_id,
-                        function_namespace=function_namespace,
-                        function_name=function_name,
+                # The run succeeded and is committed: whatever goes wrong in
+                # the bookkeeping below is no reason to fail it, let alone
+                # run the function again.
+                try:
+                    # Log execution completion to Redis
+                    await clickhouse_logger.log_execution_end(
+                        execution_id, "completed", result, None, duration_ms
                     )
 
-                if execution.batch_id is not None:
-                    from app.services import batch_service
-                    await batch_service.on_execution_terminated(
-                        db=db, batch_id=execution.batch_id,
+                    if callback_url:
+                        await _fire_callback(
+                            db=db,
+                            execution=execution,
+                            callback_url=callback_url,
+                            user_id=user_id,
+                            user_email=user_email,
+                            status="success",
+                            result=result,
+                            error=None,
+                            trigger_id=trigger_id,
+                            function_namespace=function_namespace,
+                            function_name=function_name,
+                        )
+
+                    if execution.batch_id is not None:
+                        from app.services import batch_service
+                        await batch_service.on_execution_terminated(
+                            db=db, batch_id=execution.batch_id,
+                        )
+                except Exception:
+                    logger.error(
+                        f"Bookkeeping after the successful execution {execution_id} failed",
+                        exc_info=True,
                     )
 
                 return result
@@ -587,7 +600,11 @@ class FunctionExecutor:
                 transient = isinstance(e, ExecutorUnavailable) or (
                     not dispatched and is_transient_infra_error(e)
                 )
-                if transient:
+                if succeeded:
+                    # The code ran to a valid result; only saving it failed.
+                    # Running it again would repeat its side effects.
+                    kind, max_retries = FUNCTION, 0
+                elif transient:
                     kind, max_retries = INFRASTRUCTURE, settings.queue_max_retries
                 elif dispatched and not isinstance(e, SchemaValidationError):
                     kind, max_retries = FUNCTION, function.max_retries or 0

@@ -258,6 +258,98 @@ class TestUserCodeFailure:
         assert f"{JOB_FAILURES_PREFIX}{row.execution_id}" not in redis.store
 
 
+class TestSucceededRunsAreNeverRepeated:
+    async def test_bookkeeping_error_after_success_keeps_the_result(
+        self, db, test_user, use_test_db, sandbox, monkeypatch
+    ):
+        """The batch update after a committed success fails: the job still
+        succeeds — no retry, no second run, row stays COMPLETED."""
+        from app.queue import worker
+
+        fn = await _function(db, test_user, max_retries=3)
+        row = await _pending_row(db, test_user, fn)
+        from app.models.batch import Batch, BatchKind, BatchStatus
+
+        now = datetime.utcnow()
+        batch = Batch(
+            user_id=test_user.id, kind=BatchKind.FUNCTION, target_namespace=fn.namespace,
+            target_name=fn.name, total=1, status=BatchStatus.QUEUED, started_at=now, created_at=now,
+        )
+        db.add(batch)
+        await db.commit()
+        row.batch_id = batch.id
+        await db.commit()
+        fake = sandbox(ExecutionResult.from_wire({"result": 7, "status": "completed"}))
+
+        async def batch_down(**kwargs):
+            raise ConnectionResetError("db gone")
+
+        monkeypatch.setattr("app.services.batch_service.on_execution_terminated", batch_down)
+        redis = _FakeRedis()
+        delays, exc = await _run_until_final(worker, redis, _kwargs(fn, row, test_user))
+
+        assert (delays, exc, fake.calls) == ([], None, 1)
+        await db.refresh(row)
+        assert row.status == ExecutionStatus.COMPLETED and row.output_data == 7
+
+    async def test_failing_to_save_a_success_does_not_rerun(
+        self, db, test_user, use_test_db, sandbox, monkeypatch
+    ):
+        """Even an opted-in function is not retried when only saving its
+        result failed: that would run it twice."""
+        from sqlalchemy.exc import OperationalError
+
+        fn = await _function(db, test_user, max_retries=3)
+        row = await _pending_row(db, test_user, fn)
+        sandbox(ExecutionResult.from_wire({"result": 7, "status": "completed"}))
+        real_commit, broken = db.commit, {"once": True}
+
+        async def commit():
+            if broken.pop("once", False):
+                raise OperationalError("COMMIT", {}, ConnectionResetError("reset"))
+            await real_commit()
+
+        async def rollback():
+            pass
+
+        monkeypatch.setattr(db, "commit", commit)
+        monkeypatch.setattr(db, "rollback", rollback)
+
+        with pytest.raises(FunctionExecutionError) as exc:
+            await executor.execute_function(
+                function_namespace=fn.namespace, function_name=fn.name, input_data={},
+                execution_id=row.execution_id, trigger_type="API", trigger_id="test",
+                user_id=str(test_user.id), prior_failures={},
+            )
+        assert not exc.value.dead_letter  # final; nothing to requeue either
+
+
+class TestRetrySchedulingWithoutRedis:
+    async def test_retry_is_raised_even_if_status_writes_fail(self, test_user, monkeypatch):
+        from app.queue import worker
+
+        async def engine(**kwargs):
+            raise ExecutionRetryScheduled(
+                "pod failed", kind=INFRASTRUCTURE, attempt=1, max_attempts=4
+            )
+
+        monkeypatch.setattr(executor, "execute_function", engine)
+
+        class _FlakyRedis(_FakeRedis):
+            async def set(self, key, value, ex=None):
+                if JOB_FAILURES_PREFIX in key or '"queued"' in str(value):
+                    raise ConnectionError("redis down")
+                await super().set(key, value, ex=ex)
+
+        kwargs = {
+            "job_id": "j3", "function_namespace": "default", "function_name": "f",
+            "input_data": {}, "execution_id": str(uuid.uuid4()), "trigger_type": "API",
+            "trigger_id": "t", "user_id": str(test_user.id),
+        }
+        with pytest.raises(Retry):
+            await worker.execute_function_job({"redis": _FlakyRedis(), "job_try": 1}, **kwargs)
+
+
 class TestInfrastructureFailure:
     async def test_retries_with_backoff_then_dead_letters(
         self, db, test_user, use_test_db, sandbox, monkeypatch
@@ -738,8 +830,11 @@ class TestWorkerSettings:
         from app.queue.worker import WorkerSettings
         from app.schemas.spec.function import MAX_FUNCTION_RETRIES
 
-        floor = settings.queue_saturation_timeout_seconds // 30 + max(
-            settings.queue_max_retries, MAX_FUNCTION_RETRIES
+        # Deferrals + both retry budgets (a job can use up each) + the last run
+        floor = (
+            settings.queue_saturation_timeout_seconds // 30
+            + settings.queue_max_retries
+            + MAX_FUNCTION_RETRIES
         )
         assert WorkerSettings.max_tries > floor
         assert not hasattr(WorkerSettings, "retry_delay")  # arq never read it
