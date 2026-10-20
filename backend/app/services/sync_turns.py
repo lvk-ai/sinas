@@ -104,8 +104,8 @@ class RoundFollower:
         self.last_id = last_id
         self.status = TURN_IN_PROGRESS
         self.error: Optional[str] = None
-        # The `error` event the turn failed with (its `code`, when the LLM
-        # call was refused: budget_exceeded, rate_limited).
+        # The `error` event the turn failed with (with the error envelope's
+        # `code` when it has one: budget_exceeded, provider_unavailable, ...).
         self.error_event: Optional[dict[str, Any]] = None
         # One entry per continuation run that ended on the channel: its
         # reported usage, or None when it reported none.
@@ -216,17 +216,19 @@ async def settle_turn(
     """Complete a synchronous turn's result: follow an "in_progress" round
     on `channel_id` (from `follow_from`) within `budget` seconds, then read
     what the turn ended in. `usage_parts`: the usage of the request's own
-    calls (empty when it made none). Raises TurnFailed when the
-    continuation failed."""
+    calls (empty when it made none). Raises the continuation's LLMError
+    when it failed with a code, else TurnFailed."""
     if status == TURN_IN_PROGRESS and channel_id:
         follower = await RoundFollower(channel_id, timeout=budget, last_id=follow_from).run()
         usage_parts = [*usage_parts, *follower.usages]
         if follower.status == "failed":
-            from app.providers.errors import LLMRefusalError, refusal_code
+            from app.providers.errors import LLMError, error_code
 
-            if refusal_code(follower.error_event or {}):
-                # budget_exceeded / rate_limited: the API answers it as such.
-                raise LLMRefusalError.from_event(follower.error_event)
+            if error_code(follower.error_event or {}):
+                # A failure with a code (budget_exceeded, rate_limited,
+                # provider_unavailable, ...): the API answers it with its
+                # status and the error envelope.
+                raise LLMError.from_event(follower.error_event)
             raise TurnFailed(follower.error)
         status = follower.status
         if status != TURN_IN_PROGRESS:

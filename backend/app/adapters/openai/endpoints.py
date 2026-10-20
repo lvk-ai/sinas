@@ -19,6 +19,7 @@ from app.models.chat import Chat
 from app.models.llm_provider import LLMProvider
 from app.models.user import User
 from app.providers import create_provider
+from app.providers.errors import INTERNAL_ERROR, LLMError, error_code, openai_error_body
 from app.services import sync_turns
 from app.services.deferred_completions import ROUND_SUSPENDED
 from app.services.message_service import MessageService
@@ -39,6 +40,13 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _sse_error(error: LLMError) -> str:
+    """A failed call or turn on a stream, as OpenAI sends one: a `data:` line
+    of `{"error": {...}}` (the error envelope in OpenAI's format), which the
+    OpenAI SDKs raise as an APIError."""
+    return f"data: {json.dumps(openai_error_body(error))}\n\n"
 
 
 async def _resolve_model(
@@ -341,6 +349,12 @@ async def _agent_stream(
                 if not isinstance(chunk, dict):
                     continue
                 kind = chunk.get("type")
+                if kind == "error" and error_code(chunk):
+                    # The turn failed (its reason is in the chat too): the
+                    # stream ends on it, in OpenAI's error format.
+                    yield _sse_error(LLMError.from_event(chunk))
+                    yield "data: [DONE]\n\n"
+                    return
                 if kind == "input_required":
                     asked = True
                 elif kind == ROUND_SUSPENDED:
@@ -365,6 +379,10 @@ async def _agent_stream(
             if follower.status == "input_required":
                 questions = await sync_turns.open_questions(db, chat_id)
             elif follower.status == "failed":
+                if error_code(follower.error_event or {}):
+                    yield _sse_error(LLMError.from_event(follower.error_event))
+                    yield "data: [DONE]\n\n"
+                    return
                 yield sse(DeltaContent(content=f"\n\n[The agent's turn failed: {follower.error}]"))
             elif follower.status != "completed":
                 yield sse(DeltaContent(content=f"\n\n{_STILL_WORKING}"))
@@ -464,33 +482,42 @@ async def _passthrough_stream(
         )
         yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-        async for chunk in llm_provider.stream(
-            messages=messages,
-            model=model_name,
-            **kwargs,
-        ):
-            chunk = show(chunk)
-            if chunk is None:
-                continue
-            thinking = chunk.get("thinking")
-            # "" counts: the model has started thinking, text or not.
-            if thinking is not None:
-                data_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[StreamChoice(delta=DeltaContent(reasoning_content=thinking))],
-                )
-                yield f"data: {data_chunk.model_dump_json()}\n\n"
-            text = chunk.get("content", "")
-            if text:
-                data_chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[StreamChoice(delta=DeltaContent(content=text))],
-                )
-                yield f"data: {data_chunk.model_dump_json()}\n\n"
+        try:
+            async for chunk in llm_provider.stream(
+                messages=messages,
+                model=model_name,
+                **kwargs,
+            ):
+                chunk = show(chunk)
+                if chunk is None:
+                    continue
+                thinking = chunk.get("thinking")
+                # "" counts: the model has started thinking, text or not.
+                if thinking is not None:
+                    data_chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=model_name,
+                        choices=[StreamChoice(delta=DeltaContent(reasoning_content=thinking))],
+                    )
+                    yield f"data: {data_chunk.model_dump_json()}\n\n"
+                text = chunk.get("content", "")
+                if text:
+                    data_chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=model_name,
+                        choices=[StreamChoice(delta=DeltaContent(content=text))],
+                    )
+                    yield f"data: {data_chunk.model_dump_json()}\n\n"
+        except Exception as e:
+            # The response has started: the failure goes on the stream, in
+            # OpenAI's error format, rather than cutting it off.
+            logger.warning(f"Passthrough stream to {model_name} failed: {e}")
+            typed = e if isinstance(e, LLMError) else LLMError(INTERNAL_ERROR, "The LLM call failed")
+            yield _sse_error(typed)
+            yield "data: [DONE]\n\n"
+            return
 
         final_chunk = ChatCompletionChunk(
             id=chunk_id,

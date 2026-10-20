@@ -23,9 +23,62 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from .base import BaseLLMProvider
-from .errors import LLMRefusalError, refusal_from_exception
+from .errors import LLMError, error_from_exception
 
 logger = logging.getLogger(__name__)
+
+# The finish reasons llm_usage records (`finish_reason`), whatever the
+# provider calls them; the provider's own value is kept in
+# `finish_reason_raw`.
+FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "error", "other")
+# The `error` of a call cancelled while it waited on the model API.
+CANCELLED = "cancelled"
+_FINISH_REASON_ALIASES = {
+    # OpenAI, Azure, Gemini (OpenAI-compatible), Mistral, Ollama
+    "stop": "stop",
+    "length": "length",
+    "tool_calls": "tool_calls",
+    "function_call": "tool_calls",
+    "content_filter": "content_filter",
+    "error": "error",
+    "model_length": "length",
+    # Anthropic
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "model_context_window_exceeded": "length",
+    "tool_use": "tool_calls",
+    "refusal": "content_filter",
+    # Gemini's native names, as some gateways pass them on
+    "max_output_tokens": "length",
+    "safety": "content_filter",
+    "recitation": "content_filter",
+    "blocklist": "content_filter",
+    "prohibited_content": "content_filter",
+    "spii": "content_filter",
+    "image_safety": "content_filter",
+    "malformed_function_call": "error",
+}
+
+
+def normalize_finish_reason(raw: Any) -> Optional[str]:
+    """One of FINISH_REASONS for a provider's finish/stop reason, or None
+    when it gave none. Unknown values are "other"."""
+    text = raw_finish_reason(raw)
+    if text is None:
+        return None
+    text = text.lower()
+    if text.startswith("finish_reason_"):  # FINISH_REASON_STOP and the like
+        text = text[len("finish_reason_"):]
+    return _FINISH_REASON_ALIASES.get(text, "other")
+
+
+def raw_finish_reason(raw: Any) -> Optional[str]:
+    """The provider's own finish reason as text (an SDK enum's value)."""
+    if raw is None:
+        return None
+    text = str(getattr(raw, "value", raw)).strip()
+    return text[:50] or None
 
 # Context keys recognized on llm_usage rows (all optional):
 # user_id, chat_id, message_id, agent, source, and customer (the
@@ -170,12 +223,13 @@ class UsageTrackingProvider(BaseLLMProvider):
         self._context = context or {}
         self._budget_rules = budget_rules or []
 
-    def _refusal(self, error: BaseException) -> Optional[LLMRefusalError]:
-        """The typed refusal (budget_exceeded, rate_limited) a provider error
-        stands for, if any (app/providers/errors.py)."""
+    def _classify(self, error: BaseException, model: Optional[str] = None) -> Optional[LLMError]:
+        """The typed error (budget_exceeded, rate_limited, provider_timeout,
+        ...) a provider error stands for, if any (app/providers/errors.py)."""
         try:
-            return refusal_from_exception(error, self._budget_rules, self._provider_name)
+            return error_from_exception(error, self._budget_rules, self._provider_name, model)
         except Exception:  # classifying must never hide the original error
+            logger.debug("Classifying an LLM error failed", exc_info=True)
             return None
 
     def _record(
@@ -186,8 +240,14 @@ class UsageTrackingProvider(BaseLLMProvider):
         latency_ms: int,
         streamed: bool,
         error: Optional[str] = None,
+        finish_reason: Any = None,
     ) -> None:
         usage = usage or {}
+        normalized = normalize_finish_reason(finish_reason)
+        if error is not None and error != "stream_abandoned":
+            # The call failed, even if a finish reason arrived first (OpenAI
+            # sends it before the usage chunk); finish_reason_raw keeps it.
+            normalized = "error"
         values = {
             "provider_name": self._provider_name,
             "provider_type": self._provider_type,
@@ -200,6 +260,8 @@ class UsageTrackingProvider(BaseLLMProvider):
             "latency_ms": latency_ms,
             "streamed": streamed,
             "error": error,
+            "finish_reason": normalized,
+            "finish_reason_raw": raw_finish_reason(finish_reason),
         }
         for key in _CONTEXT_KEYS:
             if self._context.get(key) is not None:
@@ -231,23 +293,35 @@ class UsageTrackingProvider(BaseLLMProvider):
                 max_tokens=max_tokens,
                 **kwargs,
             )
-        except Exception as e:
-            refusal = self._refusal(e)
+        except asyncio.CancelledError:
+            # Cancelled while waiting on the model API (the job's timeout, a
+            # shutdown): recorded as a failed call, then cancelled as asked.
             self._record(
                 model=model,
                 usage=None,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 streamed=False,
-                error=str(refusal or e)[:2000],
+                error=CANCELLED,
             )
-            if refusal is not None:
-                raise refusal from e
+            raise
+        except Exception as e:
+            typed = self._classify(e, model)
+            self._record(
+                model=model,
+                usage=None,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                streamed=False,
+                error=str(typed or e)[:2000],
+            )
+            if typed is not None:
+                raise typed from e
             raise
         self._record(
             model=model,
             usage=response.get("usage"),
             latency_ms=int((time.monotonic() - start) * 1000),
             streamed=False,
+            finish_reason=response.get("finish_reason"),
         )
         return response
 
@@ -263,6 +337,7 @@ class UsageTrackingProvider(BaseLLMProvider):
         start = time.monotonic()
         usage: Optional[dict[str, int]] = None
         error: Optional[str] = None
+        finish_reason: Any = None
         try:
             async for chunk in self._inner.stream(
                 messages=messages,
@@ -274,17 +349,24 @@ class UsageTrackingProvider(BaseLLMProvider):
             ):
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                if chunk.get("finish_reason"):
+                    finish_reason = chunk["finish_reason"]
                 yield chunk
         except GeneratorExit:
             # Consumer abandoned the stream (e.g. client disconnect);
             # record whatever arrived before the cutoff.
             error = "stream_abandoned"
             raise
+        except asyncio.CancelledError:
+            # Cancelled while waiting on the model API (the job's timeout, a
+            # shutdown): the call failed, whatever arrived before.
+            error = CANCELLED
+            raise
         except Exception as e:
-            refusal = self._refusal(e)
-            error = str(refusal or e)[:2000]
-            if refusal is not None:
-                raise refusal from e
+            typed = self._classify(e, model)
+            error = str(typed or e)[:2000]
+            if typed is not None:
+                raise typed from e
             raise
         finally:
             self._record(
@@ -293,6 +375,7 @@ class UsageTrackingProvider(BaseLLMProvider):
                 latency_ms=int((time.monotonic() - start) * 1000),
                 streamed=True,
                 error=error,
+                finish_reason=finish_reason,
             )
 
     def format_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:
@@ -314,9 +397,9 @@ class UsageTrackingProvider(BaseLLMProvider):
         try:
             return await self._inner.submit_batch(requests)
         except Exception as e:
-            refusal = self._refusal(e)
-            if refusal is not None:
-                raise refusal from e
+            typed = self._classify(e)
+            if typed is not None:
+                raise typed from e
             raise
 
     async def get_batch_status(self, provider_batch_id: str) -> dict[str, Any]:

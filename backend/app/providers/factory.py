@@ -11,6 +11,7 @@ from .anthropic_provider import AnthropicProvider
 from .azure_openai_provider import AzureOpenAIProvider
 from .gemini_provider import GeminiProvider
 from .base import BaseLLMProvider
+from .errors import PROVIDER_NOT_CONFIGURED, LLMError
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .openai_provider import OpenAIProvider
@@ -76,6 +77,23 @@ def validate_provider_overrides(overrides: Any) -> list[str]:
     return errors
 
 
+def provider_not_configured(provider_name: Optional[str]) -> LLMError:
+    """The `provider_not_configured` error for a provider that can't be used:
+    the named one (missing or inactive), or no active default. Says what an
+    admin can do about it, and nothing about the provider's configuration."""
+    if provider_name:
+        message = (
+            f"LLM provider '{provider_name}' is not available: it doesn't exist or is inactive. "
+            "An admin can activate it under LLM Providers, or set another provider for this agent."
+        )
+    else:
+        message = (
+            "No LLM provider is configured. An admin can add one under LLM Providers "
+            "(and make it the default), or set this agent's provider."
+        )
+    return LLMError(PROVIDER_NOT_CONFIGURED, message, provider=provider_name)
+
+
 def _override_is_valid(key: str, value: Any) -> bool:
     spec = AGENT_OVERRIDABLE.get(key)
     if spec is None:
@@ -94,6 +112,45 @@ def _apply_overrides(provider: BaseLLMProvider, overrides: Optional[dict[str, An
             attribute = AGENT_OVERRIDABLE[key][1]
             if hasattr(provider, attribute):
                 setattr(provider, attribute, value)
+
+
+def _build_provider(provider_config: Any, provider_type: str, api_key: Optional[str]) -> BaseLLMProvider:
+    """The provider instance for a provider row of `provider_type`."""
+    base_url = provider_config.api_endpoint or None
+
+    if provider_type == "openai":
+        return OpenAIProvider(api_key=api_key, base_url=base_url)
+    elif provider_type in ("azure", "azure_openai"):
+        config = provider_config.config or {}
+        return AzureOpenAIProvider(
+            api_key=api_key,
+            azure_endpoint=base_url,
+            api_version=config.get("api_version"),
+            azure_deployment=config.get("azure_deployment"),
+            max_tokens_param=config.get("max_tokens_param"),
+            drop_params=config.get("drop_params"),
+            extra_params=config.get("extra_params"),
+        )
+    elif provider_type == "gemini":
+        return GeminiProvider(api_key=api_key, base_url=base_url)
+    elif provider_type == "mistral":
+        return MistralProvider(api_key=api_key, base_url=base_url)
+    elif provider_type == "anthropic":
+        config = provider_config.config or {}
+        return AnthropicProvider(
+            api_key=api_key,
+            base_url=base_url,
+            enable_prompt_caching=config.get("prompt_caching", True),
+        )
+    elif provider_type == "ollama":
+        return OllamaProvider(base_url=base_url or "http://localhost:11434")
+    else:
+        raise LLMError(
+            PROVIDER_NOT_CONFIGURED,
+            f"LLM provider '{provider_config.name}' has an unsupported type '{provider_type}'. "
+            "An admin can fix it under LLM Providers.",
+            provider=provider_config.name,
+        )
 
 
 async def create_provider(
@@ -122,7 +179,8 @@ async def create_provider(
         complete()/stream() call is recorded in the llm_usage table
 
     Raises:
-        ValueError: If provider is unknown or not found
+        LLMError: `provider_not_configured`, when the provider is not found,
+            inactive, or of an unknown type (app/providers/errors.py)
     """
     from app.models import LLMProvider
 
@@ -151,46 +209,30 @@ async def create_provider(
 
     provider_config = config if result is None else result.scalar_one_or_none()
     if not provider_config:
-        raise ValueError(f"No active LLM provider found for: {provider_name or 'default'}")
-
-    # Decrypt API key if present
-    api_key = None
-    if provider_config.api_key:
-        encryption_service = EncryptionService()
-        api_key = encryption_service.decrypt(provider_config.api_key)
+        raise provider_not_configured(provider_name)
 
     # Create provider instance based on type
     provider_type = provider_config.provider_type.lower()
-    base_url = provider_config.api_endpoint or None
-
-    if provider_type == "openai":
-        provider = OpenAIProvider(api_key=api_key, base_url=base_url)
-    elif provider_type in ("azure", "azure_openai"):
-        config = provider_config.config or {}
-        provider = AzureOpenAIProvider(
-            api_key=api_key,
-            azure_endpoint=base_url,
-            api_version=config.get("api_version"),
-            azure_deployment=config.get("azure_deployment"),
-            max_tokens_param=config.get("max_tokens_param"),
-            drop_params=config.get("drop_params"),
-            extra_params=config.get("extra_params"),
-        )
-    elif provider_type == "gemini":
-        provider = GeminiProvider(api_key=api_key, base_url=base_url)
-    elif provider_type == "mistral":
-        provider = MistralProvider(api_key=api_key, base_url=base_url)
-    elif provider_type == "anthropic":
-        config = provider_config.config or {}
-        provider = AnthropicProvider(
-            api_key=api_key,
-            base_url=base_url,
-            enable_prompt_caching=config.get("prompt_caching", True),
-        )
-    elif provider_type == "ollama":
-        provider = OllamaProvider(base_url=base_url or "http://localhost:11434")
-    else:
-        raise ValueError(f"Unknown provider type: {provider_type}")
+    try:
+        # Decrypt API key if present
+        api_key = None
+        if provider_config.api_key:
+            encryption_service = EncryptionService()
+            api_key = encryption_service.decrypt(provider_config.api_key)
+        provider = _build_provider(provider_config, provider_type, api_key)
+    except LLMError:
+        raise
+    except Exception as e:
+        # An incomplete or invalid configuration (no API key, no endpoint,
+        # ...): the details go to the log, not to whoever's turn it was.
+        logger.warning(f"LLM provider '{provider_config.name}' could not be set up: {e}")
+        raise LLMError(
+            PROVIDER_NOT_CONFIGURED,
+            f"LLM provider '{provider_config.name}' could not be set up: its configuration is "
+            "incomplete or invalid (such as a missing API key or endpoint). An admin can fix it "
+            "under LLM Providers.",
+            provider=provider_config.name,
+        ) from e
 
     # Provider-level only, never per agent: whether a call carries the trace
     # context and baggage to the model API (see BaseLLMProvider).

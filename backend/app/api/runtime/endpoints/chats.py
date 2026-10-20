@@ -25,6 +25,7 @@ from app.models.chat import Chat
 from app.models.pending_approval import PendingToolApproval
 from app.models.user import User
 from app.providers.attribution import new_chat_attribution
+from app.providers.errors import ENVELOPE_KEYS, INTERNAL_ERROR, JOB_TIMEOUT, LLMError
 from app.providers.factory import create_provider
 from app.providers.tracking import UsageCollector, collect_usage
 from app.schemas.agent import AgentResponse
@@ -166,6 +167,17 @@ def round_waits_only_on_user(event: dict, asked: dict[str, Optional[str]]) -> bo
     return True
 
 
+def _error_payload(event: dict) -> dict:
+    """An SSE `error` event's data: the message under `error`, and the error
+    envelope (`code`, `retryable`, `upstream_status`, ...) when the failure
+    has one (app/providers/errors.py)."""
+    payload = {"error": event.get("error") or "An error occurred"}
+    for key in ENVELOPE_KEYS:
+        if event.get(key) is not None:
+            payload[key] = event[key]
+    return payload
+
+
 # Stream events relayed under their own SSE event name; anything else is a
 # `message` event.
 TYPED_EVENTS = ("approval_required", "tool_start", "tool_end", "input_required", "round_suspended")
@@ -214,10 +226,7 @@ async def _relay_one_channel(
             yield {"event": "done", "data": json.dumps({"status": "completed"})}
             return
         elif event_type == "error":
-            error = {"error": event.get("error", "An error occurred")}
-            if event.get("code"):  # a refused LLM call: budget_exceeded, rate_limited
-                error["code"] = event["code"]
-            yield {"event": "error", "data": json.dumps(error)}
+            yield {"event": "error", "data": json.dumps(_error_payload(event))}
             return
         elif event_type in TYPED_EVENTS:
             yield {"event": event_type, "data": json.dumps(event)}
@@ -476,7 +485,10 @@ async def invoke_agent(
     # collected for the response's usage; see app/providers/tracking.py.
     timeout = agent.default_job_timeout or settings.function_timeout or 300
     started = asyncio.get_running_loop().time()
-    with collect_usage() as usage_collector:
+    # An LLM call's retry never waits past the timeout (app/services/llm_retry.py).
+    from app.services.chat_steering import job_deadline
+
+    with collect_usage() as usage_collector, job_deadline(timeout):
         try:
             turn = await asyncio.wait_for(
                 message_service.run_turn(
@@ -488,7 +500,7 @@ async def invoke_agent(
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            raise HTTPException(504, "Agent execution timed out")
+            raise LLMError(JOB_TIMEOUT, f"Agent execution timed out after {timeout}s")
 
     # 6. Return response — following a round that waits on background work
     # for the rest of the time budget (sync_turns).
@@ -758,12 +770,13 @@ async def stream_message(
                     # Route special event types to their own SSE event names
                     chunk_type = chunk.get("type")
                     if chunk_type == "error" and chunk.get("code"):
-                        # A refused LLM call (budget_exceeded, rate_limited):
-                        # the turn ends on it, as an `error` event with its
-                        # code, like a queued stream's. The turn already
-                        # stored its error reply; nothing partial to save.
+                        # A failed turn (a refused or failed LLM call, no
+                        # provider, ...): it ends on it, as an `error` event
+                        # with the error envelope, like a queued stream's. The
+                        # turn already stored its error reply; nothing partial
+                        # to save.
                         accumulated_content["content"] = ""
-                        yield {"event": "error", "data": json.dumps({"error": chunk.get("error"), "code": chunk["code"]})}
+                        yield {"event": "error", "data": json.dumps(_error_payload(chunk))}
                         return
                     if chunk_type in TYPED_EVENTS:
                         yield {"event": chunk_type, "data": json.dumps(chunk)}
@@ -843,13 +856,13 @@ async def stream_message(
                 except Exception as save_error:
                     logger.error(f"Failed to save partial message after error: {save_error}")
 
-            yield {
-                "event": "error",
-                "data": json.dumps({
-                    "error": "An error occurred while processing your message. Please try again.",
-                    "details": str(e) if logger.level <= logging.DEBUG else None,
-                })
-            }
+            message = "An error occurred while processing your message. Please try again."
+            payload = {"error": message, "details": str(e) if logger.level <= logging.DEBUG else None}
+            if isinstance(e, LLMError):
+                payload.update(_error_payload(e.event_fields()))
+            else:
+                payload.update(LLMError(INTERNAL_ERROR, message).to_dict())
+            yield {"event": "error", "data": json.dumps(payload)}
 
     return EventSourceResponse(with_heartbeat(event_generator()))
 

@@ -60,9 +60,9 @@ class PipelineBusyError(Exception):
 
 
 class StepError(Exception):
-    """A step failed after exhausting its retries. `code`: the refusal code
-    when an agent step's LLM call was refused (budget_exceeded,
-    rate_limited; app/providers/errors.py)."""
+    """A step failed after exhausting its retries. `code`: the error code an
+    agent step's turn failed with (budget_exceeded, rate_limited,
+    provider_not_configured, ...; app/providers/errors.py)."""
 
     def __init__(self, message: str, code: Optional[str] = None):
         super().__init__(message)

@@ -30,6 +30,7 @@
               "platform/verifying-tokens",
               "platform/rbac",
               "platform/api-overview",
+      "platform/errors",
               "platform/async-jobs"
             ]
           },
