@@ -34,6 +34,7 @@ const GROUPS: Array<{ value: UsageDimension; label: string }> = [
   { value: 'source', label: 'Source' },
   { value: 'batch', label: 'Batch / regular' },
   { value: 'chat', label: 'Chat' },
+  { value: 'customer', label: 'Customer' },
   { value: 'day', label: 'Day' },
 ];
 

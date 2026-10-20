@@ -225,6 +225,13 @@ app.mount("/adapters/openai", adapters_openai_app)
 # Include runtime API routes (root level)
 app.include_router(runtime_router)
 
+# An LLM call refused for budget or rate (budget_exceeded, rate_limited)
+# answers with its own status and code, on every app (app/providers/errors.py).
+from app.providers.errors import install_refusal_handler
+
+for _api in (app, management_app, adapters_openai_app):
+    install_refusal_handler(_api)
+
 # Console SPA served from this process (lite profile — replaces the console
 # container). app.frontend() is only consulted when no API route matched, so
 # the runtime routes above keep priority; the console owning exactly the /ui

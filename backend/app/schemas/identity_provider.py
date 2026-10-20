@@ -14,6 +14,11 @@ class RoleMapping(BaseModel):
     roles: list[str]
 
 
+class ClaimMapping(BaseModel):
+    claim: str  # a dotted path in the ID token / userinfo claims
+    field: str  # the users.custom_fields key it is copied to
+
+
 class IdentityProviderCreate(BaseModel):
     name: str
     display_name: str
@@ -24,6 +29,7 @@ class IdentityProviderCreate(BaseModel):
     email_claim: Optional[str] = None
     groups_claim: Optional[str] = None
     role_mappings: list[RoleMapping] = Field(default_factory=list)
+    claim_mappings: list[ClaimMapping] = Field(default_factory=list)
     allowed_domains: list[str] = Field(default_factory=list)
     auto_provision: bool = False
     default_role: Optional[str] = None
@@ -47,6 +53,7 @@ class IdentityProviderUpdate(BaseModel):
     email_claim: Optional[str] = None
     groups_claim: Optional[str] = None
     role_mappings: Optional[list[RoleMapping]] = None
+    claim_mappings: Optional[list[ClaimMapping]] = None
     allowed_domains: Optional[list[str]] = None
     auto_provision: Optional[bool] = None
     default_role: Optional[str] = None
@@ -66,6 +73,7 @@ class IdentityProviderResponse(BaseModel):
     email_claim: str
     groups_claim: str
     role_mappings: list[RoleMapping]
+    claim_mappings: list[ClaimMapping] = Field(default_factory=list)
     allowed_domains: list[str]
     auto_provision: bool
     default_role: Optional[str]
@@ -87,6 +95,7 @@ class IdentityProviderResponse(BaseModel):
             client_id=row.client_id, client_secret=row.client_secret, scopes=list(row.scopes or []),
             email_claim=row.email_claim, groups_claim=row.groups_claim,
             role_mappings=[RoleMapping(**rule) for rule in row.role_mappings or []],
+            claim_mappings=[ClaimMapping(**m) for m in row.claim_mappings or []],
             allowed_domains=list(row.allowed_domains or []), auto_provision=bool(row.auto_provision),
             default_role=row.default_role, enforce_for_domains=list(row.enforce_for_domains or []),
             session_hours=row.session_hours, is_active=row.is_active is not False,

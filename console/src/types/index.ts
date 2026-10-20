@@ -893,6 +893,12 @@ export interface RoleMapping {
   roles: string[];
 }
 
+/** Copies a claim (a dotted path) into a user custom field at every sign-in. */
+export interface ClaimMapping {
+  claim: string;
+  field: string;
+}
+
 export interface IdentityProvider {
   id: string;
   name: string;
@@ -904,6 +910,7 @@ export interface IdentityProvider {
   email_claim: string;
   groups_claim: string;
   role_mappings: RoleMapping[];
+  claim_mappings?: ClaimMapping[];
   allowed_domains: string[];
   auto_provision: boolean;
   default_role: string | null;
@@ -926,6 +933,7 @@ export interface IdentityProviderCreate {
   email_claim?: string;
   groups_claim?: string;
   role_mappings?: RoleMapping[];
+  claim_mappings?: ClaimMapping[];
   allowed_domains?: string[];
   auto_provision?: boolean;
   default_role?: string | null;
@@ -1048,7 +1056,8 @@ export interface UsageMetrics {
   errors: number;
 }
 
-export type UsageDimension = 'agent' | 'provider' | 'model' | 'user' | 'source' | 'chat' | 'batch' | 'day' | 'hour';
+export type UsageDimension =
+  | 'agent' | 'provider' | 'model' | 'user' | 'source' | 'chat' | 'batch' | 'customer' | 'day' | 'hour';
 
 export interface UsageFilters {
   from?: string;
@@ -1059,6 +1068,8 @@ export interface UsageFilters {
   user_id?: string[];
   source?: string[];
   chat_id?: string[];
+  /** The USAGE_CUSTOMER_FIELD custom field of the user a call was for. */
+  customer?: string[];
 }
 
 export interface UsageSummary {
@@ -1101,6 +1112,7 @@ export interface UsageCall {
   streamed: boolean | null;
   latency_ms: number | null;
   error: string | null;
+  customer?: string | null;
 }
 
 export interface UsageCallsPage {

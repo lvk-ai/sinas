@@ -20,6 +20,8 @@ from app.models import Agent, Chat, Message
 from app.models.function import Function
 from app.models.llm_provider import LLMProvider
 from app.providers import create_provider
+from app.providers.attribution import new_chat_attribution
+from app.providers.errors import refusal_code
 from app.services.collection_tools import CollectionToolConverter
 from app.services.component_tools import ComponentToolConverter
 from app.services.connector_tools import ConnectorToolConverter
@@ -184,6 +186,7 @@ class MessageService:
             agent_name=agent.name,
             title=name or f"Chat with {agent.name}",
             chat_metadata={"agent_input": input_data} if input_data else None,
+            attribution=await new_chat_attribution(self.db, user_id),
         )
         self.db.add(chat)
         await self.db.commit()
@@ -976,7 +979,13 @@ class MessageService:
             error_message = Message(chat_id=chat_id, role="assistant", content=error_content)
             self.db.add(error_message)
             await self.db.commit()
-            yield {"content": error_content, "type": "error", "error": str(e)[:300]}
+            error_event = {"content": error_content, "type": "error", "error": str(e)[:300]}
+            # A refused call (budget_exceeded, rate_limited) says so by code,
+            # for API clients, job records and pipeline steps to tell apart.
+            code = refusal_code(e)
+            if code:
+                error_event["code"] = code
+            yield error_event
         finally:
             _turn_output = "".join(_turn_output_parts)
             if _turn_output:
@@ -1450,7 +1459,7 @@ class MessageService:
                         continue
                 meta = _meta_by_name.get(tc["function"]["name"], {})
                 prep = await prepare_agent_delegation(
-                    self.db, user_id, meta.get("agent_id"), args
+                    self.db, user_id, meta.get("agent_id"), args, parent_chat_id=chat_id
                 )
                 if "error" in prep:
                     error_content = json.dumps(prep)

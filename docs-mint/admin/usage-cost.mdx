@@ -138,7 +138,7 @@ cost = (prompt − cache_read − cache_write) × input
 
 All under the management API. Times are UTC. `from` is inclusive, `to` exclusive; without `from`, the last 30 days are covered, except when filtering by `chat_id`, where the chats' calls are found whenever they were made.
 
-Common filters: `from`, `to`, `agent`, `provider`, `model`, `user_id`, `source` and `chat_id`. Each can be repeated.
+Common filters: `from`, `to`, `agent`, `provider`, `model`, `user_id`, `source`, `chat_id` and `customer`. Each can be repeated.
 
 ```
 GET  /api/v1/usage/summary?group_by=agent,model     # totals, and per group
@@ -149,9 +149,9 @@ POST /api/v1/usage/ratecard/refresh                 # fetch MODEL_PRICES_URL now
 POST /api/v1/usage/backfill                         # price calls recorded without a cost
 ```
 
-`/calls` also takes `unpriced_only=true` and `errors_only=true`, and pages with `limit` (up to 500) and `offset` (`has_more` says whether there's another page). Each call has its tokens, `cost_usd` (`null` when unpriced), `price_source`, `latency_ms`, `error`, and the `user_id` and `user_email` of who made it.
+`/calls` also takes `unpriced_only=true` and `errors_only=true`, and pages with `limit` (up to 500) and `offset` (`has_more` says whether there's another page). Each call has its tokens, `cost_usd` (`null` when unpriced), `price_source`, `latency_ms`, `error`, the `user_id` and `user_email` of who made it, and the `customer` it was for.
 
-`group_by` takes any of `agent`, `provider`, `model`, `user`, `source`, `chat`, `batch`, and `day` or `hour`. Every total and group has `calls`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `unpriced_calls` and `errors`. `cost_usd` adds up the priced calls only.
+`group_by` takes any of `agent`, `provider`, `model`, `user`, `source`, `chat`, `batch`, `customer`, and `day` or `hour`. Every total and group has `calls`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `unpriced_calls` and `errors`. `cost_usd` adds up the priced calls only.
 
 The cost of a set of chats, for example to enforce a budget per run:
 
@@ -159,6 +159,10 @@ The cost of a set of chats, for example to enforce a budget per run:
 curl -H "Authorization: Bearer $KEY" \
   "$SINAS/api/v1/usage/summary?chat_id=$CHAT_1&chat_id=$CHAT_2"
 ```
+
+### Cost per customer
+
+Set `USAGE_CUSTOMER_FIELD` to a user custom field (say `orgId`) and every call records it as its `customer`, from the attribution snapshot its chat took when it was created: group by `customer`, or filter with `customer=org-42`. The field comes from [token exchange](/platform/authentication) or an identity provider's [claim mappings](/admin/sso#claim-mappings). Calls of users without the field (a shared service account, say) have no customer. See [Attribution and budgets through an LLM gateway](/admin/llm-gateway-attribution) for sending the same value to a gateway.
 
 For the cost of one request, you don't need a report: the synchronous [agent invoke](/build-resources/agents) and the non-streaming `POST /chats/{id}/messages` return a `usage` object with these metrics for the calls that request made.
 

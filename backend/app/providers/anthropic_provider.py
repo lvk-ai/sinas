@@ -7,7 +7,7 @@ from typing import Any, Optional
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from .base import BaseLLMProvider
-from .clients import guard_trace_context, secret_id, shared_client
+from .clients import guard_client, secret_id, shared_client
 
 
 def anthropic_client(
@@ -26,7 +26,7 @@ def anthropic_client(
     client = AsyncAnthropic(
         api_key=api_key,
         base_url=base_url,
-        http_client=guard_trace_context(http_client or DefaultAsyncHttpxClient()),
+        http_client=guard_client(http_client or DefaultAsyncHttpxClient()),
         **options,
     )
     telemetry = getattr(client, "open_telemetry", None)  # anthropic >= 1.14.0
@@ -684,7 +684,7 @@ class AnthropicProvider(BaseLLMProvider):
                 {"custom_id": req["custom_id"], "params": self._build_batch_params(req)}
                 for req in requests
             ],
-            extra_headers=self._sdk_context_headers() or None,
+            extra_headers=self._sdk_request_headers() or None,
         )
         return batch.id
 

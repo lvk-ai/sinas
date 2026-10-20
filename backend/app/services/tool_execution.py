@@ -19,6 +19,7 @@ from app.models import Agent, Chat, Message
 from app.models.function import Function
 from app.models.pending_approval import PendingToolApproval
 from app.core.config import settings
+from app.providers.attribution import new_chat_attribution
 from app.models.user import User
 from app.services.code_execution import execute as execute_code
 from app.services.collection_tools import CollectionToolConverter
@@ -571,8 +572,12 @@ async def prepare_agent_delegation(
     user_id: str,
     agent_id_str: str,
     arguments: dict[str, Any],
+    parent_chat_id: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Resolve a `call_agent_*` target and create (or load) its sub-chat.
+
+    A new sub-chat inherits the parent chat's attribution snapshot, so the
+    sub-agent's calls are attributed as the parent's are.
 
     Everything `execute_agent_tool` does before enqueueing — shared with the
     suspend-on-delegate path in message_service (issue #90), which enqueues
@@ -637,6 +642,7 @@ async def prepare_agent_delegation(
             agent_name=agent.name,
             title=f"Sub-chat: {agent.name}",
             chat_metadata={"agent_input": input_data} if input_data else None,
+            attribution=await new_chat_attribution(db, user_id, parent_chat_id=parent_chat_id),
         )
         db.add(sub_chat)
         await db.commit()
@@ -659,7 +665,9 @@ async def execute_agent_tool(
     _agent_tracer = get_tracer()
 
     try:
-        prep = await prepare_agent_delegation(db, user_id, agent_id_str, arguments)
+        prep = await prepare_agent_delegation(
+            db, user_id, agent_id_str, arguments, parent_chat_id=chat.id if chat else None
+        )
         if "error" in prep:
             return prep
         agent = prep["agent"]
@@ -706,11 +714,14 @@ async def execute_agent_tool(
             if event.get("type") in ("done", "error"):
                 got_terminal = True
                 if event.get("type") == "error":
-                    return {
+                    failure = {
                         "agent_name": agent.name,
                         "error": event.get("error", "Sub-agent failed"),
                         "chat_id": str(sub_chat.id),
                     }
+                    if event.get("code"):  # a refused LLM call: budget_exceeded, ...
+                        failure["error_code"] = event["code"]
+                    return failure
                 break
 
         if not got_terminal:

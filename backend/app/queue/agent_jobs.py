@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 PING_INTERVAL = 15  # seconds between keep-alive pings
 
 
+def _failure_fields(error: BaseException) -> dict[str, Any]:
+    """A failed job's error for its status record and its parent's report,
+    with the refusal code (budget_exceeded, rate_limited) when the LLM call
+    was refused (app/providers/errors.py)."""
+    from app.providers.errors import refusal_code
+
+    code = refusal_code(error)
+    return {"error": str(error), **({"error_code": code} if code else {})}
+
+
 def _acting_as_job_key(job):
     """Run an agent job through the API key its request came in on (if any):
     its tools then check the key's permissions, as in the request itself."""
@@ -353,6 +363,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     ):
         _agent_output_parts: list[str] = []
         _suspended = False
+        _refused: Optional[dict[str, Any]] = None
         try:
             async with AsyncSessionLocal() as db:
                 message_service = MessageService(db)
@@ -371,7 +382,18 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                         _agent_output_parts.append(chunk["content"])
                     if _is_suspension_chunk(chunk):
                         _suspended = True
+                    if chunk.get("type") == "error" and chunk.get("code"):
+                        _refused = chunk
                     await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+
+            if _refused is not None:
+                # The turn ended on a refused LLM call (budget_exceeded,
+                # rate_limited), already streamed as its error event: the job
+                # fails with it, so its status, batch execution and parent
+                # delegation record the code too.
+                from app.providers.errors import LLMRefusalError
+
+                raise LLMRefusalError.from_event(_refused)
 
             # Set agent output on the current span
             _agent_output = "".join(_agent_output_parts)
@@ -431,13 +453,14 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             logger.error(f"Agent message job {job_id} failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
 
-            # Publish error to stream
-            await stream_relay.publish_error(channel_id, str(e))
+            # Publish error to stream (a refusal streamed its own already)
+            if _refused is None:
+                await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
 
             # Update status
             await redis.set(
                 f"{JOB_STATUS_PREFIX}{job_id}",
-                json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+                json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
                 ex=JOB_TTL,
             )
 
@@ -455,7 +478,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                     await on_child_complete(
                         pending_delegation_id,
                         parent_tool_call_id,
-                        json.dumps({"error": str(e), "chat_id": chat_id}),
+                        json.dumps({**_failure_fields(e), "chat_id": chat_id}),
                         user_token=user_token,
                     )
                 except Exception:
@@ -720,11 +743,11 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Traceback: {traceback.format_exc()}")
 
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e))
+        await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
 
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+            json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
             ex=JOB_TTL,
         )
 
@@ -955,10 +978,10 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Delegate-resume job {job_id} failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e))
+        await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+            json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
             ex=JOB_TTL,
         )
         if execution_id:
@@ -972,7 +995,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                 await on_child_complete(
                     parent_pending_delegation_id,
                     parent_tool_call_id,
-                    json.dumps({"error": str(e), "chat_id": chat_id}),
+                    json.dumps({**_failure_fields(e), "chat_id": chat_id}),
                     user_token=user_token,
                 )
             except Exception:

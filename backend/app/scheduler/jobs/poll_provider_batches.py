@@ -73,7 +73,16 @@ async def _poll_one(batch_id: uuid_lib.UUID) -> None:
                 batch.id, batch.llm_provider_id,
             )
             return
-        provider = await create_provider(provider_name=provider_row.name, db=db)
+        # The batch is the submitter's: its identity headers and customer
+        # (app/providers/attribution.py), as at submission.
+        attribution_context = {
+            "user_id": str(batch.user_id) if batch.user_id else None,
+            "agent": f"{batch.target_namespace}/{batch.target_name}",
+            "source": "provider_batch",
+        }
+        provider = await create_provider(
+            provider_name=provider_row.name, db=db, usage_context=attribution_context
+        )
 
         status = await provider.get_batch_status(batch.provider_batch_id)
         if not status.get("ended"):
@@ -92,6 +101,22 @@ async def _poll_one(batch_id: uuid_lib.UUID) -> None:
 
         agent = await Agent.get_by_name(db, batch.target_namespace, batch.target_name)
         model = (agent.model if agent else None) or provider_row.default_model
+
+        # Each result is attributed by its own chat's snapshot (taken when the
+        # batch created it).
+        from app.core.config import settings
+        from app.models.chat import Chat
+        from app.providers.attribution import clean_value
+
+        customer_field = (settings.usage_customer_field or "").strip()
+        customers: dict = {}
+        chat_ids = [e.chat_id for e in executions if e.chat_id]
+        if customer_field and chat_ids:
+            for chat_id, snapshot in (
+                await db.execute(select(Chat.id, Chat.attribution).where(Chat.id.in_(chat_ids)))
+            ).all():
+                if isinstance(snapshot, dict):
+                    customers[chat_id] = clean_value(snapshot.get(customer_field), max_length=255)
 
         now = datetime.now(timezone.utc)
         processed = 0
@@ -136,6 +161,7 @@ async def _poll_one(batch_id: uuid_lib.UUID) -> None:
                         "streamed": False,
                         # Priced at the provider's batch rates
                         "batch": True,
+                        "customer": customers.get(execution.chat_id),
                     }
                     await price_usage(db, values)
                     db.add(LLMUsage(**values))

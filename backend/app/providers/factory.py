@@ -1,4 +1,5 @@
 """Factory for creating LLM provider instances."""
+import logging
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -14,6 +15,8 @@ from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .openai_provider import OpenAIProvider
 from .tracking import UsageTrackingProvider
+
+logger = logging.getLogger(__name__)
 
 # Provider settings an AGENT may override (Agent.provider_overrides).
 # key -> (expected type, provider attribute, allowed values or None).
@@ -191,7 +194,28 @@ async def create_provider(
 
     # Provider-level only, never per agent: whether a call carries the trace
     # context and baggage to the model API (see BaseLLMProvider).
-    provider.propagate_context = bool((provider_config.config or {}).get("propagate_context"))
+    provider_settings = provider_config.config or {}
+    provider.propagate_context = bool(provider_settings.get("propagate_context"))
+
+    # Identity headers (config.headers) for this call's user, agent, chat and
+    # API key, and the customer its usage row is attributed to. Resolved here,
+    # from the usage context every call site passes, rather than from the
+    # request that started the turn: the same holds for a queued job, a
+    # resume, a sub-agent or a scheduled run (app/providers/attribution.py).
+    from .attribution import resolve_attribution
+    from .errors import validate_budget_rules
+
+    identity_headers, customer = await resolve_attribution(
+        db, usage_context, provider_settings.get("headers")
+    )
+    provider.identity_headers = identity_headers
+    try:
+        provider.budget_rules = validate_budget_rules(provider_settings.get("budget_errors"))
+    except ValueError as e:  # written by hand into the database
+        logger.warning(f"LLM provider '{provider_config.name}': budget_errors ignored: {e}")
+        provider.budget_rules = []
+    if customer is not None:
+        usage_context = {**(usage_context or {}), "customer": customer}
 
     # Per-agent behavior overrides (Agent.provider_overrides), applied after
     # construction so they win over the provider-level config.
@@ -202,4 +226,5 @@ async def create_provider(
         provider_name=provider_config.name,
         provider_type=provider_type,
         context=usage_context,
+        budget_rules=provider.budget_rules,
     )

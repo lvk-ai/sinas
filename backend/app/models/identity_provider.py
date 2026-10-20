@@ -27,6 +27,11 @@ class IdentityProvider(Base):
     groups_claim: Mapped[str] = mapped_column(String(512), nullable=False, default="groups")
     # [{"group": ..., "roles": [...]}, {"email_domain": ..., "roles": [...]}]
     role_mappings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    # [{"claim": "<dotted claim path>", "field": "<users.custom_fields key>"}]:
+    # copied into the user's custom fields at every login (sso.sync_custom_fields).
+    claim_mappings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
     allowed_domains: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     enforce_for_domains: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     auto_provision: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

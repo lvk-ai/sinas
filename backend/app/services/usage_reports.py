@@ -28,6 +28,8 @@ DIMENSIONS: dict[str, Any] = {
     "source": LLMUsage.source,
     "chat": LLMUsage.chat_id,
     "batch": LLMUsage.batch,
+    # USAGE_CUSTOMER_FIELD of the user each call was for (NULL: none)
+    "customer": LLMUsage.customer,
     "day": func.date_trunc(literal_column("'day'"), _UTC_CREATED),
     "hour": func.date_trunc(literal_column("'hour'"), _UTC_CREATED),
 }
@@ -55,6 +57,7 @@ class UsageFilters:
     user_ids: list[uuid.UUID] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     chat_ids: list[uuid.UUID] = field(default_factory=list)
+    customers: list[str] = field(default_factory=list)
     own_user_id: Optional[uuid.UUID] = None
 
     def window(self, *, bounded: bool) -> tuple[Optional[datetime], datetime]:
@@ -81,6 +84,7 @@ class UsageFilters:
             (LLMUsage.user_id, self.user_ids),
             (LLMUsage.source, self.sources),
             (LLMUsage.chat_id, self.chat_ids),
+            (LLMUsage.customer, self.customers),
         ):
             if len(values) == 1:
                 clauses.append(column == values[0])
@@ -300,6 +304,7 @@ async def calls(
             "streamed": r.streamed,
             "latency_ms": r.latency_ms,
             "error": r.error,
+            "customer": r.customer,
         }
         for r in rows[:limit]
     ]

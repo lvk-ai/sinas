@@ -34,6 +34,11 @@ class Chat(Base):
 
     # Chat metadata for creation context (agent input, resolved function params, etc.)
     chat_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, default=None)
+    # Whom the chat's LLM calls are for: the attribution fields (ATTRIBUTION_FIELDS,
+    # USAGE_CUSTOMER_FIELD) of the credential that created it, taken once and
+    # kept for the chat's life (app/providers/attribution.py). NULL: none
+    # configured when it was created (filled in at its next LLM call).
+    attribution: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     # Example: {"agent_input": {"my_city": "London"}, "resolved_function_params": {"check_weather": {"city": "London"}}}
 
     created_at: Mapped[created_at]

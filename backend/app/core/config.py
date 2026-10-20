@@ -498,6 +498,17 @@ class Settings(BaseSettings):
     model_prices_refresh_hours: int = 24
     model_prices_timeout_seconds: int = 30
     model_prices_max_bytes: int = 16 * 1024 * 1024
+    # Attribution (app/providers/attribution.py): the user custom fields
+    # (comma-separated users.custom_fields keys, e.g. "orgId,costCenter") a
+    # chat takes a snapshot of when it is created; every LLM call in the chat
+    # is attributed by that snapshot ({{attribution.<key>}} in a provider's
+    # header templates), however and by whomever the chat is continued.
+    attribution_fields: Optional[str] = None
+    # The attribution field that names the customer a call is for, e.g.
+    # "orgId" (an attribution field whether or not ATTRIBUTION_FIELDS lists
+    # it). Recorded on each llm_usage row as `customer`, and offered by the
+    # usage API as the `customer` dimension and filter. Unset: none recorded.
+    usage_customer_field: Optional[str] = None
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data

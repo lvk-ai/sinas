@@ -24,6 +24,7 @@ from app.models.agent import Agent
 from app.models.chat import Chat
 from app.models.pending_approval import PendingToolApproval
 from app.models.user import User
+from app.providers.attribution import new_chat_attribution
 from app.providers.factory import create_provider
 from app.providers.tracking import UsageCollector, collect_usage
 from app.schemas.agent import AgentResponse
@@ -213,7 +214,10 @@ async def _relay_one_channel(
             yield {"event": "done", "data": json.dumps({"status": "completed"})}
             return
         elif event_type == "error":
-            yield {"event": "error", "data": json.dumps({"error": event.get("error", "An error occurred")})}
+            error = {"error": event.get("error", "An error occurred")}
+            if event.get("code"):  # a refused LLM call: budget_exceeded, rate_limited
+                error["code"] = event["code"]
+            yield {"event": "error", "data": json.dumps(error)}
             return
         elif event_type in TYPED_EVENTS:
             yield {"event": event_type, "data": json.dumps(event)}
@@ -315,6 +319,7 @@ async def create_chat_with_agent(
         expires_at=expires_at,
         keep_alive=chat_keep_alive,
         job_timeout=chat_job_timeout,
+        attribution=await new_chat_attribution(db, user_id),
     )
     db.add(chat)
     await db.flush()
@@ -438,6 +443,7 @@ async def invoke_agent(
             session_key=request.session_key,
             chat_metadata={"agent_input": validated_input} if validated_input else None,
             job_timeout=agent.default_job_timeout,
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.flush()

@@ -23,12 +23,14 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from .base import BaseLLMProvider
+from .errors import LLMRefusalError, refusal_from_exception
 
 logger = logging.getLogger(__name__)
 
 # Context keys recognized on llm_usage rows (all optional):
-# user_id, chat_id, message_id, agent, source
-_CONTEXT_KEYS = ("user_id", "chat_id", "message_id", "agent", "source")
+# user_id, chat_id, message_id, agent, source, and customer (the
+# USAGE_CUSTOMER_FIELD custom field of the user, set by create_provider)
+_CONTEXT_KEYS = ("user_id", "chat_id", "message_id", "agent", "source", "customer")
 
 
 async def _insert_usage(values: dict[str, Any]) -> bool:
@@ -159,12 +161,22 @@ class UsageTrackingProvider(BaseLLMProvider):
         provider_name: Optional[str] = None,
         provider_type: Optional[str] = None,
         context: Optional[dict[str, Any]] = None,
+        budget_rules: Optional[list[dict[str, Any]]] = None,
     ):
         super().__init__(api_key=inner.api_key, base_url=inner.base_url)
         self._inner = inner
         self._provider_name = provider_name
         self._provider_type = provider_type
         self._context = context or {}
+        self._budget_rules = budget_rules or []
+
+    def _refusal(self, error: BaseException) -> Optional[LLMRefusalError]:
+        """The typed refusal (budget_exceeded, rate_limited) a provider error
+        stands for, if any (app/providers/errors.py)."""
+        try:
+            return refusal_from_exception(error, self._budget_rules, self._provider_name)
+        except Exception:  # classifying must never hide the original error
+            return None
 
     def _record(
         self,
@@ -220,13 +232,16 @@ class UsageTrackingProvider(BaseLLMProvider):
                 **kwargs,
             )
         except Exception as e:
+            refusal = self._refusal(e)
             self._record(
                 model=model,
                 usage=None,
                 latency_ms=int((time.monotonic() - start) * 1000),
                 streamed=False,
-                error=str(e)[:2000],
+                error=str(refusal or e)[:2000],
             )
+            if refusal is not None:
+                raise refusal from e
             raise
         self._record(
             model=model,
@@ -266,7 +281,10 @@ class UsageTrackingProvider(BaseLLMProvider):
             error = "stream_abandoned"
             raise
         except Exception as e:
-            error = str(e)[:2000]
+            refusal = self._refusal(e)
+            error = str(refusal or e)[:2000]
+            if refusal is not None:
+                raise refusal from e
             raise
         finally:
             self._record(
@@ -293,7 +311,13 @@ class UsageTrackingProvider(BaseLLMProvider):
         return self._inner.supports_batch
 
     async def submit_batch(self, requests: list[dict[str, Any]]) -> str:
-        return await self._inner.submit_batch(requests)
+        try:
+            return await self._inner.submit_batch(requests)
+        except Exception as e:
+            refusal = self._refusal(e)
+            if refusal is not None:
+                raise refusal from e
+            raise
 
     async def get_batch_status(self, provider_batch_id: str) -> dict[str, Any]:
         return await self._inner.get_batch_status(provider_batch_id)

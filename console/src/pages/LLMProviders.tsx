@@ -7,6 +7,8 @@ import { useState } from 'react';
 import type { LLMProvider, LLMProviderCreate, LLMProviderUpdate, ModelPricing, Ratecard } from '../types';
 import { ErrorDisplay } from '../components/ErrorDisplay';
 import { RatecardSources } from '../components/Ratecard';
+import { ProviderHeaders } from '../components/ProviderHeaders';
+import { headerProblem } from '../lib/attribution';
 
 function plural(n: number, one: string, many: string): string {
   return n ? `${n} ${n === 1 ? one : many}` : '';
@@ -426,6 +428,11 @@ export function LLMProviders() {
       setCreateError('Provider type is required');
       return;
     }
+    const createHeaders = headerProblem(createFormData.config);
+    if (createHeaders) {
+      setCreateError(`Headers: ${createHeaders}`);
+      return;
+    }
     let pricing;
     try {
       pricing = parsePricingDraft(createPricing);
@@ -440,6 +447,11 @@ export function LLMProviders() {
     e.preventDefault();
     setEditError('');
     if (selectedProvider && editFormData.name?.trim()) {
+      const editHeaders = headerProblem(editFormData.config);
+      if (editHeaders) {
+        setEditError(`Headers: ${editHeaders}`);
+        return;
+      }
       let pricing;
       try {
         pricing = parsePricingDraft(editPricing);
@@ -733,6 +745,15 @@ export function LLMProviders() {
                 </p>
               </div>
 
+              <ProviderHeaders
+                idPrefix="create"
+                config={createFormData.config}
+                onChange={(config) => {
+                  setCreateFormData({ ...createFormData, config });
+                  setCreateConfigText(JSON.stringify(config, null, 2));
+                }}
+              />
+
               <PricingFields
                 idPrefix="create"
                 draft={createPricing}
@@ -917,6 +938,16 @@ export function LLMProviders() {
                   Provider-specific configuration as JSON
                 </p>
               </div>
+
+              <ProviderHeaders
+                key={selectedProvider?.id}
+                idPrefix="edit"
+                config={editFormData.config}
+                onChange={(config) => {
+                  setEditFormData({ ...editFormData, config });
+                  setEditConfigText(JSON.stringify(config, null, 2));
+                }}
+              />
 
               <PricingFields
                 idPrefix="edit"

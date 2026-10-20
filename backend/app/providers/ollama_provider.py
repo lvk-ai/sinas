@@ -51,7 +51,7 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             response = await client.post(
-                f"{self.base_url}/api/chat", json=payload, headers=self._context_headers()
+                f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             )
 
             # Debug logging
@@ -110,7 +110,7 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             async with client.stream(
-                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._context_headers()
+                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             ) as response:
                 response.raise_for_status()
 

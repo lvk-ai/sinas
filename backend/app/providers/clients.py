@@ -111,7 +111,7 @@ CONTEXT_OPT_IN_HEADER = "x-sinas-propagate-context"
 _W3C_CONTEXT_FIELDS = ("traceparent", "tracestate", "baggage")
 
 
-def _trace_context_fields() -> set[str]:
+def trace_context_fields() -> set[str]:
     """The headers that carry a trace context: the W3C ones, and whatever the
     registered propagator sets (`OTEL_PROPAGATORS` may add others, e.g. B3)."""
     fields = set(_W3C_CONTEXT_FIELDS)
@@ -128,7 +128,7 @@ async def _drop_unrequested_trace_context(request: Any) -> None:
     if CONTEXT_OPT_IN_HEADER in request.headers:
         del request.headers[CONTEXT_OPT_IN_HEADER]
         return
-    for field in _trace_context_fields():
+    for field in trace_context_fields():
         if field in request.headers:
             del request.headers[field]
 
@@ -147,4 +147,68 @@ def guard_trace_context(http_client: H) -> H:
             **hooks,
             "request": [*request_hooks, _drop_unrequested_trace_context],
         }
+    return http_client
+
+
+# ── Budget refusals are final ──────────────────────────────────────────────
+#
+# The SDKs retry a 429 (and 408, 409, 5xx) on their own, twice by default,
+# with backoff. A gateway that refuses a call because a budget is spent may
+# answer 429; retrying that only spends time (and, at some gateways, counts
+# as more refused calls). So a response the SDK would retry is classified
+# first (`errors.classify`, with the provider's own `budget_errors` rules),
+# and a budget refusal is marked `x-should-retry: false`, which both SDKs
+# obey. The provider's rules travel to the hook as a private request header,
+# taken off again before the request is sent.
+
+#: Carries a provider's `budget_errors` rules (JSON) to the response hook.
+#: Never sent.
+BUDGET_RULES_HEADER = "x-sinas-budget-rules"
+_RULES_EXTENSION = "sinas_budget_rules"
+
+
+def _sdk_would_retry(status: int) -> bool:
+    return status in (408, 409, 429) or status >= 500
+
+
+async def _take_budget_rules(request: Any) -> None:
+    value = request.headers.get(BUDGET_RULES_HEADER)
+    if value is not None:
+        del request.headers[BUDGET_RULES_HEADER]
+        request.extensions = {**request.extensions, _RULES_EXTENSION: value}
+
+
+async def _final_budget_refusal(response: Any) -> None:
+    if not _sdk_would_retry(response.status_code):
+        return
+    from .errors import BUDGET_EXCEEDED, classify, parse_rules_header
+
+    try:
+        await response.aread()
+        try:
+            body: Any = response.json()
+        except Exception:
+            body = response.text
+        rules = parse_rules_header(response.request.extensions.get(_RULES_EXTENSION))
+        if classify(response.status_code, body, "", rules) == BUDGET_EXCEEDED:
+            response.headers["x-should-retry"] = "false"
+    except Exception as e:  # the SDK's own handling goes on regardless
+        logger.debug(f"Classifying an LLM error response failed: {e}")
+
+
+def guard_client(http_client: H) -> H:
+    """`http_client` guarded for an LLM SDK: trace context only on request
+    (`guard_trace_context`), and budget refusals never retried by the SDK.
+    Guarding a client twice adds each hook once."""
+    guard_trace_context(http_client)
+    hooks = http_client.event_hooks  # type: ignore[attr-defined]
+    request_hooks = list(hooks.get("request", []))
+    response_hooks = list(hooks.get("response", []))
+    if _take_budget_rules not in request_hooks:
+        request_hooks.append(_take_budget_rules)
+    if _final_budget_refusal not in response_hooks:
+        response_hooks.append(_final_budget_refusal)
+    http_client.event_hooks = {  # type: ignore[attr-defined]
+        **hooks, "request": request_hooks, "response": response_hooks,
+    }
     return http_client
