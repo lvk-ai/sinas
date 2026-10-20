@@ -324,6 +324,41 @@ class TestSucceededRunsAreNeverRepeated:
         assert not exc.value.dead_letter  # final; nothing to requeue either
 
 
+class TestFinalBookkeepingErrors:
+    async def test_exhausted_job_still_dead_letters(
+        self, db, test_user, use_test_db, sandbox, monkeypatch
+    ):
+        """The batch update after the final failure errors: the failure's
+        flags survive, so the job still lands in the DLQ."""
+        from app.models.batch import Batch, BatchKind, BatchStatus
+        from app.queue import worker
+
+        monkeypatch.setattr(settings, "queue_max_retries", 0)
+        fn = await _function(db, test_user)
+        row = await _pending_row(db, test_user, fn)
+        now = datetime.utcnow()
+        batch = Batch(
+            user_id=test_user.id, kind=BatchKind.FUNCTION, target_namespace=fn.namespace,
+            target_name=fn.name, total=1, status=BatchStatus.QUEUED, started_at=now, created_at=now,
+        )
+        db.add(batch)
+        await db.commit()
+        row.batch_id = batch.id
+        await db.commit()
+        sandbox(ExecutorUnavailable("No workers available"))
+
+        async def batch_down(**kwargs):
+            raise ConnectionResetError("db gone")
+
+        monkeypatch.setattr("app.services.batch_service.on_execution_terminated", batch_down)
+        redis = _FakeRedis()
+        _, exc = await _run_until_final(worker, redis, _kwargs(fn, row, test_user))
+
+        assert isinstance(exc, FunctionExecutionError) and exc.dead_letter
+        (entry,) = _dlq(redis)
+        assert entry["error_type"] == "infrastructure"
+
+
 class TestRetrySchedulingWithoutRedis:
     async def test_retry_is_raised_even_if_status_writes_fail(self, test_user, monkeypatch):
         from app.queue import worker

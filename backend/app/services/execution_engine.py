@@ -680,30 +680,39 @@ class FunctionExecutor:
                     )
                     raise err from e
 
-                # Log execution failure to Redis
-                await clickhouse_logger.log_execution_end(
-                    execution_id, "failed", None, str(e), None
-                )
-
-                if callback_url:
-                    await _fire_callback(
-                        db=db,
-                        execution=execution,
-                        callback_url=callback_url,
-                        user_id=user_id,
-                        user_email=user_email,
-                        status="failure",
-                        result=None,
-                        error=str(e),
-                        trigger_id=trigger_id,
-                        function_namespace=function_namespace,
-                        function_name=function_name,
+                # The failure is committed: an error in the bookkeeping below
+                # must not replace `err`, whose flags tell the queue worker
+                # whether to dead-letter the job.
+                try:
+                    # Log execution failure to Redis
+                    await clickhouse_logger.log_execution_end(
+                        execution_id, "failed", None, str(e), None
                     )
 
-                if execution.batch_id is not None:
-                    from app.services import batch_service
-                    await batch_service.on_execution_terminated(
-                        db=db, batch_id=execution.batch_id,
+                    if callback_url:
+                        await _fire_callback(
+                            db=db,
+                            execution=execution,
+                            callback_url=callback_url,
+                            user_id=user_id,
+                            user_email=user_email,
+                            status="failure",
+                            result=None,
+                            error=str(e),
+                            trigger_id=trigger_id,
+                            function_namespace=function_namespace,
+                            function_name=function_name,
+                        )
+
+                    if execution.batch_id is not None:
+                        from app.services import batch_service
+                        await batch_service.on_execution_terminated(
+                            db=db, batch_id=execution.batch_id,
+                        )
+                except Exception:
+                    logger.error(
+                        f"Bookkeeping after the failed execution {execution_id} failed",
+                        exc_info=True,
                     )
 
                 raise err
