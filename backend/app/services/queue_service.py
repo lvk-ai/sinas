@@ -809,7 +809,6 @@ class QueueService:
         from sqlalchemy import select
 
         from app.core.database import AsyncSessionLocal
-        from app.models.batch import Batch
         from app.models.execution import Execution, ExecutionStatus
 
         try:
@@ -822,22 +821,45 @@ class QueueService:
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
-                if execution is None or execution.status != ExecutionStatus.PENDING:
-                    return  # changed meanwhile: leave it
-                for field, value in snapshot["execution"].items():
-                    setattr(execution, field, value)
-                if snapshot.get("batch") and snapshot.get("batch_id") is not None:
-                    batch = (
-                        await db.execute(
-                            select(Batch).where(Batch.id == snapshot["batch_id"]).with_for_update()
-                        )
-                    ).scalar_one_or_none()
-                    if batch is not None and batch.finished_at is None:
-                        batch.status = snapshot["batch"]["status"]
-                        batch.finished_at = snapshot["batch"]["finished_at"]
+                if execution is not None and execution.status == ExecutionStatus.PENDING:
+                    for field, value in snapshot["execution"].items():
+                        setattr(execution, field, value)
                 await db.commit()
+
+                if snapshot.get("batch") and snapshot.get("batch_id") is not None:
+                    await self._refinish_batch(db, snapshot["batch_id"], snapshot["batch"])
         except Exception:
             logger.error(f"Could not restore execution {execution_id} after a failed requeue", exc_info=True)
+
+    async def _refinish_batch(self, db, batch_id, before: dict[str, Any]) -> None:
+        """Close a batch the failed requeue had reopened — judged by its
+        children now, under the batch lock, since other requeues may have
+        changed them meanwhile: still a child in flight → stays open (its
+        termination finishes the batch); the same outcome as before → the
+        old status and finished_at come back, no second callback; a
+        different outcome → finished afresh, callback included."""
+        from sqlalchemy import select
+
+        from app.models.batch import Batch
+        from app.services import batch_service
+
+        batch = (
+            await db.execute(select(Batch).where(Batch.id == batch_id).with_for_update())
+        ).scalar_one_or_none()
+        if batch is None or batch.finished_at is not None:
+            await db.commit()
+            return
+        if await batch_service._count_pending(db, batch_id) > 0:
+            await db.commit()
+            return
+        counts = await batch_service._count_by_status(db, batch_id)
+        if batch_service._derive_terminal_status(counts) == before["status"]:
+            batch.status = before["status"]
+            batch.finished_at = before["finished_at"]
+            await db.commit()
+            return
+        await db.commit()  # release the lock; on_execution_terminated takes it
+        await batch_service.on_execution_terminated(db=db, batch_id=batch_id)
 
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         """

@@ -609,6 +609,61 @@ class TestDeadLetterQueueApi:
             await pool.aclose()
 
 
+class TestFailedRequeueRestoresBatch:
+    async def test_judged_by_the_children_now(self, db, test_user, use_test_db):
+        """A failed requeue closes the batch it reopened again — unless
+        another child was requeued meanwhile (still in flight: the batch
+        stays open; finished differently: the batch finishes afresh)."""
+        from app.models.batch import Batch, BatchKind, BatchStatus
+        from app.services.queue_service import queue_service
+
+        fn = await _function(db, test_user)
+        now = datetime.utcnow()
+        batch = Batch(
+            user_id=test_user.id, kind=BatchKind.FUNCTION, target_namespace=fn.namespace,
+            target_name=fn.name, total=2, status=BatchStatus.FAILED, started_at=now,
+            finished_at=now, created_at=now,
+        )
+        db.add(batch)
+        await db.commit()
+        a, b = await _pending_row(db, test_user, fn), await _pending_row(db, test_user, fn)
+        for row in (a, b):
+            row.status, row.batch_id = ExecutionStatus.FAILED, batch.id
+        await db.commit()
+
+        # A's requeue reopens the batch, B is requeued meanwhile (in flight)
+        snapshot = await queue_service._reset_execution_for_requeue(a.execution_id)
+        b.status = ExecutionStatus.PENDING
+        await db.commit()
+        await queue_service._restore_after_failed_requeue(a.execution_id, snapshot)
+        await db.refresh(batch)
+        await db.refresh(a)
+        assert a.status == ExecutionStatus.FAILED
+        assert (batch.status, batch.finished_at) == (BatchStatus.RUNNING, None)  # B will close it
+        from app.services import batch_service
+
+        b.status = ExecutionStatus.FAILED
+        await db.commit()
+        await batch_service.on_execution_terminated(db=db, batch_id=batch.id)
+        await db.refresh(batch)
+        assert batch.status == BatchStatus.FAILED and batch.finished_at is not None
+
+        # Same again, but B already succeeded: finished afresh, with B's outcome
+        snapshot = await queue_service._reset_execution_for_requeue(a.execution_id)
+        b.status = ExecutionStatus.COMPLETED
+        await db.commit()
+        await queue_service._restore_after_failed_requeue(a.execution_id, snapshot)
+        await db.refresh(batch)
+        assert batch.status == BatchStatus.PARTIAL and batch.finished_at is not None
+
+        # Nothing else changed: the old status and finished_at come back
+        finished = batch.finished_at
+        snapshot = await queue_service._reset_execution_for_requeue(a.execution_id)
+        await queue_service._restore_after_failed_requeue(a.execution_id, snapshot)
+        await db.refresh(batch)
+        assert (batch.status, batch.finished_at) == (BatchStatus.PARTIAL, finished)
+
+
 async def _ret(value):
     return value
 
