@@ -267,7 +267,9 @@ def attribution_keys() -> list[str]:
     from app.core.config import settings
 
     keys: list[str] = []
-    for raw in [*(settings.attribution_fields or "").split(","), settings.usage_customer_field or ""]:
+    # The customer field first: it is always part of the snapshot, however
+    # many others are listed.
+    for raw in [settings.usage_customer_field or "", *(settings.attribution_fields or "").split(",")]:
         key = raw.strip()
         if key and FIELD_KEY.match(key) and key not in keys:
             keys.append(key)
@@ -430,8 +432,13 @@ async def _chat_snapshot(db: Any, chat_id: Any, user: Any) -> Optional[dict[str,
 # ── Identity ───────────────────────────────────────────────────────────────
 
 
-def _uses(templates: dict[str, str], prefix: str) -> bool:
-    return any(v.startswith(prefix) for t in templates.values() for v in template_variables(t))
+def _uses(templates: dict[str, Any], prefix: str) -> bool:
+    return any(
+        v.startswith(prefix)
+        for t in templates.values()
+        if isinstance(t, str)  # a malformed stored template renders nothing
+        for v in template_variables(t)
+    )
 
 
 async def resolve_attribution(
@@ -459,11 +466,11 @@ async def resolve_attribution(
     customer_field = (settings.usage_customer_field or "").strip() or None
     user_id = context.get("user_id")
     chat_id = context.get("chat_id")
-    wants_snapshot = bool(customer_field) or _uses(templates, "attribution.")
     if not templates and not (customer_field and user_id):
         return {}, None
 
     try:
+        wants_snapshot = bool(customer_field) or _uses(templates, "attribution.")
         variables: dict[str, Any] = {}
         user = None
         if user_id and (wants_snapshot or _uses(templates, "user.")):
