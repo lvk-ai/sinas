@@ -1,6 +1,6 @@
 """Skill-to-tool converter for LLM tool calling."""
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,28 +9,11 @@ from app.models.skill import Skill
 logger = logging.getLogger(__name__)
 
 
-async def _skill_access(
-    db: AsyncSession, user_id: Optional[str], permissions: Optional[dict[str, bool]]
-) -> Callable[[Any], bool]:
-    """Which skills a wildcard may reach: those the user may read."""
-    from app.services.resource_resolver import user_can
-
-    if user_id and permissions is None:
-        from app.core.auth import get_effective_permissions
-
-        permissions = await get_effective_permissions(db, user_id)
-    return user_can(user_id, permissions, "read")
-
-
 class SkillToolConverter:
     """Converts skills to OpenAI tool format and manages retrieval."""
 
     async def get_available_skills(
-        self,
-        db: AsyncSession,
-        enabled_skills: Optional[list[dict[str, Any]]] = None,
-        user_id: Optional[str] = None,
-        permissions: Optional[dict[str, bool]] = None,
+        self, db: AsyncSession, enabled_skills: Optional[list[dict[str, Any]]] = None
     ) -> list[dict[str, Any]]:
         """
         Get skills and convert to OpenAI tools format.
@@ -41,8 +24,6 @@ class SkillToolConverter:
         Args:
             db: Database session
             enabled_skills: List of skill configs with {"skill": "namespace/name", "preload": bool}
-            user_id: The chat's user: a wildcard offers only skills they may read
-            permissions: The user's effective permissions (looked up if None)
 
         Returns:
             List of skills in OpenAI tool format (only non-preloaded)
@@ -64,9 +45,10 @@ class SkillToolConverter:
             if skill_ref:
                 on_demand_refs.append(skill_ref)
 
-        resolved = await resolve_resource_refs(
-            db, on_demand_refs, Skill, can_access=await _skill_access(db, user_id, permissions)
-        )
+        # Wildcards expand to every matching skill, without the user's own
+        # skill permissions: an enabled skill is the agent author's grant
+        # (instructions, no data or credentials), named or through a pattern.
+        resolved = await resolve_resource_refs(db, on_demand_refs, Skill)
 
         for skill_ref, skill in resolved:
 
@@ -77,10 +59,7 @@ class SkillToolConverter:
         return tools
 
     async def get_preloaded_skills_content(
-        self,
-        db: AsyncSession,
-        enabled_skills: Optional[list[dict[str, Any]]] = None,
-        user_id: Optional[str] = None,
+        self, db: AsyncSession, enabled_skills: Optional[list[dict[str, Any]]] = None
     ) -> str:
         """
         Get content for preloaded skills to inject into system prompt.
@@ -90,7 +69,6 @@ class SkillToolConverter:
         Args:
             db: Database session
             enabled_skills: List of skill configs with {"skill": "namespace/name", "preload": bool}
-            user_id: The chat's user: a wildcard preloads only skills they may read
 
         Returns:
             Combined markdown content for all preloaded skills
@@ -111,9 +89,7 @@ class SkillToolConverter:
             if skill_ref:
                 preload_refs.append(skill_ref)
 
-        resolved = await resolve_resource_refs(
-            db, preload_refs, Skill, can_access=await _skill_access(db, user_id, None)
-        )
+        resolved = await resolve_resource_refs(db, preload_refs, Skill)
 
         for skill_ref, skill in resolved:
             contents.append(f"# Skill: {skill.namespace}/{skill.name}\n\n{skill.content}")
@@ -152,7 +128,6 @@ class SkillToolConverter:
         tool_name: str,
         arguments: dict[str, Any],
         enabled_skills: Optional[list[Any]] = None,
-        user_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Handle a skill tool call by returning the skill's content.
@@ -162,8 +137,9 @@ class SkillToolConverter:
             tool_name: Name of the tool (e.g., "get_skill_default_web_research")
             arguments: Tool arguments (empty for skills)
             enabled_skills: The chat agent's enabled skills: when given, only a
-                skill they grant (a wildcard: one the user may read) is returned
-            user_id: The chat's user
+                skill on that list (by name or through a wildcard) is returned.
+                A skill enabled for an agent is the author's grant, wildcard
+                or not: the user's own skill permissions don't apply.
 
         Returns:
             Skill content (markdown) or None if skill not found
@@ -195,10 +171,10 @@ class SkillToolConverter:
             return None
 
         if enabled_skills is not None:
-            from app.services.resource_resolver import ref_granted
+            from app.services.resource_resolver import matches_ref_pattern
 
             ref = f"{skill.namespace}/{skill.name}"
-            if not ref_granted(ref, enabled_skills, skill, await _skill_access(db, user_id, None), "skill"):
+            if not matches_ref_pattern(ref, enabled_skills):
                 logger.warning(f"Security: skill '{ref}' is not enabled for this agent")
                 return None
 

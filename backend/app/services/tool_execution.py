@@ -1217,7 +1217,6 @@ async def _execute_single_tool(
                 result = await skill_converter.handle_skill_tool_call(
                     db=db, tool_name=tool_name, arguments=arguments,
                     enabled_skills=await _chat_agent_list(db, chat, "enabled_skills"),
-                    user_id=user_id,
                 )
                 if result is None:
                     result = {"error": f"Skill not found for tool: {tool_name}"}

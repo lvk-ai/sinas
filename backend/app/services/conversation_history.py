@@ -23,11 +23,9 @@ async def build_agent_system_content(
     agent: Agent,
     skill_converter: SkillToolConverter,
     template_variables: Optional[dict[str, Any]] = None,
-    user_id: Optional[str] = None,
 ) -> str:
     """Render the agent's full system content: Jinja2-templated system
-    prompt + preloaded skills + output-schema instruction. `user_id` is the
-    chat's user: a wildcard preloads only skills they may read.
+    prompt + preloaded skills + output-schema instruction.
 
     Shared by the initial LLM call (build_conversation_history) and the
     tool-loop follow-up (message_service) so the system prompt can't
@@ -46,7 +44,7 @@ async def build_agent_system_content(
 
     if agent.enabled_skills:
         preloaded_content = await skill_converter.get_preloaded_skills_content(
-            db=db, enabled_skills=agent.enabled_skills, user_id=user_id
+            db=db, enabled_skills=agent.enabled_skills
         )
         if preloaded_content:
             system_content += f"\n\n# Preloaded Skills\n\n{preloaded_content}"
@@ -126,7 +124,7 @@ async def build_conversation_history(
         agent = await db.get(Agent, chat.agent_id)
         if agent:
             system_content = await build_agent_system_content(
-                db, agent, skill_converter, template_variables, user_id=user_id
+                db, agent, skill_converter, template_variables
             )
 
     # Inject relevant context if enabled

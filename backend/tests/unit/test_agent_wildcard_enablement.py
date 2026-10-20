@@ -325,27 +325,56 @@ async def test_collection_wildcards_follow_the_same_rules(db, admin_user):
 
 
 @pytest.mark.asyncio
-async def test_skill_wildcards_reach_only_readable_skills(db, admin_user):
-    user = await _user(db, "sinas.skills/*/*.read:own")  # their own skills
+async def test_skill_wildcards_are_the_authors_grant_as_before(db, admin_user):
+    """Skills are instructions the author enables: a wildcard reaches every
+    matching skill, as on base, whatever the user's own skill permissions
+    (the default role reads only its own) — admin- and package-installed
+    skills keep working for regular users. Calls must be on the agent's list."""
     ns = f"sk{_uid()}"
     db.add_all([
-        Skill(user_id=user.id, namespace=ns, name="mine", description="d", content="mine-content"),
-        Skill(user_id=admin_user.id, namespace=ns, name="theirs", description="d", content="theirs-content"),
+        Skill(user_id=admin_user.id, namespace=ns, name="a", description="d", content="a-content"),
+        Skill(user_id=admin_user.id, namespace=ns, name="b", description="d", content="b-content"),
     ])
     await db.flush()
     conv = SkillToolConverter()
-    tools = await conv.get_available_skills(db, [{"skill": f"{ns}/*"}], user_id=str(user.id))
-    assert _names(tools) == {f"get_skill_{ns}_mine"}
-    preloaded = await conv.get_preloaded_skills_content(db, [{"skill": f"{ns}/*", "preload": True}], user_id=str(user.id))
-    assert "mine-content" in preloaded and "theirs-content" not in preloaded
-    # Named exactly: the author's grant, as before.
-    exact = await conv.get_available_skills(db, [{"skill": f"{ns}/theirs"}], user_id=str(user.id))
-    assert _names(exact) == {f"get_skill_{ns}_theirs"}
-    # Calls are checked against the agent's list the same way.
+    tools = await conv.get_available_skills(db, [{"skill": f"{ns}/*"}])
+    assert _names(tools) == {f"get_skill_{ns}_a", f"get_skill_{ns}_b"}
+    preloaded = await conv.get_preloaded_skills_content(db, [{"skill": f"{ns}/*", "preload": True}])
+    assert "a-content" in preloaded and "b-content" in preloaded
+
     call = conv.handle_skill_tool_call
-    assert await call(db, f"get_skill_{ns}_theirs", {}, enabled_skills=[{"skill": f"{ns}/*"}], user_id=str(user.id)) is None
-    assert await call(db, f"get_skill_{ns}_theirs", {}, enabled_skills=[{"skill": f"{ns}/theirs"}], user_id=str(user.id)) == "theirs-content"
-    assert await call(db, f"get_skill_{ns}_mine", {}, enabled_skills=[{"skill": f"{ns}/*"}], user_id=str(user.id)) == "mine-content"
+    assert await call(db, f"get_skill_{ns}_a", {}, enabled_skills=[{"skill": f"{ns}/*"}]) == "a-content"
+    assert await call(db, f"get_skill_{ns}_a", {}, enabled_skills=[{"skill": f"{ns}/a"}]) == "a-content"
+    assert await call(db, f"get_skill_{ns}_a", {}, enabled_skills=[{"skill": f"{ns}/b"}]) is None  # not on the list
+    assert await call(db, f"get_skill_{ns}_a", {}, enabled_skills=[]) is None
+
+
+@pytest.mark.asyncio
+async def test_skill_wildcards_reach_skills_regular_users_cannot_read(db, admin_user):
+    """End to end through tool discovery, for a user with the default skills
+    permission (read:own), on an agent whose skills an admin installed."""
+    from app.models.agent import Agent
+    from app.models.chat import Chat
+    from app.services.collection_tools import CollectionToolConverter
+    from app.services.query_tools import QueryToolConverter
+    from app.services.tool_discovery import get_available_tools
+
+    regular = await _user(db, "sinas.skills/*/*.read:own")
+    ns = f"sk{_uid()}"
+    db.add(Skill(user_id=admin_user.id, namespace=ns, name="guide", description="d", content="c"))
+    agent = Agent(user_id=admin_user.id, namespace=ns, name="a", enabled_skills=[{"skill": f"{ns}/*", "preload": False}])
+    db.add(agent)
+    await db.flush()
+    chat = Chat(user_id=regular.id, agent_id=agent.id, title="t")
+    db.add(chat)
+    await db.flush()
+    tools = await get_available_tools(
+        db=db, user_id=str(regular.id), chat=chat,
+        function_converter=FunctionToolConverter(), query_converter=QueryToolConverter(),
+        skill_converter=SkillToolConverter(), component_converter=ComponentToolConverter(),
+        collection_converter=CollectionToolConverter(),
+    )
+    assert f"get_skill_{ns}_guide" in _names(tools)
 
 
 @pytest.mark.asyncio

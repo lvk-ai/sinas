@@ -252,7 +252,7 @@ async def get_available_tools(
     # Get skill tools (only if list has items - opt-in)
     if agent.enabled_skills and len(agent.enabled_skills) > 0:
         skill_tools = await skill_converter.get_available_skills(
-            db=db, enabled_skills=agent.enabled_skills, user_id=user_id, permissions=user_permissions
+            db=db, enabled_skills=agent.enabled_skills
         )
         tools.extend(skill_tools)
 

@@ -14,7 +14,8 @@ behaves as it always did. A wildcard is a blanket: it sweeps in resources
 the author never named, including ones created later, by anyone. So a
 wildcard only expands to resources the chat's user may use themselves:
 `can_access` (the permission the runtime checks for that kind) is applied to
-wildcard matches, never to exact ones.
+wildcard matches, never to exact ones. Skills are the exception: an enabled
+skill, named or through a pattern, is the author's grant (as it always was).
 """
 import logging
 from typing import Any, Callable, Optional

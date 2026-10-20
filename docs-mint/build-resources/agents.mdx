@@ -48,7 +48,7 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 
 Only a whole name is a wildcard. Anything else with a `*` in it (`*/name`, `sales/send_*`) is refused when the agent is saved, through the API or config apply, as is a `*` where exactly one thing must be named: a hook's `function`, or a key of `function_parameters` / `query_parameters`.
 
-A named resource (`namespace/name`) is the agent author's grant and is offered to every user of the agent. A wildcard is a blanket that also sweeps in resources created later, by anyone, so it only ever expands to the resources **the chat's user may use themselves**:
+A named resource (`namespace/name`) is the agent author's grant and is offered to every user of the agent. A wildcard is a blanket that also sweeps in resources created later, by anyone, so it only ever expands to the resources **the chat's user may use themselves** (skills excepted):
 
 | Field | A wildcard reaches the resources the user has |
 |---|---|
@@ -56,7 +56,7 @@ A named resource (`namespace/name`) is the agent author's grant and is offered t
 | `enabled_queries` | `sinas.queries/{ns}/{name}.execute:own` |
 | `enabled_pipelines` | `sinas.pipelines/{ns}/{name}.run:own` |
 | `enabled_agents` | `sinas.agents/{ns}/{name}.read:own` (as named agents) |
-| `enabled_skills` | read access to the skill |
+| `enabled_skills` | no permission: skills are instructions, and an enabled skill is the author's grant, named or through a pattern (every matching skill) |
 | `enabled_components` | read access to the component (own, shared or public with `:own`) |
 | `enabled_connectors` | read access to the connector (what running an operation through the API takes) |
 | `enabled_mcp_servers` | read access to the server (as named servers) |
