@@ -61,9 +61,13 @@ class StreamRelay:
             event["usage"] = usage
         await self.publish(channel_id, event)
 
-    async def publish_error(self, channel_id: str, error: str) -> None:
-        """Publish a terminal 'error' event."""
-        await self.publish(channel_id, {"type": "error", "error": error})
+    async def publish_error(self, channel_id: str, error: str, code: Optional[str] = None) -> None:
+        """Publish a terminal 'error' event; `code` names a refused LLM call
+        (budget_exceeded, rate_limited; app/providers/errors.py)."""
+        event: dict[str, Any] = {"type": "error", "error": error}
+        if code:
+            event["code"] = code
+        await self.publish(channel_id, event)
 
     async def last_entry_id(self, channel_id: str) -> str:
         """The id of the channel's newest event ("0" when it has none): a

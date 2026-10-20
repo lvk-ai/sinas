@@ -10,6 +10,7 @@ from opentelemetry import trace
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.providers.attribution import new_chat_attribution
 from app.core.database import AsyncSessionLocal
 from app.core.telemetry import record_error, traced
 from app.models.execution import TriggerType
@@ -120,6 +121,7 @@ async def _execute_scheduled_agent(
                 agent_name=agent.name,
                 title=f"{schedule_name} — {timestamp}",
                 chat_metadata={"agent_input": input_data} if input_data else None,
+                attribution=await new_chat_attribution(db, user.id),
             )
             db.add(chat)
             await db.commit()

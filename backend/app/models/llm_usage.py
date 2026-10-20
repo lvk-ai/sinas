@@ -57,6 +57,10 @@ class LLMUsage(Base):
     price_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     # A provider batch-API call (usually discounted)
     batch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Whom the call is for: the user's USAGE_CUSTOMER_FIELD custom field
+    # (an organization id, say) when the call was made. NULL when that
+    # setting is off or the user had no such field.
+    customer: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -67,4 +71,5 @@ class LLMUsage(Base):
         Index("idx_llm_usage_created", "created_at"),
         Index("idx_llm_usage_agent_created", "agent", "created_at"),
         Index("idx_llm_usage_provider_created", "provider_name", "created_at"),
+        Index("idx_llm_usage_customer_created", "customer", "created_at"),
     )

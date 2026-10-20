@@ -383,9 +383,83 @@ def _has_group_rules(provider: IdentityProvider) -> bool:
 
 
 def needs_userinfo(provider: IdentityProvider, claims: dict) -> bool:
-    return claim_values(claims, provider.email_claim) is None or (
-        _has_group_rules(provider) and claim_values(claims, provider.groups_claim) is None
+    return (
+        claim_values(claims, provider.email_claim) is None
+        or (_has_group_rules(provider) and claim_values(claims, provider.groups_claim) is None)
+        or any(
+            _lookup(claims, str(m.get("claim") or "").split(".")) is _MISSING
+            for m in provider.claim_mappings or []
+        )
     )
+
+
+# ------------------------------------------------------------------ claim mappings
+
+# A copied string longer than this, or a list longer than MAX_CLAIM_ITEMS, is
+# not copied (never cut: a cut value is a wrong value).
+MAX_CLAIM_VALUE_LENGTH = 1024
+MAX_CLAIM_ITEMS = 50
+_SCALAR = (str, int, float, bool)
+
+
+def mapped_claim_value(claims: dict, path: str) -> Any:
+    """The value a claim mapping copies: a string, number or boolean; a list
+    of them (a one-item list as its item, so a single `organization` in a
+    list claim reads as that organization). None — the field is removed —
+    when the claim is absent, empty, an object, or too long."""
+    found = _lookup(claims, path.split("."))
+    if found is _MISSING or found is None:
+        return None
+    if isinstance(found, list):
+        if not found or len(found) > MAX_CLAIM_ITEMS or not all(isinstance(v, _SCALAR) for v in found):
+            return None
+        items = [_scalar(v) for v in found]
+        if any(v is None for v in items):
+            return None
+        return items[0] if len(items) == 1 else items
+    return _scalar(found) if isinstance(found, _SCALAR) else None
+
+
+def _scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value and len(value) <= MAX_CLAIM_VALUE_LENGTH else None
+    return value
+
+
+def sync_custom_fields(
+    user: User, provider: IdentityProvider, claims: dict, previous: Optional[dict] = None
+) -> dict[str, Any]:
+    """Make the custom fields this provider maps match the claims of this login.
+
+    A mapped field is the identity provider's: set to the claim's value, and
+    removed when the claim is absent, so a value the IdP no longer sends
+    doesn't linger. Fields no mapping names are never touched, whoever set
+    them (an admin, token exchange). A field this provider set at its last
+    login (`previous`, kept on the identity) whose mapping was removed since
+    is removed too, unless its value changed since (then someone else owns
+    it now). Returns what this login set, to keep as the next `previous`."""
+    mappings = [m for m in provider.claim_mappings or [] if m.get("claim") and m.get("field")]
+    if not mappings and not previous:
+        return {}
+    current = dict(user.custom_fields or {})
+    fields = dict(current)
+    now: dict[str, Any] = {}
+    for mapping in mappings:
+        value = mapped_claim_value(claims, mapping["claim"])
+        if value is None:
+            fields.pop(mapping["field"], None)
+        else:
+            fields[mapping["field"]] = now[mapping["field"]] = value
+    mapped = {m["field"] for m in mappings}
+    for field, value in (previous or {}).items():
+        if field not in mapped and field in fields and fields[field] == value:
+            del fields[field]
+    if fields != current:
+        user.custom_fields = fields
+        changed = sorted(k for k in set(fields) | set(current) if fields.get(k) != current.get(k))
+        logger.info(f"SSO {provider.name}: custom fields of user {user.id} synced: {changed}")
+    return now
 
 
 # ------------------------------------------------------------------ who signs in
@@ -488,6 +562,17 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
                     # Given once, like a role granted by hand: no sync takes it away.
                     db.add(UserRole(role_id=role.id, user_id=user.id, active=True))
 
+    previous_metadata = (
+        await db.execute(
+            select(UserIdentity.identity_metadata).where(
+                UserIdentity.provider == issuer, UserIdentity.subject == subject
+            )
+        )
+    ).scalar_one_or_none() or {}
+    previous_fields = previous_metadata.get("claim_fields") if isinstance(previous_metadata, dict) else None
+    claim_fields = sync_custom_fields(
+        user, provider, claims, previous_fields if isinstance(previous_fields, dict) else None
+    )
     await link_user_identity(
         db, user, issuer, subject,
         {
@@ -495,6 +580,8 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
             "email": email,
             "email_verified": verified,
             **{k: claims[k] for k in ("name", "preferred_username") if isinstance(claims.get(k), str)},
+            # What the claim mappings set at this login (sync_custom_fields).
+            **({"claim_fields": claim_fields} if claim_fields else {}),
         },
     )
     groups = set(claim_values(claims, provider.groups_claim) or [])

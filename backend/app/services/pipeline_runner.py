@@ -60,7 +60,13 @@ class PipelineBusyError(Exception):
 
 
 class StepError(Exception):
-    """A step failed after exhausting its retries."""
+    """A step failed after exhausting its retries. `code`: the refusal code
+    when an agent step's LLM call was refused (budget_exceeded,
+    rate_limited; app/providers/errors.py)."""
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
 
 
 def _now() -> datetime:
@@ -217,6 +223,7 @@ async def _execute_agent_step(
 ) -> Any:
     from app.models.agent import Agent
     from app.models.chat import Chat
+    from app.providers.attribution import new_chat_attribution
     from app.services.queue_service import queue_service
     from app.services.stream_relay import stream_relay
 
@@ -236,6 +243,7 @@ async def _execute_agent_step(
             title=f"pipeline:{pipeline_label} — {_now().strftime('%Y-%m-%d %H:%M')}",
             chat_metadata={"agent_input": input_data} if input_data else None,
             job_timeout=agent.default_job_timeout,
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.commit()
@@ -288,7 +296,10 @@ async def _execute_agent_step(
         if event.get("type") in ("done", "error"):
             got_terminal = True
             if event.get("type") == "error":
-                raise StepError(f"Agent {namespace}/{name} failed: {event.get('error', 'unknown error')}")
+                raise StepError(
+                    f"Agent {namespace}/{name} failed: {event.get('error', 'unknown error')}",
+                    code=event.get("code"),
+                )
             break
 
     if not got_terminal:
@@ -686,6 +697,8 @@ async def run_pipeline(
                     break
                 except StepError as e:
                     last_err = e
+                    if e.code == "budget_exceeded":
+                        break  # retrying can't help until the budget does
                     if attempt < max_attempts - 1:
                         delay = _backoff_delay(attempt, backoff)
                         logger.warning(
@@ -699,7 +712,10 @@ async def run_pipeline(
             if last_err is not None:
                 summary["status"] = "failed"
                 summary["error"] = str(last_err)[:2000]
-                raise StepError(f"Step '{name}': {last_err}")
+                code = getattr(last_err, "code", None)
+                if code:
+                    summary["errorCode"] = code
+                raise StepError(f"Step '{name}': {last_err}", code=code)
 
             summary["status"] = "succeeded"
             context["steps"][name] = {"output": result}

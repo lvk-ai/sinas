@@ -158,12 +158,15 @@ async def _agent_mode(
             raise HTTPException(404, "Chat not found")
     else:
         # Create new chat
+        from app.providers.attribution import new_chat_attribution
+
         chat = Chat(
             user_id=user_id,
             agent_id=agent.id,
             agent_namespace=agent.namespace,
             agent_name=agent.name,
             title=f"OpenAI adapter: {agent.namespace}/{agent.name}",
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.commit()

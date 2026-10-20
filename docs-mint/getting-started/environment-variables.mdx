@@ -128,6 +128,8 @@ The deployment ratecard calls are priced from, in LiteLLM's `model_prices_and_co
 | `MODEL_PRICES_REFRESH_HOURS` | `24` | Age at which the URL copy is fetched again. |
 | `MODEL_PRICES_TIMEOUT_SECONDS` | `30` | URL fetch timeout. |
 | `MODEL_PRICES_MAX_BYTES` | `16777216` | Largest ratecard accepted. |
+| `ATTRIBUTION_FIELDS` | _(none)_ | Comma-separated user custom fields (e.g. `orgId,costCenter`) a chat takes a snapshot of when it is created, for `{{attribution.<key>}}` in an LLM provider's header templates. See [Attribution and budgets through an LLM gateway](/admin/llm-gateway-attribution). |
+| `USAGE_CUSTOMER_FIELD` | _(none)_ | The attribution field (e.g. `orgId`) recorded on every LLM call as its `customer`, for the usage API's `customer` dimension. Always part of the snapshot. |
 
 ## Executors
 

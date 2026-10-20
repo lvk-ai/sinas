@@ -53,7 +53,7 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             response = await client.post(
-                f"{self.base_url}/api/chat", json=payload, headers=self._sdk_context_headers()
+                f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             )
 
             # Debug logging
@@ -112,8 +112,13 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             async with client.stream(
-                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._sdk_context_headers()
+                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             ) as response:
+                if response.is_error:
+                    # Read the body first: the error raised next carries the
+                    # response, and classifying it (a gateway's budget
+                    # refusal, app/providers/errors.py) needs the body.
+                    await response.aread()
                 response.raise_for_status()
 
                 async for line in response.aiter_lines():

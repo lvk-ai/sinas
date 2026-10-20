@@ -1,0 +1,198 @@
+---
+title: "Attribution and budgets through an LLM gateway"
+description: "Send identity-derived headers on every LLM call, record spend per customer, and surface budget refusals as budget_exceeded"
+---
+
+
+Many deployments put a gateway between Sinas and the model APIs: a spend-tracking proxy, a corporate AI gateway, an internal router. To attribute spend and enforce budgets per customer (an organization, a team, a tenant), the gateway needs to know whom each call is for. Sinas tells it with **headers built from identity**: an LLM provider's `config.headers` maps a header name to a template, filled in for every call from the user the call runs for, its agent, its chat and its API key.
+
+Four pieces work together:
+
+1. **Who the customer is.** A user [custom field](/admin/users-roles), e.g. `orgId`, set by [token exchange](/platform/authentication) (`custom_fields`) or by an identity provider's [claim mappings](/admin/sso#claim-mappings) at every sign-in.
+2. **Which fields are attribution.** `ATTRIBUTION_FIELDS=orgId,costCenter` names them. A chat takes a **snapshot** of them when it's created (below).
+3. **Telling the gateway.** The provider's header templates send them on every call: `{{attribution.orgId}}`.
+4. **Recording it in Sinas.** `USAGE_CUSTOMER_FIELD=orgId` records the snapshot's `orgId` on every call's usage row, so the [usage API](/admin/usage-cost#cost-per-customer) groups and filters by `customer`. (It is an attribution field whether or not `ATTRIBUTION_FIELDS` lists it.)
+
+And when the gateway refuses a call because the customer's budget is spent, Sinas reports a distinct error, `budget_exceeded`, instead of a generic provider error ([below](#budget-refusals)).
+
+## The attribution snapshot
+
+A chat takes a snapshot of the attribution fields when it is created (`chats.attribution`), from the user it is created for, and **keeps it for its life**. Every LLM call in the chat is attributed by that snapshot, however the chat continues:
+
+- a later message, on any channel (the runtime API, the OpenAI-compatible adapter, a webhook with a session key), even after the user's fields changed;
+- an approval or a question answered by someone else, a resume, background work, a wakeup or a watch;
+- a sub-agent: its chat inherits the parent chat's snapshot.
+
+So a user who works for several organizations is attributed per chat: each chat keeps the organization it was started under, and a new sign-in (or token exchange) for another organization changes the fields for the chats started after it, never a running one. A chat created before any attribution field was configured takes its snapshot at its next LLM call.
+
+`{{attribution.<key>}}` reads the snapshot; `{{user.custom_fields.<key>}}` reads the user's fields as they are at the time of the call. Use the snapshot for anything a budget or a bill depends on.
+
+## Header templates
+
+```yaml
+llmProviders:
+  - name: gateway
+    type: openai
+    endpoint: https://llm-gateway.internal/v1
+    apiKey: ${GATEWAY_KEY}
+    config:
+      headers:
+        x-customer-id: "{{attribution.orgId}}"
+        x-request-tags: "agent:{{agent.namespace}}/{{agent.name}}"
+        x-run: "{{api_key.name}}"
+```
+
+The same `config.headers` object goes in the REST API (`POST/PATCH /api/v1/llm-providers`) and in the console's provider form (**Headers**).
+
+A template is static text and these variables, nothing else (no expressions, filters or defaults):
+
+| Variable | Value |
+|---|---|
+| `{{attribution.<key>}}` | One of the chat's attribution fields, from its snapshot (`<key>`: letters, digits and `_`). Outside a chat (a provider batch submission, the adapter's passthrough mode): the user's attribution fields at the time of the call |
+| `{{user.id}}` | The id of the user the call runs for: the chat's owner |
+| `{{user.email}}` | Their email address |
+| `{{user.custom_fields.<key>}}` | One of their custom fields, as it is now |
+| `{{agent.namespace}}`, `{{agent.name}}` | The agent handling the chat |
+| `{{chat.id}}` | The chat |
+| `{{api_key.name}}` | The name of the API key the turn acts through, when it does (and the key is the user's own and still valid) |
+
+**Rules:**
+
+- **A header is sent whole or not at all.** If any variable in a template has no value (unset, empty, not a string, number or boolean), or a value that isn't safe in a header, the header is left out, and the call goes through without it. `org-{{attribution.orgId}}` never goes out as `org-`.
+- **Values are printable ASCII**, without `"` and `\`, at most 1024 characters, and are never cut or escaped to fit. Line breaks and every other control character make a value unsafe, so a value can't inject a header. Without `"` and `\`, a template can safely build a JSON header value, like `{"org":"{{attribution.orgId}}"}`.
+- **Header names** are letters, digits and `-`. At most 20 headers. **Reserved names are refused**: credentials (`Authorization`, `x-api-key`, `api-key`, gateway keys such as `cf-aig-authorization` and `x-portkey-api-key`: set the key in the provider's API key field), framing (`Host`, `Content-Length`, `Content-Type`, ...), the trace context (`traceparent`, `tracestate`, `baggage`, `b3`, ...; whether a call carries it is the provider's `propagate_context` setting alone), and the SDKs' own (`anthropic-*`, `x-stainless-*`, `x-goog-*`, `x-amz-*`).
+- **A template wins.** A header of the same name from anywhere else (`extra_params`, an SDK default) is replaced, whatever its case.
+- **Inbound headers are never forwarded.** No header of a request to Sinas (the runtime API, the OpenAI-compatible adapter, an MCP client) reaches a model API, so a caller can't set or override these values.
+
+**Where they apply:** every call made through the provider, for every provider type (OpenAI, Azure OpenAI, Anthropic, Gemini, Mistral, Ollama), streamed or not: agent turns however they run (inline, queued, resumed after an approval or an answer, sub-agent delegations, wakeups, watches, schedules, webhooks, pipelines, the OpenAI-compatible adapter), and compaction summaries. The identity is resolved for each call from the chat it is made for, so a queued or resumed turn carries the same values as an inline one.
+
+**Provider batches** go out as one request for many items, so their headers are resolved from the submitter: the user (with their attribution fields at submission), the agent, the API key of the submission. `{{chat.id}}` has no single value there, so a header using it is left out of a batch. Polling a batch's status and fetching its results carry no template headers.
+
+## Security
+
+- **Values come from identity**, never from the request: custom fields are set by an administrator, token exchange (an admin credential) or the identity provider at sign-in.
+- **Personal data leaves your infrastructure only when you put it in a template.** `{{user.email}}` sends an email address to the gateway (and, if the gateway forwards headers, beyond it). Prefer opaque ids.
+- **A shared service key carries the key owner's identity.** A turn run through an API key acts as the key's owner, so per-user values apply only when requests run as the end user: through token exchange, SSO, or a key owned by that user. Calls of a shared service account without the field carry no customer header and are recorded without a customer: platform cost.
+- Static secret headers (a value from a [Secret](/build-resources/secrets)) aren't supported; put a gateway credential in the provider's API key field.
+
+## Recording spend in Sinas
+
+```bash
+ATTRIBUTION_FIELDS=orgId,costCenter   # optional: more fields for templates
+USAGE_CUSTOMER_FIELD=orgId
+```
+
+Every call then records its chat's snapshot `orgId` as `customer` on its usage row. The usage API takes `group_by=customer` and `customer=<value>` filters, and `/usage/calls` items have a `customer`. A provider batch's results are recorded with the customer of each item's chat (a snapshot taken when the batch created it).
+
+```bash
+curl -H "Authorization: Bearer $KEY" "$SINAS/api/v1/usage/summary?group_by=customer&from=2026-10-01"
+```
+
+## Budget refusals
+
+When a model API or gateway refuses a call because a budget, quota or credit balance is spent, Sinas raises a typed error with a stable code:
+
+| Code | HTTP status from Sinas | Meaning | Retried |
+|---|---|---|---|
+| `budget_exceeded` | 402 | A budget, quota or credit balance is exhausted. Retrying won't help until it's raised or resets. | Never: not by the SDK, the queue, or a pipeline step |
+| `rate_limited` | 429 | Too many requests now (a 429 that isn't a budget refusal). | The SDK retries it with backoff first |
+
+**Detection is conservative**, from the status code and well-known error shapes:
+
+- HTTP **402**;
+- an error `type` or `code` (OpenAI-style `error.type`/`error.code`, or top-level) of `budget_exceeded`, `insufficient_quota`, `billing_error` or `billing_hard_limit_reached`;
+- a message containing `ExceededBudget`, `ExceededTokenBudget`, `Budget has been exceeded`, `Budget limit exceeded`, `exceeded budget`, `credit balance is too low` or `insufficient credits` (budget errors some gateways return under another status, such as 400, 401 or 403);
+- or the provider's own rules, for any other gateway:
+
+```yaml
+llmProviders:
+  - name: gateway
+    # ...
+    config:
+      budget_errors:
+        # A rule matches when every key it has matches.
+        - status: [403, 429]            # an HTTP status, or a list
+          message_contains: spend cap   # case-insensitive
+        - type: tenant_quota_exhausted  # error.type (or code) in the body
+```
+
+**Where it shows:**
+
+- Non-streaming calls (`POST /chats/{id}/messages`, agent invoke, sync webhooks, the OpenAI-compatible adapter, provider batch submission): HTTP **402** with `{"detail": "budget_exceeded: ...", "code": "budget_exceeded"}` (429 and `rate_limited` for a rate limit, with `Retry-After` when the provider sent one).
+- Streams: the terminal `error` event carries `"code": "budget_exceeded"`.
+- Queued turns: the job's status record is `failed` with `error_code`; a batch execution's error, and a waiting parent agent's tool result (`error_code`), say it too.
+- Pipelines: the failed agent step's summary has `errorCode`, and the step is not retried.
+- Usage: the call's row has `error` starting with `budget_exceeded:`.
+
+The error text always starts with the code, so it survives wherever only a message is kept.
+
+## Recipes
+
+These are examples; any gateway that reads a header works the same way.
+
+### LiteLLM proxy
+
+LiteLLM records the customer of a call from `x-litellm-customer-id` (or `x-litellm-end-user-id`), and tags from `x-litellm-tags`; headers take precedence over the body.
+
+```yaml
+llmProviders:
+  - name: litellm
+    type: openai
+    endpoint: https://litellm.internal
+    apiKey: ${LITELLM_VIRTUAL_KEY}
+    pricingProvider: openai
+    config:
+      headers:
+        x-litellm-customer-id: "{{attribution.orgId}}"
+        x-litellm-tags: "sinas,agent:{{agent.namespace}}/{{agent.name}}"
+```
+
+Give each customer a budget in LiteLLM (`POST /customer/new` with `user_id` set to the org id, `max_budget` and `budget_duration`). When it is spent, LiteLLM refuses calls with `ExceededBudget: End User=... over budget`, which Sinas reports as `budget_exceeded`; LiteLLM's key, team and user budget errors (`type: budget_exceeded`) are recognised too.
+
+### Portkey
+
+```yaml
+      headers:
+        x-portkey-metadata: '{"_user":"{{attribution.orgId}}","agent":"{{agent.name}}"}'
+```
+
+### Helicone
+
+```yaml
+      headers:
+        Helicone-User-Id: "{{attribution.orgId}}"
+        Helicone-Property-Agent: "{{agent.namespace}}/{{agent.name}}"
+```
+
+### Cloudflare AI Gateway
+
+```yaml
+      headers:
+        cf-aig-metadata: '{"org":"{{attribution.orgId}}","agent":"{{agent.name}}"}'
+```
+
+Cloudflare keeps up to five metadata entries per request.
+
+### OpenRouter
+
+OpenRouter attributes spend per API key and by the request body's `user` field, which templates don't set; its app attribution headers can be static: `HTTP-Referer: https://sinas.example.com`, `X-Title: Sinas`. Its budget errors (402, and 403 `Budget limit exceeded`) are recognised.
+
+### OpenAI projects
+
+`OpenAI-Organization` and `OpenAI-Project` can be set per provider as static values, e.g. one provider per project:
+
+```yaml
+      headers:
+        OpenAI-Project: proj_abc123
+```
+
+### Kong, Envoy and internal gateways
+
+AI gateways that rate-limit or meter by a request header (a Kong plugin keyed on a header, an Envoy AI Gateway rate-limit descriptor, an in-house proxy) take whatever header you configure there:
+
+```yaml
+      headers:
+        x-tenant-id: "{{attribution.orgId}}"
+```
+
+If the gateway answers a spent budget with its own error, add a `budget_errors` rule for it.

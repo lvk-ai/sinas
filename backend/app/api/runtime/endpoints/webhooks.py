@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import set_permission_used, verify_jwt_or_api_key
 from app.core.database import get_db
+from app.providers.attribution import new_chat_attribution
 from app.core.permissions import check_permission
 from app.models.execution import TriggerType
 from app.models.webhook import Webhook
@@ -201,6 +202,7 @@ async def _execute_agent_webhook(
             title=f"webhook:{webhook.path}",
             session_key=session_key,
             job_timeout=agent.default_job_timeout,
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.flush()

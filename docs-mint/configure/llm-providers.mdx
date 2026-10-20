@@ -46,6 +46,21 @@ llmProviders:
 
 In the console this is **Price models as** in the provider form's Pricing section. See [Usage & Cost](/admin/usage-cost#openai-compatible-providers) for how models are matched.
 
+**Headers from identity, and budget refusals:**
+
+`config.headers` sends headers built from the identity of each call (the user's custom fields, the agent, the chat, the API key) on every request to the provider, so a gateway in front of it can attribute spend and enforce budgets per customer. `config.budget_errors` teaches Sinas your gateway's budget error, so it surfaces as `budget_exceeded`. See [Attribution and budgets through an LLM gateway](/admin/llm-gateway-attribution).
+
+```yaml
+llmProviders:
+  - name: gateway
+    type: openai
+    endpoint: https://llm-gateway.internal/v1
+    config:
+      headers:
+        x-customer-id: "{{attribution.orgId}}"
+        x-request-tags: "agent:{{agent.namespace}}/{{agent.name}}"
+```
+
 **Provider resolution for agents:**
 1. Agent's explicit `llm_provider_id` if set
 2. Agent's `model` field with the resolved provider

@@ -84,6 +84,38 @@ class RoleMappingSpec(SpecModel):
         return email_domain is not None and email_domain == self.email_domain
 
 
+class ClaimMappingSpec(SpecModel):
+    """Copy a claim into a user custom field at every login.
+
+    `claim` is a dotted path into the verified ID token claims (filled in
+    from userinfo), like emailClaim: `org_id`, `organization.id`, or a key
+    holding dots as is (`https://example.com/org_id`). `field` is the
+    users.custom_fields key it lands in, an identifier."""
+
+    claim: str = Field(min_length=1, max_length=512)
+    field: str = Field(min_length=1, max_length=64)
+
+    @field_validator("claim")
+    @classmethod
+    def _claim(cls, value: str) -> str:
+        value = value.strip()
+        if not value or value.startswith(".") or value.endswith(".") or any(c.isspace() for c in value):
+            raise ValueError(f"'{value}' is not a claim path")
+        return value
+
+    @field_validator("field")
+    @classmethod
+    def _field(cls, value: str) -> str:
+        from app.providers.attribution import FIELD_KEY
+
+        value = value.strip()
+        if not FIELD_KEY.match(value):
+            raise ValueError(
+                f"'{value}' is not a custom field name: letters, digits and _, not starting with a digit"
+            )
+        return value
+
+
 class IdentityProviderSpec(SpecModel):
     name: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     display_name: str = Field(min_length=1, max_length=255)
@@ -96,6 +128,8 @@ class IdentityProviderSpec(SpecModel):
     email_claim: str = Field(default="email", min_length=1, max_length=512)
     groups_claim: str = Field(default="groups", min_length=1, max_length=512)
     role_mappings: list[RoleMappingSpec] = Field(default_factory=list)
+    # Claims copied into the user's custom fields at every login.
+    claim_mappings: list[ClaimMappingSpec] = Field(default_factory=list, max_length=50)
     allowed_domains: list[str] = Field(default_factory=list)
     auto_provision: bool = False
     default_role: Optional[str] = Field(default=None, max_length=255)
@@ -134,6 +168,24 @@ class IdentityProviderSpec(SpecModel):
     def _domain_list(cls, value: list[str]) -> list[str]:
         return _domains(value)
 
+    @field_validator("claim_mappings")
+    @classmethod
+    def _one_claim_per_field(cls, value: list[ClaimMappingSpec]) -> list[ClaimMappingSpec]:
+        seen: set[str] = set()
+        for mapping in value:
+            if mapping.field in seen:
+                raise ValueError(f"custom field '{mapping.field}' is mapped twice")
+            seen.add(mapping.field)
+        return value
+
+    def canonical(self) -> dict[str, Any]:
+        state = super().canonical()
+        # Left out while unset, so providers from before claim mappings keep
+        # their checksum and history.
+        if not self.claim_mappings:
+            state.pop("claim_mappings", None)
+        return state
+
     @property
     def key(self) -> str:
         return self.name
@@ -146,8 +198,9 @@ class IdentityProviderSpec(SpecModel):
 
     def to_config(self) -> dict[str, Any]:
         out = super().to_config()
-        if not out.get("roleMappings"):
-            out.pop("roleMappings", None)
+        for field in ("roleMappings", "claimMappings"):
+            if not out.get(field):
+                out.pop(field, None)
         for field in ("allowedDomains", "enforceForDomains"):
             if not out.get(field):
                 out.pop(field, None)

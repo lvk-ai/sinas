@@ -6,7 +6,7 @@ from typing import Any, Optional, TypeVar
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from .base import BaseLLMProvider, reasoning_text
-from .clients import guard_trace_context, secret_id, shared_client
+from .clients import guard_client, secret_id, shared_client
 
 C = TypeVar("C", bound=AsyncOpenAI)
 
@@ -15,9 +15,9 @@ def openai_client(client_class: type[C] = AsyncOpenAI, *, http_client: Any = Non
     """The SDK client an OpenAI-style provider (OpenAI, Azure, Mistral,
     Gemini) talks through: `client_class(**options)`, whose requests carry
     trace context only when the provider asks (`propagate_context`), however
-    a future SDK might send its own (see `clients.guard_trace_context`)."""
+    a future SDK might send its own (see `clients.guard_client`)."""
     return client_class(
-        http_client=guard_trace_context(http_client or DefaultAsyncHttpxClient()), **options
+        http_client=guard_client(http_client or DefaultAsyncHttpxClient()), **options
     )
 
 
@@ -257,7 +257,7 @@ class OpenAIProvider(BaseLLMProvider):
         input_file = await self.client.files.create(
             file=("batch.jsonl", jsonl),
             purpose="batch",
-            extra_headers=self._sdk_context_headers() or None,
+            extra_headers=self._sdk_request_headers() or None,
         )
         return input_file.id
 
@@ -292,7 +292,7 @@ class OpenAIProvider(BaseLLMProvider):
             input_file_id=input_file_id,
             endpoint="/v1/chat/completions",
             completion_window="24h",
-            extra_headers=self._sdk_context_headers() or None,
+            extra_headers=self._sdk_request_headers() or None,
         )
         return batch.id
 
