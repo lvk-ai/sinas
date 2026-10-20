@@ -242,8 +242,10 @@ class UsageTrackingProvider(BaseLLMProvider):
     ) -> None:
         usage = usage or {}
         normalized = normalize_finish_reason(finish_reason)
-        if normalized is None and error is not None and error != "stream_abandoned":
-            normalized = "error"  # the call raised before it finished
+        if error is not None and error != "stream_abandoned":
+            # The call failed, even if a finish reason arrived first (OpenAI
+            # sends it before the usage chunk); finish_reason_raw keeps it.
+            normalized = "error"
         values = {
             "provider_name": self._provider_name,
             "provider_type": self._provider_type,

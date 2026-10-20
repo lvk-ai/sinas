@@ -98,15 +98,12 @@ def _within_job_timeout(
         seconds = agent_job_timeout(kwargs.get("job_timeout"))
         # The chat lock the job takes lives as long as the job may run.
         token = chat_steering.current_job_timeout.set(seconds)
-        # LLM call retries don't wait past it (app/services/llm_retry.py).
-        deadline_token = chat_steering.current_job_deadline.set(
-            asyncio.get_running_loop().time() + seconds
-        )
         try:
-            async with asyncio.timeout(seconds):
-                return await job(ctx, **kwargs)
+            # LLM call retries don't wait past it (app/services/llm_retry.py).
+            with chat_steering.job_deadline(seconds):
+                async with asyncio.timeout(seconds):
+                    return await job(ctx, **kwargs)
         finally:
-            chat_steering.current_job_deadline.reset(deadline_token)
             chat_steering.current_job_timeout.reset(token)
 
     return run

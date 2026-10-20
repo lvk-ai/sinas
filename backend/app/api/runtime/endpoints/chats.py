@@ -486,10 +486,9 @@ async def invoke_agent(
     timeout = agent.default_job_timeout or settings.function_timeout or 300
     started = asyncio.get_running_loop().time()
     # An LLM call's retry never waits past the timeout (app/services/llm_retry.py).
-    from app.services.chat_steering import current_job_deadline
+    from app.services.chat_steering import job_deadline
 
-    deadline_token = current_job_deadline.set(started + timeout)
-    with collect_usage() as usage_collector:
+    with collect_usage() as usage_collector, job_deadline(timeout):
         try:
             turn = await asyncio.wait_for(
                 message_service.run_turn(
@@ -502,8 +501,6 @@ async def invoke_agent(
             )
         except asyncio.TimeoutError:
             raise LLMError(JOB_TIMEOUT, f"Agent execution timed out after {timeout}s")
-        finally:
-            current_job_deadline.reset(deadline_token)
 
     # 6. Return response — following a round that waits on background work
     # for the rest of the time budget (sync_turns).

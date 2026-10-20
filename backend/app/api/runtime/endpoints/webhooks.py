@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import set_permission_used, verify_jwt_or_api_key
 from app.core.database import get_db
 from app.providers.attribution import new_chat_attribution
+from app.providers.errors import JOB_TIMEOUT, LLMError
 from app.core.permissions import check_permission
 from app.models.execution import TriggerType
 from app.models.webhook import Webhook
@@ -235,19 +236,21 @@ async def _execute_agent_webhook(
     message_service = MessageService(db)
     timeout = agent.default_job_timeout or settings.function_timeout or 300
     started = asyncio.get_running_loop().time()
-    try:
-        turn = await asyncio.wait_for(
-            message_service.run_turn(
-                chat_id=chat_id,
-                user_id=user_id,
-                user_token=token,
-                content=message,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        from app.providers.errors import JOB_TIMEOUT, LLMError
+    from app.services.chat_steering import job_deadline
 
+    try:
+        # An LLM call's retry never waits past the timeout (app/services/llm_retry.py).
+        with job_deadline(timeout):
+            turn = await asyncio.wait_for(
+                message_service.run_turn(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=token,
+                    content=message,
+                ),
+                timeout=timeout,
+            )
+    except asyncio.TimeoutError:
         # 504 with the error envelope, like the agent invoke's.
         raise LLMError(JOB_TIMEOUT, f"Agent execution timed out after {timeout}s")
     try:
@@ -624,7 +627,9 @@ async def execute_webhook(
 
         return response
 
-    except HTTPException:
+    except (HTTPException, LLMError):
+        # A failed agent turn answers with its code's status and the error
+        # envelope (app/providers/errors.py), like the agent invoke.
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Webhook execution failed: {str(e)}")

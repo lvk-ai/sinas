@@ -8,7 +8,6 @@ the job's timeout; never for budget_exceeded or any other code; a stream
 only before it showed anything (nothing is shown twice); the chat lock is
 refreshed after each wait; and the tool-loop follow-up goes through it.
 """
-import asyncio
 
 import httpx
 import openai
@@ -85,14 +84,11 @@ def test_the_budget_comes_from_the_settings(monkeypatch):
 
 
 async def test_a_wait_never_runs_past_the_jobs_timeout():
-    loop = asyncio.get_running_loop()
-    token = chat_steering.current_job_deadline.set(loop.time() + 20)
-    try:
+    with chat_steering.job_deadline(20):
         budget = RetryBudget(max_attempts=3, max_wait=90)
         assert budget.delay_for(_limited(2)) == 2  # 2s + the margin fit in 20s
         assert budget.delay_for(_limited(10)) is None  # 10s + 15s margin don't
-    finally:
-        chat_steering.current_job_deadline.reset(token)
+    assert llm_retry.job_time_left() is None
 
 
 # ── calls and streams ──────────────────────────────────────────────────────
@@ -334,3 +330,71 @@ async def test_the_follow_up_never_replays_a_stream_that_showed_output(db, chat,
     with pytest.raises(LLMRefusalError):
         await _follow_up(db, chat, test_user, provider, monkeypatch)
     assert provider.calls == 1 and slept == []
+
+
+# ── synchronous requests give their turn their timeout as the deadline ─────
+
+
+async def _sync_agent(db, user, timeout):
+    import uuid
+
+    from app.models import Agent
+
+    agent = Agent(
+        namespace="sync", name=f"deadline-{uuid.uuid4().hex[:6]}", user_id=user.id, model="m",
+        is_active=True, default_job_timeout=timeout,
+    )
+    db.add(agent)
+    await db.flush()
+    return agent
+
+
+def _refusing_turn(monkeypatch, seen):
+    from app.services.message_service import MessageService
+
+    async def run_turn(self, *a, **k):
+        seen.append(llm_retry.job_time_left())
+        # What a retry would make of a wait longer than the time left.
+        seen.append(RetryBudget(max_attempts=3, max_wait=90).delay_for(_limited(60)))
+        raise _limited(60)
+
+    monkeypatch.setattr(MessageService, "run_turn", run_turn)
+
+
+async def test_an_invoke_gives_its_turn_its_timeout_as_the_deadline(client, db, admin_user, monkeypatch):
+    from tests.conftest import auth_headers
+
+    agent = await _sync_agent(db, admin_user, timeout=30)
+    seen = []
+    _refusing_turn(monkeypatch, seen)
+    r = await client.post(
+        f"/agents/{agent.namespace}/{agent.name}/invoke", json={"message": "hi"}, headers=auth_headers(admin_user)
+    )
+    assert r.status_code == 429 and r.json()["code"] == RATE_LIMITED, r.text
+    left, delay = seen
+    assert 0 < left <= 30
+    assert delay is None  # a 60s wait doesn't fit: the rate limit is answered at once
+
+
+async def test_a_sync_webhook_gives_its_turn_its_timeout_as_the_deadline(client, db, admin_user, monkeypatch):
+    import uuid
+
+    from tests.conftest import auth_headers
+
+    agent = await _sync_agent(db, admin_user, timeout=30)
+    path = f"deadline/{uuid.uuid4().hex[:8]}"
+    created = await client.post(
+        "/api/v1/webhooks",
+        json={
+            "path": path, "target_type": "agent", "agent_namespace": agent.namespace, "agent_name": agent.name,
+            "message_template": "go", "response_mode": "sync",
+        },
+        headers=auth_headers(admin_user),
+    )
+    assert created.status_code == 201, created.text
+    seen = []
+    _refusing_turn(monkeypatch, seen)
+    r = await client.post(f"/webhooks/{path}", json={}, headers=auth_headers(admin_user))
+    assert r.status_code == 429 and r.json()["code"] == RATE_LIMITED, r.text
+    left, delay = seen
+    assert 0 < left <= 30 and delay is None

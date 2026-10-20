@@ -210,7 +210,9 @@ class _Failing:
         raise RuntimeError("boom")
 
     async def stream(self, *a, **k):
-        yield {"content": "par", "finish_reason": None}
+        # OpenAI sends the finish reason before its usage chunk: a failure
+        # after it still makes the call a failed one.
+        yield {"content": "par", "finish_reason": "stop"}
         raise RuntimeError("boom")
 
 
@@ -221,7 +223,7 @@ async def test_a_failed_call_is_recorded_as_error(recorded):
     with pytest.raises(RuntimeError):
         [c async for c in provider.stream(MESSAGES, model="m")]
     await _settled()
-    assert [(r["finish_reason"], r["finish_reason_raw"]) for r in recorded] == [("error", None), ("error", None)]
+    assert [(r["finish_reason"], r["finish_reason_raw"]) for r in recorded] == [("error", None), ("error", "stop")]
 
 
 # ── provider batches ───────────────────────────────────────────────────────
