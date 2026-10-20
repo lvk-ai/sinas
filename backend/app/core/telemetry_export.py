@@ -30,6 +30,8 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
 from opentelemetry.trace import SpanContext, SpanKind, Status
 
+from app.middleware.request_logger import redact_path, redact_url_query
+
 #: The instrumentation scope of the spans Sinas records itself.
 SINAS_SCOPE = "sinas"
 
@@ -192,8 +194,6 @@ def redact_text(text: str) -> str:
     line of defence: code should not log secrets in the first place."""
     if not text:
         return text
-    from app.middleware.request_logger import redact_url_query
-
     text = redact_url_query(text)
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
@@ -203,8 +203,6 @@ def redact_text(text: str) -> str:
 def redact_url(value: str) -> str:
     """A URL attribute without userinfo, credential query values or a
     credential path segment (`/watch/<secret>`)."""
-    from app.middleware.request_logger import redact_path, redact_url_query
-
     try:
         parts = urlsplit(value)
     except ValueError:
@@ -217,14 +215,10 @@ def redact_url(value: str) -> str:
 
 
 def _redact_query(value: str) -> str:
-    from app.middleware.request_logger import redact_url_query
-
     return redact_url_query("?" + value)[1:]
 
 
 def _redact_path_attr(value: str) -> str:
-    from app.middleware.request_logger import redact_path, redact_url_query
-
     path, sep, query = value.partition("?")
     return redact_path(path) + (redact_url_query("?" + query) if sep else "")
 
@@ -454,6 +448,9 @@ class RedactingLogProcessor(_log_record_processor_base()):  # type: ignore[misc]
 # (a failing exporter logging about itself would loop) and HTTP client
 # internals.
 _NEVER_EXPORTED = ("opentelemetry", "urllib3", "requests", "httpcore", "httpcore2", "hpack", "grpc")
+# Below WARNING, these only repeat what their spans record (httpx logs every
+# request at INFO; SQLAlchemy's echo logs every statement).
+_SPANS_SAY_IT = ("httpx", "httpx2", "sqlalchemy.engine")
 
 
 def _severity(levelno: int) -> Any:
@@ -484,6 +481,8 @@ class OTLPLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.name.startswith(_NEVER_EXPORTED):
+            return
+        if record.levelno < logging.WARNING and record.name.startswith(_SPANS_SAY_IT):
             return
         try:
             try:

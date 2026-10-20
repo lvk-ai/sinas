@@ -650,6 +650,12 @@ async def run_background_code_job(
             logger.exception("Background job %s crashed", job_id)
             result = {"error": str(e)}
             status = "failed"
+        if status == "failed":
+            from opentelemetry import trace
+
+            from app.core.telemetry import mark_error
+
+            mark_error(trace.get_current_span(), f"Background run failed: {result.get('error')}", "job_failed")
         await report(status, result)
     finally:
         reset_api_key(key_token)

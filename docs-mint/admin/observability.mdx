@@ -178,6 +178,13 @@ otel:
     enabled: true
     level: INFO
   httpClientPropagation: none
+
+## The chart's network policy denies egress to other namespaces: allow the
+## collector's (or the export times out). Not needed for external endpoints.
+networkPolicy:
+  egressNamespaces:
+    - namespace: observability
+      ports: [4318]
 ```
 
 ```bash
@@ -185,7 +192,7 @@ kubectl create secret generic langfuse-otel \
   --from-literal=headers='Authorization=Basic <base64 of pk-lf-…:sk-lf-…>,x-langfuse-ingestion-version=4'
 ```
 
-Every Sinas deployment gets the same settings. `headersSecret` becomes `OTEL_EXPORTER_<NAME>_HEADERS` from that Secret, so credentials never sit in the Deployment spec. Standard `OTEL_*` variables not covered by these values can be set through `extraEnv`.
+A collector in another namespace must be allowed in `networkPolicy.egressNamespaces` (above): the chart's network policy blocks cross-namespace traffic by default, and an export to a blocked address times out rather than failing fast. Every Sinas deployment gets the same settings. An exporter with `enabled: false` is left out, its Secret reference too. `headersSecret` becomes `OTEL_EXPORTER_<NAME>_HEADERS` from that Secret, so credentials never sit in the Deployment spec. Standard `OTEL_*` variables not covered by these values can be set through `extraEnv`.
 
 ## Docker Compose
 

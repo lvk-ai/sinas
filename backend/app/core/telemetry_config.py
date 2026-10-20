@@ -30,7 +30,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 # Attribute presets: how the LLM attributes of Sinas's own spans are named on
 # the way out (see telemetry_export.PRESETS). `none` sends no prompt/response
@@ -169,12 +169,17 @@ def _signal_urls(endpoint: str, protocol: str) -> tuple[str, str]:
     """
     if protocol == "grpc":
         return endpoint, endpoint
-    base = endpoint.rstrip("/")
+    # The path changes, nothing else: a query (which may be a credential)
+    # stays where it is.
+    parts = urlsplit(endpoint)
+    base = parts.path.rstrip("/")
     for suffix in ("/v1/traces", "/v1/logs"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-    return f"{base}/v1/traces", f"{base}/v1/logs"
+    return tuple(  # type: ignore[return-value]
+        urlunsplit(parts._replace(path=f"{base}/v1/{signal}")) for signal in ("traces", "logs")
+    )
 
 
 def _check_url(url: str, *, where: str, protocol: str) -> None:
@@ -319,9 +324,12 @@ def list_exporters(raw: Optional[str], env: Mapping[str, str]) -> tuple[list[Exp
             endpoint = env.get(prefix + "ENDPOINT") or entry.get("endpoint")
             traces_url = entry.get("traces_endpoint")
             logs_url = entry.get("logs_endpoint")
+            for field_name, value in (
+                ("endpoint", endpoint), ("traces_endpoint", traces_url), ("logs_endpoint", logs_url)
+            ):
+                if value is not None and not isinstance(value, str):
+                    raise ExporterConfigError(f"{where}: {field_name} must be a string")
             if endpoint:
-                if not isinstance(endpoint, str):
-                    raise ExporterConfigError(f"{where}: endpoint must be a string")
                 default_traces, default_logs = _signal_urls(endpoint.strip(), protocol)
                 traces_url = traces_url or default_traces
                 logs_url = logs_url or default_logs
@@ -375,6 +383,8 @@ def list_exporters(raw: Optional[str], env: Mapping[str, str]) -> tuple[list[Exp
             seen.add(name)
         except ExporterConfigError as e:
             errors.append(str(e))
+        except Exception as e:  # never let one entry take the others down
+            errors.append(f"{where}: invalid entry ({type(e).__name__})")
     return exporters, errors
 
 

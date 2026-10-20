@@ -19,6 +19,7 @@ LLM provider calls are recorded by Sinas's `llm.call` spans, not as HTTP
 client spans, and carry trace context only when the provider is configured
 to (`propagate_context`, `providers.clients.guard_trace_context`).
 """
+import asyncio
 import functools
 import logging
 import os
@@ -617,9 +618,14 @@ def traced(span_name: str, kind: trace.SpanKind = trace.SpanKind.INTERNAL) -> Ca
     return decorate
 
 
-def traced_job(span_name: str) -> Callable[[F], F]:
+def traced_job(
+    span_name: str, failed: Optional[Callable[[Any], Optional[str]]] = None
+) -> Callable[[F], F]:
     """An arq job run as a CONSUMER span `span_name`, in the trace context it
-    was enqueued with (`trace_context` kwarg), failures recorded."""
+    was enqueued with (`trace_context` kwarg). The span is marked failed when
+    the job raises (not for `arq.Retry`, which is flow control), is cancelled
+    (a worker timeout or shutdown), or returns what `failed` says is a
+    failure (it returns the description, or None)."""
 
     def decorate(job: F) -> F:
         @functools.wraps(job)
@@ -638,12 +644,22 @@ def traced_job(span_name: str) -> Callable[[F], F]:
                 set_status_on_exception=False,
             ) as span:
                 try:
-                    return await job(ctx, *args, **kwargs)
+                    result = await job(ctx, *args, **kwargs)
+                except asyncio.CancelledError:
+                    mark_error(span, "Job cancelled or timed out", "cancelled")
+                    raise
                 except Exception as exc:
-                    # arq.Retry is flow control, not a failure.
                     if type(exc).__name__ != "Retry":
                         record_error(span, exc)
                     raise
+                if failed is not None:
+                    try:
+                        description = failed(result)
+                    except Exception:
+                        description = None
+                    if description:
+                        mark_error(span, description, "job_failed")
+                return result
 
         return run  # type: ignore[return-value]
 

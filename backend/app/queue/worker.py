@@ -5,7 +5,7 @@ import logging
 import random
 import time
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from arq import func
 from arq.cron import cron
@@ -406,7 +406,14 @@ async def _agent_worker_startup(ctx: dict, process: str) -> None:
     logger.info(f"Agent worker started (id={worker_id})")
 
 
-@traced_job("pipeline.run")
+def _failed_pipeline_run(result: Any) -> Optional[str]:
+    """A pipeline run that ended failed or timed out (it returns, not raises)."""
+    if isinstance(result, dict) and result.get("status") in ("failed", "timed_out"):
+        return str(result.get("error") or f"Pipeline run {result['status']}")
+    return None
+
+
+@traced_job("pipeline.run", failed=_failed_pipeline_run)
 async def execute_pipeline_run_job(ctx: dict, **kwargs: Any) -> Any:
     """Execute one pipeline run (one user scope) in the pipeline worker."""
     from app.services import pipeline_runner
@@ -618,7 +625,7 @@ async def chat_retention_tick_job(ctx: dict) -> bool:
     return await scheduled_tick() is not None
 
 
-@traced_job("retention.run")
+@traced_job("retention.run", failed=lambda status: "Retention run failed" if status == "failed" else None)
 async def chat_retention_run_job(ctx: dict, run_id: str) -> str:
     """A run queued by POST /retention/run ("Run now")."""
     import uuid as _uuid

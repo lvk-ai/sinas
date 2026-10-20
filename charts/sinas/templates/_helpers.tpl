@@ -258,15 +258,23 @@ without an `otel` key.
 {{- if $otel.enabled }}
 - name: OTEL_ENABLED
   value: "true"
-{{- $exporters := list }}
+{{- /* Entries with enabled: false are left out entirely, Secret reference
+       included: a disabled exporter's Secret may be gone. */}}
+{{- $active := list }}
 {{- range ($otel.exporters | default list) }}
+{{- if or (not (hasKey . "enabled")) .enabled }}
+{{- $active = append $active . }}
+{{- end }}
+{{- end }}
+{{- $exporters := list }}
+{{- range $active }}
 {{- $exporters = append $exporters (omit . "headersSecret") }}
 {{- end }}
 {{- if $exporters }}
 - name: OTEL_EXPORTERS
   value: {{ toJson $exporters | quote }}
 {{- end }}
-{{- range ($otel.exporters | default list) }}
+{{- range $active }}
 {{- $name := required "otel.exporters[].name is required" .name }}
 {{- with .headersSecret }}
 - name: OTEL_EXPORTER_{{ regexReplaceAll "[^A-Za-z0-9]" $name "_" | upper }}_HEADERS

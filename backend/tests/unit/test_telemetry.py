@@ -177,6 +177,17 @@ def test_a_list_of_exporters_each_with_its_own_settings():
     assert tempo.preset == "genai" and tempo.insecure is True
 
 
+def test_an_endpoint_query_is_kept_where_it_is():
+    raw = json.dumps([
+        {"name": "a", "endpoint": f"https://c.test/otel/v1/traces?key={SECRET}"},
+        {"name": "b", "endpoint": f"https://c.test/otel?key={SECRET}"},
+    ])
+    a, b = list_exporters(raw, {})[0]
+    assert a.traces_endpoint == f"https://c.test/otel/v1/traces?key={SECRET}"
+    assert a.logs_endpoint == f"https://c.test/otel/v1/logs?key={SECRET}"
+    assert b.traces_endpoint == f"https://c.test/otel/v1/traces?key={SECRET}"
+
+
 def test_a_per_name_variable_overrides_the_endpoint_and_preset():
     raw = json.dumps([{"name": "my-apm", "endpoint": "http://a:4318"}])
     env = {"OTEL_EXPORTER_MY_APM_ENDPOINT": "http://b:4318", "OTEL_EXPORTER_MY_APM_PRESET": "none"}
@@ -198,6 +209,8 @@ def test_a_per_name_variable_overrides_the_endpoint_and_preset():
         {"name": "x", "endpoint": "http://a", "signals": ["metrics"]},
         {"name": "x", "endpoint": "http://a", "headers": {"authorization": 42.5, "x": [SECRET]}},
         {"name": "x", "endpoint": "http://a", "headers": f"{SECRET}"},
+        {"name": "x", "endpoint": "http://a", "traces_endpoint": 123},
+        {"name": "x", "endpoint": ["http://a"]},
     ],
 )
 def test_a_bad_entry_is_reported_without_its_secrets_and_skipped(entry):
@@ -575,6 +588,30 @@ def test_a_failing_job_marks_its_span_error_retry_does_not(spans):
     assert retried.status.status_code != StatusCode.ERROR
 
 
+def test_a_cancelled_job_and_a_returned_failure_mark_the_span(spans):
+    @telemetry.traced_job("code.background")
+    async def cancelled(ctx, **kwargs):
+        raise asyncio.CancelledError()
+
+    @telemetry.traced_job("pipeline.run", failed=lambda r: r.get("error") if r["status"] == "failed" else None)
+    async def returns(ctx, **kwargs):
+        return kwargs["result"]
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled({})
+        await returns({}, result={"status": "failed", "error": "step 2 failed"})
+        await returns({}, result={"status": "succeeded"})
+
+    asyncio.run(run())
+    cancelled_span = _error_span(spans, "code.background")
+    assert cancelled_span.attributes["error.type"] == "cancelled"
+    failed_run, ok_run = [s for s in spans.get_finished_spans() if s.name == "pipeline.run"]
+    assert failed_run.status.status_code == StatusCode.ERROR
+    assert failed_run.status.description == "step 2 failed"
+    assert ok_run.status.status_code != StatusCode.ERROR
+
+
 def test_a_tool_that_fails_marks_its_span_error(spans, monkeypatch):
     from app.services import tool_execution
 
@@ -591,11 +628,23 @@ def test_a_tool_that_fails_marks_its_span_error(spans, monkeypatch):
     monkeypatch.setattr(tool_execution, "_execute_single_tool", returning_error)
     asyncio.run(tool_execution.execute_single_tool(call, "chat", "user", "tok", []))
 
-    raised, returned = [s for s in spans.get_finished_spans() if s.name == "tool.call"]
+    async def delegation_failed(*args, **kwargs):  # the error is not the first key
+        return ("c3", "t", json.dumps({"agent_name": "x", "error": "Sub-agent failed", "chat_id": "c"}))
+
+    async def fine(*args, **kwargs):
+        return ("c4", "t", json.dumps({"result": "ok", "errors_seen": 0}))
+
+    for impl in (delegation_failed, fine):
+        monkeypatch.setattr(tool_execution, "_execute_single_tool", impl)
+        asyncio.run(tool_execution.execute_single_tool(call, "chat", "user", "tok", []))
+
+    raised, returned, delegated, ok = [s for s in spans.get_finished_spans() if s.name == "tool.call"]
     assert raised.status.status_code == StatusCode.ERROR and raised.events[0].name == "exception"
     assert returned.status.status_code == StatusCode.ERROR
     assert returned.status.description == "not allowed"
     assert returned.attributes["gen_ai.tool.name"] == "t"
+    assert delegated.status.description == "Sub-agent failed"
+    assert ok.status.status_code != StatusCode.ERROR
 
 
 def test_a_failing_streamed_llm_call_is_recorded(spans):

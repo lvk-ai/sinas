@@ -758,7 +758,7 @@ async def execute_agent_tool(
 
 def _tool_error(result_content: Any) -> Optional[str]:
     """The error a tool returned (`{"error": ...}`), if it returned one."""
-    if not isinstance(result_content, str) or not result_content.startswith('{"error"'):
+    if not isinstance(result_content, str) or '"error"' not in result_content:
         return None
     try:
         parsed = json.loads(result_content)

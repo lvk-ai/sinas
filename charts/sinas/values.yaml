@@ -371,6 +371,9 @@ otel:
   #    endpoint: http://otel-collector.observability:4318
   #    preset: none
   #    signals: [traces, logs]
+  ## A collector in another namespace also needs
+  ## networkPolicy.egressNamespaces (e.g. namespace: observability,
+  ## ports: [4318]), or exports time out.
   logs:
     ## Python logging -> OTLP logs, to the exporters with the logs signal.
     enabled: false
