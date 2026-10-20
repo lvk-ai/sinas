@@ -6,7 +6,7 @@ import { ArrowLeft, Save, Trash2, Loader2, Bot, ArrowUp, ArrowDown, Plus, X } fr
 import type { AgentUpdate, EffortLevel } from '../types';
 import { JSONSchemaEditor } from '../components/JSONSchemaEditor';
 import { ApiUsage } from '../components/ApiUsage';
-import { WildcardPatterns } from '../components/WildcardPatterns';
+import { AccessSetting, JsonObjectSetting, NameListSetting, WildcardPatterns } from '../components/WildcardPatterns';
 import { isWildcardRef } from '../lib/wildcardRefs';
 import { useAuth } from '../lib/auth-context';
 import {
@@ -1184,7 +1184,12 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   refKey="skill"
                   noun="skills"
                   makeEntry={(ref: string) => ({ skill: ref, preload: false })}
-                  describe={(e: any) => (e.preload ? 'preloaded' : undefined)}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <label className="flex items-center gap-2 text-xs text-gray-400">
+                      <input type="checkbox" checked={!!e.preload} onChange={(ev) => change({ ...e, preload: ev.target.checked })} />
+                      Preload into the system prompt (instead of a tool)
+                    </label>
+                  )}
                   onChange={(updated: any[]) => setFormData({ ...formData, enabled_skills: updated as any })}
                 />
                 {skills && skills.length > 0 ? (
@@ -1450,7 +1455,9 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                     noun="stores"
                     withAccess
                     makeEntry={(ref: string, access: string) => ({ store: ref, access })}
-                    describe={(e: any) => (e.access === 'readwrite' ? 'read/write' : 'read')}
+                    settings={(e: any, change: (next: any) => void) => (
+                    <AccessSetting value={e.access} onChange={(access) => change({ ...e, access })} />
+                  )}
                     onChange={(updated: any[]) => setFormData({ ...formData, enabled_stores: updated as any })}
                   />
                   {stores && stores.length > 0 ? (
@@ -1582,7 +1589,14 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   refKey="server"
                   noun="MCP servers"
                   makeEntry={(ref: string) => ({ server: ref, tools: [] })}
-                  describe={(e: any) => (e.tools?.length ? e.tools.join(', ') : 'all tools')}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <NameListSetting
+                      label="Tool patterns on every matching server (comma-separated globs; empty = all)"
+                      value={e.tools}
+                      placeholder="search_*, get_*"
+                      onChange={(tools) => change({ ...e, tools })}
+                    />
+                  )}
                   onChange={(updated: any[]) => setFormData({ ...formData, enabled_mcp_servers: updated as any })}
                 />
                 {(() => {
@@ -1748,7 +1762,9 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   noun="collections"
                   withAccess
                   makeEntry={(ref: string, access: string) => ({ collection: ref, access })}
-                  describe={(e: any) => (e.access === 'readwrite' ? 'read/write' : 'read')}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <AccessSetting value={e.access} onChange={(access) => change({ ...e, access })} />
+                  )}
                   onChange={(updated: any[]) => setFormData({ ...formData, enabled_collections: updated as any })}
                 />
                 {collections && collections.length > 0 ? (
@@ -1988,7 +2004,21 @@ for chunk in client.chats.stream(chat["id"], "Hello"):
                   refKey="connector"
                   noun="connectors"
                   makeEntry={(ref: string) => ({ connector: ref, operations: [], parameters: {} })}
-                  describe={(e: any) => (e.operations?.length ? e.operations.join(', ') : 'all operations')}
+                  settings={(e: any, change: (next: any) => void) => (
+                    <div className="space-y-2">
+                      <NameListSetting
+                        label="Operations on every matching connector (comma-separated; empty = all)"
+                        value={e.operations}
+                        placeholder="get_status, list_items"
+                        onChange={(operations) => change({ ...e, operations })}
+                      />
+                      <JsonObjectSetting
+                        label="Locked parameters by operation (JSON; Jinja2 templates allowed)"
+                        value={e.parameters}
+                        onChange={(parameters) => change({ ...e, parameters })}
+                      />
+                    </div>
+                  )}
                   onChange={(updated: any[]) => setFormData({ ...formData, enabled_connectors: updated as any })}
                 />
                 {connectors && connectors.length > 0 ? (

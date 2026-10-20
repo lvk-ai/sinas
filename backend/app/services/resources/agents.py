@@ -41,6 +41,8 @@ class AgentApplier(ResourceApplier[AgentSpec]):
         "llm_provider_name", "enabled_functions", "enabled_skills", "enabled_queries",
         "enabled_stores", "enabled_collections", "enabled_components", "enabled_connectors",
         "enabled_pipelines", "enabled_agents", "hooks", "enabled_mcp_servers",
+        # Their keys name one function or query each: a wildcard key is refused.
+        "function_parameters", "query_parameters",
     )
     # Operator state: a deleted (switched-off) agent stays off, and the
     # default chosen in the console stays the default, unless config says so.

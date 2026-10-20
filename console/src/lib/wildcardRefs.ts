@@ -43,6 +43,30 @@ export function withoutRef<T>(entries: T[] | null | undefined, ref: string, key?
   return (entries || []).filter((e) => entryRef(e, key) !== ref);
 }
 
+/** The list with the entry for `ref` replaced by `next`, in place. */
+export function withReplaced<T>(entries: T[] | null | undefined, ref: string, next: T, key?: string): T[] {
+  return (entries || []).map((e) => (entryRef(e, key) === ref ? next : e));
+}
+
+/** Comma-separated text to a list of names ("" = none). */
+export function parseNameList(text: string): string[] {
+  return text.split(',').map((t) => t.trim()).filter(Boolean);
+}
+
+/**
+ * Text typed as a JSON object (a connector entry's parameters by operation),
+ * or null when it isn't one. Empty text is an empty object.
+ */
+export function parseJsonObject(text: string): Record<string, unknown> | null {
+  if (!text.trim()) return {};
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The list with `entry` added, replacing an entry for the same reference. */
 export function withEntry<T>(entries: T[] | null | undefined, entry: T, key?: string): T[] {
   const ref = entryRef(entry, key);

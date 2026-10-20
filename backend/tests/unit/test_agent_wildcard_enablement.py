@@ -410,6 +410,13 @@ async def test_rest_refuses_patterns_nothing_could_resolve(client, admin_user):
 
     response = await client.put(f"/api/v1/agents/{ns}/good", json={"enabled_components": ["*/x"]}, headers=headers)
     assert response.status_code == 400, response.text
+    # A parameters-only update is checked too.
+    for field in ("function_parameters", "query_parameters"):
+        response = await client.put(
+            f"/api/v1/agents/{ns}/good", json={field: {"sales/*": {"region": "eu"}}}, headers=headers
+        )
+        assert response.status_code == 400, (field, response.text)
+        assert "parameters are set per" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

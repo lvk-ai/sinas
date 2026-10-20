@@ -39,3 +39,19 @@ test('adding replaces the entry for the same reference; removing keeps the other
   assert.deepEqual(m.withoutRef(stores, 'crm/*', 'store'), [{ store: 'crm/notes', access: 'readwrite' }]);
   assert.deepEqual(m.withEntry(['ui/x'], 'ui/*'), ['ui/x', 'ui/*']);
 });
+
+test('a wildcard entry is edited in place', () => {
+  const conns = [{ connector: 'apis/*', operations: [] }, { connector: 'apis/x', operations: ['get'] }];
+  assert.deepEqual(m.withReplaced(conns, 'apis/*', { connector: 'apis/*', operations: ['list'] }, 'connector'), [
+    { connector: 'apis/*', operations: ['list'] },
+    { connector: 'apis/x', operations: ['get'] },
+  ]);
+});
+
+test('settings typed as text', () => {
+  assert.deepEqual(m.parseNameList(' get, list ,,'), ['get', 'list']);
+  assert.deepEqual(m.parseNameList(''), []);
+  assert.deepEqual(m.parseJsonObject(''), {});
+  assert.deepEqual(m.parseJsonObject('{"post": {"channel": "x"}}'), { post: { channel: 'x' } });
+  for (const bad of ['[]', '1', '{', 'null']) assert.equal(m.parseJsonObject(bad), null, bad);
+});
