@@ -370,7 +370,11 @@ class _FakeHttpxClient:
     responses: dict = {}
 
     def __init__(self, *args, **kwargs):
-        pass
+        # What `clients.guard_trace_context` hooks into on a real client.
+        self.event_hooks = {}
+
+    async def send(self, request, **kwargs):  # never reached: post/get are faked
+        raise NotImplementedError
 
     async def __aenter__(self):
         return self

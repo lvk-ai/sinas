@@ -7,7 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from .base import BaseLLMProvider
-from .clients import shared_client
+from .clients import guard_trace_context, shared_client
 
 
 class OllamaProvider(BaseLLMProvider):
@@ -21,7 +21,9 @@ class OllamaProvider(BaseLLMProvider):
 
     def _http(self):
         """The shared HTTP client, in a context that leaves it open."""
-        return nullcontext(shared_client(("ollama",), lambda: httpx.AsyncClient(timeout=300.0)))
+        return nullcontext(
+            shared_client(("ollama",), lambda: guard_trace_context(httpx.AsyncClient(timeout=300.0)))
+        )
 
     async def complete(
         self,

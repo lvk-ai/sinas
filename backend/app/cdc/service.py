@@ -174,6 +174,9 @@ class CDCManager:
         from app.core.database import AsyncSessionLocal
         from app.models.database_trigger import DatabaseTrigger
         from app.services.database_pool import DatabasePoolManager
+        from opentelemetry.trace import SpanKind
+
+        from app.core.telemetry import get_tracer
         from app.services.queue_service import queue_service
 
         pool_manager = DatabasePoolManager.get_instance()
@@ -286,24 +289,31 @@ class CDCManager:
                             # (below) regardless of downstream success; a pipeline's
                             # own cursor (if any) is managed by the pipeline runner.
                             execution_id = str(uuid.uuid4())
-                            if trigger.target_type == "pipeline":
-                                await queue_service.enqueue_pipeline_fire(
-                                    namespace=trigger.pipeline_namespace or "default",
-                                    name=trigger.pipeline_name,
-                                    run_input=payload,
-                                    trigger_type="CDC",
-                                    trigger_id=trigger_id,
-                                )
-                            else:
-                                await queue_service.enqueue_function(
-                                    function_namespace=trigger.function_namespace,
-                                    function_name=trigger.function_name,
-                                    input_data=payload,
-                                    execution_id=execution_id,
-                                    trigger_type="CDC",
-                                    trigger_id=trigger_id,
-                                    user_id=str(trigger.user_id),
-                                )
+                            # One span per batch handed on: the job it enqueues
+                            # is recorded in the same trace.
+                            with get_tracer().start_as_current_span(
+                                "cdc.change",
+                                kind=SpanKind.PRODUCER,
+                                attributes={"cdc.trigger.id": trigger_id, "cdc.rows": len(rows)},
+                            ):
+                                if trigger.target_type == "pipeline":
+                                    await queue_service.enqueue_pipeline_fire(
+                                        namespace=trigger.pipeline_namespace or "default",
+                                        name=trigger.pipeline_name,
+                                        run_input=payload,
+                                        trigger_type="CDC",
+                                        trigger_id=trigger_id,
+                                    )
+                                else:
+                                    await queue_service.enqueue_function(
+                                        function_namespace=trigger.function_namespace,
+                                        function_name=trigger.function_name,
+                                        input_data=payload,
+                                        execution_id=execution_id,
+                                        trigger_type="CDC",
+                                        trigger_id=trigger_id,
+                                        user_id=str(trigger.user_id),
+                                    )
 
                             # Update bookmark and clear error
                             async with AsyncSessionLocal() as db:
@@ -437,6 +447,9 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [cdc] %(levelname)s %(name)s: %(message)s",
     )
+    from app.core.telemetry import flush_telemetry, init_telemetry
+
+    init_telemetry("cdc-worker")
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -445,6 +458,7 @@ async def main() -> None:
         await run(stop_event)
     finally:
         await close_redis()
+        flush_telemetry()
 
 
 if __name__ == "__main__":

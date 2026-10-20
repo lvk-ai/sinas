@@ -661,7 +661,7 @@ async def execute_agent_tool(
     create_chat_with_agent_fn,
 ) -> dict[str, Any]:
     """Execute an agent tool call by creating or resuming a chat."""
-    from app.core.telemetry import get_tracer, otel_attr
+    from app.core.telemetry import get_tracer, mark_error, otel_attr, record_error
     _agent_tracer = get_tracer()
 
     try:
@@ -688,15 +688,20 @@ async def execute_agent_tool(
             otel_attr("labels"): json.dumps([f"agent:{agent.namespace}/{agent.name}"]),
         })
 
-        await queue_service.enqueue_agent_message(
-            chat_id=str(sub_chat.id),
-            user_id=user_id,
-            user_token=user_token,
-            content=content,
-            channel_id=channel_id,
-            agent=f"{agent.namespace}/{agent.name}",
-            depth=child_depth,
-        )
+        # Enqueued from inside the delegate span, so the sub-agent's job (in
+        # its worker) is recorded as a child of this call.
+        with trace.use_span(
+            _delegate_span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+        ):
+            await queue_service.enqueue_agent_message(
+                chat_id=str(sub_chat.id),
+                user_id=user_id,
+                user_token=user_token,
+                content=content,
+                channel_id=channel_id,
+                agent=f"{agent.namespace}/{agent.name}",
+                depth=child_depth,
+            )
 
         # Wait for the sub-agent to finish by reading the Redis stream.
         # Use a longer timeout than the default SUBSCRIBE_WAIT_TIMEOUT since
@@ -714,6 +719,8 @@ async def execute_agent_tool(
             if event.get("type") in ("done", "error"):
                 got_terminal = True
                 if event.get("type") == "error":
+                    mark_error(_delegate_span, str(event.get("error") or "Sub-agent failed"), "sub_agent_error")
+                    _delegate_span.end()
                     failure = {
                         "agent_name": agent.name,
                         "error": event.get("error", "Sub-agent failed"),
@@ -729,7 +736,7 @@ async def execute_agent_tool(
                 f"Agent-to-agent stream timed out: {agent.namespace}/{agent.name} "
                 f"(channel={channel_id}, chat={sub_chat.id})"
             )
-            _delegate_span.set_status(trace.StatusCode.ERROR, "timeout")
+            mark_error(_delegate_span, "Sub-agent did not respond in time", "timeout")
             _delegate_span.end()
             return {
                 "agent_name": agent.name,
@@ -752,14 +759,66 @@ async def execute_agent_tool(
         logger.error(f"Failed to execute agent tool {agent_id_str}: {e}")
         logger.debug("Delegation failure traceback:\n%s", traceback.format_exc())
         try:
-            _delegate_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
-            _delegate_span.end()
+            if _delegate_span.is_recording():
+                record_error(_delegate_span, e)
+                _delegate_span.end()
         except (NameError, Exception):
             pass
         return {"error": str(e)}
 
 
+def _tool_error(result_content: Any) -> Optional[str]:
+    """The error a tool returned (`{"error": ...}`), if it returned one."""
+    if not isinstance(result_content, str) or '"error"' not in result_content:
+        return None
+    try:
+        parsed = json.loads(result_content)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return str(parsed["error"])
+    return None
+
+
 async def execute_single_tool(
+    tool_call: dict[str, Any],
+    chat_id: str,
+    user_id: str,
+    user_token: str,
+    tools: list[dict[str, Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[str, str, str]:
+    """Execute a single tool call (`_execute_single_tool`) as a `tool.call`
+    span: a tool that raises, or returns an error, marks it failed."""
+    from app.core.telemetry import get_tracer, mark_error, otel_attr
+
+    function = tool_call.get("function") or {}
+    tool_name = function.get("name", "")
+    arguments = function.get("arguments", "")
+    with get_tracer().start_as_current_span(
+        "tool.call",
+        attributes={
+            "gen_ai.tool.name": tool_name,
+            "gen_ai.tool.call.id": str(tool_call.get("id", "")),
+            otel_attr("span_type"): "tool",
+            otel_attr("input"): arguments if isinstance(arguments, str) else json.dumps(arguments, default=str),
+            otel_attr("thread_id"): str(chat_id),
+            otel_attr("user_id"): str(user_id),
+        },
+    ) as span:
+        result = await _execute_single_tool(tool_call, chat_id, user_id, user_token, tools, *args, **kwargs)
+        if span.is_recording():
+            content = result[2]
+            span.set_attribute(otel_attr("output"), content[:10000] if isinstance(content, str) else "")
+            error = _tool_error(content)
+            status = getattr(span, "status", None)
+            if error and not (status is not None and status.status_code == trace.StatusCode.ERROR):
+                mark_error(span, error, "tool_error")
+        return result
+
+
+async def _execute_single_tool(
     tool_call: dict[str, Any],
     chat_id: str,
     user_id: str,
@@ -1248,6 +1307,9 @@ async def execute_single_tool(
                     result_content = truncate_tool_result(result_content, max_result_size)
 
     except Exception as e:
+        from app.core.telemetry import record_error
+
+        record_error(trace.get_current_span(), e)
         print(f"❌ Tool execution failed: {tool_name}: {e}", flush=True)
         logger.error(f"Tool execution failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")

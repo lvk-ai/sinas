@@ -71,11 +71,12 @@ class BaseLLMProvider(ABC):
 
     def _request_headers(self) -> dict[str, str]:
         """Every header Sinas adds to a request sent over plain HTTP (not
-        through an SDK client): the trace context, when enabled, and the
+        through an SDK client, but through a client guarded the same way):
+        the trace context, when enabled and marked for the guard, and the
         identity headers."""
         from .attribution import merge_headers
 
-        return merge_headers(self._context_headers(), self.identity_headers)
+        return merge_headers(self._sdk_context_headers(), self.identity_headers)
 
     def _sdk_request_headers(self) -> dict[str, str]:
         """`_request_headers` for a call through an SDK client: the trace

@@ -102,6 +102,20 @@ Default off. When enabled, every operation (function execution, code execution, 
 
 Meter integrity: sandbox and shared executor containers/pods receive no Redis/database credentials, so code they run cannot alter the count. `TRUSTED_EXECUTOR=inprocess` breaks that guarantee (client code runs inside a credential-bearing process) — enabling metering in that mode logs a warning. Metered instances should use `docker_shared` (Docker) or `k8s_shared` (Kubernetes), or `disabled` if shared-pool functions aren't needed.
 
+## OpenTelemetry (Optional)
+
+Off by default. Traces, and optionally logs, to any OTLP backend, several at once. The standard `OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_TRACES_SAMPLER` variables apply. Full reference and backend recipes: [Observability](/admin/observability).
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_ENABLED` | `false` | Master switch. Off: nothing is installed. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(none)_ | One exporter, configured by the OpenTelemetry SDK from the standard variables. |
+| `OTEL_EXPORTERS` | _(none)_ | JSON list of named exporters, each with its own endpoint, protocol and preset; credentials in `OTEL_EXPORTER_<NAME>_HEADERS`. |
+| `OTEL_PRESET` | `genai` | LLM attribute names for the standard exporter: `genai`, `langfuse`, `langwatch`, `none` (no conversation content). |
+| `OTEL_LOGS_ENABLED` | `false` | Export Python logs as OTLP logs, correlated with traces and redacted. |
+| `OTEL_HTTP_CLIENT_PROPAGATION` | `none` | Trace context on outgoing webhook/connector/MCP calls: `none`, `tracecontext`, `all`. |
+| `OTEL_EXPORTER_ENDPOINT`, `OTEL_EXPORTER_HEADERS`, `OTEL_VENDOR` | _(none)_ | Deprecated single exporter; still honoured. |
+
 ## LLM Cost (Optional)
 
 The deployment ratecard calls are priced from, in LiteLLM's `model_prices_and_context_window.json` format. Unset (and no per-provider pricing), calls are recorded unpriced. See [Usage & Cost](/admin/usage-cost).
