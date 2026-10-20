@@ -8,14 +8,14 @@ before stay NULL. No index: the usage API only returns the value, it doesn't
 filter or group by it.
 
 Revision ID: a9f1n2s3h4r5
-Revises: a8t9r0i1b2u3
+Revises: f1v2s3r4c5h6
 Create Date: 2026-10-20
 """
 import sqlalchemy as sa
 from alembic import op
 
 revision = "a9f1n2s3h4r5"
-down_revision = "a8t9r0i1b2u3"
+down_revision = "f1v2s3r4c5h6"
 branch_labels = None
 depends_on = None
 
