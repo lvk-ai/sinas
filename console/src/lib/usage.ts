@@ -47,6 +47,21 @@ export function pageRangeLabel(offset: number, count: number): string {
   return `${offset + 1}–${offset + count}`;
 }
 
+/** The drill-down's page, tied to the filters (the "scope") it was paged under. */
+export interface CallsPageState {
+  scope: string;
+  offset: number;
+}
+
+/**
+ * The page to show under `scope`: the same state while the filters are
+ * unchanged, else the first page under the new ones. Never an old page:
+ * going back to earlier filters starts at the newest calls again.
+ */
+export function callsPageFor(state: CallsPageState, scope: string): CallsPageState {
+  return state.scope === scope ? state : { scope, offset: 0 };
+}
+
 export function previousOffset(offset: number, pageSize: number = CALLS_PAGE_SIZE): number {
   return Math.max(0, offset - pageSize);
 }

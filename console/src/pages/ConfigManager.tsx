@@ -37,6 +37,13 @@ export function ConfigManager() {
   // declares. Only changeable while editing, and changing it starts over, so
   // the dry run and the apply always run with the same setting.
   const [prune, setPrune] = useState(false);
+  // The YAML and prune setting the dry run on screen previewed: Confirm
+  // applies exactly these, never what the editor holds by then.
+  const [previewed, setPreviewed] = useState<{ config: string; prune: boolean } | null>(null);
+  // Bumped whenever the workflow starts over, so the answer to a request
+  // from an abandoned run (Clear or a new file mid-request) is dropped.
+  const workflowRef = useRef(0);
+  const busy = currentStep === 'validating' || currentStep === 'dryrun' || currentStep === 'applying';
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { showToast } = useToast();
 
@@ -54,6 +61,8 @@ export function ConfigManager() {
   };
 
   const resetWorkflow = () => {
+    workflowRef.current += 1;
+    setPreviewed(null);
     setCurrentStep('edit');
     setValidationResult(null);
     setDryRunResult(null);
@@ -66,11 +75,20 @@ export function ConfigManager() {
       return;
     }
 
+    const run = workflowRef.current;
+    const config = yamlContent;
+    const pruneRequested = prune;
+    // A new attempt: what a previous one showed or previewed no longer applies.
+    setPreviewed(null);
+    setDryRunResult(null);
+    setApplyResult(null);
+
     // Step 1: Validate
     setCurrentStep('validating');
 
     try {
-      const validation = await apiClient.validateConfig(yamlContent);
+      const validation = await apiClient.validateConfig(config);
+      if (workflowRef.current !== run) return;
       setValidationResult(validation);
 
       if (!validation.valid) {
@@ -84,7 +102,8 @@ export function ConfigManager() {
       // Step 2: Dry run
       setCurrentStep('dryrun');
 
-      const dryRun = await apiClient.applyConfig(yamlContent, { dryRun: true, prune });
+      const dryRun = await apiClient.applyConfig(config, { dryRun: true, prune: pruneRequested });
+      if (workflowRef.current !== run) return;
       setDryRunResult(dryRun);
 
       if (!dryRun.success) {
@@ -94,19 +113,24 @@ export function ConfigManager() {
       }
 
       showToast('Dry run completed successfully', 'success');
+      setPreviewed({ config, prune: pruneRequested });
       setCurrentStep('confirm');
 
     } catch (error: any) {
+      if (workflowRef.current !== run) return;
       showToast(`Error: ${error.message}`, 'error');
       setCurrentStep('edit');
     }
   };
 
   const handleConfirm = async () => {
+    if (!previewed) return;
+    const run = workflowRef.current;
     setCurrentStep('applying');
 
     try {
-      const result = await apiClient.applyConfig(yamlContent, { prune });
+      const result = await apiClient.applyConfig(previewed.config, { prune: previewed.prune });
+      if (workflowRef.current !== run) return;
       setApplyResult(result);
 
       if (result.success) {
@@ -117,6 +141,7 @@ export function ConfigManager() {
         setCurrentStep('edit');
       }
     } catch (error: any) {
+      if (workflowRef.current !== run) return;
       showToast(`Apply error: ${error.message}`, 'error');
       setCurrentStep('edit');
     }
@@ -172,7 +197,9 @@ export function ConfigManager() {
 
   // What a prune removed or, in a dry run, would remove: listed by name, so
   // the consequence of the checkbox is visible before anything is confirmed.
-  const renderRemovals = (result: ConfigApplyResponse, dryRun: boolean) => {
+  // 'preview': a dry run; 'applied': a successful apply; 'rolledBack': a
+  // failed apply, which changes nothing.
+  const renderRemovals = (result: ConfigApplyResponse, mode: 'preview' | 'applied' | 'rolledBack') => {
     const groups = removalsByKind(result.changes);
     const count = removalCount(result.changes);
     const kept = keptByPrune(result.warnings);
@@ -180,7 +207,8 @@ export function ConfigManager() {
     return (
       <div className="mb-4 rounded-lg border border-red-800/40 bg-red-900/10 p-4">
         <h3 className="font-semibold text-red-400">
-          {dryRun ? 'Would be removed' : 'Removed'} ({pluralResources(count)})
+          {mode === 'preview' ? 'Would be removed' : mode === 'applied' ? 'Removed' : 'Not removed (rolled back)'}{' '}
+          ({pluralResources(count)})
         </h3>
         {count === 0 ? (
           <p className="text-sm text-gray-400 mt-1">
@@ -220,9 +248,9 @@ export function ConfigManager() {
             </ul>
           </div>
         )}
-        {count > 0 && (
+        {count > 0 && mode !== 'rolledBack' && (
           <p className="text-xs text-gray-400 mt-3">
-            {dryRun ? 'Removals are' : 'These removals are'} recorded in{' '}
+            {mode === 'preview' ? 'Removals are' : 'These removals are'} recorded in{' '}
             <Link to="/history" className="text-blue-500 hover:text-blue-400 underline">Change History</Link>
             {' '}and can be restored from there.
           </p>
@@ -261,7 +289,8 @@ export function ConfigManager() {
               />
               <button
                 onClick={() => fileInputRef.current?.click()}
-                className="px-3 py-1.5 border border-line rounded-lg text-sm font-medium text-gray-300 bg-surface-1 hover:bg-hover"
+                disabled={busy}
+                className="disabled:opacity-50 disabled:cursor-not-allowed px-3 py-1.5 border border-line rounded-lg text-sm font-medium text-gray-300 bg-surface-1 hover:bg-hover"
               >
                 Upload File
               </button>
@@ -270,7 +299,8 @@ export function ConfigManager() {
                   setYamlContent('');
                   resetWorkflow();
                 }}
-                className="px-3 py-1.5 border border-line rounded-lg text-sm font-medium text-gray-300 bg-surface-1 hover:bg-hover"
+                disabled={busy}
+                className="disabled:opacity-50 disabled:cursor-not-allowed px-3 py-1.5 border border-line rounded-lg text-sm font-medium text-gray-300 bg-surface-1 hover:bg-hover"
               >
                 Clear
               </button>
@@ -454,7 +484,7 @@ export function ConfigManager() {
 
           {renderSummary(dryRunResult.summary)}
 
-          {prune && renderRemovals(dryRunResult, true)}
+          {prune && renderRemovals(dryRunResult, 'preview')}
 
           {dryRunResult.errors && dryRunResult.errors.length > 0 && (
             <div className="mb-4">
@@ -538,9 +568,9 @@ export function ConfigManager() {
             {applyResult.success ? '✓ Configuration Applied Successfully' : '✗ Apply Failed - Nothing Was Changed'}
           </h2>
 
-          {renderSummary(applyResult.summary)}
+          {applyResult.success && renderSummary(applyResult.summary)}
 
-          {prune && renderRemovals(applyResult, !applyResult.success)}
+          {previewed?.prune && renderRemovals(applyResult, applyResult.success ? 'applied' : 'rolledBack')}
 
           {applyResult.errors && applyResult.errors.length > 0 && (
             <div className="mb-4">
@@ -571,7 +601,9 @@ export function ConfigManager() {
           {applyResult.changes && applyResult.changes.length > 0 && (
             <div>
               <h3 className="font-medium text-gray-100 mb-2">
-                Changes Applied ({applyResult.changes.length} resources):
+                {applyResult.success
+                  ? `Changes Applied (${applyResult.changes.length} resources):`
+                  : `Attempted Changes, Rolled Back (${applyResult.changes.length} resources):`}
               </h3>
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {applyResult.changes.map((change, idx) => (

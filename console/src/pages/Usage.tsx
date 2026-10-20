@@ -10,6 +10,8 @@ import { RATECARD_QUERY_KEY, useRatecard } from '../lib/ratecard';
 import {
   CALLS_PAGE_SIZE,
   callRow,
+  callsPageFor,
+  type CallsPageState,
   formatTokens,
   formatUsd,
   pageRangeLabel,
@@ -115,8 +117,13 @@ export function Usage() {
   // The calls drill-down pages through the same filters; any change to them
   // (or to its own switches) starts it again at the first page.
   const callsScope = JSON.stringify([filters, unpricedOnly, errorsOnly]);
-  const [callsPage, setCallsPage] = useState({ scope: callsScope, offset: 0 });
-  const callsOffset = callsPage.scope === callsScope ? callsPage.offset : 0;
+  const [callsPage, setCallsPage] = useState<CallsPageState>({ scope: callsScope, offset: 0 });
+  const currentCallsPage = callsPageFor(callsPage, callsScope);
+  // Adjusting state while rendering (React's documented pattern): the stored
+  // page follows the filters, so returning to earlier ones can't bring back
+  // the page that was open under them.
+  if (currentCallsPage !== callsPage) setCallsPage(currentCallsPage);
+  const callsOffset = currentCallsPage.offset;
   const calls = useQuery({
     queryKey: ['usage-calls', filters, unpricedOnly, errorsOnly, callsOffset],
     queryFn: () => apiClient.getUsageCalls(filters, { offset: callsOffset, unpricedOnly, errorsOnly }),

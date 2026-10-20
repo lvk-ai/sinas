@@ -46,6 +46,21 @@ test('paging: range label and the previous page never go below the first call', 
   assert.equal(m.previousOffset(0), 0);
 });
 
+test('the page follows the filters: a change, and a change back, both start at the newest calls', () => {
+  const all = JSON.stringify([filters, false, false]);
+  const unpriced = JSON.stringify([filters, true, false]);
+  let state = { scope: all, offset: 0 };
+  // Page 2 under the first filters
+  state = { scope: all, offset: 50 };
+  assert.equal(m.callsPageFor(state, all), state, 'unchanged filters keep the page (same object)');
+  // Unpriced only on: first page
+  state = m.callsPageFor(state, unpriced);
+  assert.deepEqual(state, { scope: unpriced, offset: 0 });
+  // ...and off again, without paging in between: still the first page, not page 2
+  state = m.callsPageFor(state, all);
+  assert.deepEqual(state, { scope: all, offset: 0 });
+});
+
 const call = (over = {}) => ({
   id: 'c1',
   created_at: '2026-10-19T12:34:56+00:00',
