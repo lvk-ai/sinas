@@ -47,6 +47,12 @@ class LLMUsage(Base):
     streamed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Set when the call raised; token counts may then be 0/partial
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Why generation stopped, normalized (app/providers/tracking.py
+    # FINISH_REASONS: stop, length, tool_calls, content_filter, error,
+    # other), and as the provider said it (end_turn, max_tokens, ...). NULL
+    # for calls recorded before it was, or when the provider gave none.
+    finish_reason: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    finish_reason_raw: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Cost in USD, priced when the row is written and never recomputed
     # (app/services/llm_pricing.py). NULL: no price was known for the model.

@@ -22,6 +22,7 @@ from app.providers.anthropic_provider import anthropic_client
 from app.providers.errors import (
     BUDGET_EXCEEDED,
     RATE_LIMITED,
+    LLMError,
     LLMRefusalError,
     classify,
     refusal_code,
@@ -261,7 +262,7 @@ async def test_the_api_answers_a_refusal_as_402_budget_exceeded():
     from app.main import adapters_openai_app, app, management_app
 
     for target in (app, management_app, adapters_openai_app):
-        assert LLMRefusalError in target.exception_handlers
+        assert LLMError in target.exception_handlers
 
     @app.get("/__test_refusal")
     async def _refuse():
@@ -307,9 +308,12 @@ def test_a_failed_job_records_the_code():
     from app.queue.agent_jobs import _failure_fields
 
     assert _failure_fields(LLMRefusalError(BUDGET_EXCEEDED, "out")) == {
-        "error": "budget_exceeded: out", "error_code": "budget_exceeded",
+        "error": "budget_exceeded: out", "error_code": "budget_exceeded", "retryable": False,
     }
-    assert _failure_fields(RuntimeError("boom")) == {"error": "boom"}
+    # Any other failure is an internal_error, its text unchanged.
+    assert _failure_fields(RuntimeError("boom")) == {
+        "error": "boom", "error_code": "internal_error", "retryable": False,
+    }
 
 
 def test_a_pipeline_step_keeps_the_code():
@@ -396,12 +400,16 @@ def test_a_queued_turn_ended_by_a_refusal_fails_its_job_with_the_code(monkeypatc
     async def publish_error(channel_id, error, code=None):
         published.append({"type": "error", "error": error, "code": code})
 
+    async def publish_failure(channel_id, error):
+        published.append({"type": "error", "error": str(error)})
+
     async def publish_done(channel_id, **kw):
         published.append({"type": "done"})
 
     monkeypatch.setattr(ms, "MessageService", _Refused)
     monkeypatch.setattr(stream_relay, "publish", publish)
     monkeypatch.setattr(stream_relay, "publish_error", publish_error)
+    monkeypatch.setattr(stream_relay, "publish_failure", publish_failure)
     monkeypatch.setattr(stream_relay, "publish_done", publish_done)
     redis = _StatusRedis()
     job_id = str(uuid.uuid4())

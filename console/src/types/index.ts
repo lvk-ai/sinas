@@ -1112,6 +1112,10 @@ export interface UsageCall {
   streamed: boolean | null;
   latency_ms: number | null;
   error: string | null;
+  // Why generation stopped: stop | length | tool_calls | content_filter |
+  // error | other (null for older calls), and the provider's own value.
+  finish_reason?: string | null;
+  finish_reason_raw?: string | null;
   customer?: string | null;
 }
 

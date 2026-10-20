@@ -28,6 +28,7 @@ import {
   nextPendingPollMs,
   textFromMessageChunk,
 } from '../../lib/chatStream';
+import { streamErrorMessage } from '../../lib/llmErrors';
 
 /**
  * The console's chat session: @sinas/sdk's useChat (0.7), plus what the
@@ -203,12 +204,10 @@ export function useConsoleChat(
       const approval = approvalFromEvent(chunk.data);
       if (approval) setPendingApprovals((prev) => addApproval(prev, approval));
     } else if (chunk.event === 'error') {
-      try {
-        const parsed = JSON.parse(chunk.data);
-        setError(parsed.error || 'Stream error');
-      } catch {
-        setError(chunk.data || 'Stream error');
-      }
+      // The turn failed: why (the error envelope), with a hint for codes
+      // whose message doesn't already say what to do. The reason is in the
+      // transcript too, once the stream ends and the chat is re-read.
+      setError(streamErrorMessage(chunk.data));
     }
   }, []);
 

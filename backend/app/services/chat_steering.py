@@ -28,6 +28,8 @@ import logging
 import math
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
 
@@ -55,6 +57,21 @@ INTERRUPT_TTL = 600
 # chat whose job_timeout is longer than AGENT_JOB_TIMEOUT keeps its lock
 # for as long as its turn may run.
 current_job_timeout: ContextVar[Optional[float]] = ContextVar("current_job_timeout", default=None)
+# When that job times out (event loop time): an LLM call's retry
+# (app/services/llm_retry.py) never waits past it.
+current_job_deadline: ContextVar[Optional[float]] = ContextVar("current_job_deadline", default=None)
+
+
+@contextmanager
+def job_deadline(seconds: float) -> Iterator[None]:
+    """Mark that the work in this context (an agent job, or a synchronous
+    request that runs a turn under its own timeout) ends in `seconds`, for
+    current_job_deadline. Tasks started inside it inherit the deadline."""
+    token = current_job_deadline.set(asyncio.get_running_loop().time() + seconds)
+    try:
+        yield
+    finally:
+        current_job_deadline.reset(token)
 
 # Slack on top of the job timeout before an abandoned lock (a crashed
 # worker) frees the chat.
