@@ -106,7 +106,7 @@ docker run -d --name "${PREFIX}-sinas" --network "$NET" --memory 768m \
   -e BACKEND_PORT="${SINAS_PORT}" -e CONSOLE_URL="http://localhost:${SINAS_PORT}/ui" \
   ${CONSOLE_ARGS[@]+"${CONSOLE_ARGS[@]}"} \
   --entrypoint sh "$BACKEND_IMAGE" \
-  -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${SINAS_PORT}" >/dev/null
+  -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${SINAS_PORT} --proxy-headers" >/dev/null
 
 wait_for "http://localhost:${KC_PORT}/realms/sinas-e2e/.well-known/openid-configuration" Keycloak 120
 wait_for "http://localhost:${SINAS_PORT}/health" "Sinas backend" 90

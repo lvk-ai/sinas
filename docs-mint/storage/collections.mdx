@@ -19,7 +19,7 @@ Collections are containers for file uploads with versioning, metadata validation
 
 **File features:**
 
-- **Versioning** — Every upload creates a new version. Previous versions are preserved.
+- **Versioning** — Uploading with `on_conflict: "new_version"` (or an agent's `write_file`) to an existing name adds a new version. Previous versions are preserved.
 - **Metadata** — Each file carries JSON metadata validated against the collection's schema.
 - **Visibility** — Files can be `private` (owner only) or `shared` (users with collection `:all` access).
 - **Content filtering** — Optional function runs on upload that can approve, reject, or modify the file. The filter must answer within `CONTENT_FILTER_TIMEOUT_SECONDS` (default 60s, time spent queued for a worker included); otherwise the upload fails with `504` and nothing is stored. Uploads never fall back to storing the file unfiltered. The same timeout applies to the workbench filter (`WORKBENCH_CONTENT_FILTER_FUNCTION`).
@@ -45,3 +45,35 @@ DELETE /files/{namespace}/{collection}/{filename}        # Delete file
 POST   /files/{namespace}/{collection}/{filename}/url    # Generate temporary download URL
 POST   /files/{namespace}/{collection}/search            # Search files
 ```
+
+### Uploading to a name that is taken
+
+`POST /files/{namespace}/{collection}` takes an optional `on_conflict` field that decides what happens when the collection already has a file with that name (your own, or a shared one):
+
+| `on_conflict` | Name taken | Status |
+|---|---|---|
+| `rename` (default) | The upload is stored as a new file with a unique suffix (`report.pdf` → `report_1a2b3c4d.pdf`) | `201` |
+| `return_existing` | Nothing is stored. Returns the existing file if its current version has the same content (SHA-256), and `409` if the content differs | `200` / `409` |
+| `new_version` | The upload becomes the existing file's next version (your own file, or any file with `upload:all`) | `201` |
+| `error` | Nothing is stored | `409` |
+
+When the name is free, every mode creates the file and answers `201`.
+
+`return_existing` is the mode for bulk loaders and anything else that retries: re-sending an upload that already landed answers `200` with the same file instead of creating a renamed duplicate, and two identical uploads sent at once create one file. Content is compared to what was originally uploaded, so a file a content filter rewrote on the way in still matches its retry (for files uploaded since 0.5.0). Metadata is not compared. The content filter doesn't run when nothing is stored.
+
+A `409` carries the existing file in its `detail`:
+
+```json
+{
+  "detail": {
+    "code": "file_exists",
+    "message": "A file named 'report.pdf' already exists in this collection",
+    "file_id": "6f1c…",
+    "name": "report.pdf",
+    "current_version": 1,
+    "content_matches": true
+  }
+}
+```
+
+`code` is `file_exists` for `error` and `file_content_mismatch` for `return_existing`. When the taken name belongs to someone else's shared file and you lack `download:own` on the collection, both modes answer `409` `file_exists` with only the `name`: no id, metadata or link, and no content comparison. `update_existing: true` is the older spelling of `on_conflict: "new_version"`.

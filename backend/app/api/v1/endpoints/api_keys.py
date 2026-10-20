@@ -274,6 +274,21 @@ async def update_api_key(
     )
     set_permission_used(http_request, "sinas.api_keys.update")
 
+    # A key's attribution context is fixed for its users: only an admin
+    # holding sinas.api_keys.assign_context:all may change it (null clears).
+    new_context = None
+    if "context" in request_data.model_fields_set:
+        from app.providers.attribution import validate_context
+
+        if not check_permission(permissions, ASSIGN_CONTEXT):
+            set_permission_used(http_request, ASSIGN_CONTEXT, has_perm=False)
+            raise HTTPException(status_code=403, detail="Not authorized to change an API key's context")
+        set_permission_used(http_request, ASSIGN_CONTEXT)
+        try:
+            new_context = validate_context(request_data.context) or None
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     if request_data.permissions is not None and request_data.permissions:
         # Same mint-time guard as create: the updater cannot grant beyond
         # their own permissions (the live cap bounds requests regardless)
@@ -305,6 +320,8 @@ async def update_api_key(
         api_key.name = request_data.name
     if request_data.permissions is not None:
         api_key.permissions = request_data.permissions
+    if "context" in request_data.model_fields_set:
+        api_key.context = new_context
 
     await db.flush()
 

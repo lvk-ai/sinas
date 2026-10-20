@@ -43,7 +43,7 @@ class APIKeyCreate(BaseModel):
         description=(
             "Attribution context for the key (e.g. {\"orgId\": \"org-2\"}); needs "
             "sinas.api_keys.assign_context:all. Left out, the key takes the context of the "
-            "session (or key) creating it. Immutable once created."
+            "session (or key) creating it. Its users can't change it afterwards."
         ),
     )
 
@@ -58,6 +58,9 @@ class APIKeyUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     permissions: Optional[dict[str, bool]] = None
     role_ids: Optional[list[uuid.UUID]] = None
+    # Only with sinas.api_keys.assign_context:all (403 otherwise); null clears.
+    # Left out, the key keeps its context.
+    context: Optional[dict[str, Any]] = None
 
 
 class APIKeyResponse(BaseModel):

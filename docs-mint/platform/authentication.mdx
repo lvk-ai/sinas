@@ -100,7 +100,7 @@ API keys can be used via `Authorization: Bearer <key>` or `X-API-Key: <key>` hea
 
 A key acts with **its own** permissions everywhere, including through agents: when a chat is started or continued with a key, the agent's tools (functions, queries, stores, collections, sub-agents, pipelines) are checked against the key's live permissions, not its owner's — and so are components and artifacts shown in that chat. A key that may only chat with an agent can't use that agent's tools; grant the key those tools' permissions too. Revoking or narrowing a key takes effect immediately, also for runs already queued.
 
-A key carries an [attribution context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context) when the session (or key) that created it had one: it is copied onto the key, can't be changed, and every request made with the key carries it. Only an admin holding `sinas.api_keys.assign_context:all` may create a key with a given `context` instead. A key created by a session without a context has none.
+A key carries an [attribution context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context) when the session (or key) that created it had one: it is copied onto the key, its users can't change it, and every request made with the key carries it. Only an admin holding `sinas.api_keys.assign_context:all` may create a key with a given `context`, or change a key's context (`PATCH /api/v1/api-keys/{id}` with `context`; `null` clears it). A key created by a session without a context has none.
 
 ## Token Exchange (bring your own auth)
 

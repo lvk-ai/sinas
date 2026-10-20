@@ -160,9 +160,9 @@ async def _check_within_agent(db: AsyncSession, spec, agent) -> None:
     parameters for (pre-filled or locked inputs, e.g. an account id) and a
     function that needs approval are refused rather than run unguarded."""
     from app.models.function import Function
-    from app.services.resource_resolver import matches_ref_pattern
+    from app.services.resource_resolver import matches_ref_pattern, ref_access
 
-    refs = [*spec.enabled_queries, *spec.enabled_functions, *(e.store for e in spec.enabled_stores)]
+    refs =[*spec.enabled_queries, *spec.enabled_functions, *(e.store for e in spec.enabled_stores)]
     for ref in refs:
         if "*" in ref:
             raise PermissionError(f"Name {ref} exactly: an artifact can't declare a wildcard")
@@ -190,11 +190,11 @@ async def _check_within_agent(db: AsyncSession, spec, agent) -> None:
         raise PermissionError("Artifacts can't declare agents or components")
     agent_stores = [e for e in (agent.enabled_stores or []) if isinstance(e, dict)]
     for entry in spec.enabled_stores:
-        matching = [e for e in agent_stores if matches_ref_pattern(entry.store, [e])]
-        if not matching:
+        # The mode the agent's tools get: the most specific entry decides.
+        access = ref_access(entry.store, agent_stores, "store")
+        if access is None:
             raise PermissionError(f"Store {entry.store} is not enabled for this agent")
-        writable = any(e.get("access") == "readwrite" for e in matching)
-        if entry.access == "readwrite" and not writable:
+        if entry.access == "readwrite" and access != "readwrite":
             raise PermissionError(f"Store {entry.store} is read-only for this agent")
 
 

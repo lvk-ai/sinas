@@ -38,28 +38,18 @@ async def resolve_agent_patterns(
     - "namespace/name" — specific agent by namespace/name
     - UUID string — legacy lookup by ID
     """
+    from app.services.resource_resolver import resolve_resource_refs
+
     seen_ids: set[uuid.UUID] = set()
     resolved: list[Agent] = []
 
     for pattern in patterns:
         agents_to_check: list[Agent] = []
 
-        if pattern == "*/*":
-            result = await db.execute(
-                select(Agent).where(Agent.is_active == True)
-            )
-            agents_to_check = list(result.scalars().all())
-        elif pattern.endswith("/*"):
-            ns = pattern[:-2]
-            result = await db.execute(
-                select(Agent).where(Agent.namespace == ns, Agent.is_active == True)
-            )
-            agents_to_check = list(result.scalars().all())
-        elif "/" in pattern:
-            ns, name = pattern.split("/", 1)
-            agent = await Agent.get_by_name(db, ns, name)
-            if agent:
-                agents_to_check = [agent]
+        if "/" in pattern:
+            # Exact refs and wildcards resolve as every other enabled_* list
+            # does; every agent then needs read access, exact ones included.
+            agents_to_check = [a for _, a in await resolve_resource_refs(db, [pattern], Agent)]
         else:
             # Try as UUID (legacy)
             try:
@@ -200,18 +190,22 @@ async def get_available_tools(
     if not agent:
         return tools
 
+    # The user's effective permissions, looked up once: every wildcard in
+    # the agent's enabled_* lists expands only to what they may use.
+    user_permissions = await get_effective_permissions(db, user_id)
+
     # Add state tools (based on agent's enabled stores)
     context_tool_defs = await StateTools.get_tool_definitions(
         db=db,
         user_id=user_id,
         enabled_stores=agent.enabled_stores,
+        permissions=user_permissions,
     )
     tools.extend(context_tool_defs)
 
     # Add agent tools (other agents this agent can call)
     agent_enabled = agent.enabled_agents or []
     if agent_enabled:
-        user_permissions = await get_effective_permissions(db, user_id)
         resolved_agents = await resolve_agent_patterns(
             db, agent_enabled, user_id, user_permissions
         )
@@ -239,6 +233,7 @@ async def get_available_tools(
             enabled_functions=agent.enabled_functions,
             function_parameters=agent.function_parameters,
             agent_input_context=agent_input_context,
+            permissions=user_permissions,
         )
         tools.extend(function_tools)
 
@@ -250,6 +245,7 @@ async def get_available_tools(
             enabled_queries=agent.enabled_queries,
             query_parameters=agent.query_parameters,
             agent_input_context=agent_input_context,
+            permissions=user_permissions,
         )
         tools.extend(query_tools)
 
@@ -263,14 +259,16 @@ async def get_available_tools(
     # Get collection tools (only if list has items - opt-in)
     if agent.enabled_collections and len(agent.enabled_collections) > 0:
         collection_tools = await collection_converter.get_available_collections(
-            db=db, user_id=user_id, enabled_collections=agent.enabled_collections
+            db=db, user_id=user_id, enabled_collections=agent.enabled_collections,
+            permissions=user_permissions,
         )
         tools.extend(collection_tools)
 
     # Get component tools (only if list has items - opt-in)
     if agent.enabled_components and len(agent.enabled_components) > 0:
         component_tools = await component_converter.get_available_components(
-            db=db, enabled_components=agent.enabled_components
+            db=db, enabled_components=agent.enabled_components, user_id=user_id,
+            permissions=user_permissions,
         )
         tools.extend(component_tools)
 
@@ -281,6 +279,8 @@ async def get_available_tools(
             db=db,
             enabled_connectors=agent.enabled_connectors,
             agent_input_context=agent_input,
+            user_id=user_id,
+            permissions=user_permissions,
         )
         tools.extend(connector_tools)
 
@@ -305,7 +305,8 @@ async def get_available_tools(
         from app.services.pipeline_tools import PipelineToolConverter
 
         pipeline_tools = await PipelineToolConverter().get_available_pipelines(
-            db=db, user_id=user_id, enabled_pipelines=enabled_pipelines
+            db=db, user_id=user_id, enabled_pipelines=enabled_pipelines,
+            permissions=user_permissions,
         )
         tools.extend(pipeline_tools)
 

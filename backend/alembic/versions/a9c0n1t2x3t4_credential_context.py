@@ -5,14 +5,14 @@ The attribution context a session (refresh token) or an API key carries
 metadata-only, no table rewrite.
 
 Revision ID: a9c0n1t2x3t4
-Revises: a8t9r0i1b2u3
+Revises: f1v2s3r4c5h6
 Create Date: 2026-10-20
 """
 import sqlalchemy as sa
 from alembic import op
 
 revision = "a9c0n1t2x3t4"
-down_revision = "a8t9r0i1b2u3"
+down_revision = "f1v2s3r4c5h6"
 branch_labels = None
 depends_on = None
 

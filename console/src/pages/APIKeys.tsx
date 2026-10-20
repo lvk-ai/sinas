@@ -1,10 +1,14 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../lib/api';
-import { Key, Plus, Trash2, Copy, Check, X } from 'lucide-react';
+import { Key, Plus, Trash2, Copy, Check, X, Pencil } from 'lucide-react';
 import { useState } from 'react';
-import type { APIKeyCreate } from '../types';
+import type { APIKey, APIKeyCreate } from '../types';
 import { useToast } from '../lib/toast-context';
+import { useAuth } from '../lib/auth-context';
+import { canEditAPIKey } from '../lib/apiKeyEdit';
 import { PermissionEditor } from '../components/PermissionEditor';
+import { APIKeyRolePicker } from '../components/APIKeyRolePicker';
+import { EditAPIKeyModal } from '../components/EditAPIKeyModal';
 
 export function APIKeys() {
   const queryClient = useQueryClient();
@@ -13,6 +17,8 @@ export function APIKeys() {
   const [createdKey, setCreatedKey] = useState<{ id: string; key: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [showInactive, setShowInactive] = useState(false);
+  const [editingKey, setEditingKey] = useState<APIKey | null>(null);
+  const { user } = useAuth();
   const [formData, setFormData] = useState<APIKeyCreate>({
     name: '',
     permissions: {},
@@ -35,6 +41,26 @@ export function APIKeys() {
   // The built-in role for CI/CD deploy keys (see DEFAULT_ROLE_PERMISSIONS).
   // Only the platform's own (an instance may have a role of its own by that name).
   const deployersRole = roles?.find((role) => role.name === 'Deployers' && role.managed_by === 'system');
+
+  // Edit is offered where PATCH /api-keys/{id} would allow it: update:all for
+  // any key, update:own for the caller's own.
+  const { data: updateAccess } = useQuery({
+    queryKey: ['apiKeys-update-access'],
+    queryFn: async () => {
+      const [updateAll, updateOwn] = await Promise.all([
+        apiClient.hasPermissions(['sinas.api_keys.update:all']),
+        apiClient.hasPermissions(['sinas.api_keys.update:own']),
+      ]);
+      return { updateAll, updateOwn };
+    },
+    retry: false,
+  });
+  const canEdit = (key: APIKey) =>
+    canEditAPIKey(key, {
+      userId: user?.id,
+      updateAll: updateAccess?.updateAll ?? false,
+      updateOwn: updateAccess?.updateOwn ?? false,
+    });
 
   const filteredApiKeys = apiKeys?.filter(key => showInactive || key.is_active);
 
@@ -227,6 +253,15 @@ export function APIKeys() {
                   >
                     {key.is_active ? 'Active' : 'Inactive'}
                   </span>
+                  {canEdit(key) && (
+                    <button
+                      onClick={() => setEditingKey(key)}
+                      className="text-gray-400 hover:text-gray-100 p-2"
+                      title="Edit permissions"
+                    >
+                      <Pencil className="w-5 h-5" />
+                    </button>
+                  )}
                   <button
                     onClick={() => {
                       if (confirm('Are you sure you want to revoke this API key? This action cannot be undone.')) {
@@ -357,42 +392,12 @@ export function APIKeys() {
               </div>
 
               {roles && roles.length > 0 && (
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Linked Roles (Optional)
-                  </label>
-                  <div className="max-h-40 overflow-y-auto border border-line rounded-lg divide-y divide-line-soft">
-                    {roles.map((role) => (
-                      <label
-                        key={role.id}
-                        className="flex items-center gap-2 px-3 py-2 text-sm text-gray-300 cursor-pointer hover:bg-surface-0"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={formData.role_ids?.includes(role.id) ?? false}
-                          onChange={(e) => {
-                            const current = formData.role_ids ?? [];
-                            setFormData({
-                              ...formData,
-                              role_ids: e.target.checked
-                                ? [...current, role.id]
-                                : current.filter((id) => id !== role.id),
-                            });
-                          }}
-                          className="rounded border-line text-primary-600 focus:ring-primary-500"
-                        />
-                        <span>{role.name}</span>
-                        {role.description && (
-                          <span className="text-xs text-gray-500 truncate">{role.description}</span>
-                        )}
-                      </label>
-                    ))}
-                  </div>
-                  <p className="text-xs text-gray-500 mt-1">
-                    The key follows linked roles as they change (no re-minting), always capped by
-                    your own live permissions.
-                  </p>
-                </div>
+                <APIKeyRolePicker
+                  roles={roles}
+                  value={formData.role_ids ?? []}
+                  onChange={(role_ids) => setFormData({ ...formData, role_ids })}
+                  capHint="your own"
+                />
               )}
 
               <PermissionEditor
@@ -433,6 +438,14 @@ export function APIKeys() {
           </div>
         </div>
         </>
+      )}
+
+      {editingKey && (
+        <EditAPIKeyModal
+          apiKey={editingKey}
+          isOwnKey={editingKey.user_id === user?.id}
+          onClose={() => setEditingKey(null)}
+        />
       )}
 
       {/* Created Key Modal */}

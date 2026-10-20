@@ -18,6 +18,7 @@ from app.schemas.database_connection import (
     DatabaseConnectionTestRequest,
     DatabaseConnectionTestResponse,
     DatabaseConnectionUpdate,
+    normalize_connection_type,
 )
 
 from app.services.resources import rest
@@ -199,7 +200,7 @@ async def test_database_connection_raw(
     """Test a database connection with raw parameters (before saving). Admin only."""
     start_time = time.time()
     try:
-        if request.connection_type == "postgresql":
+        if normalize_connection_type(request.connection_type) == "postgresql":
             ssl_mode = request.ssl_mode or "prefer"
             conn = await asyncpg.connect(
                 host=request.host,
@@ -258,7 +259,7 @@ async def test_database_connection(
 
     start_time = time.time()
     try:
-        if connection.connection_type == "postgresql":
+        if normalize_connection_type(connection.connection_type) == "postgresql":
             ssl_mode = connection.ssl_mode or "prefer"
             conn = await asyncpg.connect(
                 host=connection.host,

@@ -226,14 +226,20 @@ async def test_a_key_copies_the_creating_sessions_context(client, db):
 
 
 async def test_a_user_cant_give_a_key_another_context(client, db):
-    user = await _user_with(db, "sinas.api_keys.create:own")
+    user = await _user_with(db, "sinas.api_keys.create:own", "sinas.api_keys.update:own")
     token = create_access_token(str(user.id), user.email, context={"orgId": "org-2"})
     r = await client.post("/api/v1/api-keys", json={"name": "k", "context": {"orgId": "org-1"}}, headers=_bearer(token))
     assert r.status_code == 403
-    # And the update endpoint has no context to change.
+    # Nor change it afterwards: an update with a context is refused (and
+    # one without leaves it as it is).
     r = await client.post("/api/v1/api-keys", json={"name": "k"}, headers=_bearer(token))
     key_id = r.json()["id"]
-    r = await client.patch(f"/api/v1/api-keys/{key_id}", json={"context": {"orgId": "org-1"}}, headers=_bearer(token))
+    for body in ({"context": {"orgId": "org-1"}}, {"context": None}):
+        r = await client.patch(f"/api/v1/api-keys/{key_id}", json=body, headers=_bearer(token))
+        assert r.status_code == 403, r.text
+    r = await client.patch(f"/api/v1/api-keys/{key_id}", json={"name": "renamed"}, headers=_bearer(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["context"] == {"orgId": "org-2"}
     key = await db.get(APIKey, uuid.UUID(key_id))
     await db.refresh(key)
     assert key.context == {"orgId": "org-2"}
@@ -250,6 +256,21 @@ async def test_an_admin_with_the_permission_sets_a_keys_context(client, db):
         "/api/v1/api-keys", json={"name": "bad", "context": {"orgId": "a\nb"}}, headers=auth_headers(admin)
     )
     assert r.status_code == 422
+
+
+async def test_an_admin_with_the_permission_changes_a_keys_context(client, db):
+    admin = await _user_with(
+        db, "sinas.api_keys.create:own", "sinas.api_keys.update:own", "sinas.api_keys.assign_context:all"
+    )
+    r = await client.post("/api/v1/api-keys", json={"name": "svc", "context": {"orgId": "org-7"}}, headers=auth_headers(admin))
+    key_id = r.json()["id"]
+    r = await client.patch(f"/api/v1/api-keys/{key_id}", json={"context": {"orgId": "org-8"}}, headers=auth_headers(admin))
+    assert r.status_code == 200, r.text
+    assert r.json()["context"] == {"orgId": "org-8"}
+    r = await client.patch(f"/api/v1/api-keys/{key_id}", json={"context": {"org-id": "x"}}, headers=auth_headers(admin))
+    assert r.status_code == 422
+    r = await client.patch(f"/api/v1/api-keys/{key_id}", json={"context": None}, headers=auth_headers(admin))
+    assert r.status_code == 200 and r.json()["context"] is None
 
 
 async def test_keys_created_without_a_session_context_have_none(client, db):

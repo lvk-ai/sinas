@@ -119,7 +119,7 @@ PERMISSION_REGISTRY: list[dict[str, Any]] = [
         "resource": "api_keys",
         "description": "API key management",
         # assign_context: create a key with an explicit attribution context
-        "actions": ["create", "read", "delete", "assign_context"],
+        "actions": ["create", "read", "update", "delete", "assign_context"],
     },
     {
         "resource": "auth",

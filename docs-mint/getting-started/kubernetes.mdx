@@ -234,6 +234,24 @@ the request-log API answers `503` with that explanation. See
 | `fileStorage.storageClass` | _(emptyDir)_ | RWX storage class for shared file storage on multi-node clusters |
 | `networkPolicy.enabled` | `true` | Namespace isolation + sandbox lockdown |
 | `networkPolicy.ingressNamespace` | _(any)_ | Restrict which namespace may reach backend/console |
+| `backend.forwardedAllowIps` | private ranges | Proxies trusted to report the client IP (see below) |
+
+## Client IPs behind the ingress
+
+Login and OTP rate limits count requests per client IP, and request logs record it. The backend runs uvicorn with `--proxy-headers` and takes the client from `X-Forwarded-For` only on connections from `backend.forwardedAllowIps` (`FORWARDED_ALLOW_IPS`), reading the header right to left up to the first address it doesn't trust.
+
+The default trusts the private ranges that pod and node IPs come from (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `fc00::/7`). The backend Service is `ClusterIP`, so its connections come from the ingress controller. Two things to check:
+
+- If your clients themselves have private addresses (an internal deployment), narrow the list to the ingress controller's pod CIDR. Otherwise a client counts as a trusted hop and can put any address in front of its own.
+- The ingress controller has to see the real client IP itself, for example with `externalTrafficPolicy: Local` on its LoadBalancer Service or with PROXY protocol. Otherwise every client arrives as a node IP and they all share one rate-limit bucket.
+
+Never use `*`: uvicorn then believes the leftmost, client-supplied entry.
+
+```yaml
+backend:
+  forwardedAllowIps:
+    - 10.42.0.0/16   # ingress controller pods
+```
 
 ## Limitations
 

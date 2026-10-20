@@ -194,8 +194,8 @@ class APIKey(Base, PermissionMixin):
     revoked_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
     # Attribution context (app/providers/attribution.py): copied from the
     # session that created the key, or set by an admin holding
-    # sinas.api_keys.assign_context:all. Immutable; requests made with the
-    # key carry it.
+    # sinas.api_keys.assign_context:all (the only ones who may change it).
+    # Requests made with the key carry it.
     context: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Relationships
