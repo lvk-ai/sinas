@@ -215,8 +215,6 @@ async def update_database_trigger(
     current_user_data=Depends(get_current_user_with_permissions),
 ):
     """Update a database trigger."""
-    if trigger_data.is_active:
-        _require_cdc()
     user_id, permissions = current_user_data
 
     has_all = check_permission(permissions, "sinas.database_triggers.update:all")
@@ -227,6 +225,10 @@ async def update_database_trigger(
         request,
         "sinas.database_triggers.update:all" if has_all else "sinas.database_triggers.update:own",
     )
+    # Only switching a paused trigger on is refused: clients that send the
+    # whole object repeat is_active=true on edits, and those must still work.
+    if trigger_data.is_active and not trigger.is_active:
+        _require_cdc()
 
     ctx = _context(db, user_id, trigger.user_id)
     connection_id = trigger.database_connection_id

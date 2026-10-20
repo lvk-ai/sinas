@@ -97,6 +97,29 @@ async def test_switching_on_is_refused_but_pausing_and_editing_work(
     assert (await client.delete(url, headers=h)).status_code == 204
 
 
+async def test_edits_that_repeat_is_active_true_still_work(client, admin_user, body, monkeypatch):
+    """Clients that PATCH the whole object send is_active=true with every edit
+    of a trigger that is on; that switches nothing on, so it isn't refused."""
+    await _create(client, admin_user, body)
+    monkeypatch.setattr(settings, "cdc_enabled", False)
+    r = await client.patch(
+        f"/api/v1/database-triggers/{body['name']}",
+        json={"is_active": True, "batch_size": 7},
+        headers=auth_headers(admin_user),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["batch_size"] == 7 and r.json()["is_active"] is True
+
+
+async def test_a_missing_trigger_is_a_404_even_with_cdc_off(client, admin_user, monkeypatch):
+    monkeypatch.setattr(settings, "cdc_enabled", False)
+    r = await client.patch(
+        "/api/v1/database-triggers/does-not-exist", json={"is_active": True},
+        headers=auth_headers(admin_user),
+    )
+    assert r.status_code == 404
+
+
 async def test_turning_cdc_off_and_on_leaves_triggers_as_they_were(
     client, admin_user, body, monkeypatch
 ):
