@@ -118,13 +118,13 @@ llmProviders:
 
 **Where it shows:**
 
-- Non-streaming calls (`POST /chats/{id}/messages`, agent invoke, sync webhooks, the OpenAI-compatible adapter, provider batch submission): HTTP **402** with `{"detail": "budget_exceeded: ...", "code": "budget_exceeded"}` (429 and `rate_limited` for a rate limit, with `Retry-After` when the provider sent one).
+- Non-streaming calls (`POST /chats/{id}/messages`, agent invoke, sync webhooks, the OpenAI-compatible adapter, provider batch submission): HTTP **402** with `{"detail": "budget_exceeded: ...", "code": "budget_exceeded", "retryable": false}` (429 and `rate_limited` for a rate limit, with `Retry-After` when the provider sent one).
 - Streams: the terminal `error` event carries `"code": "budget_exceeded"`.
 - Queued turns: the job's status record is `failed` with `error_code`; a batch execution's error, and a waiting parent agent's tool result (`error_code`), say it too.
 - Pipelines: the failed agent step's summary has `errorCode`, and the step is not retried.
 - Usage: the call's row has `error` starting with `budget_exceeded:`.
 
-The error text always starts with the code, so it survives wherever only a message is kept.
+The error text always starts with the code, so it survives wherever only a message is kept. These are two of the codes of the error envelope every LLM failure is reported with; see [LLM and agent errors](/platform/errors) for the others.
 
 ## Recipes
 

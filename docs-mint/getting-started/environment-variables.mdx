@@ -186,6 +186,8 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `CHATS_UNPAGINATED_MAX` | `10000` | Most chats `GET /chats` returns without `limit` or `cursor`. Past it the response holds the most recently updated this many, with `X-Truncated: true` and the cursor for the rest (see **Listing chats** under [Agents](/build-resources/agents)) |
 | `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds). A chat's or agent's `job_timeout` overrides it for that chat's messages |
 | `AGENT_JOB_TIMEOUT_MAX` | `3600` | Cap on a chat's or agent's `job_timeout` (seconds); a longer one runs this long |
+| `LLM_RETRY_MAX_ATTEMPTS` | `3` | Calls Sinas makes at most for one of an agent turn's LLM calls that is rate limited (`rate_limited`) or finds the model API unavailable (`provider_unavailable`), on top of the SDK's own retries; `1` turns Sinas's retry off. See [LLM and agent errors](/platform/errors#retries) |
+| `LLM_RETRY_MAX_WAIT_SECONDS` | `90` | How long Sinas waits in all, per call, before making it again (the provider's `Retry-After` or `retryDelay`, else a backoff); never past the turn's job timeout |
 | `AGENT_DELEGATE_TIMEOUT` | `600` | How long a parent agent waits for a delegated sub-agent (block mode). Raise together with `AGENT_JOB_TIMEOUT` — in block mode the parent's own job clock keeps running while it waits |
 | `AGENT_DELEGATE_MODE` | `block` | `block`: parent holds its worker slot while awaiting sub-agents. `suspend`: parent job ends at delegation and a resume job continues the conversation when the children finish (frees the slot) |
 | `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |

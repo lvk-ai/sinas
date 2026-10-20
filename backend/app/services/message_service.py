@@ -21,8 +21,9 @@ from app.models.function import Function
 from app.models.llm_provider import LLMProvider
 from app.providers import create_provider
 from app.providers.attribution import new_chat_attribution
-from app.providers.errors import refusal_code
+from app.providers.errors import PROVIDER_NOT_CONFIGURED, LLMError, chat_error_content, turn_error
 from app.services.collection_tools import CollectionToolConverter
+from app.services.llm_retry import call_with_retry, stream_with_retry
 from app.services.component_tools import ComponentToolConverter
 from app.services.connector_tools import ConnectorToolConverter
 from app.utils.schema import validate_with_coercion
@@ -269,6 +270,10 @@ class MessageService:
         # Determine final provider/model/temperature
         # Priority: message params > agent settings > database default
         provider_name = None
+        # Why the turn can't run (provider_not_configured), raised once the
+        # user's message is stored, so the chat shows the message and why it
+        # got no answer (issue #202).
+        not_runnable: Optional[LLMError] = None
         if provider:
             provider_name = provider
         elif agent and agent.llm_provider_id:
@@ -289,10 +294,12 @@ class MessageService:
                 )
                 inactive_provider = result.scalar_one_or_none()
                 if inactive_provider:
-                    raise ValueError(
-                        f"Agent '{agent.namespace}/{agent.name}' is configured to use LLM provider "
-                        f"'{inactive_provider.name}' which is currently inactive. Please activate the "
-                        f"provider or update the agent's LLM provider setting."
+                    not_runnable = LLMError(
+                        PROVIDER_NOT_CONFIGURED,
+                        f"Agent '{agent.namespace}/{agent.name}' uses LLM provider "
+                        f"'{inactive_provider.name}', which is inactive. An admin can activate it "
+                        "under LLM Providers, or set another provider for this agent.",
+                        provider=inactive_provider.name,
                     )
 
         final_model = model or (agent.model if agent else None)
@@ -343,6 +350,8 @@ class MessageService:
         self.db.add(user_message)
         await self.db.commit()
         await self.db.refresh(user_message)
+        if not_runnable is not None:
+            raise not_runnable
 
         # Run user message hooks (before LLM call)
         hook_result = None
@@ -445,6 +454,14 @@ class MessageService:
             provider_config = result.scalar_one_or_none()
             if provider_config:
                 final_model = provider_config.default_model
+        if not final_model:
+            raise LLMError(
+                PROVIDER_NOT_CONFIGURED,
+                "No model is set for this agent, and its LLM provider has no default model. "
+                "An admin can set the provider's default model under LLM Providers, or set "
+                "this agent's model.",
+                provider=provider_name,
+            )
 
         # Build response_format from agent's output_schema if present
         response_format = None
@@ -653,6 +670,18 @@ class MessageService:
     async def _send_message_locked(
         self, chat_id: str, user_id: str, user_token: str, content: str
     ) -> TurnResult:
+        try:
+            return await self._run_turn_locked(chat_id, user_id, user_token, content)
+        except LLMError as e:
+            # A failed LLM call (or no provider to make it with): the API
+            # answers it with its envelope; the chat keeps why, as a
+            # streamed turn's does (issue #202).
+            await self._record_turn_error(chat_id, e)
+            raise
+
+    async def _run_turn_locked(
+        self, chat_id: str, user_id: str, user_token: str, content: str
+    ) -> TurnResult:
         prep = await self._prepare_message_context(
             chat_id=chat_id,
             user_id=user_id,
@@ -698,13 +727,16 @@ class MessageService:
 
             clean_tools = strip_tool_metadata(prep["tools"])
 
-            response = await prep["llm_provider"].complete(
-                messages=prep["messages"],
-                model=prep["final_model"],
-                tools=clean_tools,
-                temperature=prep["final_temperature"],
-                max_tokens=prep["final_max_tokens"],
-                **llm_kwargs,
+            response = await call_with_retry(
+                lambda: prep["llm_provider"].complete(
+                    messages=prep["messages"],
+                    model=prep["final_model"],
+                    tools=clean_tools,
+                    temperature=prep["final_temperature"],
+                    max_tokens=prep["final_max_tokens"],
+                    **llm_kwargs,
+                ),
+                chat_id=chat_id,
             )
             end_time = datetime.now(UTC)
 
@@ -920,6 +952,33 @@ class MessageService:
         )
         await self.db.commit()
 
+    async def _record_turn_error(self, chat_id: str, error: LLMError) -> str:
+        """Leave a failed turn's error in its chat as an assistant reply (its
+        code first), so the chat stays valid and shows why the turn got no
+        answer. Best-effort: never masks the failure it records. Returns the
+        reply's text."""
+        content = chat_error_content(error)
+        for attempt in range(2):
+            try:
+                self.db.add(Message(chat_id=chat_id, role="assistant", content=content))
+                await self.db.commit()
+                break
+            except Exception as persist_error:
+                # The session may be in a failed transaction (the error came
+                # from the database): start over once on a clean one.
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                if attempt:
+                    logger.error(f"Could not persist turn error for chat {chat_id}: {persist_error}")
+        return content
+
+    def _error_event(self, error: LLMError, content: str) -> dict[str, Any]:
+        """A failed turn's terminal stream event: the error envelope, with the
+        reply it left in the chat as `content`."""
+        return {"content": content, "type": "error", **error.event_fields()}
+
     async def _send_message_stream_locked(
         self,
         chat_id: str,
@@ -927,17 +986,26 @@ class MessageService:
         user_token: str,
         content: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        prep = await self._prepare_message_context(
-            chat_id=chat_id,
-            user_id=user_id,
-            content=content,
-            provider=None,
-            model=None,
-            temperature=None,
-            inject_context=True,
-            context_limit=5,
-            template_variables=None,
-        )
+        try:
+            prep = await self._prepare_message_context(
+                chat_id=chat_id,
+                user_id=user_id,
+                content=content,
+                provider=None,
+                model=None,
+                temperature=None,
+                inject_context=True,
+                context_limit=5,
+                template_variables=None,
+            )
+        except Exception as e:
+            # The turn can't start (no provider or model, the agent's provider
+            # inactive, ...): it ends here like any failed turn, its reason in
+            # the chat and on the stream (issue #202), not just in a log.
+            logger.warning(f"Turn for chat {chat_id} could not start: {e}")
+            error = turn_error(e)
+            yield self._error_event(error, await self._record_turn_error(chat_id, error))
+            return
 
         # User hook blocked the pipeline
         if prep.get("blocked"):
@@ -999,20 +1067,13 @@ class MessageService:
                         _turn_output_parts.append(chunk["content"])
                     yield chunk
         except Exception as e:
-            print(f"❌ Error during message streaming: {e}", flush=True)
+            logger.error(f"Error during message streaming for chat {chat_id}: {e}")
             record_error(turn_span, e)
-            error_content = f"An error occurred while processing your message. Please try again.\n\nError: {str(e)[:300]}"
-            # Save error as assistant message so chat history stays valid
-            error_message = Message(chat_id=chat_id, role="assistant", content=error_content)
-            self.db.add(error_message)
-            await self.db.commit()
-            error_event = {"content": error_content, "type": "error", "error": str(e)[:300]}
-            # A refused call (budget_exceeded, rate_limited) says so by code,
-            # for API clients, job records and pipeline steps to tell apart.
-            code = refusal_code(e)
-            if code:
-                error_event["code"] = code
-            yield error_event
+            # The error envelope (code, retryable, upstream_status), for API
+            # clients, job records and pipeline steps to tell failures apart;
+            # saved as an assistant message so chat history stays valid.
+            error = turn_error(e)
+            yield self._error_event(error, await self._record_turn_error(chat_id, error))
         finally:
             _turn_output = "".join(_turn_output_parts)
             if _turn_output:
@@ -1058,12 +1119,15 @@ class MessageService:
 
         _llm_start = time.time_ns()
         try:
-            async for chunk in llm_provider.stream(
-                messages=messages,
-                model=final_model,
-                tools=clean_tools,
-                temperature=final_temperature,
-                max_tokens=max_tokens,
+            async for chunk in stream_with_retry(
+                lambda: llm_provider.stream(
+                    messages=messages,
+                    model=final_model,
+                    tools=clean_tools,
+                    temperature=final_temperature,
+                    max_tokens=max_tokens,
+                ),
+                chat_id=chat_id,
             ):
                 if chunk.get("usage"):
                     stream_usage = chunk["usage"]
@@ -1871,12 +1935,18 @@ class MessageService:
         _llm_start = time.time_ns()
         _followup_usage = None
         try:
-            async for chunk in llm_provider.stream(
-                messages=updated_messages,
-                model=model,
-                tools=clean_tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            # A rate limit (or an unavailable model API) here would throw
+            # away every tool call of the turn so far: retried within bounds,
+            # before anything streamed (app/services/llm_retry.py, #131).
+            async for chunk in stream_with_retry(
+                lambda: llm_provider.stream(
+                    messages=updated_messages,
+                    model=model,
+                    tools=clean_tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+                chat_id=chat_id,
             ):
                 if chunk.get("usage"):
                     _followup_usage = chunk["usage"]

@@ -246,7 +246,10 @@ async def _execute_agent_webhook(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Agent execution timed out")
+        from app.providers.errors import JOB_TIMEOUT, LLMError
+
+        # 504 with the error envelope, like the agent invoke's.
+        raise LLMError(JOB_TIMEOUT, f"Agent execution timed out after {timeout}s")
     try:
         outcome = await sync_turns.settle_turn(
             db,

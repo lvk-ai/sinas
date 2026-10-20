@@ -455,6 +455,11 @@ async def world():
                 select(Agent).where(Agent.namespace == "way-of-working", Agent.name == "assistant")
             )
         ).scalar_one()
+        # The package's agent runs on the default provider's default model;
+        # the test database has no provider, and a turn without a model
+        # doesn't start (provider_not_configured), so name the scripted one.
+        agent.model = "scripted-model"
+        await s.commit()
 
         chat = await MessageService(s).create_chat_with_agent(str(agent.id), str(user.id), {})
 

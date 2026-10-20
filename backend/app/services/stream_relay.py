@@ -69,6 +69,15 @@ class StreamRelay:
             event["code"] = code
         await self.publish(channel_id, event)
 
+    async def publish_failure(self, channel_id: str, error: BaseException) -> None:
+        """Publish a terminal 'error' event for a failed turn: the error
+        envelope (`code`, `retryable`, `upstream_status`, ...) of `error`, or
+        `internal_error` for an error that isn't an LLM failure
+        (app/providers/errors.py)."""
+        from app.providers.errors import turn_error
+
+        await self.publish(channel_id, {"type": "error", **turn_error(error).event_fields()})
+
     async def last_entry_id(self, channel_id: str) -> str:
         """The id of the channel's newest event ("0" when it has none): a
         subscription from here sees only what is published after now."""

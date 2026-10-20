@@ -304,6 +304,8 @@ async def calls(
             "streamed": r.streamed,
             "latency_ms": r.latency_ms,
             "error": r.error,
+            "finish_reason": r.finish_reason,
+            "finish_reason_raw": r.finish_reason_raw,
             "customer": r.customer,
         }
         for r in rows[:limit]

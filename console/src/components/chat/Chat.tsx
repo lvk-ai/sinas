@@ -366,7 +366,7 @@ export function Chat({
               alignItems: 'center',
             }}
           >
-            <span>{error}</span>
+            <span style={{ whiteSpace: 'pre-line' }}>{error}</span>
             <button
               onClick={clearError}
               style={{

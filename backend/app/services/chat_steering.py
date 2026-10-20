@@ -55,6 +55,9 @@ INTERRUPT_TTL = 600
 # chat whose job_timeout is longer than AGENT_JOB_TIMEOUT keeps its lock
 # for as long as its turn may run.
 current_job_timeout: ContextVar[Optional[float]] = ContextVar("current_job_timeout", default=None)
+# When that job times out (event loop time): an LLM call's retry
+# (app/services/llm_retry.py) never waits past it.
+current_job_deadline: ContextVar[Optional[float]] = ContextVar("current_job_deadline", default=None)
 
 # Slack on top of the job timeout before an abandoned lock (a crashed
 # worker) frees the chat.

@@ -77,7 +77,8 @@ class OllamaProvider(BaseLLMProvider):
                 "content": content,
                 "tool_calls": None,
                 "usage": self.extract_usage(data),
-                "finish_reason": "stop",  # Ollama doesn't always provide this
+                # done_reason: "stop", "length", ...; older Ollamas send none
+                "finish_reason": data.get("done_reason") or "stop",
             }
 
             if tool_calls_data:
@@ -135,7 +136,7 @@ class OllamaProvider(BaseLLMProvider):
                         result = {
                             "content": content if content else None,
                             "tool_calls": None,
-                            "finish_reason": "stop" if done else None,
+                            "finish_reason": (data.get("done_reason") or "stop") if done else None,
                         }
 
                         # Thinking models (with thinking on) send it apart

@@ -25,13 +25,22 @@ PING_INTERVAL = 15  # seconds between keep-alive pings
 
 
 def _failure_fields(error: BaseException) -> dict[str, Any]:
-    """A failed job's error for its status record and its parent's report,
-    with the refusal code (budget_exceeded, rate_limited) when the LLM call
-    was refused (app/providers/errors.py)."""
-    from app.providers.errors import refusal_code
+    """A failed job's error for its status record and its parent's report:
+    `error`, and the error envelope's `error_code`, `retryable` and (when
+    the model API answered) `upstream_status` (app/providers/errors.py)."""
+    from app.providers.errors import failure_fields
 
-    code = refusal_code(error)
-    return {"error": str(error), **({"error_code": code} if code else {})}
+    return failure_fields(error)
+
+
+# What a job that was cancelled, or ran out of its job_timeout, reports.
+_TIMED_OUT = "Job cancelled or timed out"
+
+
+def _timed_out_error():
+    from app.providers.errors import JOB_TIMEOUT, LLMError
+
+    return LLMError(JOB_TIMEOUT, _TIMED_OUT)
 
 
 def _acting_as_job_key(job):
@@ -89,10 +98,15 @@ def _within_job_timeout(
         seconds = agent_job_timeout(kwargs.get("job_timeout"))
         # The chat lock the job takes lives as long as the job may run.
         token = chat_steering.current_job_timeout.set(seconds)
+        # LLM call retries don't wait past it (app/services/llm_retry.py).
+        deadline_token = chat_steering.current_job_deadline.set(
+            asyncio.get_running_loop().time() + seconds
+        )
         try:
             async with asyncio.timeout(seconds):
                 return await job(ctx, **kwargs)
         finally:
+            chat_steering.current_job_deadline.reset(deadline_token)
             chat_steering.current_job_timeout.reset(token)
 
     return run
@@ -363,7 +377,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     ):
         _agent_output_parts: list[str] = []
         _suspended = False
-        _refused: Optional[dict[str, Any]] = None
+        _failed_turn: Optional[dict[str, Any]] = None
         try:
             async with AsyncSessionLocal() as db:
                 message_service = MessageService(db)
@@ -383,17 +397,17 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                     if _is_suspension_chunk(chunk):
                         _suspended = True
                     if chunk.get("type") == "error" and chunk.get("code"):
-                        _refused = chunk
+                        _failed_turn = chunk
                     await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
 
-            if _refused is not None:
-                # The turn ended on a refused LLM call (budget_exceeded,
-                # rate_limited), already streamed as its error event: the job
-                # fails with it, so its status, batch execution and parent
-                # delegation record the code too.
-                from app.providers.errors import LLMRefusalError
+            if _failed_turn is not None:
+                # The turn failed (a refused or failed LLM call, no provider,
+                # ...), already streamed as its error event with its code:
+                # the job fails with it, so its status, batch execution and
+                # parent delegation record the code too.
+                from app.providers.errors import LLMError
 
-                raise LLMRefusalError.from_event(_refused)
+                raise LLMError.from_event(_failed_turn)
 
             # Set agent output on the current span
             _agent_output = "".join(_agent_output_parts)
@@ -453,9 +467,9 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             logger.error(f"Agent message job {job_id} failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
 
-            # Publish error to stream (a refusal streamed its own already)
-            if _refused is None:
-                await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
+            # Publish error to stream (a failed turn streamed its own already)
+            if _failed_turn is None:
+                await stream_relay.publish_failure(channel_id, e)
 
             # Update status
             await redis.set(
@@ -495,10 +509,10 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             if not completed:
                 logger.warning(f"Agent message job {job_id} cancelled/timed out")
                 try:
-                    await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                    await stream_relay.publish_failure(channel_id, _timed_out_error())
                     await redis.set(
                         f"{JOB_STATUS_PREFIX}{job_id}",
-                        json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                        json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                         ex=JOB_TTL,
                     )
                 except Exception:
@@ -520,11 +534,9 @@ async def _persist_turn_error(chat_id: str, error: Exception) -> None:
     """
     from app.core.database import AsyncSessionLocal
     from app.models.chat import Message
+    from app.providers.errors import chat_error_content, turn_error
 
-    content = (
-        "An error occurred while processing your message. Please try again."
-        f"\n\nError: {str(error)[:300]}"
-    )
+    content = chat_error_content(turn_error(error))
     try:
         async with AsyncSessionLocal() as db:
             db.add(Message(chat_id=chat_id, role="assistant", content=content))
@@ -744,7 +756,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Traceback: {traceback.format_exc()}")
 
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
+        await stream_relay.publish_failure(channel_id, e)
 
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
@@ -760,10 +772,10 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
         if not completed:
             logger.warning(f"Agent resume job {job_id} cancelled/timed out")
             try:
-                await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                await stream_relay.publish_failure(channel_id, _timed_out_error())
                 await redis.set(
                     f"{JOB_STATUS_PREFIX}{job_id}",
-                    json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                    json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                     ex=JOB_TTL,
                 )
             except Exception:
@@ -980,7 +992,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Delegate-resume job {job_id} failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e), code=_failure_fields(e).get("error_code"))
+        await stream_relay.publish_failure(channel_id, e)
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
             json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
@@ -1015,10 +1027,10 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         if not completed:
             logger.warning(f"Delegate-resume job {job_id} cancelled/timed out")
             try:
-                await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                await stream_relay.publish_failure(channel_id, _timed_out_error())
                 await redis.set(
                     f"{JOB_STATUS_PREFIX}{job_id}",
-                    json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                    json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                     ex=JOB_TTL,
                 )
             except Exception:

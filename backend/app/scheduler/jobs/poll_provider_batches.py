@@ -21,6 +21,7 @@ from app.models import LLMProvider, LLMUsage
 from app.models.batch import Batch
 from app.models.chat import Message
 from app.models.execution import Execution, ExecutionStatus
+from app.providers.tracking import raw_finish_reason, normalize_finish_reason
 from app.services.llm_pricing import price_usage
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,8 @@ async def _poll_one(batch_id: uuid_lib.UUID) -> None:
                         "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
                         "cache_write_tokens": usage.get("cache_write_tokens", 0) or 0,
                         "streamed": False,
+                        "finish_reason": normalize_finish_reason(result.get("finish_reason")),
+                        "finish_reason_raw": raw_finish_reason(result.get("finish_reason")),
                         # Priced at the provider's batch rates
                         "batch": True,
                         "customer": customers.get(execution.chat_id),

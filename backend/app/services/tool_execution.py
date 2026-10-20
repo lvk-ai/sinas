@@ -726,8 +726,14 @@ async def execute_agent_tool(
                         "error": event.get("error", "Sub-agent failed"),
                         "chat_id": str(sub_chat.id),
                     }
-                    if event.get("code"):  # a refused LLM call: budget_exceeded, ...
+                    if event.get("code"):
+                        # The error envelope (budget_exceeded, rate_limited,
+                        # provider_unavailable, ...): lets the parent model
+                        # tell a retryable failure from a final one.
                         failure["error_code"] = event["code"]
+                        for key in ("retryable", "upstream_status"):
+                            if event.get(key) is not None:
+                                failure[key] = event[key]
                     return failure
                 break
 
