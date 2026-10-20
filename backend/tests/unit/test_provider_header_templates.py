@@ -516,6 +516,24 @@ async def test_without_attribution_fields_no_snapshot_is_taken(db, monkeypatch):
     assert headers == {} and customer is None and chat.attribution is None
 
 
+async def test_a_malformed_stored_template_never_stops_the_call(db, monkeypatch):
+    monkeypatch.setattr(settings, "usage_customer_field", None)
+    user = await _user(db, {"orgId": "org-1"})
+    headers, customer = await resolve_attribution(
+        db, {"user_id": str(user.id)}, {"x-customer-id": None, "x-ok": "{{user.id}}"}
+    )
+    assert headers == {} and customer is None  # the whole set is ignored, no exception
+
+
+def test_the_customer_field_is_always_in_the_snapshot(monkeypatch):
+    from app.providers.attribution import attribution_keys
+
+    monkeypatch.setattr(settings, "attribution_fields", ",".join(f"f{i}" for i in range(25)))
+    monkeypatch.setattr(settings, "usage_customer_field", "orgId")
+    keys = attribution_keys()
+    assert keys[0] == "orgId" and len(keys) == 20
+
+
 async def test_a_failed_lookup_sends_nothing_and_never_raises(db):
     headers, customer = await resolve_attribution(db, {"user_id": "not-a-uuid"}, TEMPLATES)
     assert headers == {} and customer is None
