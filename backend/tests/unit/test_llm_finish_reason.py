@@ -7,6 +7,7 @@ content_filter / error / other, with the provider's own value beside it; a
 failed call is "error"; /usage/calls returns both (added fields only); the
 migration leaves one head.
 """
+import asyncio
 import json
 import uuid
 from types import SimpleNamespace
@@ -39,8 +40,6 @@ def recorded(monkeypatch):
 
 
 async def _settled():
-    import asyncio
-
     await asyncio.sleep(0)
 
 
@@ -224,6 +223,37 @@ async def test_a_failed_call_is_recorded_as_error(recorded):
         [c async for c in provider.stream(MESSAGES, model="m")]
     await _settled()
     assert [(r["finish_reason"], r["finish_reason_raw"]) for r in recorded] == [("error", None), ("error", "stop")]
+
+
+class _Hanging:
+    """Never answers (until cancelled); its stream sends the finish reason
+    first, as OpenAI does before its usage chunk."""
+
+    api_key = None
+    base_url = None
+
+    async def complete(self, *a, **k):
+        await asyncio.Event().wait()
+
+    async def stream(self, *a, **k):
+        yield {"content": "par", "finish_reason": "stop"}
+        await asyncio.Event().wait()
+
+
+async def test_a_call_cancelled_by_the_jobs_timeout_is_recorded_as_error(recorded):
+    provider = UsageTrackingProvider(_Hanging(), provider_name="p")
+
+    async def consume():
+        [c async for c in provider.stream(MESSAGES, model="m")]
+
+    for call in (provider.complete(MESSAGES, model="m"), consume()):
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await call
+    await _settled()
+    assert [(r["error"], r["finish_reason"], r["finish_reason_raw"]) for r in recorded] == [
+        ("cancelled", "error", None), ("cancelled", "error", "stop"),
+    ]
 
 
 # ── provider batches ───────────────────────────────────────────────────────

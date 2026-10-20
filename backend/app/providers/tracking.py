@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 # provider calls them; the provider's own value is kept in
 # `finish_reason_raw`.
 FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "error", "other")
+# The `error` of a call cancelled while it waited on the model API.
+CANCELLED = "cancelled"
 _FINISH_REASON_ALIASES = {
     # OpenAI, Azure, Gemini (OpenAI-compatible), Mistral, Ollama
     "stop": "stop",
@@ -291,6 +293,17 @@ class UsageTrackingProvider(BaseLLMProvider):
                 max_tokens=max_tokens,
                 **kwargs,
             )
+        except asyncio.CancelledError:
+            # Cancelled while waiting on the model API (the job's timeout, a
+            # shutdown): recorded as a failed call, then cancelled as asked.
+            self._record(
+                model=model,
+                usage=None,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                streamed=False,
+                error=CANCELLED,
+            )
+            raise
         except Exception as e:
             typed = self._classify(e, model)
             self._record(
@@ -343,6 +356,11 @@ class UsageTrackingProvider(BaseLLMProvider):
             # Consumer abandoned the stream (e.g. client disconnect);
             # record whatever arrived before the cutoff.
             error = "stream_abandoned"
+            raise
+        except asyncio.CancelledError:
+            # Cancelled while waiting on the model API (the job's timeout, a
+            # shutdown): the call failed, whatever arrived before.
+            error = CANCELLED
             raise
         except Exception as e:
             typed = self._classify(e, model)
