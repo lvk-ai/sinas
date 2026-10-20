@@ -509,7 +509,11 @@ class ContainerPool:
                 container.id,
                 [
                     "python3", "-c",
-                    f'import sys; open("{request_path}","wb").write(sys.stdin.buffer.read())',
+                    # A result file left by an earlier run of this execution
+                    # id (a retry, a DLQ requeue) would be read as this run's.
+                    f'import os, sys\n'
+                    f'if os.path.exists("{result_file}"): os.remove("{result_file}")\n'
+                    f'open("{request_path}","wb").write(sys.stdin.buffer.read())',
                 ],
                 stdin=True,
                 stdout=True,

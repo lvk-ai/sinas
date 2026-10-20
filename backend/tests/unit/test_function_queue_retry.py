@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.models import Function
 from app.models.execution import Execution, ExecutionStatus
 from app.services.execution_engine import (
+    INFRASTRUCTURE,
     ExecutionRetryScheduled,
     FunctionExecutionError,
     executor,
@@ -70,17 +71,19 @@ class _FakeRedis:
 
 
 class _FakeSandbox:
-    """A sandbox executor whose every run has the given outcome."""
+    """A sandbox executor whose runs have the given outcomes in turn (the
+    last one repeats)."""
 
-    def __init__(self, outcome):
-        self.outcome = outcome
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
         self.calls = 0
 
     async def execute(self, **kwargs):
+        outcome = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
         self.calls += 1
-        if isinstance(self.outcome, BaseException):
-            raise self.outcome
-        return self.outcome
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 @pytest.fixture
@@ -98,8 +101,8 @@ def use_test_db(db, monkeypatch):
 
 @pytest.fixture
 def sandbox(monkeypatch):
-    def install(outcome):
-        fake = _FakeSandbox(outcome)
+    def install(*outcomes):
+        fake = _FakeSandbox(*outcomes)
         monkeypatch.setattr(executor, "_sandbox_executor", fake)
         monkeypatch.setattr(executor, "_sandbox_executor_resolved", True)
         return fake
@@ -301,15 +304,79 @@ class TestInfrastructureFailure:
             raise ConnectionRefusedError("connection refused")
 
         monkeypatch.setattr(executor, "load_function", down)
+        callbacks = []
+
+        async def fire_callback(**kwargs):
+            callbacks.append(kwargs)
+
+        monkeypatch.setattr("app.services.execution_engine._fire_callback", fire_callback)
         redis = _FakeRedis()
-        delays, exc = await _run_until_final(worker, redis, _kwargs(fn, row, test_user))
+        kwargs = {**_kwargs(fn, row, test_user), "callback_url": "https://app.example/cb"}
+        delays, exc = await _run_until_final(worker, redis, kwargs)
 
         assert len(delays) == 1
         assert isinstance(exc, ExecutorUnavailable)
         (entry,) = _dlq(redis)
         assert entry["error_type"] == "infrastructure" and entry["attempts"] == 2
+        assert entry["callback_url"] == "https://app.example/cb"
         await db.refresh(row)
         assert row.status == ExecutionStatus.FAILED and "dead-letter" in row.error
+        # The caller is told once, at the end — not per attempt
+        (cb,) = callbacks
+        assert cb["status"] == "failure" and "connection refused" in cb["error"]
+        assert cb["callback_url"] == "https://app.example/cb"
+
+    async def test_outages_do_not_use_up_the_functions_retries(
+        self, db, test_user, use_test_db, sandbox
+    ):
+        """Infrastructure and function failures have separate budgets: an
+        outage before the first real run leaves max_retries=1 intact."""
+        from app.queue import worker
+
+        fn = await _function(db, test_user, max_retries=1)
+        row = await _pending_row(db, test_user, fn)
+        fake = sandbox(
+            ExecutorUnavailable("No workers available"),
+            ExecutionResult.failed("upstream 503"),
+        )
+        redis = _FakeRedis()
+
+        delays, exc = await _run_until_final(worker, redis, _kwargs(fn, row, test_user))
+
+        # outage (retried), code failure (its one retry), code failure (final)
+        assert fake.calls == 3 and len(delays) == 2
+        assert isinstance(exc, FunctionExecutionError) and exc.dead_letter and not exc.transient
+        (entry,) = _dlq(redis)
+        assert entry["error_type"] == "function" and entry["attempts"] == 3
+
+    async def test_admission_outage_before_dispatch_retries(
+        self, db, test_user, use_test_db, monkeypatch
+    ):
+        """The shared-pool admission gate losing Redis happens before the
+        code is dispatched: an infrastructure failure, not the function's."""
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        from app.queue import worker
+
+        monkeypatch.setattr(settings, "queue_max_retries", 1)
+        fn = await _function(db, test_user, max_retries=0)
+        fn.shared_pool = True
+        await db.commit()
+        row = await _pending_row(db, test_user, fn)
+
+        @contextlib.asynccontextmanager
+        async def redis_down(depth, execution_id):
+            raise RedisConnectionError("Error 111 connecting to redis:6379")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr("app.services.shared_admission.shared_pool_admission", redis_down)
+        redis = _FakeRedis()
+        delays, exc = await _run_until_final(worker, redis, _kwargs(fn, row, test_user))
+
+        assert len(delays) == 1
+        assert isinstance(exc, FunctionExecutionError) and exc.transient and exc.dead_letter
+        (entry,) = _dlq(redis)
+        assert entry["error_type"] == "infrastructure"
 
     def test_unrelated_errors_are_not_transient(self):
         from app.services.execution_engine import is_transient_infra_error
@@ -330,7 +397,7 @@ class TestSaturationDeferrals:
         calls = {"n": 0}
 
         async def engine(**kwargs):
-            seen.append(kwargs["failed_attempts"])
+            seen.append(dict(kwargs["prior_failures"]))
             calls["n"] += 1
             if calls["n"] <= 12:
                 raise SharedPoolSaturated("4/4 slots in use")
@@ -352,7 +419,7 @@ class TestSaturationDeferrals:
         }
         delays, exc = await _run_until_final(worker, redis, kwargs, max_runs=30)
 
-        assert len(delays) == 12 and seen == [0] * 13
+        assert len(delays) == 12 and seen == [{}] * 13
         assert isinstance(exc, FunctionExecutionError)
         assert _dlq(redis) == []
         assert f"{JOB_FAILURES_PREFIX}j1" not in redis.store
@@ -364,12 +431,15 @@ class TestSaturationDeferrals:
         seen = []
 
         async def engine(**kwargs):
-            seen.append(kwargs["failed_attempts"])
+            prior = kwargs["prior_failures"].get(INFRASTRUCTURE, 0)
+            seen.append(prior)
             if len(seen) <= 5:
                 raise SharedPoolSaturated("4/4 slots in use")
-            n = kwargs["failed_attempts"] + 1
+            n = prior + 1
             if n <= settings.queue_max_retries:
-                raise ExecutionRetryScheduled("pod failed", transient=True, attempt=n, max_attempts=3)
+                raise ExecutionRetryScheduled(
+                    "pod failed", kind=INFRASTRUCTURE, attempt=n, max_attempts=3
+                )
             err = FunctionExecutionError("Function execution failed: pod failed")
             err.transient = err.dead_letter = err.recorded = True
             raise err
@@ -463,17 +533,80 @@ class TestDeadLetterQueueApi:
             await db.refresh(row)
             assert (row.status, row.error) == (ExecutionStatus.PENDING, None)
 
-            # Requeueing again while it is queued is refused, not lost
+            # Requeueing again while it is queued is refused, not lost, and
+            # leaves the active job's state alone
             await redis.lpush(DLQ_KEY, json.dumps(entry))
+            await redis.set(f"{JOB_FAILURES_PREFIX}{eid}", json.dumps({"function": 1}))
+            row.error = "Attempt 1 of 2 failed, retrying: boom"
+            await db.commit()
             r = await client.post(f"/api/v1/queue/dlq/{eid}/retry", headers=h)
             assert r.status_code == 409
             assert len(await redis.lrange(DLQ_KEY, 0, -1)) == 1
+            assert await redis.get(f"{JOB_FAILURES_PREFIX}{eid}") is not None
+            await db.refresh(row)
+            assert row.error == "Attempt 1 of 2 failed, retrying: boom"
+
+            # One requeue at a time
+            from app.services.queue_service import DLQ_REQUEUE_LOCK_PREFIX
+
+            await redis.set(f"{DLQ_REQUEUE_LOCK_PREFIX}{eid}", "1")
+            r = await client.post(f"/api/v1/queue/dlq/{eid}/retry", headers=h)
+            assert r.status_code == 409 and "already being requeued" in r.text
+        finally:
+            await pool.aclose()
+
+    async def test_requeue_reopens_a_finished_batch(
+        self, client, db, admin_user, test_user, use_test_db, monkeypatch
+    ):
+        from arq.connections import create_pool
+
+        from app.core.redis import get_redis, get_redis_settings
+        from app.models.batch import Batch, BatchKind, BatchStatus
+
+        fn = await _function(db, test_user)
+        now = datetime.utcnow()
+        batch = Batch(
+            user_id=test_user.id, kind=BatchKind.FUNCTION, target_namespace=fn.namespace,
+            target_name=fn.name, total=1, status=BatchStatus.FAILED, started_at=now,
+            finished_at=now, created_at=now,
+        )
+        db.add(batch)
+        await db.commit()
+        row = await _pending_row(db, test_user, fn)
+        row.status, row.batch_id = ExecutionStatus.FAILED, batch.id
+        await db.commit()
+
+        redis = await get_redis()
+        pool = await create_pool(get_redis_settings())
+        monkeypatch.setattr("app.services.queue_service.get_arq_pool", lambda: _ret(pool))
+        try:
+            entry = {**_kwargs(fn, row, test_user), "error": "x", "error_type": "infrastructure"}
+            await redis.lpush(DLQ_KEY, json.dumps(entry))
+            r = await client.post(
+                f"/api/v1/queue/dlq/{row.execution_id}/retry", headers=auth_headers(admin_user)
+            )
+            assert r.status_code == 200, r.text
+            await db.refresh(batch)
+            # Reopened: its terminal status and callback follow the requeued run
+            assert (batch.status, batch.finished_at) == (BatchStatus.RUNNING, None)
         finally:
             await pool.aclose()
 
 
 async def _ret(value):
     return value
+
+
+class TestStaleResults:
+    def test_k8s_wait_script_clears_a_stale_result_before_triggering(self):
+        """A retry or requeue reuses the execution id; a result file left by
+        the earlier run must never be read back as the new run's."""
+        from app.services.executor._wire import build_wait_script
+
+        script = build_wait_script("e1", 5, write_trigger=True)
+        assert script.index('os.remove("/tmp/exec_result_e1.json")') < script.index(
+            'open("/tmp/exec_trigger_e1", "w")'
+        )
 
 
 class TestWorkerSettings:

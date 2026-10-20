@@ -53,18 +53,32 @@ def is_transient_infra_error(exc: BaseException) -> bool:
     return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
 
 
+# The two kinds of failed attempt, each with its own retry budget.
+INFRASTRUCTURE = "infrastructure"  # the code never ran: QUEUE_MAX_RETRIES
+FUNCTION = "function"  # the function's own failure: Function.max_retries
+
+
+def dead_letter_note(attempts: int) -> str:
+    """Appended to a dead-lettered execution's error."""
+    return (
+        f" (failed {attempts} attempt{'s' if attempts != 1 else ''}; "
+        "moved to the dead-letter queue)"
+    )
+
+
 class ExecutionRetryScheduled(Exception):
     """A queued execution failed but has attempts left (issue #135).
 
     The engine put the Execution row back to PENDING with the error noted,
     and skipped the failure bookkeeping (callback, batch, execution log):
     nothing has terminated yet. The queue worker re-runs the job after a
-    backoff.
+    backoff. `kind` is INFRASTRUCTURE or FUNCTION; `attempt` counts that
+    kind's failures only.
     """
 
-    def __init__(self, message: str, *, transient: bool, attempt: int, max_attempts: int):
+    def __init__(self, message: str, *, kind: str, attempt: int, max_attempts: int):
         super().__init__(message)
-        self.transient = transient
+        self.kind = kind
         self.attempt = attempt
         self.max_attempts = max_attempts
 
@@ -294,7 +308,7 @@ class FunctionExecutor:
         chat_id: str | None = None,
         callback_url: str | None = None,
         depth: int = 0,
-        failed_attempts: int | None = None,
+        prior_failures: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Execute a function with input validation and tracking.
 
@@ -302,11 +316,14 @@ class FunctionExecutor:
         embedded in the per-execution access token so a nested call can
         compute its own depth and be bounded by settings.max_execution_depth.
 
-        `failed_attempts` is how many earlier runs of this queue job failed
-        (None = not run by the queue: never retried). Which failures retry:
+        `prior_failures` counts the earlier failed runs of this queue job per
+        kind, {INFRASTRUCTURE: n, FUNCTION: m} (None = not run by the queue:
+        never retried). Each kind has its own budget, so an outage never uses
+        up a function's retries (nor the reverse):
 
-        - the infrastructure could not start the code (`ExecutorUnavailable`):
-          up to settings.queue_max_retries times;
+        - the infrastructure failed before the code ran (`ExecutorUnavailable`,
+          or a lost DB/Redis connection before dispatch): up to
+          settings.queue_max_retries times;
         - the function's own code failed: up to `Function.max_retries` times
           (default 0 — functions may have side effects, retrying is opt-in);
         - anything deterministic (input/output schema validation, a disabled
@@ -553,20 +570,26 @@ class FunctionExecutor:
                 await db.commit()
                 raise
             except Exception as e:
-                transient = isinstance(e, ExecutorUnavailable)
+                # Infrastructure: the executor said the code never started, or
+                # a connection dropped before dispatch (e.g. the admission
+                # gate's Redis).
+                transient = isinstance(e, ExecutorUnavailable) or (
+                    not dispatched and is_transient_infra_error(e)
+                )
                 if transient:
-                    max_retries = settings.queue_max_retries
+                    kind, max_retries = INFRASTRUCTURE, settings.queue_max_retries
                 elif dispatched and not isinstance(e, SchemaValidationError):
-                    max_retries = function.max_retries or 0
+                    kind, max_retries = FUNCTION, function.max_retries or 0
                 else:
-                    max_retries = 0  # deterministic: retrying changes nothing
-                attempt = (failed_attempts or 0) + 1
+                    kind, max_retries = FUNCTION, 0  # deterministic: retrying changes nothing
+                prior = (prior_failures or {}).get(kind, 0)
+                attempt = prior + 1
                 # Prefer the function's real traceback from the container; fall
                 # back to the backend stack for errors raised outside the function
                 # (schema validation, db, container plumbing, etc.).
                 execution.traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
 
-                if failed_attempts is not None and failed_attempts < max_retries:
+                if prior_failures is not None and prior < max_retries:
                     # Not terminal yet: back in the queue, the failure noted.
                     execution.status = ExecutionStatus.PENDING
                     execution.error = (
@@ -575,22 +598,19 @@ class FunctionExecutor:
                     await db.commit()
                     raise ExecutionRetryScheduled(
                         str(e),
-                        transient=transient,
+                        kind=kind,
                         attempt=attempt,
                         max_attempts=max_retries + 1,
                     ) from e
 
                 # Retryable, but out of attempts: the queue dead-letters it.
-                dead_letter = failed_attempts is not None and (transient or max_retries > 0)
+                dead_letter = prior_failures is not None and (transient or max_retries > 0)
 
                 # Update execution record with error
                 execution.status = ExecutionStatus.FAILED
                 execution.error = str(e)
                 if dead_letter:
-                    execution.error += (
-                        f" (failed {attempt} attempt{'s' if attempt != 1 else ''}; "
-                        "moved to the dead-letter queue)"
-                    )
+                    execution.error += dead_letter_note(sum(prior_failures.values()) + 1)
                 execution.completed_at = datetime.utcnow()
 
                 await db.commit()
@@ -770,6 +790,66 @@ class FunctionExecutor:
             "execution_id": execution_id,
             "job_id": job_id,
         }
+
+    async def record_failure(
+        self,
+        *,
+        execution_id: str,
+        error: str,
+        user_id: str,
+        trigger_id: str,
+        function_namespace: str,
+        function_name: str,
+        callback_url: str | None = None,
+    ) -> None:
+        """The failure bookkeeping for a queued execution that failed before
+        or outside `execute_function`'s own (pool saturation that never let
+        up, the database unreachable while preparing, the function gone):
+        row FAILED, execution log, callback, batch. A row that already
+        reached a terminal state is left alone. Best effort: never raises."""
+        try:
+            async with AsyncSessionLocal() as db:
+                execution = (
+                    await db.execute(select(Execution).where(Execution.execution_id == execution_id))
+                ).scalar_one_or_none()
+                if execution is None or execution.status not in (
+                    ExecutionStatus.PENDING,
+                    ExecutionStatus.RUNNING,
+                ):
+                    return
+                execution.status = ExecutionStatus.FAILED
+                execution.error = error
+                execution.completed_at = datetime.utcnow()
+                await db.commit()
+
+                await clickhouse_logger.log_execution_end(execution_id, "failed", None, error, None)
+
+                if callback_url:
+                    from app.models.user import User
+
+                    user = (
+                        await db.execute(select(User).where(User.id == user_id))
+                    ).scalar_one_or_none()
+                    await _fire_callback(
+                        db=db,
+                        execution=execution,
+                        callback_url=callback_url,
+                        user_id=user_id,
+                        user_email=user.email if user else "unknown@unknown.com",
+                        status="failure",
+                        result=None,
+                        error=error,
+                        trigger_id=trigger_id,
+                        function_namespace=function_namespace,
+                        function_name=function_name,
+                    )
+
+                if execution.batch_id is not None:
+                    from app.services import batch_service
+
+                    await batch_service.on_execution_terminated(db=db, batch_id=execution.batch_id)
+        except Exception:
+            logger.error(f"Could not record the failure of execution {execution_id}", exc_info=True)
 
     def clear_cache(self):
         """Clear function cache."""

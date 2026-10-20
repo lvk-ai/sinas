@@ -204,6 +204,7 @@ class TestWorkerDefersOnSaturation:
             yield db
 
         monkeypatch.setattr("app.core.database.AsyncSessionLocal", fake_session)
+        monkeypatch.setattr("app.services.execution_engine.AsyncSessionLocal", fake_session)
 
         redis = _FakeRedis()
         kwargs = _job_kwargs(execution_id)

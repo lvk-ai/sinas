@@ -785,7 +785,13 @@ class SharedWorkerManager:
             api = container.client.api
             exec_id = api.exec_create(
                 container.id,
-                ['python3', '-c', f'import sys; open("{request_file}","wb").write(sys.stdin.buffer.read())'],
+                # A result file left by an earlier run of this execution id
+                # (a retry, a DLQ requeue) would be read back as this run's.
+                ['python3', '-c', (
+                    f'import os, sys\n'
+                    f'if os.path.exists("{result_file}"): os.remove("{result_file}")\n'
+                    f'open("{request_file}","wb").write(sys.stdin.buffer.read())'
+                )],
                 stdin=True,
                 stdout=True,
                 stderr=True,

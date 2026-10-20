@@ -48,18 +48,13 @@ async def _heartbeat_loop(redis, worker_id: str, data: dict) -> None:
 RETRY_BACKOFF_CAP_SECONDS = 300
 
 
-def _retry_backoff(failed_attempts: int) -> float:
-    """Delay before re-running a job whose `failed_attempts`-th run failed:
+def _retry_backoff(attempt: int) -> float:
+    """Delay before re-running a job after its `attempt`-th failure:
     QUEUE_RETRY_DELAY doubled per failure, capped, plus up to 20% jitter so
     jobs that failed together (a worker outage) don't retry in lockstep."""
     base = max(1, settings.queue_retry_delay)
-    delay = min(base * 2 ** (failed_attempts - 1), RETRY_BACKOFF_CAP_SECONDS)
+    delay = min(base * 2 ** (attempt - 1), RETRY_BACKOFF_CAP_SECONDS)
     return delay + random.uniform(0, delay * 0.2)
-
-
-def _dead_letter_note(attempts: int) -> str:
-    """Appended to a dead-lettered execution's error."""
-    return f" (failed {attempts} attempt{'s' if attempts != 1 else ''}; moved to the dead-letter queue)"
 
 
 async def _execution_cancelled(execution_id: str) -> bool:
@@ -83,39 +78,6 @@ async def _execution_cancelled(execution_id: str) -> bool:
         return False
 
 
-async def _fail_execution_row(execution_id: str, error: str) -> None:
-    """Mark an execution FAILED that the engine could not: the failure came
-    before or outside its own bookkeeping (pool saturation that never let
-    up, the database unreachable, the function gone). Leaves a row that
-    already reached a terminal state alone."""
-    from datetime import datetime as _dt
-
-    from sqlalchemy import select as _select
-
-    from app.core.database import AsyncSessionLocal
-    from app.models.execution import Execution, ExecutionStatus
-
-    try:
-        async with AsyncSessionLocal() as db:
-            row = (
-                await db.execute(
-                    _select(Execution).where(Execution.execution_id == execution_id)
-                )
-            ).scalar_one_or_none()
-            if row is None or row.status not in (ExecutionStatus.PENDING, ExecutionStatus.RUNNING):
-                return
-            row.status = ExecutionStatus.FAILED
-            row.error = error
-            row.completed_at = _dt.utcnow()
-            await db.commit()
-            if row.batch_id is not None:
-                from app.services import batch_service
-
-                await batch_service.on_execution_terminated(db=db, batch_id=row.batch_id)
-    except Exception:
-        logger.error(f"Could not mark execution {execution_id} failed", exc_info=True)
-
-
 async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     """
     Execute a function in the worker process.
@@ -134,14 +96,20 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
       with `max_retries` (it may have side effects);
     - deterministic failures (input validation, function missing): final.
 
-    Failed attempts are counted in Redis (JOB_FAILURES_PREFIX), not with
+    Failed attempts are counted in Redis (JOB_FAILURES_PREFIX), per kind
+    (infrastructure / function, each against its own budget), not with
     arq's job_try, which deferrals advance too. A retryable failure that runs
     out of attempts lands in the dead-letter queue, from which an admin can
     requeue it (POST /queue/dlq/{job_id}/retry).
     """
     from redis.asyncio import Redis
 
-    from app.services.execution_engine import ExecutionRetryScheduled
+    from app.services.execution_engine import (
+        INFRASTRUCTURE,
+        ExecutionRetryScheduled,
+        dead_letter_note,
+        executor,
+    )
     from app.services.executor.base import ExecutorUnavailable
 
     job_id = kwargs["job_id"]
@@ -168,10 +136,12 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
 
     job_try = ctx.get("job_try", 1)
     failures_key = f"{JOB_FAILURES_PREFIX}{job_id}"
+    # {"infrastructure": n, "function": m}: earlier failed runs, per kind
     try:
-        failed_attempts = int(await redis.get(failures_key) or 0)
-    except (TypeError, ValueError):
-        failed_attempts = 0
+        failures = {k: int(v) for k, v in json.loads(await redis.get(failures_key) or "{}").items()}
+    except (TypeError, ValueError, AttributeError):
+        failures = {}
+    failed_attempts = sum(failures.values())
 
     logger.info(
         f"Worker executing function {function_namespace}/{function_name} "
@@ -218,20 +188,38 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
         running["attempt"] = failed_attempts + 1
     await redis.set(f"{JOB_STATUS_PREFIX}{job_id}", json.dumps(running), ex=JOB_TTL)
 
-    async def schedule_retry(error: str, attempt: int, max_attempts: int) -> None:
+    async def schedule_retry(error: str, kind: str, attempt: int, max_attempts: int) -> None:
         """Count the failed attempt and re-run the job after a backoff."""
-        await redis.set(failures_key, str(attempt), ex=JOB_TTL)
+        await redis.set(failures_key, json.dumps({**failures, kind: attempt}), ex=JOB_TTL)
         defer = _retry_backoff(attempt)
         detail = (
             f"attempt {attempt} of {max_attempts} failed, retrying in {defer:.0f}s: {error}"
         )
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({**base_fields, "status": "queued", "attempt": attempt, "detail": detail}),
+            json.dumps({
+                **base_fields,
+                "status": "queued",
+                "attempt": failed_attempts + 1,
+                "detail": detail,
+            }),
             ex=JOB_TTL,
         )
         logger.warning(f"Function job {job_id}: {detail}")
         raise Retry(defer=defer)
+
+    async def record_failure(error: str) -> None:
+        """Row FAILED, callback, batch — for failures the engine did not
+        record itself."""
+        await executor.record_failure(
+            execution_id=execution_id,
+            error=error,
+            user_id=user_id,
+            trigger_id=trigger_id,
+            function_namespace=function_namespace,
+            function_name=function_name,
+            callback_url=callback_url,
+        )
 
     async def fail_job(error: str, *, dead_letter: bool, error_type: str) -> None:
         """Terminal failure: final status, notify waiters, dead-letter."""
@@ -295,8 +283,6 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     # the function's own spans) is recorded under it.
     _fn_token = otel_context.attach(otel_trace.set_span_in_context(_fn_span, parent_ctx))
     try:
-        from app.services.execution_engine import executor
-
         result = await executor.execute_function(
             function_namespace=function_namespace,
             function_name=function_name,
@@ -308,7 +294,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
             chat_id=chat_id,
             callback_url=callback_url,
             depth=depth,
-            failed_attempts=failed_attempts,
+            prior_failures=failures,
         )
 
         # Store result
@@ -378,7 +364,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
         record_error(_fn_span, e)
         error = f"{e} (pool saturated for {elapsed:.0f}s, window {window}s)"
         logger.error(f"Function job {job_id} failed: {error}")
-        await _fail_execution_row(execution_id, f"{error}{_dead_letter_note(failed_attempts + 1)}")
+        await record_failure(f"{error}{dead_letter_note(failed_attempts + 1)}")
         await fail_job(error, dead_letter=True, error_type="saturation")
         completed = True
         raise
@@ -386,17 +372,18 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     except ExecutionRetryScheduled as e:
         # The engine left the row PENDING with the failure noted.
         completed = True
-        await schedule_retry(str(e), e.attempt, e.max_attempts)
+        await schedule_retry(str(e), e.kind, e.attempt, e.max_attempts)
 
     except ExecutorUnavailable as e:
         # Infrastructure failure before the engine took over (database
         # unreachable while preparing the run): nothing ran, nothing recorded.
-        if failed_attempts < settings.queue_max_retries:
+        infra = failures.get(INFRASTRUCTURE, 0)
+        if infra < settings.queue_max_retries:
             completed = True
-            await schedule_retry(str(e), failed_attempts + 1, settings.queue_max_retries + 1)
+            await schedule_retry(str(e), INFRASTRUCTURE, infra + 1, settings.queue_max_retries + 1)
         record_error(_fn_span, e)
         logger.error(f"Function job {job_id} failed: {e}")
-        await _fail_execution_row(execution_id, f"{e}{_dead_letter_note(failed_attempts + 1)}")
+        await record_failure(f"{e}{dead_letter_note(failed_attempts + 1)}")
         await fail_job(str(e), dead_letter=True, error_type="infrastructure")
         completed = True
         raise
@@ -409,7 +396,7 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
             # Failed before or outside the engine's own bookkeeping (the
             # function is gone, an unexpected error): make sure the row
             # doesn't stay PENDING forever.
-            await _fail_execution_row(execution_id, str(e))
+            await record_failure(str(e))
         dead_letter = bool(getattr(e, "dead_letter", False))
         await fail_job(
             str(e),
