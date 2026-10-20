@@ -4,7 +4,7 @@
 failure of the function's code is final. See issue #135.
 
 Revision ID: r1e2t3r4y5f6
-Revises: f1v2s3r4c5h6
+Revises: a9f1n2s3h4r5
 Create Date: 2026-10-20
 """
 import sqlalchemy as sa
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "r1e2t3r4y5f6"
-down_revision = "f1v2s3r4c5h6"
+down_revision = "a9f1n2s3h4r5"
 branch_labels = None
 depends_on = None
 
