@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutorUnavailable
+from app.services.executor.base import ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -731,15 +731,18 @@ class SharedWorkerManager:
             # Fetch function code from database
             from app.models.function import Function
 
-            result = await db.execute(
-                select(Function).where(
-                    Function.namespace == function_namespace,
-                    Function.name == function_name,
-                    Function.is_active == True,
-                    Function.shared_pool == True,
+            async with before_run("Loading the function"):
+                result = await db.execute(
+                    select(Function).where(
+                        Function.namespace == function_namespace,
+                        Function.name == function_name,
+                        Function.is_active == True,
+                        Function.shared_pool == True,
+                    )
                 )
-            )
-            function = result.scalar_one_or_none()
+                function = result.scalar_one_or_none()
+            async with before_run("Loading secrets"):
+                secrets = await self._load_secrets(db, user_id)
 
             if not function:
                 return {
@@ -765,7 +768,7 @@ class SharedWorkerManager:
                     "execution_id": execution_id,
                     "trigger_type": trigger_type,
                     "chat_id": chat_id,
-                    "secrets": await self._load_secrets(db, user_id),
+                    "secrets": secrets,
                 },
             }
 

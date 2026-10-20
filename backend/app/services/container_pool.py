@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutorUnavailable
+from app.services.executor.base import ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -440,14 +440,15 @@ class ContainerPool:
         # Fetch function code
         from app.models.function import Function
 
-        result = await db.execute(
-            select(Function).where(
-                Function.namespace == function_namespace,
-                Function.name == function_name,
-                Function.is_active == True,
+        async with before_run("Loading the function"):
+            result = await db.execute(
+                select(Function).where(
+                    Function.namespace == function_namespace,
+                    Function.name == function_name,
+                    Function.is_active == True,
+                )
             )
-        )
-        function = result.scalar_one_or_none()
+            function = result.scalar_one_or_none()
 
         if not function:
             return {

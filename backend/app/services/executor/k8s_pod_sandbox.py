@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult, ExecutorUnavailable
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +50,15 @@ class K8sPodSandboxExecutor:
             run_payload_in_pod,
         )
 
-        result = await db.execute(
-            select(Function).where(
-                Function.namespace == function_namespace,
-                Function.name == function_name,
-                Function.is_active == True,
+        async with before_run("Loading the function"):
+            result = await db.execute(
+                select(Function).where(
+                    Function.namespace == function_namespace,
+                    Function.name == function_name,
+                    Function.is_active == True,
+                )
             )
-        )
-        function = result.scalar_one_or_none()
+            function = result.scalar_one_or_none()
         if not function:
             return ExecutionResult.failed(
                 f"Function {function_namespace}/{function_name} not found"

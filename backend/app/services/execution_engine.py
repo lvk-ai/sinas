@@ -1,5 +1,6 @@
 """Function execution engine with tracking and validation."""
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -17,7 +18,12 @@ from app.core.database import AsyncSessionLocal
 from app.models.execution import Execution, ExecutionStatus
 from app.models.function import Function
 from app.services.clickhouse_logger import clickhouse_logger
-from app.services.executor.base import ExecutionResult, ExecutorUnavailable, ResultStatus
+from app.services.executor.base import (
+    ExecutionResult,
+    ExecutorUnavailable,
+    ResultStatus,
+    is_transient_infra_error,
+)
 from app.services.shared_admission import SharedPoolSaturated
 
 logger = logging.getLogger(__name__)
@@ -36,21 +42,6 @@ class FunctionExecutionError(Exception):
     dead_letter = False
     # The engine recorded the failure itself (row FAILED, callback, batch).
     recorded = False
-
-
-def is_transient_infra_error(exc: BaseException) -> bool:
-    """A lost connection to the database, Redis or another service: worth
-    retrying, provided the function's code has not run yet."""
-    from redis.exceptions import ConnectionError as RedisConnectionError
-    from redis.exceptions import TimeoutError as RedisTimeoutError
-    from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
-
-    if isinstance(
-        exc,
-        (OSError, RedisConnectionError, RedisTimeoutError, OperationalError, InterfaceError),
-    ):
-        return True
-    return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
 
 
 # The two kinds of failed attempt, each with its own retry budget.
@@ -85,6 +76,26 @@ class ExecutionRetryScheduled(Exception):
 
 class SchemaValidationError(Exception):
     pass
+
+
+async def _save_retry_note(execution_id: str, note: str, error_traceback: str) -> None:
+    """Mark an execution PENDING with its retry note through a fresh session
+    (the caller's failed). Best effort: the retry goes ahead regardless."""
+    from sqlalchemy import update
+
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(Execution)
+                .where(
+                    Execution.execution_id == execution_id,
+                    Execution.status.in_([ExecutionStatus.PENDING, ExecutionStatus.RUNNING]),
+                )
+                .values(status=ExecutionStatus.PENDING, error=note, traceback=error_traceback)
+            )
+            await db.commit()
+    except Exception:
+        logger.warning(f"Could not note the retry of execution {execution_id}", exc_info=True)
 
 
 async def _fire_callback(
@@ -587,15 +598,22 @@ class FunctionExecutor:
                 # Prefer the function's real traceback from the container; fall
                 # back to the backend stack for errors raised outside the function
                 # (schema validation, db, container plumbing, etc.).
-                execution.traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
+                error_traceback = getattr(e, "container_traceback", None) or traceback.format_exc()
+                execution.traceback = error_traceback
 
                 if prior_failures is not None and prior < max_retries:
                     # Not terminal yet: back in the queue, the failure noted.
+                    # The retry must not hinge on this write: the session
+                    # may have lost its connection with the failure itself.
+                    note = f"Attempt {attempt} of {max_retries + 1} failed, retrying: {e}"
                     execution.status = ExecutionStatus.PENDING
-                    execution.error = (
-                        f"Attempt {attempt} of {max_retries + 1} failed, retrying: {e}"
-                    )
-                    await db.commit()
+                    execution.error = note
+                    try:
+                        await db.commit()
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            await db.rollback()
+                        await _save_retry_note(execution_id, note, error_traceback)
                     raise ExecutionRetryScheduled(
                         str(e),
                         kind=kind,
@@ -607,13 +625,38 @@ class FunctionExecutor:
                 dead_letter = prior_failures is not None and (transient or max_retries > 0)
 
                 # Update execution record with error
-                execution.status = ExecutionStatus.FAILED
-                execution.error = str(e)
+                execution_error = str(e)
                 if dead_letter:
-                    execution.error += dead_letter_note(sum(prior_failures.values()) + 1)
+                    execution_error += dead_letter_note(sum(prior_failures.values()) + 1)
+                execution.status = ExecutionStatus.FAILED
+                execution.error = execution_error
                 execution.completed_at = datetime.utcnow()
 
-                await db.commit()
+                err = FunctionExecutionError(f"Function execution failed: {e}")
+                err.transient = transient
+                err.dead_letter = dead_letter
+                err.recorded = True
+
+                try:
+                    await db.commit()
+                except Exception:
+                    # The session went down with the failure: record it
+                    # through a fresh one (row, log, callback, batch).
+                    logger.warning(
+                        f"Recording the failure of {execution_id} in a fresh session", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await db.rollback()
+                    await self.record_failure(
+                        execution_id=execution_id,
+                        error=execution_error,
+                        user_id=user_id,
+                        trigger_id=trigger_id,
+                        function_namespace=function_namespace,
+                        function_name=function_name,
+                        callback_url=callback_url,
+                    )
+                    raise err from e
 
                 # Log execution failure to Redis
                 await clickhouse_logger.log_execution_end(
@@ -641,10 +684,6 @@ class FunctionExecutor:
                         db=db, batch_id=execution.batch_id,
                     )
 
-                err = FunctionExecutionError(f"Function execution failed: {e}")
-                err.transient = transient
-                err.dead_letter = dead_letter
-                err.recorded = True
                 raise err
 
     async def resume_execution(

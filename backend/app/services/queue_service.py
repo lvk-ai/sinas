@@ -722,6 +722,10 @@ class QueueService:
             try:
                 if old_status is not None:
                     await redis.set(f"{JOB_STATUS_PREFIX}{execution_id}", old_status, ex=JOB_TTL)
+                else:
+                    # The old key had expired (DLQ entries outlive it): drop
+                    # the "queued" one enqueue_function wrote.
+                    await redis.delete(f"{JOB_STATUS_PREFIX}{execution_id}")
             except Exception:
                 logger.warning(f"Could not restore the job status of {execution_id}", exc_info=True)
             raise

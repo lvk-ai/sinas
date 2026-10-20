@@ -379,11 +379,59 @@ class TestInfrastructureFailure:
         assert entry["error_type"] == "infrastructure"
 
     def test_unrelated_errors_are_not_transient(self):
-        from app.services.execution_engine import is_transient_infra_error
+        from app.services.executor.base import is_transient_infra_error
 
         assert is_transient_infra_error(ConnectionRefusedError())
         assert not is_transient_infra_error(ValueError("bad input"))
         assert not is_transient_infra_error(KeyError("x"))
+
+    async def test_executor_preparation_outage_is_unavailable(self):
+        """An executor loading the function (or secrets, or the image) before
+        it runs anything: a lost connection there is ExecutorUnavailable."""
+        from sqlalchemy.exc import OperationalError
+
+        from app.services.executor.base import before_run
+
+        with pytest.raises(ExecutorUnavailable, match="Loading the function"):
+            async with before_run("Loading the function"):
+                raise OperationalError("SELECT 1", {}, ConnectionResetError("reset"))
+        with pytest.raises(ValueError):  # anything else passes through
+            async with before_run("Loading the function"):
+                raise ValueError("bad")
+
+    async def test_retry_scheduled_even_when_the_session_is_broken(
+        self, db, test_user, use_test_db, sandbox, monkeypatch
+    ):
+        """The failure took the session's connection with it: the retry note
+        goes through a fresh session and the retry is scheduled regardless."""
+        from sqlalchemy.exc import OperationalError
+
+        fn = await _function(db, test_user)
+        row = await _pending_row(db, test_user, fn)
+        sandbox(ExecutorUnavailable("Sandbox container failed to start: db gone"))
+
+        real_commit, broken = db.commit, {"once": True}
+
+        async def commit():
+            if broken.pop("once", False):
+                raise OperationalError("COMMIT", {}, ConnectionResetError("reset"))
+            await real_commit()
+
+        async def rollback():  # the test's outer transaction must survive
+            pass
+
+        monkeypatch.setattr(db, "commit", commit)
+        monkeypatch.setattr(db, "rollback", rollback)
+
+        with pytest.raises(ExecutionRetryScheduled) as exc:
+            await executor.execute_function(
+                function_namespace=fn.namespace, function_name=fn.name, input_data={},
+                execution_id=row.execution_id, trigger_type="API", trigger_id="test",
+                user_id=str(test_user.id), prior_failures={},
+            )
+        assert exc.value.kind == "infrastructure"
+        await db.refresh(row)
+        assert row.status == ExecutionStatus.PENDING and row.error.startswith("Attempt 1 of")
 
 
 class TestSaturationDeferrals:
@@ -583,10 +631,13 @@ class TestDeadLetterQueueApi:
             await redis.lpush(DLQ_KEY, json.dumps(entry))
 
             # Enqueueing fails: execution and batch are put back as they were
-            async def redis_down():
-                raise ConnectionError("redis down")
+            class _DownPool:
+                async def enqueue_job(self, *args, **kwargs):
+                    raise ConnectionError("redis down")
 
-            monkeypatch.setattr("app.services.queue_service.get_arq_pool", redis_down)
+            monkeypatch.setattr(
+                "app.services.queue_service.get_arq_pool", lambda: _ret(_DownPool())
+            )
             from app.services.queue_service import queue_service
 
             with pytest.raises(ConnectionError):
@@ -596,6 +647,8 @@ class TestDeadLetterQueueApi:
             assert batch.status == BatchStatus.FAILED and batch.finished_at is not None
             assert row.status == ExecutionStatus.FAILED
             assert len(await redis.lrange(DLQ_KEY, 0, -1)) == 1  # kept for another try
+            # No status key claims it queued (the old one had expired)
+            assert await redis.get(f"{JOB_STATUS_PREFIX}{row.execution_id}") is None
 
             monkeypatch.setattr("app.services.queue_service.get_arq_pool", lambda: _ret(pool))
             r = await client.post(
