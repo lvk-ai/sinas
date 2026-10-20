@@ -1,7 +1,7 @@
 """Connector tool converter — exposes connector operations as agent tools."""
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from jinja2 import Template
 from sqlalchemy import select
@@ -16,6 +16,49 @@ logger = logging.getLogger(__name__)
 CONNECTOR_TOOL_PREFIX = "connector__"
 
 
+async def _connector_access(
+    db: AsyncSession, user_id: Optional[str], permissions: Optional[dict[str, bool]]
+) -> Callable[[Any], bool]:
+    """Which connectors a wildcard may reach: those the user may read, the
+    access the connectors API requires to run an operation."""
+    from app.services.resource_resolver import user_can
+
+    if user_id and permissions is None:
+        from app.core.auth import get_effective_permissions
+
+        permissions = await get_effective_permissions(db, user_id)
+    return user_can(user_id, permissions, "read")
+
+
+def connector_binding(
+    connector_ref: str, enabled_connectors: list[Any]
+) -> Optional[tuple[Optional[set[str]], dict[str, Any]]]:
+    """What the entries enable on this connector: (operation names, or None
+    for all of them; parameters by operation), or None when no entry
+    matches. The most specific entries decide (an exact entry over
+    "namespace/*" over "*/*"), so an exact entry narrows or widens what a
+    wildcard gives one connector; equally specific entries combine: the
+    union of their operations, and per operation the first entry's parameters."""
+    from app.services.resource_resolver import matching_entries
+
+    _, entries = matching_entries(connector_ref, enabled_connectors, "connector")
+    if not entries:
+        return None
+    operations: Optional[set[str]] = set()
+    parameters: dict[str, Any] = {}
+    for entry in entries:
+        entry = entry if isinstance(entry, dict) else {}
+        entry_ops = entry.get("operations") or []
+        if not entry_ops:
+            operations = None  # every operation
+        elif operations is not None:
+            operations.update(entry_ops)
+        for op_name, op_params in (entry.get("parameters") or {}).items():
+            if op_name not in parameters and (not entry_ops or op_name in entry_ops):
+                parameters[op_name] = op_params
+    return operations, parameters
+
+
 class ConnectorToolConverter:
     """Converts connector operations to OpenAI-format tools and executes them."""
 
@@ -24,46 +67,57 @@ class ConnectorToolConverter:
         db: AsyncSession,
         enabled_connectors: Optional[list[dict[str, Any]]] = None,
         agent_input_context: Optional[dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """Build tool definitions for enabled connector operations.
 
         enabled_connectors format:
         [
             {
-                "connector": "namespace/name",
+                "connector": "namespace/name",   # or "namespace/*", "*/*"
                 "operations": ["post_message", "get_channel"],
                 "parameters": {
                     "post_message": {"channel": "{{ slack_channel }}"}
                 }
             }
         ]
+
+        A wildcard entry's operations and parameters apply to every connector
+        it matches; see `connector_binding` for several entries matching one.
         """
         if not enabled_connectors:
             return []
 
+        from app.services.resource_resolver import entry_ref, resolve_resource_refs
+
+        # "namespace/*" and "*/*" match every connector there that the user
+        # may use themselves (read access, as the connectors API requires to
+        # run an operation); an exact entry names one, as it always did.
+        resolved = await resolve_resource_refs(
+            db,
+            [entry_ref(entry, "connector") for entry in enabled_connectors],
+            Connector,
+            can_access=await _connector_access(db, user_id, permissions),
+        )
+
         tools = []
-        for entry in enabled_connectors:
-            connector_ref = entry.get("connector", "")
-            parts = connector_ref.split("/", 1)
-            if len(parts) != 2:
-                logger.warning(f"Invalid connector reference: {connector_ref}")
+        for connector_ref, connector in resolved:
+            if not connector.is_active:
+                logger.warning(f"Connector '{connector_ref}' is inactive")
                 continue
 
-            namespace, name = parts
-            connector = await Connector.get_by_name(db, namespace, name)
-            if not connector or not connector.is_active:
-                logger.warning(f"Connector '{connector_ref}' not found or inactive")
+            binding = connector_binding(connector_ref, enabled_connectors)
+            if binding is None:
                 continue
-
-            enabled_ops = entry.get("operations", [])
-            param_overrides = entry.get("parameters", {})
+            enabled_ops, param_overrides = binding
 
             for op in connector.operations:
                 op_name = op.get("name")
                 if not op_name:
                     continue
                 # Filter to enabled operations
-                if enabled_ops and op_name not in enabled_ops:
+                if enabled_ops is not None and op_name not in enabled_ops:
                     continue
 
                 # Resolve parameter overrides
@@ -141,8 +195,14 @@ class ConnectorToolConverter:
         user_token: Optional[str] = None,
         locked_params: Optional[dict[str, Any]] = None,
         user_id: Optional[str] = None,
+        enabled_connectors: Optional[list[Any]] = None,
     ) -> dict[str, Any]:
-        """Execute a connector tool call."""
+        """Execute a connector tool call.
+
+        With `enabled_connectors` (the chat agent's, as of now), the call must
+        still be within them, resolved as discovery resolves them: a
+        connector reached through a wildcard only when the user may read it,
+        and only an operation the deciding entry enables."""
         # Parse tool name: connector__namespace__name__operation
         parts = tool_name[len(CONNECTOR_TOOL_PREFIX):].split("__", 2)
         if len(parts) != 3:
@@ -153,6 +213,19 @@ class ConnectorToolConverter:
         connector = await Connector.get_by_name(db, namespace, name)
         if not connector or not connector.is_active:
             return {"error": f"Connector '{namespace}/{name}' not found or inactive"}
+
+        if enabled_connectors is not None:
+            from app.services.resource_resolver import ref_granted
+
+            ref = f"{namespace}/{name}"
+            access = await _connector_access(db, user_id, None)
+            binding = connector_binding(ref, enabled_connectors)
+            if binding is None or not ref_granted(ref, enabled_connectors, connector, access, "connector"):
+                logger.warning(f"Security: connector '{ref}' is not enabled for this agent")
+                return {"error": f"Connector '{ref}' is not enabled for this agent"}
+            operations, _ = binding
+            if operations is not None and operation_name not in operations:
+                return {"error": f"Operation '{operation_name}' of connector '{ref}' is not enabled for this agent"}
 
         # Merge locked params with LLM-provided arguments
         merged_params = {**(locked_params or {}), **arguments}
