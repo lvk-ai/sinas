@@ -233,6 +233,26 @@ scheduling:
 ## Backend (FastAPI)
 backend:
   replicas: 1
+  ## Proxies trusted to report the client IP (FORWARDED_ALLOW_IPS), which IP
+  ## rate limits and request logs use. uvicorn takes the client from
+  ## X-Forwarded-For only on a connection from one of these (IPs or CIDRs),
+  ## walking the header right to left to the first address not listed. The
+  ## backend Service is ClusterIP, reached through the ingress controller, so
+  ## the default trusts the private ranges pod and node IPs come from.
+  ##   - Narrow it to your ingress controller's pod CIDR when clients
+  ##     themselves have private addresses (internal deployments): a trusted
+  ##     client could otherwise put any address in front of its own.
+  ##   - Never "*": uvicorn then believes the leftmost, client-supplied entry.
+  ##   - Empty = 127.0.0.1 only, i.e. X-Forwarded-For is ignored.
+  ## The ingress must see the real client IP itself, e.g. its LoadBalancer
+  ## Service with externalTrafficPolicy: Local (or PROXY protocol); otherwise
+  ## every client arrives as a node IP and shares one rate-limit bucket.
+  forwardedAllowIps:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - fc00::/7
   resources:
     requests:
       cpu: "300m"

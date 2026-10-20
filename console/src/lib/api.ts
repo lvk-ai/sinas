@@ -2,6 +2,7 @@ import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { chatListParams, type ChatListFilter, type ChatListPage } from './chatPages';
 import { configApplyBody, type ConfigApplyOptions, type ConfigApplyResponse } from './configApply';
 import { usageCallsParams, type UsageCallsOptions } from './usage';
+import type { APIKeyUpdate } from './apiKeyEdit';
 import type {
   AdminCreateResetLinkResponse,
   RetentionPreview,
@@ -405,6 +406,12 @@ class APIClient {
 
   async revokeAPIKey(keyId: string): Promise<void> {
     await this.configClient.delete(`/api-keys/${keyId}`);
+  }
+
+  /** Edit a key in place (no rotation): send only what changed. */
+  async updateAPIKey(keyId: string, data: APIKeyUpdate): Promise<APIKey> {
+    const response = await this.configClient.patch(`/api-keys/${keyId}`, data);
+    return response.data;
   }
 
   // Chats (Runtime API)

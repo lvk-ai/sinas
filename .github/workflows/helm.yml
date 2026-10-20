@@ -33,6 +33,9 @@ jobs:
             --set postgres.password=ci --set clickhouse.password=ci \
             > /tmp/default.yaml
           grep -q "kind: StatefulSet" /tmp/default.yaml
+          # Client IP from the ingress's X-Forwarded-For, trusted proxies only
+          grep -q -- "--proxy-headers" /tmp/default.yaml
+          grep -A1 "name: FORWARDED_ALLOW_IPS" /tmp/default.yaml | grep -q '10.0.0.0/8'
           grep -q "name: clickhouse" /tmp/default.yaml
 
       - name: helm template (compact profile, clickhouse disabled)

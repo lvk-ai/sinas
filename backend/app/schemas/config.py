@@ -113,7 +113,7 @@ class DatabaseConnectionConfig(BaseModel):
     """Database connection configuration"""
 
     name: str
-    connectionType: str  # postgresql, clickhouse, snowflake
+    connectionType: str  # postgresql (checked per resource by DatabaseConnectionSpec)
     host: str
     port: int
     database: str
