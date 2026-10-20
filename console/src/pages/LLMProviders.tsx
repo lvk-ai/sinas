@@ -44,6 +44,16 @@ function pricingDraft(provider?: LLMProvider): PricingDraft {
   };
 }
 
+/** Whether the configuration JSON as typed is an object (not a draft mid-edit). */
+function isJsonObject(text: string): boolean {
+  try {
+    const value = JSON.parse(text.trim() || '{}');
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 function parseObject(text: string, what: string): Record<string, unknown> {
   let value: unknown;
   try {
@@ -355,6 +365,9 @@ export function LLMProviders() {
   const [editFormData, setEditFormData] = useState<LLMProviderUpdate>({});
   const [editConfigText, setEditConfigText] = useState('{}');
   const [createConfigText, setCreateConfigText] = useState('{}');
+  // The header rows' first problem, reported by ProviderHeaders.
+  const [createHeaderProblem, setCreateHeaderProblem] = useState<string | null>(null);
+  const [editHeaderProblem, setEditHeaderProblem] = useState<string | null>(null);
   const [createPricing, setCreatePricing] = useState<PricingDraft>(pricingDraft());
   const [editPricing, setEditPricing] = useState<PricingDraft>(pricingDraft());
   const [editError, setEditError] = useState('');
@@ -428,7 +441,7 @@ export function LLMProviders() {
       setCreateError('Provider type is required');
       return;
     }
-    const createHeaders = headerProblem(createFormData.config);
+    const createHeaders = createHeaderProblem ?? headerProblem(createFormData.config);
     if (createHeaders) {
       setCreateError(`Headers: ${createHeaders}`);
       return;
@@ -447,7 +460,7 @@ export function LLMProviders() {
     e.preventDefault();
     setEditError('');
     if (selectedProvider && editFormData.name?.trim()) {
-      const editHeaders = headerProblem(editFormData.config);
+      const editHeaders = editHeaderProblem ?? headerProblem(editFormData.config);
       if (editHeaders) {
         setEditError(`Headers: ${editHeaders}`);
         return;
@@ -748,6 +761,8 @@ export function LLMProviders() {
               <ProviderHeaders
                 idPrefix="create"
                 config={createFormData.config}
+                disabled={!isJsonObject(createConfigText)}
+                onProblemChange={setCreateHeaderProblem}
                 onChange={(config) => {
                   setCreateFormData({ ...createFormData, config });
                   setCreateConfigText(JSON.stringify(config, null, 2));
@@ -943,6 +958,8 @@ export function LLMProviders() {
                 key={selectedProvider?.id}
                 idPrefix="edit"
                 config={editFormData.config}
+                disabled={!isJsonObject(editConfigText)}
+                onProblemChange={setEditHeaderProblem}
                 onChange={(config) => {
                   setEditFormData({ ...editFormData, config });
                   setEditConfigText(JSON.stringify(config, null, 2));

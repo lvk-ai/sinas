@@ -319,6 +319,44 @@ def test_a_pipeline_step_keeps_the_code():
     assert StepError("x").code is None
 
 
+def test_an_ollama_stream_reads_the_error_body_to_classify_it(monkeypatch):
+    from app.providers import OllamaProvider, ollama_provider
+
+    budget = _Refusing(429, {"error": {"type": "budget_exceeded", "message": "Budget has been exceeded!"}})
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        ollama_provider.httpx, "AsyncClient",
+        lambda **kw: real(transport=httpx.MockTransport(budget.handle(httpx.Response))),
+    )
+    provider = UsageTrackingProvider(OllamaProvider(base_url="http://gateway.test"), provider_name="gw")
+    with pytest.raises(LLMRefusalError) as caught:
+        asyncio.run(_call(provider, True))
+    assert caught.value.code == BUDGET_EXCEEDED
+
+
+async def test_an_inline_stream_ends_on_a_refusal_as_an_error_event(client, db, admin_user, monkeypatch):
+    """The default (inline) stream sends a refused turn as an SSE `error`
+    event with its code, and no `done` after it."""
+    from app.models.chat import Chat
+    from app.services import message_service as ms
+    from tests.conftest import auth_headers
+
+    async def refused(self, **kwargs):
+        yield {"content": "An error occurred ...", "type": "error",
+               "error": "budget_exceeded: refused", "code": "budget_exceeded"}
+
+    monkeypatch.setattr(ms.MessageService, "send_message_stream", refused)
+    chat = Chat(user_id=admin_user.id, title="t")
+    db.add(chat)
+    await db.flush()
+    r = await client.post(f"/chats/{chat.id}/messages/stream", json={"content": "hi"}, headers=auth_headers(admin_user))
+    assert r.status_code == 200, r.text
+    events = [line[len("event: "):].strip() for line in r.text.splitlines() if line.startswith("event: ")]
+    assert "error" in events and "done" not in events
+    data = [line for line in r.text.splitlines() if line.startswith("data: ") and "budget_exceeded" in line]
+    assert data and json.loads(data[0][len("data: "):])["code"] == "budget_exceeded"
+
+
 class _StatusRedis:
     def __init__(self):
         self.values = {}

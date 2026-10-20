@@ -757,6 +757,14 @@ async def stream_message(
                         chunk = {"content": str(chunk)}
                     # Route special event types to their own SSE event names
                     chunk_type = chunk.get("type")
+                    if chunk_type == "error" and chunk.get("code"):
+                        # A refused LLM call (budget_exceeded, rate_limited):
+                        # the turn ends on it, as an `error` event with its
+                        # code, like a queued stream's. The turn already
+                        # stored its error reply; nothing partial to save.
+                        accumulated_content["content"] = ""
+                        yield {"event": "error", "data": json.dumps({"error": chunk.get("error"), "code": chunk["code"]})}
+                        return
                     if chunk_type in TYPED_EVENTS:
                         yield {"event": chunk_type, "data": json.dumps(chunk)}
                         if chunk_type == "input_required":

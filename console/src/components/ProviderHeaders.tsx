@@ -11,16 +11,23 @@ import {
 /**
  * An LLM provider's identity headers (config.headers): name + template rows,
  * kept in step with the configuration JSON next to it (an edit there shows
- * here, and an edit here rewrites `headers` there).
+ * here, and an edit here rewrites `headers` there). `disabled` while that
+ * JSON doesn't parse, so an edit here can't overwrite an unfinished draft.
+ * `onProblemChange` reports the rows' first problem (duplicates included,
+ * which the config object can't hold), for the form to refuse saving.
  */
 export function ProviderHeaders({
   idPrefix,
   config,
   onChange,
+  disabled = false,
+  onProblemChange,
 }: {
   idPrefix: string;
   config: Record<string, unknown> | undefined;
   onChange: (config: Record<string, unknown>) => void;
+  disabled?: boolean;
+  onProblemChange?: (problem: string | null) => void;
 }) {
   const [rows, setRows] = useState<HeaderRow[]>(() => headerRowsFromConfig(config));
   const configHeaders = JSON.stringify(config?.headers ?? {});
@@ -37,6 +44,10 @@ export function ProviderHeaders({
     onChange(configWithHeaders(config, next));
   };
   const problems = headerRowProblems(rows);
+  const firstProblem = problems.find((p) => p !== null) ?? null;
+  useEffect(() => {
+    onProblemChange?.(firstProblem);
+  }, [firstProblem, onProblemChange]);
 
   return (
     <div className="border-t border-line-soft pt-4">
@@ -45,6 +56,7 @@ export function ProviderHeaders({
         <button
           type="button"
           onClick={() => update([...rows, { name: '', template: '' }])}
+          disabled={disabled}
           className="btn btn-secondary text-xs flex items-center"
         >
           <Plus className="w-3 h-3 mr-1" />
@@ -63,6 +75,9 @@ export function ProviderHeaders({
           How it works
         </a>
       </p>
+      {disabled && (
+        <p className="text-xs text-amber-400 mb-2">Fix the configuration JSON to edit headers here.</p>
+      )}
       <div className="space-y-2">
         {rows.map((row, i) => (
           <div key={i}>
@@ -73,6 +88,7 @@ export function ProviderHeaders({
                   value={row.name}
                   onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)))}
                   placeholder="x-customer-id"
+                  disabled={disabled}
                   className="input font-mono text-xs"
                 />
               </div>
@@ -81,12 +97,14 @@ export function ProviderHeaders({
                   value={row.template}
                   onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, template: e.target.value } : r)))}
                   placeholder="{{attribution.orgId}}"
+                  disabled={disabled}
                   className="input font-mono text-xs"
                 />
               </div>
               <button
                 type="button"
                 onClick={() => update(rows.filter((_, j) => j !== i))}
+                disabled={disabled}
                 className="p-2 text-gray-500 hover:text-red-600"
                 title="Remove header"
               >
