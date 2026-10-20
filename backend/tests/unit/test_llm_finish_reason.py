@@ -298,4 +298,8 @@ def test_the_migration_leaves_one_head():
     config = Config(str(backend / "alembic.ini"))
     config.set_main_option("script_location", str(backend / "alembic"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["a9f1n2s3h4r5"]
+    # One head (a later migration may follow this one), and this one in its
+    # history.
+    assert len(heads) == 1, heads
+    script = ScriptDirectory.from_config(config)
+    assert "a9f1n2s3h4r5" in {rev.revision for rev in script.walk_revisions()}
