@@ -229,6 +229,7 @@ mints a one-time setup link with `python -m app.cli setup-link` (see NOTES.txt).
       name: {{ .Values.jwt.existingSecret }}
       key: {{ .Values.jwt.existingSecretKey | default "jwt-private-key" }}
 {{- end }}
+{{- include "sinas.otelEnv" . }}
 - name: BACKEND_PORT
   value: "8000"
 {{/* public_base_url (setup link, OAuth callback, public file URLs) derives
@@ -242,6 +243,71 @@ mints a one-time setup link with `python -m app.cli setup-link` (see NOTES.txt).
 {{- end }}
 {{- with .Values.extraEnv }}
 {{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+OpenTelemetry environment (part of backendEnv). Exporters go to
+OTEL_EXPORTERS as JSON without their headersSecret; each headersSecret
+becomes OTEL_EXPORTER_<NAME>_HEADERS from that Secret, so credentials never
+sit in the Deployment spec. Paren-safe for `--reuse-values` from a release
+without an `otel` key.
+*/}}
+{{- define "sinas.otelEnv" -}}
+{{- $otel := .Values.otel | default dict }}
+{{- if $otel.enabled }}
+- name: OTEL_ENABLED
+  value: "true"
+{{- /* Entries with enabled: false are left out entirely, Secret reference
+       included: a disabled exporter's Secret may be gone. */}}
+{{- $active := list }}
+{{- range ($otel.exporters | default list) }}
+{{- if or (not (hasKey . "enabled")) .enabled }}
+{{- $active = append $active . }}
+{{- end }}
+{{- end }}
+{{- $exporters := list }}
+{{- range $active }}
+{{- $exporters = append $exporters (omit . "headersSecret") }}
+{{- end }}
+{{- if $exporters }}
+- name: OTEL_EXPORTERS
+  value: {{ toJson $exporters | quote }}
+{{- end }}
+{{- range $active }}
+{{- $name := required "otel.exporters[].name is required" .name }}
+{{- with .headersSecret }}
+- name: OTEL_EXPORTER_{{ regexReplaceAll "[^A-Za-z0-9]" $name "_" | upper }}_HEADERS
+  valueFrom:
+    secretKeyRef:
+      name: {{ required "otel.exporters[].headersSecret.name is required" .name | quote }}
+      key: {{ .key | default "headers" | quote }}
+{{- end }}
+{{- end }}
+{{- with $otel.serviceName }}
+- name: OTEL_SERVICE_NAME
+  value: {{ . | quote }}
+{{- end }}
+{{- with $otel.resourceAttributes }}
+- name: OTEL_RESOURCE_ATTRIBUTES
+  value: {{ . | quote }}
+{{- end }}
+{{- with $otel.sampler }}
+- name: OTEL_TRACES_SAMPLER
+  value: {{ . | quote }}
+{{- end }}
+{{- with $otel.samplerArg }}
+- name: OTEL_TRACES_SAMPLER_ARG
+  value: {{ . | quote }}
+{{- end }}
+{{- if ($otel.logs).enabled }}
+- name: OTEL_LOGS_ENABLED
+  value: "true"
+- name: OTEL_LOGS_LEVEL
+  value: {{ ($otel.logs).level | default "INFO" | quote }}
+{{- end }}
+- name: OTEL_HTTP_CLIENT_PROPAGATION
+  value: {{ $otel.httpClientPropagation | default "none" | quote }}
 {{- end }}
 {{- end }}
 

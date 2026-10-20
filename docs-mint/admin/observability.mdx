@@ -1,0 +1,369 @@
+---
+title: "Observability"
+description: "Traces and logs over OpenTelemetry, to any OTLP backend, several at once"
+---
+
+Sinas speaks [OpenTelemetry](https://opentelemetry.io) (OTLP). It can send traces, and optionally logs, to any backend that accepts OTLP: an OpenTelemetry Collector, Grafana Tempo and Loki, SigNoz, Jaeger, Honeycomb, Datadog, Sentry, Langfuse, LangWatch, and others. It can send to several at once, for example an LLM observability tool and a general APM side by side, each receiving the attributes it understands.
+
+Telemetry is **off by default**. While it is off, nothing is installed: no exporter, no instrumentation, no overhead per request. No backend is the default either: you choose where telemetry goes.
+
+## Quick start
+
+Send everything to an OpenTelemetry Collector, and let the collector fan out to your backends:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+```
+
+Every Sinas process (backend, queue workers, scheduler, CDC worker, or the single all-in-one process) picks the settings up and starts exporting.
+
+## What is recorded
+
+**Requests.** Every HTTP request to the API is a server span (`GET /api/v1/agents/{namespace}/{name}`), recorded by FastAPI's native OpenTelemetry support. Health checks and the console's static files are not traced (`OTEL_EXCLUDED_PATHS`). With `OTEL_FASTAPI_OPERATION_SPANS` (default on), dependency resolution, the endpoint and response serialization appear as child spans.
+
+**Database, cache and outgoing HTTP.** SQL statements (SQLAlchemy, statements without their parameter values), Redis commands (command names only, arguments masked) and outgoing HTTP calls (webhooks, connectors, MCP servers, OAuth and SSO providers) are client spans under whatever started them. A client span with no parent, such as a worker's polling loop or a heartbeat, is dropped: it would otherwise be a one-span trace every few seconds.
+
+**Sinas's own spans.**
+
+| Span | Where | What |
+|---|---|---|
+| `conversation.turn` | agent turn | One streamed turn: the user message, the reply, the agent. |
+| `llm.call` | each model call | Model, provider, token usage, input and output. |
+| `tool.call` | each tool call | Tool name, arguments and result; ERROR when the tool failed or returned an error. |
+| `agent.delegate` | agent-to-agent call | The sub-agent called, and its reply. The sub-agent's job is a child span. |
+| `agent.job`, `agent.resume`, `agent.delegate_resume` | agent workers | A queued turn, and its continuations after approvals and delegations. |
+| `function.job` | function workers | A function execution; its own queries and HTTP calls are children. |
+| `pipeline.run`, `pipeline.fire`, `code.background`, `retention.run` | workers | Other queued jobs. |
+| `schedule.function`, `schedule.agent`, `schedule.pipeline` | scheduler | A schedule firing; the job it enqueues is a child. |
+| `cdc.change` | CDC worker | A batch of database changes handed to a function or pipeline. |
+
+**One trace across processes.** A job carries the trace context of the request (or schedule, or change) that enqueued it, so a chat message, the agent turn in a worker, its tool calls and a sub-agent in another worker are one trace.
+
+**Processes.** Every span's resource carries `sinas.process`: `backend`, `queue-worker`, `queue-agent`, `queue-agent-sub`, `queue-pipeline`, `scheduler`, `cdc-worker`, or `all-in-one`. `service.name` is `sinas` unless you set `OTEL_SERVICE_NAME`; `{process}` in it is replaced, so `OTEL_SERVICE_NAME=sinas-{process}` gives each process its own service in an APM's service map.
+
+**Not traced.** Each streamed chunk's write to the stream relay (that would be two spans per token), and Sinas's own polling loops.
+
+## Errors
+
+A failure marks its span `ERROR`, with `error.type` and, where there is an exception, an `exception` event holding its type, message and stack trace:
+
+- a request that ends in a 5xx or an unhandled exception;
+- a failed job (function, agent, pipeline, background run); a job that is retried is not a failure, a cancelled or timed-out one is;
+- a failed model call, streamed or not;
+- a tool that raises or returns an error, and a sub-agent that fails or times out;
+- a schedule or a change batch that could not be enqueued.
+
+Exception messages, stack traces and status descriptions are redacted on export (see [Privacy](#privacy-and-security)). Backends that drop span events (Sentry's OTLP intake does) still show the status and `error.type`.
+
+## Configuration
+
+All settings are environment variables, read by every Sinas process. With Docker Compose they go in `.env`; with Helm, in `otel:` values (see [Helm](#helm)).
+
+### Exporters
+
+Three ways to configure where telemetry goes. Use any combination; each configured exporter receives everything.
+
+**1. The standard OpenTelemetry variables.** They make one exporter, configured by the OpenTelemetry SDK itself, exactly as the [OpenTelemetry specification](https://opentelemetry.io/docs/specs/otel/protocol/exporter/) describes them:
+
+| Variable | Description |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; `/v1/traces` and `/v1/logs` are appended (OTLP/HTTP). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `..._LOGS_ENDPOINT` | Full URL for one signal. |
+| `OTEL_EXPORTER_OTLP_HEADERS` (`..._TRACES_HEADERS`, `..._LOGS_HEADERS`) | `name=value,name2=value2`; values may be URL-encoded. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (`..._TRACES_PROTOCOL`, ...) | `http/protobuf` (default) or `grpc` (see [gRPC](#grpc)). |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`, `..._COMPRESSION`, `..._CERTIFICATE` | As the SDK documents them. |
+| `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER` | `none` turns that signal off for this exporter. |
+
+Sinas sends nothing unless an endpoint is set: the SDK's own default (`localhost:4318`) is never assumed. The LLM attribute names this exporter sends are set by `OTEL_PRESET` (default `genai`).
+
+**2. Named exporters: `OTEL_EXPORTERS`.** A JSON list, one object per backend:
+
+```bash .env
+OTEL_EXPORTERS='[
+  {"name": "langfuse", "endpoint": "https://cloud.langfuse.com/api/public/otel", "preset": "langfuse"},
+  {"name": "apm", "endpoint": "http://otel-collector:4318", "preset": "none", "signals": ["traces", "logs"]}
+]'
+OTEL_EXPORTER_LANGFUSE_HEADERS=Authorization=Basic cGstbGYtLi4uOnNrLWxmLS4uLg==,x-langfuse-ingestion-version=4
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `name` | required | Letters, digits, `_`, `-`. Not `otlp…` or `legacy` (reserved). |
+| `endpoint` | required | OTLP base URL (`/v1/traces`, `/v1/logs` appended), or a full `…/v1/traces` URL as some vendors print it. For gRPC: `host:port` or a URL. |
+| `traces_endpoint`, `logs_endpoint` | from `endpoint` | Full URLs, when a backend uses others. |
+| `headers` | none | Object, or `"name=value,…"`. Put credentials in `OTEL_EXPORTER_<NAME>_HEADERS` instead. |
+| `protocol` | `http/protobuf` | Or `grpc`. |
+| `preset` | `genai` | LLM attribute names: `genai`, `langfuse`, `langwatch`, `none`. See [Presets](#presets). |
+| `spans` | `sinas` for `langfuse`/`langwatch`, else `all` | `all`: every span. `sinas`: only Sinas's own spans (turns, model and tool calls, jobs), not SQL, Redis or HTTP spans. |
+| `signals` | `["traces"]` | Add `"logs"` to send logs too (with `OTEL_LOGS_ENABLED`). |
+| `timeout` | SDK default (10) | Seconds. |
+| `compression` | none | `gzip`. |
+| `insecure` | | gRPC without TLS. |
+| `enabled` | `true` | `false` keeps an entry without using it. |
+
+For an exporter named `<name>` (upper-cased, `-` as `_`), these variables add to or override its entry, so a secret never has to be in the JSON:
+
+| Variable | |
+|---|---|
+| `OTEL_EXPORTER_<NAME>_HEADERS` | Merged over `headers`. Same format as `OTEL_EXPORTER_OTLP_HEADERS`. |
+| `OTEL_EXPORTER_<NAME>_ENDPOINT` | Replaces `endpoint`. |
+| `OTEL_EXPORTER_<NAME>_PROTOCOL`, `OTEL_EXPORTER_<NAME>_PRESET` | Replace `protocol`, `preset`. |
+
+A malformed entry is reported in the log, by position and field, never with its header values, and skipped; the others still export.
+
+**3. The pre-0.5.0 single exporter (deprecated).** `OTEL_EXPORTER_ENDPOINT` (a full OTLP/HTTP traces URL), `OTEL_EXPORTER_HEADERS` (`name=value,…`) and `OTEL_VENDOR` still work: they make an exporter named `legacy` that receives Sinas's own spans in the `OTEL_VENDOR` preset, as before. See [Migrating](#migrating-from-otel_exporter_endpoint).
+
+### Presets
+
+Sinas records its LLM attributes once; each exporter's preset decides the names they are sent under, so Langfuse, LangWatch and an APM can each receive what they understand from the same spans.
+
+| Preset | Sends | For |
+|---|---|---|
+| `genai` | [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/): `gen_ai.conversation.id`, `gen_ai.operation.name`, `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments` / `.result`, `gen_ai.request.model`, `gen_ai.usage.*`, `user.id`. | Backends that read the GenAI conventions, and the default. |
+| `langfuse` | `langfuse.session.id`, `langfuse.user.id`, `langfuse.observation.type` (`generation`, `tool`, `agent`, `chain`), `langfuse.observation.input` / `.output`, `langfuse.trace.tags`. | Langfuse. |
+| `langwatch` | `langwatch.thread.id`, `langwatch.user.id`, `langwatch.span.type`, `langwatch.input` / `.output`, `langwatch.labels`. | LangWatch. Unchanged from earlier versions. |
+| `none` | Ids, model and token usage; **no prompt, response, tool argument or result content**. | APMs, and any backend that must not hold conversation content. |
+| `generic_otel` | The pre-0.5.0 `gen_ai.thread.id`, `gen_ai.input`, … names. | Deprecated; dashboards built on those names. |
+
+### Other settings
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_ENABLED` | `false` | The switch. Off: nothing is installed. `OTEL_SDK_DISABLED=true` also turns it off. |
+| `OTEL_PRESET` | `genai` | Preset of the standard-variables exporter (an explicitly set `OTEL_VENDOR` is used when this is unset). |
+| `OTEL_SERVICE_NAME` | `sinas` | `service.name`; `{process}` is replaced by the process. Unset: `service.name` from `OTEL_RESOURCE_ATTRIBUTES`, else `sinas`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | | Extra resource attributes, e.g. `deployment.environment=production`. |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `parentbased_always_on` | Standard sampling, e.g. `parentbased_traceidratio` and `0.1`. |
+| `OTEL_LOGS_ENABLED` | `false` | Export Python logs as OTLP logs (see [Logs](#logs)). |
+| `OTEL_LOGS_LEVEL` | `INFO` | Lowest level exported. |
+| `OTEL_HTTP_CLIENT_PROPAGATION` | `none` | Trace context on outgoing webhook, connector, MCP and OAuth calls: `none`, `tracecontext` (`traceparent`, `tracestate`), `all` (also `baggage`). The calls are traced either way. |
+| `OTEL_EXCLUDED_PATHS` | `/health,/api/v1/system/health,/ui/*` | Request paths not traced; `*` at the end for a prefix. `OTEL_PYTHON_FASTAPI_EXCLUDED_URLS` (regular expressions) is honoured too. |
+| `OTEL_FASTAPI_OPERATION_SPANS` | `true` | FastAPI's dependency, endpoint and serialization spans under each request. |
+
+## Logs
+
+With `OTEL_LOGS_ENABLED=true`, Python logging is exported as OTLP logs to every exporter whose `signals` include `"logs"` (and to the standard-variables exporter, unless `OTEL_LOGS_EXPORTER=none`). Each record carries the trace and span id it was logged under, so a backend links a log line to its trace. FastAPI's own records of unhandled request exceptions are exported the same way.
+
+What a record carries: the message, level, logger name, code location and, for an exception, its type, message and stack trace. Fields passed with `extra=` are not exported. Messages and exception text are redacted before export (below). Logs printed to the console are unchanged.
+
+## Privacy and security
+
+- **Conversation content.** With every preset except `none`, `llm.call`, `tool.call` and turn spans carry prompts, replies, tool arguments and results (truncated to 10,000 characters for model calls). Use `none` for any backend that must not hold them, or `spans: "sinas"` plus `preset: "none"` for one that only needs timings.
+- **Credentials in headers** (API keys, Basic auth) are never logged: not at startup, not in configuration errors, not in a repr. The startup log names each exporter, its host and preset, nothing more.
+- **Redaction on export.** URL attributes lose their userinfo and credential-like query values (`?token=`, `?api_key=`, …, as the request log masks them) and the secret in `/watch/<secret>` paths. Exception messages, stack traces, status descriptions and exported log messages are masked for `password=`-style pairs, `Bearer`/`Basic` values, JWTs, provider API keys (`sk-…`) and passwords in connection URLs. This is a second line of defence, not a licence to log secrets.
+- **LLM providers never receive trace context** unless the provider is configured with `propagate_context` (useful for a gateway such as a LiteLLM proxy). This holds with the HTTP instrumentation installed: model calls are kept out of it, so they are not traced twice and nothing is added to their requests.
+- **Other outgoing calls** carry no trace context by default (`OTEL_HTTP_CLIENT_PROPAGATION=none`): a webhook target or MCP server learns nothing about your traces. `tracecontext` lets your own services join Sinas's traces; `all` also forwards `baggage`, which may say whom a request is for.
+- **Incoming requests.** A `traceparent` (and `baggage`) a caller sends is adopted: Sinas's spans join the caller's trace.
+
+## Helm
+
+```yaml values.yaml
+otel:
+  enabled: true
+  serviceName: "sinas-{process}"
+  resourceAttributes: "deployment.environment=production"
+  exporters:
+    - name: langfuse
+      endpoint: https://cloud.langfuse.com/api/public/otel
+      preset: langfuse
+      headersSecret:          # a Secret you create; its key holds "name=value,..."
+        name: langfuse-otel
+        key: headers
+    - name: collector
+      endpoint: http://otel-collector.observability:4318
+      preset: none
+      signals: [traces, logs]
+  logs:
+    enabled: true
+    level: INFO
+  httpClientPropagation: none
+
+## The chart's network policy denies egress to other namespaces: allow the
+## collector's (or the export times out). Not needed for external endpoints.
+networkPolicy:
+  egressNamespaces:
+    - namespace: observability
+      ports: [4318]
+```
+
+```bash
+kubectl create secret generic langfuse-otel \
+  --from-literal=headers='Authorization=Basic <base64 of pk-lf-…:sk-lf-…>,x-langfuse-ingestion-version=4'
+```
+
+A collector in another namespace must be allowed in `networkPolicy.egressNamespaces` (above): the chart's network policy blocks cross-namespace traffic by default, and an export to a blocked address times out rather than failing fast. Every Sinas deployment gets the same settings. An exporter with `enabled: false` is left out, its Secret reference too. `headersSecret` becomes `OTEL_EXPORTER_<NAME>_HEADERS` from that Secret, so credentials never sit in the Deployment spec. Standard `OTEL_*` variables not covered by these values can be set through `extraEnv`.
+
+## Docker Compose
+
+Every Sinas service reads `.env`, so the variables above go there. Put JSON in single quotes, so Compose keeps it as is:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTERS='[{"name":"collector","endpoint":"http://otel-collector:4318","preset":"none","signals":["traces","logs"]}]'
+OTEL_LOGS_ENABLED=true
+```
+
+## Recipes
+
+### An OpenTelemetry Collector, fanning out
+
+The most flexible setup: Sinas sends everything to one collector, and the collector routes, samples, filters and fans out, without Sinas knowing about any backend.
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+OTEL_PRESET=genai
+OTEL_LOGS_ENABLED=true
+```
+
+```yaml otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      http: { endpoint: 0.0.0.0:4318 }
+      grpc: { endpoint: 0.0.0.0:4317 }
+processors:
+  batch: {}
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls: { insecure: true }
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+  otlphttp/signoz:
+    endpoint: https://ingest.eu.signoz.cloud:443
+    headers: { signoz-ingestion-key: ${env:SIGNOZ_KEY} }
+service:
+  pipelines:
+    traces: { receivers: [otlp], processors: [batch], exporters: [otlp/tempo, otlphttp/signoz] }
+    logs:   { receivers: [otlp], processors: [batch], exporters: [otlphttp/loki] }
+```
+
+### Grafana Tempo and Loki
+
+Through a collector as above (Tempo takes OTLP traces, Loki 3 takes OTLP logs at `/otlp`), or straight to Grafana Cloud's OTLP gateway:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-eu-west-2.grafana.net/otlp
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64 of instanceId:token>
+OTEL_PRESET=none
+OTEL_LOGS_ENABLED=true
+```
+
+### Langfuse
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTERS='[{"name":"langfuse","endpoint":"https://cloud.langfuse.com/api/public/otel","preset":"langfuse"}]'
+OTEL_EXPORTER_LANGFUSE_HEADERS=Authorization=Basic <base64 of pk-lf-…:sk-lf-…>,x-langfuse-ingestion-version=4
+```
+
+Use `https://us.cloud.langfuse.com/api/public/otel` for the US region, or your own host for a self-hosted Langfuse. Langfuse accepts OTLP/HTTP only. By default it receives only Sinas's own spans (turns, model and tool calls, jobs), each nested under the nearest one it receives.
+
+### LangWatch
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTERS='[{"name":"langwatch","endpoint":"https://app.langwatch.ai/api/otel/v1/traces","preset":"langwatch"}]'
+OTEL_EXPORTER_LANGWATCH_HEADERS=Authorization=Bearer <LangWatch API key>
+```
+
+### An LLM tool and an APM together
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_SERVICE_NAME=sinas-{process}
+OTEL_EXPORTERS='[
+  {"name": "langfuse", "endpoint": "https://cloud.langfuse.com/api/public/otel", "preset": "langfuse"},
+  {"name": "apm", "endpoint": "http://otel-collector:4318", "preset": "none", "signals": ["traces", "logs"]}
+]'
+OTEL_EXPORTER_LANGFUSE_HEADERS=Authorization=Basic <…>,x-langfuse-ingestion-version=4
+OTEL_LOGS_ENABLED=true
+```
+
+Langfuse gets conversations, model and tool calls with their content; the APM gets every span, request, query and outgoing call, without conversation content.
+
+### SigNoz
+
+SigNoz Cloud:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=https://ingest.<region>.signoz.cloud:443
+OTEL_EXPORTER_OTLP_HEADERS=signoz-ingestion-key=<key>
+OTEL_SERVICE_NAME=sinas-{process}
+OTEL_LOGS_ENABLED=true
+```
+
+Self-hosted SigNoz: `OTEL_EXPORTER_OTLP_ENDPOINT=http://<signoz-otel-collector>:4318`, no header.
+
+### Sentry
+
+Sentry ingests OTLP traces (open beta). Its endpoint is a full traces URL per project:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTERS='[{"name":"sentry","endpoint":"https://o<org-id>.ingest.sentry.io/api/<project-id>/integration/otlp/v1/traces","preset":"none"}]'
+OTEL_EXPORTER_SENTRY_HEADERS=x-sentry-auth=sentry sentry_key=<public key>
+```
+
+Sentry drops span events, so a failed span shows its `ERROR` status, description and `error.type`, without the exception event. Its logs intake is at `…/integration/otlp/v1/logs` with the same header: add `"signals": ["traces", "logs"]` to send logs too.
+
+### Honeycomb
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io
+OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=<API key>
+OTEL_SERVICE_NAME=sinas-{process}
+```
+
+Use `https://api.eu1.honeycomb.io` for the EU instance.
+
+### Datadog
+
+Send to the Datadog Agent's OTLP receiver (enable it with `DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT=0.0.0.0:4318`), or to a collector with the Datadog exporter:
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://datadog-agent:4318
+OTEL_PRESET=none
+OTEL_SERVICE_NAME=sinas-{process}
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production
+```
+
+### Jaeger, locally
+
+```bash
+docker run -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/jaeger:latest
+```
+
+```bash .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
+OTEL_SERVICE_NAME=sinas-{process}
+```
+
+Open `http://localhost:16686`.
+
+## gRPC
+
+Every backend above accepts OTLP/HTTP, which the Sinas image ships. OTLP/gRPC (`protocol: grpc`, `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`) needs the gRPC exporter, which is not in the image because of its size; a custom image adds it with `uv sync --locked --extra otel-grpc`. Without it, an exporter set to gRPC is reported at startup and skipped; the others still export.
+
+## Sampling
+
+The standard samplers apply: `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with `OTEL_TRACES_SAMPLER_ARG=0.1` keeps one trace in ten, and follows the caller's decision when a request arrives with a `traceparent`. Spans are exported in batches, off the request path. For tail sampling (keep every failed trace, sample the rest), use a collector.
+
+## Migrating from `OTEL_EXPORTER_ENDPOINT`
+
+The variables of earlier versions keep working, with what they sent before: the same attribute names (`OTEL_VENDOR`), and only Sinas's own spans. Startup logs a deprecation warning. To move:
+
+| Before | Now |
+|---|---|
+| `OTEL_EXPORTER_ENDPOINT=https://app.langwatch.ai/api/otel/v1/traces` | `OTEL_EXPORTERS='[{"name":"langwatch","endpoint":"https://app.langwatch.ai/api/otel/v1/traces","preset":"langwatch"}]'` |
+| `OTEL_EXPORTER_HEADERS=Authorization=Bearer xxx` | `OTEL_EXPORTER_LANGWATCH_HEADERS=Authorization=Bearer xxx` |
+| `OTEL_VENDOR=langfuse` | `"preset": "langfuse"` on the exporter |
+
+What changed for every exporter in 0.5.0: Sinas's spans carry canonical attribute names in the process and each exporter applies its preset on export; `OTEL_SERVICE_NAME` no longer defaults to `sinas` when `OTEL_RESOURCE_ATTRIBUTES` names a service; LLM calls made while streaming are recorded with their real duration (they were zero-length) and failed calls are recorded as `ERROR` spans.

@@ -339,6 +339,50 @@ jwt:
   issuer: ""
   audience: ""
 
+## OpenTelemetry: traces (and optionally logs) to any OTLP backend, several at
+## once. Off by default; nothing is installed in the services while off.
+## Docs: Admin > Observability. Every service gets the same settings and tags
+## its telemetry with its own sinas.process (backend, queue-agent, ...).
+otel:
+  enabled: false
+  ## service.name; "{process}" is replaced, e.g. "sinas-{process}". "" = "sinas".
+  serviceName: ""
+  ## OTEL_RESOURCE_ATTRIBUTES, e.g. "deployment.environment=production"
+  resourceAttributes: ""
+  ## OTEL_TRACES_SAMPLER / _ARG, e.g. parentbased_traceidratio / "0.25".
+  ## "" = the SDK default (parentbased_always_on).
+  sampler: ""
+  samplerArg: ""
+  ## Named exporters (OTEL_EXPORTERS). Each: name, endpoint (OTLP base URL,
+  ## or a full .../v1/traces URL; host:port for grpc), protocol
+  ## (http/protobuf | grpc), preset (genai | langfuse | langwatch | none),
+  ## spans (all | sinas), signals ([traces] / [traces, logs]), timeout (s),
+  ## compression (gzip), insecure (grpc).
+  ## headersSecret: credentials from an existing Secret, whose key holds
+  ## "name=value,name2=value2"; becomes OTEL_EXPORTER_<NAME>_HEADERS.
+  exporters: []
+  #  - name: langfuse
+  #    endpoint: https://cloud.langfuse.com/api/public/otel
+  #    preset: langfuse
+  #    headersSecret:
+  #      name: langfuse-otel
+  #      key: headers
+  #  - name: collector
+  #    endpoint: http://otel-collector.observability:4318
+  #    preset: none
+  #    signals: [traces, logs]
+  ## A collector in another namespace also needs
+  ## networkPolicy.egressNamespaces (e.g. namespace: observability,
+  ## ports: [4318]), or exports time out.
+  logs:
+    ## Python logging -> OTLP logs, to the exporters with the logs signal.
+    enabled: false
+    level: INFO
+  ## Trace context on outgoing webhook/connector/MCP calls:
+  ## none | tracecontext | all. LLM provider calls follow each provider's
+  ## own propagate_context setting.
+  httpClientPropagation: none
+
 ## Extra environment variables appended to every sinas service (backend,
 ## queue workers, scheduler, cdc-worker). Any backend Settings knob
 ## (app/core/config.py) can be set here without a chart change, e.g.:

@@ -518,7 +518,7 @@ async def start_background_job(
     checkpoint entry (the round suspended on it)."""
     from app.core.auth import current_api_key_id
     from app.core.redis import get_arq_pool, get_redis
-    from app.core.telemetry import inject_trace_context
+    from app.core.telemetry import inject_job_context
 
     if not settings.code_execution_enabled:
         return {"error": "Code execution is disabled on this deployment."}
@@ -543,7 +543,7 @@ async def start_background_job(
         "execute_background_code_job",
         job_id=job_id, chat_id=chat_id, user_id=user_id, code=code, description=description,
         tool_call_id=tool_call_id, pending_completion_id=pending_completion_id,
-        api_key_id=current_api_key_id(), trace_context=inject_trace_context(),
+        api_key_id=current_api_key_id(), trace_context=inject_job_context(),
         # Timed by the function's own arq timeout (WorkerSettings): arq's
         # enqueue_job takes no per-job timeout.
         _job_id=job_id, _queue_name=BACKGROUND_QUEUE,
@@ -650,6 +650,12 @@ async def run_background_code_job(
             logger.exception("Background job %s crashed", job_id)
             result = {"error": str(e)}
             status = "failed"
+        if status == "failed":
+            from opentelemetry import trace
+
+            from app.core.telemetry import mark_error
+
+            mark_error(trace.get_current_span(), f"Background run failed: {result.get('error')}", "job_failed")
         await report(status, result)
     finally:
         reset_api_key(key_token)

@@ -673,6 +673,10 @@ async def test_the_resume_acts_through_the_key_the_inline_round_ran_under(env, w
     # The job ran without the key's permissions behind it in this test
     # (the key does not exist); what matters is what it was queued under.
     assert worker.jobs[0]["api_key_id"] == "11111111-1111-1111-1111-111111111111"
+    # Let the job end, however it ends, before the test does: left running,
+    # it wrote into the chat during teardown (FK violation on cleanup) and on
+    # into the next test's closed event loop.
+    await asyncio.wait_for(asyncio.gather(*worker.tasks, return_exceptions=True), 15)
     worker.tasks.clear()
 
 
