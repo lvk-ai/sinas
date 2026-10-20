@@ -144,6 +144,8 @@ services:
       ALLOW_PACKAGE_INSTALLATION: ${ALLOW_PACKAGE_INSTALLATION:-true}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env file}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      # Same resolved value as the postgres and scheduler services.
+      BUILTIN_DATABASE_ENABLED: ${BUILTIN_DATABASE_ENABLED:-true}
       DOCKER_NETWORK: ${DOCKER_NETWORK:-auto}
       FUNCTION_CONTAINER_IMAGE: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/executor:${IMAGE_TAG:-latest}
       # Caddy serves the console on its own port (Caddyfile); links into it
@@ -327,6 +329,9 @@ services:
       DOCKER_NETWORK: ${DOCKER_NETWORK:-auto}
       FUNCTION_CONTAINER_IMAGE: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/executor:${IMAGE_TAG:-latest}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      # Creates sinas_data + its connection on boot; the same resolved value
+      # as the postgres service (shell or .env), so the two agree.
+      BUILTIN_DATABASE_ENABLED: ${BUILTIN_DATABASE_ENABLED:-true}
     depends_on:
       redis:
         condition: service_healthy
