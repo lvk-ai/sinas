@@ -2,9 +2,12 @@
 // Pure functions (tested in tests/wildcard-refs.test.mjs).
 //
 // The editor lists each resource with a checkbox; a wildcard entry matches
-// no single row, so it is shown (and added or removed) on its own. The rules
-// mirror the backend's (resource_resolver.py): only a whole name is a
-// wildcard; anything else with a "*" is refused when the agent is saved.
+// no single row, so it is shown (and added, configured or removed) on its
+// own. The rules mirror the backend's (resource_resolver.py): only a whole
+// name is a wildcard; anything else with a "*" is refused when the agent is
+// saved. Entries are edited by position: a list may hold two entries for one
+// pattern (e.g. a connector pattern with different operations), and editing
+// one must leave the other alone.
 
 /** The reference of a string entry, or of a dict entry under `key`. */
 export function entryRef(entry: unknown, key?: string): string {
@@ -33,19 +36,28 @@ export function wildcardPatternProblem(ref: string): string | null {
   return "Use 'namespace/*' (everything in a namespace) or '*/*' (everything)";
 }
 
-/** The wildcard entries of a list, in list order. */
-export function wildcardEntries<T>(entries: T[] | null | undefined, key?: string): T[] {
-  return (entries || []).filter((e) => isWildcardRef(entryRef(e, key)));
+/** The positions of the wildcard entries in a list, in list order. */
+export function wildcardIndices(entries: unknown[] | null | undefined, key?: string): number[] {
+  const indices: number[] = [];
+  (entries || []).forEach((e, i) => {
+    if (isWildcardRef(entryRef(e, key))) indices.push(i);
+  });
+  return indices;
 }
 
-/** The list without the entry for `ref`. */
-export function withoutRef<T>(entries: T[] | null | undefined, ref: string, key?: string): T[] {
-  return (entries || []).filter((e) => entryRef(e, key) !== ref);
+/** Whether the list already has an entry for `ref`. */
+export function hasRef(entries: unknown[] | null | undefined, ref: string, key?: string): boolean {
+  return (entries || []).some((e) => entryRef(e, key) === ref);
 }
 
-/** The list with the entry for `ref` replaced by `next`, in place. */
-export function withReplaced<T>(entries: T[] | null | undefined, ref: string, next: T, key?: string): T[] {
-  return (entries || []).map((e) => (entryRef(e, key) === ref ? next : e));
+/** The list without the entry at `index`. */
+export function withoutAt<T>(entries: T[] | null | undefined, index: number): T[] {
+  return (entries || []).filter((_, i) => i !== index);
+}
+
+/** The list with the entry at `index` replaced by `next`; the others untouched. */
+export function withReplacedAt<T>(entries: T[] | null | undefined, index: number, next: T): T[] {
+  return (entries || []).map((e, i) => (i === index ? next : e));
 }
 
 /** Comma-separated text to a list of names ("" = none). */
@@ -65,10 +77,4 @@ export function parseJsonObject(text: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
-}
-
-/** The list with `entry` added, replacing an entry for the same reference. */
-export function withEntry<T>(entries: T[] | null | undefined, entry: T, key?: string): T[] {
-  const ref = entryRef(entry, key);
-  return [...withoutRef(entries, ref, key), entry];
 }

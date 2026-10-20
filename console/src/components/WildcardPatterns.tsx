@@ -1,13 +1,13 @@
 import { useState, type ReactNode } from 'react';
 import {
   entryRef,
+  hasRef,
   parseJsonObject,
   parseNameList,
-  wildcardEntries,
+  wildcardIndices,
   wildcardPatternProblem,
-  withEntry,
-  withoutRef,
-  withReplaced,
+  withoutAt,
+  withReplacedAt,
 } from '../lib/wildcardRefs';
 
 type Access = 'readonly' | 'readwrite';
@@ -39,15 +39,17 @@ export function WildcardPatterns<T>({
   const [draft, setDraft] = useState('');
   const [access, setAccess] = useState<Access>('readonly');
   const [error, setError] = useState<string | null>(null);
-  const patterns = wildcardEntries(entries, refKey);
+  const list = entries || [];
+  const positions = wildcardIndices(list, refKey);
 
   const add = () => {
-    const problem = wildcardPatternProblem(draft);
+    const ref = draft.trim();
+    const problem = wildcardPatternProblem(ref) ?? (hasRef(list, ref, refKey) ? 'Already listed: edit it above' : null);
     if (problem) {
       setError(problem);
       return;
     }
-    onChange(withEntry(entries, makeEntry(draft.trim(), access), refKey));
+    onChange([...list, makeEntry(ref, access)]);
     setDraft('');
     setError(null);
   };
@@ -59,26 +61,28 @@ export function WildcardPatterns<T>({
         <code className="text-xs bg-surface-1 px-1 rounded">*/*</code>) enable every matching {noun} the
         chat's user may use themselves; a {noun.replace(/s$/, '')} enabled by name below keeps its own settings.
       </p>
-      {patterns.length > 0 && (
+      {positions.length > 0 && (
         <div className="space-y-2 mb-2">
-          {patterns.map((entry) => {
+          {positions.map((index) => {
+            const entry = list[index];
             const ref = entryRef(entry, refKey);
             return (
-              <div key={ref} className="border border-line-soft rounded-lg p-2">
+              // By position: a list may hold two entries for one pattern.
+              <div key={`${index}:${ref}`} className="border border-line-soft rounded-lg p-2">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-mono text-gray-100">{ref}</span>
                   <button
                     type="button"
                     className="text-xs text-gray-500 hover:text-gray-200"
                     aria-label={`Remove ${ref}`}
-                    onClick={() => onChange(withoutRef(entries, ref, refKey))}
+                    onClick={() => onChange(withoutAt(list, index))}
                   >
                     Remove
                   </button>
                 </div>
                 {settings && (
                   <div className="mt-2">
-                    {settings(entry, (next) => onChange(withReplaced(entries, ref, next, refKey)))}
+                    {settings(entry, (next) => onChange(withReplacedAt(list, index, next)))}
                   </div>
                 )}
               </div>
@@ -136,7 +140,11 @@ export function AccessSetting({ value, onChange }: { value: string | undefined; 
   );
 }
 
-/** Comma-separated names (operations, tool globs), stored on blur; empty = all. */
+/**
+ * Comma-separated names (operations, tool globs); empty = all. Stored on
+ * every keystroke, so a save (Enter included) never sends the old list; the
+ * typed text is kept as is while the field has focus.
+ */
 export function NameListSetting({
   label, value, placeholder, onChange,
 }: { label: string; value: string[] | undefined; placeholder: string; onChange: (names: string[]) => void }) {
@@ -147,11 +155,11 @@ export function NameListSetting({
       <input
         type="text"
         value={draft ?? (value || []).join(', ')}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          if (draft !== null) onChange(parseNameList(draft));
-          setDraft(null);
+        onChange={(e) => {
+          setDraft(e.target.value);
+          onChange(parseNameList(e.target.value));
         }}
+        onBlur={() => setDraft(null)}
         placeholder={placeholder}
         className="input w-full font-mono text-sm mt-1"
       />
@@ -159,7 +167,11 @@ export function NameListSetting({
   );
 }
 
-/** A JSON object (a connector entry's locked parameters by operation), stored on blur when valid. */
+/**
+ * A JSON object (a connector entry's locked parameters by operation), stored
+ * whenever the text is valid JSON; while it isn't, the last valid value stays
+ * and the field says so.
+ */
 export function JsonObjectSetting({
   label, value, onChange,
 }: { label: string; value: Record<string, unknown> | undefined; onChange: (next: Record<string, unknown>) => void }) {
@@ -171,19 +183,19 @@ export function JsonObjectSetting({
       <span className="text-xs text-gray-500">{label}</span>
       <textarea
         value={draft ?? shown}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          const parsed = parseJsonObject(e.target.value);
+          if (parsed !== null) onChange(parsed);
+        }}
         onBlur={() => {
-          const parsed = draft === null ? null : parseJsonObject(draft);
-          if (parsed !== null) {
-            onChange(parsed);
-            setDraft(null);
-          }
+          if (draft !== null && parseJsonObject(draft) !== null) setDraft(null);
         }}
         placeholder='{"post_message": {"channel": "{{ channel }}"}}'
         rows={3}
         className="input w-full font-mono text-xs mt-1"
       />
-      {invalid && <span className="text-xs text-red-400">Not a JSON object: not saved</span>}
+      {invalid && <span className="text-xs text-red-400">Not a JSON object yet: saving keeps the last valid parameters</span>}
     </label>
   );
 }

@@ -23,29 +23,27 @@ test('only a whole name is a wildcard', () => {
   assert.equal(m.wildcardPatternProblem('  sales/*  '), null);
 });
 
-test('wildcard entries of string and dict lists', () => {
-  assert.deepEqual(m.wildcardEntries(['a/b', 'a/*', '*/*']), ['a/*', '*/*']);
+test('wildcard entries of string and dict lists, by position', () => {
+  assert.deepEqual(m.wildcardIndices(['a/b', 'a/*', '*/*']), [1, 2]);
   const stores = [{ store: 'crm/notes', access: 'readonly' }, { store: 'crm/*', access: 'readwrite' }];
-  assert.deepEqual(m.wildcardEntries(stores, 'store'), [stores[1]]);
-  assert.deepEqual(m.wildcardEntries(undefined, 'store'), []);
+  assert.deepEqual(m.wildcardIndices(stores, 'store'), [1]);
+  assert.deepEqual(m.wildcardIndices(undefined, 'store'), []);
+  assert.equal(m.hasRef(stores, 'crm/*', 'store'), true);
+  assert.equal(m.hasRef(stores, 'hr/*', 'store'), false);
 });
 
-test('adding replaces the entry for the same reference; removing keeps the others', () => {
-  const stores = [{ store: 'crm/*', access: 'readonly' }, { store: 'crm/notes', access: 'readwrite' }];
-  assert.deepEqual(m.withEntry(stores, { store: 'crm/*', access: 'readwrite' }, 'store'), [
-    { store: 'crm/notes', access: 'readwrite' },
-    { store: 'crm/*', access: 'readwrite' },
+test('editing or removing one entry leaves a sibling for the same pattern alone', () => {
+  const conns = [
+    { connector: 'apis/*', operations: ['get'] },
+    { connector: 'apis/*', operations: ['list'], parameters: { list: { x: 1 } } },
+    { connector: 'apis/x', operations: [] },
+  ];
+  assert.deepEqual(m.withReplacedAt(conns, 0, { connector: 'apis/*', operations: ['get', 'put'] }), [
+    { connector: 'apis/*', operations: ['get', 'put'] },
+    conns[1],
+    conns[2],
   ]);
-  assert.deepEqual(m.withoutRef(stores, 'crm/*', 'store'), [{ store: 'crm/notes', access: 'readwrite' }]);
-  assert.deepEqual(m.withEntry(['ui/x'], 'ui/*'), ['ui/x', 'ui/*']);
-});
-
-test('a wildcard entry is edited in place', () => {
-  const conns = [{ connector: 'apis/*', operations: [] }, { connector: 'apis/x', operations: ['get'] }];
-  assert.deepEqual(m.withReplaced(conns, 'apis/*', { connector: 'apis/*', operations: ['list'] }, 'connector'), [
-    { connector: 'apis/*', operations: ['list'] },
-    { connector: 'apis/x', operations: ['get'] },
-  ]);
+  assert.deepEqual(m.withoutAt(conns, 0), [conns[1], conns[2]]);
 });
 
 test('settings typed as text', () => {
