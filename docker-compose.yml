@@ -59,6 +59,9 @@ services:
       POSTGRES_USER: ${DATABASE_USER:-postgres}
       POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env file}
       POSTGRES_DB: ${DATABASE_NAME:-sinas}
+      # Read by init-sinas-data.sh: false skips creating sinas_data, as the
+      # backend does (it only runs on a fresh data volume).
+      BUILTIN_DATABASE_ENABLED: ${BUILTIN_DATABASE_ENABLED:-true}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backend/init-postgres.sh:/docker-entrypoint-initdb.d/init-sinas-data.sh:ro
@@ -147,6 +150,17 @@ services:
       # (shared components, password setup) need to know.
       CONSOLE_URL: ${CONSOLE_URL:-https://${DOMAIN:-localhost}:51245/ui}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Client IPs (IP rate limits, request logs) come from X-Forwarded-For,
+      # trusted only on connections from Caddy's fixed address on the proxy
+      # network. A client reaching :8000 directly can't set its own. Keep it
+      # equal to SINAS_CADDY_IP; never "*" (uvicorn then takes the leftmost,
+      # client-supplied entry).
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-10.254.253.2}
+    # default first: the network sorted first is the one code-execution
+    # containers join (DOCKER_NETWORK=auto).
+    networks:
+      - default
+      - proxy
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -154,7 +168,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
 
   queue-worker:
     image: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/backend:${IMAGE_TAG:-latest}
@@ -349,11 +363,20 @@ services:
     image: ${IMAGE_REGISTRY:-ghcr.io/sinas-platform/sinas}/console:${IMAGE_TAG:-latest}
     container_name: sinas-console
     restart: unless-stopped
+    networks:
+      - default
+      - proxy
 
   caddy:
     image: caddy:2-alpine
     container_name: sinas-caddy
     restart: unless-stopped
+    # Only on the proxy network, at a fixed address: its connections to the
+    # backend come from SINAS_CADDY_IP, the one address FORWARDED_ALLOW_IPS
+    # trusts.
+    networks:
+      proxy:
+        ipv4_address: ${SINAS_CADDY_IP:-10.254.253.2}
     ports:
       - "80:80"
       - "443:443"
@@ -367,6 +390,18 @@ services:
     environment:
       DOMAIN: ${DOMAIN}
       SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-admin@example.com}
+
+networks:
+  default:
+  # Caddy -> backend/console. A fixed subnet so Caddy can have a fixed
+  # address; other containers get theirs from ip_range, which must not
+  # contain SINAS_CADDY_IP. Change all three (and FORWARDED_ALLOW_IPS) if the
+  # subnet collides with one of yours.
+  proxy:
+    ipam:
+      config:
+        - subnet: ${SINAS_PROXY_SUBNET:-10.254.253.0/24}
+          ip_range: ${SINAS_PROXY_IP_RANGE:-10.254.253.128/25}
 
 volumes:
   postgres_data:

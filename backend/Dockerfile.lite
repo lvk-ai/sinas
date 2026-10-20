@@ -22,4 +22,5 @@ COPY --from=console /usr/share/nginx/html/ui /app/console-dist
 ENV ALL_IN_ONE=true \
     SERVE_CONSOLE=true
 
-CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+# --proxy-headers + FORWARDED_ALLOW_IPS: see the backend Dockerfile.
+CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --workers 1

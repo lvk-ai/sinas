@@ -60,4 +60,8 @@ EXPOSE 8000
 
 # Run database migrations on startup, then start the application with multiple workers
 # UVICORN_WORKERS environment variable can override default of 4
-CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-4}
+# --proxy-headers: the client IP (IP rate limits, request logs) is taken from
+# X-Forwarded-For, but only on connections from FORWARDED_ALLOW_IPS (read by
+# uvicorn; default 127.0.0.1). Set it to your reverse proxy's address(es) as
+# the container sees them; never "*" when port 8000 is reachable directly.
+CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --workers ${UVICORN_WORKERS:-4}
