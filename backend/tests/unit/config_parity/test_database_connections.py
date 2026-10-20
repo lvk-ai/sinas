@@ -219,3 +219,64 @@ class TestReviewFixes:
         assert (await _apply(db, admin_user, databaseConnections=[_yaml(name, readOnly=True)])).success
         row = await _row(db, name)
         assert row.read_only is True and row.password == before
+
+
+class TestConnectionType:
+    """Only PostgreSQL has a driver. Any other type used to be stored, then
+    opened with asyncpg anyway (#293)."""
+
+    async def test_config_apply_rejects_an_unsupported_type(self, db: AsyncSession, admin_user):
+        name = _name()
+        result = await _apply(db, admin_user, databaseConnections=[_yaml(name, connectionType="clickhouse")])
+        assert not result.success
+        assert any("Unsupported connection type 'clickhouse'" in e for e in result.errors), result.errors
+        assert await _row(db, name) is None
+
+    async def test_the_postgres_spelling_keeps_working_stored_canonically(self, db: AsyncSession, admin_user):
+        name = _name()
+        assert (await _apply(db, admin_user, databaseConnections=[_yaml(name, connectionType="Postgres")])).success
+        assert (await _row(db, name)).connection_type == "postgresql"
+
+    async def test_rest_create_and_update_reject_an_unsupported_type(self, client, db: AsyncSession, admin_user):
+        name, h = _name(), auth_headers(admin_user)
+        body = {
+            "name": name, "connection_type": "snowflake", "host": "db.example", "port": 5432,
+            "database": "sales", "username": "reader",
+        }
+        r = await client.post("/api/v1/database-connections", json=body, headers=h)
+        assert r.status_code == 422 and "Unsupported connection type 'snowflake'" in r.text
+        assert await _row(db, name) is None
+        r = await client.post("/api/v1/database-connections", json={**body, "connection_type": "postgresql"}, headers=h)
+        assert r.status_code == 201, r.text
+        conn_id = r.json()["id"]
+        r = await client.patch(f"/api/v1/database-connections/{conn_id}", json={"connection_type": "clickhouse"}, headers=h)
+        assert r.status_code == 422 and "Unsupported connection type 'clickhouse'" in r.text
+        assert (await _row(db, name)).connection_type == "postgresql"
+
+    async def test_a_stored_unsupported_type_stays_editable_but_opens_no_pool(
+        self, client, db: AsyncSession, admin_user, monkeypatch
+    ):
+        from app.services.database_pool import DatabasePoolManager, UnsupportedConnectionTypeError
+
+        name, h = _name(), auth_headers(admin_user)
+        db.add(DatabaseConnection(
+            name=name, connection_type="clickhouse", host="db.example", port=8123,
+            database="sales", username="reader",
+        ))
+        await db.flush()
+        row = await _row(db, name)
+        # The console sends the whole form back: the stored type, unchanged.
+        r = await client.patch(
+            f"/api/v1/database-connections/{row.id}",
+            json={"connection_type": "clickhouse", "read_only": True}, headers=h,
+        )
+        assert r.status_code == 200, r.text
+
+        async def _no_pool(**kwargs):
+            raise AssertionError("an unsupported connection must not be opened with asyncpg")
+
+        monkeypatch.setattr("app.services.database_pool.asyncpg.create_pool", _no_pool)
+        with pytest.raises(UnsupportedConnectionTypeError, match="'clickhouse'"):
+            await DatabasePoolManager().get_pool(db, str(row.id))
+        r = await client.get(f"/api/v1/database-connections/{name}/schemas", headers=h)
+        assert r.status_code == 400 and "clickhouse" in r.text, r.text

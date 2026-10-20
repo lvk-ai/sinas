@@ -6,14 +6,14 @@ description: "External database connections"
 
 Database connections store credentials and manage connection pools for external databases.
 
-**Supported databases:** PostgreSQL, ClickHouse, Snowflake
+**Supported databases:** PostgreSQL. Creating or updating a connection with any other `connection_type` is rejected with a validation error (REST and config apply); `postgres` is accepted as an alias and stored as `postgresql`. A connection stored with an unsupported type before this check existed fails with a clear error when it's used, instead of being opened as PostgreSQL; change its type if it is one.
 
 **Key properties:**
 
 | Property | Description |
 |---|---|
 | `name` | Unique connection name |
-| `connection_type` | `postgresql`, `clickhouse`, or `snowflake` |
+| `connection_type` | `postgresql` |
 | `host`, `port`, `database`, `username`, `password` | Connection details |
 | `ssl_mode` | Optional SSL configuration |
 | `config` | Pool settings (`min_pool_size`, `max_pool_size`) |

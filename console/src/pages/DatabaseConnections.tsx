@@ -283,8 +283,6 @@ export function DatabaseConnections() {
                   required
                 >
                   <option value="postgresql">PostgreSQL</option>
-                  <option value="clickhouse">ClickHouse</option>
-                  <option value="snowflake">Snowflake</option>
                 </select>
               </div>
               <div className="grid grid-cols-3 gap-3">
@@ -459,8 +457,16 @@ export function DatabaseConnections() {
                   required
                 >
                   <option value="postgresql">PostgreSQL</option>
-                  <option value="clickhouse">ClickHouse</option>
-                  <option value="snowflake">Snowflake</option>
+                  {/* A type stored before only PostgreSQL was accepted stays
+                      selectable as itself, so editing other fields keeps it. */}
+                  {editFormData.connection_type && editFormData.connection_type !== 'postgresql' && (
+                    <option value={editFormData.connection_type}>
+                      {editFormData.connection_type}
+                      {['postgres', 'postgresql'].includes(editFormData.connection_type.trim().toLowerCase())
+                        ? ''
+                        : ' (unsupported)'}
+                    </option>
+                  )}
                 </select>
               </div>
               <div className="grid grid-cols-3 gap-3">

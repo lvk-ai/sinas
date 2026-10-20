@@ -13,8 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.encryption import EncryptionService
 from app.models.database_connection import DatabaseConnection
+from app.schemas.database_connection import SUPPORTED_CONNECTION_TYPES, normalize_connection_type
 
 logger = logging.getLogger(__name__)
+
+
+class UnsupportedConnectionTypeError(ValueError):
+    """A stored connection whose type has no driver."""
 
 
 class DatabasePoolManager:
@@ -59,6 +64,17 @@ class DatabasePoolManager:
         conn = result.scalar_one_or_none()
         if not conn:
             raise ValueError(f"Database connection '{connection_id}' not found or inactive")
+
+        # Every pool is asyncpg; a row of another type (stored before the
+        # type was validated) must fail here, not be opened as Postgres.
+        connection_type = normalize_connection_type(conn.connection_type or "")
+        if connection_type not in SUPPORTED_CONNECTION_TYPES:
+            raise UnsupportedConnectionTypeError(
+                f"Database connection '{conn.name}' has connection type "
+                f"'{conn.connection_type}', which Sinas can't open. Supported: "
+                f"{', '.join(SUPPORTED_CONNECTION_TYPES)}. Change its connection type "
+                f"if it is a PostgreSQL database."
+            )
 
         config_hash = self._config_hash(conn)
 

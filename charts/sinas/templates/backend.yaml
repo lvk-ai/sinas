@@ -36,7 +36,7 @@ spec:
           command:
             - sh
             - -c
-            - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
+            - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --workers 1"
           ports:
             - containerPort: 8000
           env:
@@ -49,6 +49,11 @@ spec:
             - name: SERVE_CONSOLE
               value: "true"
             {{- end }}
+            ## Proxies trusted to set X-Forwarded-For (--proxy-headers above);
+            ## see backend.forwardedAllowIps.
+            {{- $forwarded := .Values.backend.forwardedAllowIps | default (list "127.0.0.1") }}
+            - name: FORWARDED_ALLOW_IPS
+              value: {{ (kindIs "slice" $forwarded | ternary (join "," $forwarded) $forwarded) | quote }}
             - name: SUPERADMIN_EMAIL
               value: {{ .Values.superadminEmail | quote }}
             - name: SMTP_HOST
