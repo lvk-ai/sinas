@@ -13,4 +13,4 @@ def test_users_role_may_update_own_api_keys():
 
 def test_registry_lists_update_for_api_keys():
     entry = next(e for e in PERMISSION_REGISTRY if e["resource"] == "api_keys")
-    assert entry["actions"] == ["create", "read", "update", "delete"]
+    assert entry["actions"] == ["create", "read", "update", "delete", "assign_context"]

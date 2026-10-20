@@ -124,6 +124,12 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
     callback_url = kwargs.get("callback_url")
     depth = kwargs.get("depth", 0)
 
+    # The enqueuing request's attribution context, for the function's access
+    # token (this job's own task: nothing to reset).
+    from app.core.auth import bind_credential_context
+
+    bind_credential_context(kwargs.get("credential_context"))
+
     redis: Redis = ctx.get("redis") or Redis.from_url(settings.redis_url, decode_responses=True)
 
     # Restore trace context from the enqueue side
@@ -262,6 +268,9 @@ async def execute_function_job(ctx: dict, **kwargs: Any) -> Any:
                     "chat_id": chat_id,
                     "callback_url": callback_url,
                     "depth": depth,
+                    # The original request's attribution context, so a
+                    # requeue runs with it rather than the admin's.
+                    "credential_context": kwargs.get("credential_context"),
                     "error": error,
                     "error_type": error_type,
                     "attempts": attempts,

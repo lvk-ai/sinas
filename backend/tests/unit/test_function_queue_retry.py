@@ -650,6 +650,7 @@ class TestDeadLetterQueueApi:
                 "callback_url": None, "depth": 0, "chat_id": None,
                 "error": "Sandbox container failed to start", "error_type": "infrastructure",
                 "attempts": 4, "failed_at": 1.0,
+                "credential_context": {"orgId": "org-1"},
             }
             await redis.lpush(DLQ_KEY, json.dumps(entry))
             await redis.set(f"{result_key_prefix}{eid}", b"failed-run", ex=3600)
@@ -665,6 +666,13 @@ class TestDeadLetterQueueApi:
             r = await client.post(f"/api/v1/queue/dlq/{eid}/retry", headers=h)
             assert r.status_code == 200, r.text
             assert r.json()["new_job_id"] == eid
+
+            # Requeued with the original request's attribution context, not
+            # the requeueing admin's
+            from arq.jobs import Job
+
+            info = await Job(eid, pool).info()
+            assert info.kwargs["credential_context"] == {"orgId": "org-1"}
 
             # Really queued for arq, out of the DLQ, failure count reset
             assert await redis.zscore("sinas:queue:functions", eid) is not None

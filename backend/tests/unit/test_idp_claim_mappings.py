@@ -205,7 +205,7 @@ async def test_the_rest_api_reads_and_writes_mappings(client, db, admin_user):
     }
     r = await client.post("/api/v1/identity-providers", json=body, headers=auth_headers(admin_user))
     assert r.status_code == 201, r.text
-    assert r.json()["claim_mappings"] == [{"claim": "tid", "field": "tenantId"}]
+    assert [(m["claim"], m["field"]) for m in r.json()["claim_mappings"]] == [("tid", "tenantId")]
 
     r = await client.put(
         f"/api/v1/identity-providers/{name}", json={"claim_mappings": [{"claim": "tid", "field": "bad-name"}]},

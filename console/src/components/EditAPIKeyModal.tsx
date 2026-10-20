@@ -93,6 +93,22 @@ export function EditAPIKeyModal({ apiKey, isOwnKey, onClose }: EditAPIKeyModalPr
               request; the key value stays the same.
             </div>
 
+            {apiKey.context && Object.keys(apiKey.context).length > 0 && (
+              <div>
+                <span className="block text-sm font-medium text-gray-300 mb-2">Attribution context</span>
+                <div className="flex flex-wrap gap-1">
+                  {Object.entries(apiKey.context).map(([field, value]) => (
+                    <span key={field} className="px-2 py-0.5 bg-surface-2 text-gray-300 text-xs rounded font-mono">
+                      {field}={String(value)}
+                    </span>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Taken from the session that created the key, and fixed: it can't be edited here.
+                </p>
+              </div>
+            )}
+
             <div>
               <label htmlFor="edit-key-name" className="block text-sm font-medium text-gray-300 mb-2">
                 Key Name *

@@ -43,6 +43,9 @@ class UserWithRolesResponse(BaseModel):
     roles: list[str]
     custom_fields: Optional[dict[str, Any]] = None
     identities: list[UserIdentityResponse] = []
+    # The session-context values the user may hold, per membership-checked
+    # context field (ATTRIBUTION_MEMBERSHIPS), e.g. {"orgId": ["org-1", "org-2"]}
+    memberships: dict[str, list[Any]] = {}
 
     class Config:
         from_attributes = True

@@ -100,6 +100,8 @@ API keys can be used via `Authorization: Bearer <key>` or `X-API-Key: <key>` hea
 
 A key acts with **its own** permissions everywhere, including through agents: when a chat is started or continued with a key, the agent's tools (functions, queries, stores, collections, sub-agents, pipelines) are checked against the key's live permissions, not its owner's — and so are components and artifacts shown in that chat. A key that may only chat with an agent can't use that agent's tools; grant the key those tools' permissions too. Revoking or narrowing a key takes effect immediately, also for runs already queued.
 
+A key carries an [attribution context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context) when the session (or key) that created it had one: it is copied onto the key, its users can't change it, and every request made with the key carries it. Only an admin holding `sinas.api_keys.assign_context:all` may create a key with a given `context`, or change a key's context (`PATCH /api/v1/api-keys/{id}` with `context`; `null` clears it). A key created by a session without a context has none.
+
 ## Token Exchange (bring your own auth)
 
 If your application already authenticates users itself, you don't need to run a second Sinas login flow. Your backend exchanges its knowledge of "who is logged in" for Sinas tokens:
@@ -128,6 +130,7 @@ Behavior details:
 - With `auto_provision: true`, unknown users are created and assigned the `TOKEN_EXCHANGE_DEFAULT_ROLE` (default `GuestUsers`). `email` is required to provision.
 - `metadata` is stored on the identity and refreshed on every exchange. `custom_fields` is shallow-merged into the user's custom fields (partner keys win, admin-set keys survive).
 - `provisioned: true` in the response indicates the exchange created the user.
+- `context` (optional, e.g. `{"orgId": "org-2"}`) is the session's [attribution context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context): the access token carries it as a `context` claim, every refresh keeps it, and the chats the session starts are attributed by it. Only the exchanging service can set it. With `ATTRIBUTION_MEMBERSHIPS`, it must be one the user is a member for (with the `custom_fields` of this exchange), or the exchange is refused with 403.
 
 The exchange endpoint trusts the caller to assert identities — treat keys with `sinas.auth.exchange:all` like any other admin credential.
 
