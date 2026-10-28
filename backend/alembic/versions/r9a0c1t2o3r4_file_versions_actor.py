@@ -6,7 +6,7 @@ the version. Existing rows are user writes as far as anyone can tell: the
 history does not record which were agent writes, so they backfill to "user".
 
 Revision ID: r9a0c1t2o3r4
-Revises: r8e9t0i1d2x3
+Revises: r1e2t3r4y5f6
 Create Date: 2026-10-20
 """
 
@@ -16,7 +16,7 @@ from alembic import op
 from app.models.base import GUID
 
 revision = "r9a0c1t2o3r4"
-down_revision = "r8e9t0i1d2x3"
+down_revision = "r1e2t3r4y5f6"
 branch_labels = None
 depends_on = None
 
