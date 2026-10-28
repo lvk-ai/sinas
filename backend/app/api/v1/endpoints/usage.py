@@ -60,6 +60,9 @@ def _filters(
     user_id: list[uuid.UUID] = Query([], description="User id (repeatable)"),
     source: list[str] = Query([], description="Call site, e.g. chat, provider_batch (repeatable)"),
     chat_id: list[uuid.UUID] = Query([], description="Chat id (repeatable)"),
+    customer: list[str] = Query(
+        [], description="Customer, the USAGE_CUSTOMER_FIELD custom field (repeatable)"
+    ),
     current_user_data: tuple = Depends(get_current_user_with_permissions),
 ) -> UsageFilters:
     own = _scope(request, current_user_data)
@@ -74,6 +77,7 @@ def _filters(
         user_ids=user_id,
         sources=source,
         chat_ids=chat_id,
+        customers=customer,
         own_user_id=own,
     )
 
@@ -82,7 +86,7 @@ def _filters(
 async def usage_summary(
     group_by: list[str] = Query(
         [],
-        description="Any of agent, provider, model, user, source, chat, batch, and day or hour; "
+        description="Any of agent, provider, model, user, source, chat, batch, customer, and day or hour; "
         "repeatable or comma-separated",
     ),
     limit: int = Query(1000, ge=1, le=10000, description="Max groups"),

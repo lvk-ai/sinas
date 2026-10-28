@@ -56,6 +56,8 @@ class ComponentScope:
     share_id: Optional[str] = None
     read_only: bool = False
     api_key_id: Optional[str] = None
+    # The attribution context the page's requests carry (from the render).
+    context: Optional[dict] = None
 
     @property
     def ref(self) -> str:
@@ -69,6 +71,7 @@ def generate_component_access_token(
     session_start: Optional[int] = None,
     share_id: Optional[str] = None,
     api_key_id: Optional[str] = None,
+    context: Optional[dict] = None,
 ) -> str:
     now = int(time.time())
     payload = {
@@ -85,6 +88,9 @@ def generate_component_access_token(
         # Rendered for an API key's request or agent run: acts with the key's
         # permissions (core/auth get_effective_permissions).
         payload["api_key_id"] = str(api_key_id)
+    if context:
+        # The render's attribution context (app/providers/attribution.py).
+        payload["context"] = context
     # Internal purpose token, like render and file-serve tokens: HS256.
     return jwt.encode(payload, settings.secret_key, algorithm="HS256")
 

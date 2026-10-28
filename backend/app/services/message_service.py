@@ -4,6 +4,7 @@ import json
 import uuid
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Optional
 
@@ -19,7 +20,10 @@ from app.models import Agent, Chat, Message
 from app.models.function import Function
 from app.models.llm_provider import LLMProvider
 from app.providers import create_provider
+from app.providers.attribution import new_chat_attribution
+from app.providers.errors import PROVIDER_NOT_CONFIGURED, LLMError, chat_error_content, turn_error
 from app.services.collection_tools import CollectionToolConverter
+from app.services.llm_retry import call_with_retry, stream_with_retry
 from app.services.component_tools import ComponentToolConverter
 from app.services.connector_tools import ConnectorToolConverter
 from app.utils.schema import validate_with_coercion
@@ -27,8 +31,7 @@ from app.services.content_tokens import strip_base64_data, refresh_message_token
 from app.services.hook_service import run_hooks, HookResult
 from app.services.tool_result_store import save_tool_result
 from app.services import workbench_refs
-from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
-from app.services import workbench_refs
+from app.services.deferred_completions import ROUND_SUSPENDED, SUSPENSION_EVENT_TYPES
 from app.services.conversation_history import (
     build_agent_system_content,
     build_conversation_history,
@@ -53,11 +56,39 @@ from app.services.tool_execution import (
     accumulate_tool_call_delta,
     validate_tool_calls,
 )
+import time
+
 from opentelemetry import trace
-from app.core.telemetry import get_tracer, otel_attr
+from app.core.telemetry import ending_on_error, get_tracer, otel_attr, record_error
 
 logger = logging.getLogger(__name__)
 _tracer = get_tracer()
+
+
+def _record_llm_span(
+    start_ns: int,
+    attributes: dict[str, Any],
+    usage: Optional[dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    """An `llm.call` span for a streamed call, recorded once the stream has
+    ended (or failed): from `start_ns`, when the request was made, to now.
+    Never affects the flow."""
+    try:
+        span = get_tracer().start_span("llm.call", start_time=start_ns, attributes=attributes)
+        if usage and usage.get("total_tokens"):
+            span.set_attribute("gen_ai.usage.input_tokens", usage.get("prompt_tokens", 0))
+            span.set_attribute("gen_ai.usage.output_tokens", usage.get("completion_tokens", 0))
+        if error is not None:
+            record_error(span, error)
+        span.end()
+    except Exception:
+        pass
+
+# Tool results for calls of a round that never ran: refused at the approval
+# gate, or stopped by an operator interrupt before execution.
+REJECTED_TOOL_RESULT = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+INTERRUPTED_TOOL_RESULT = json.dumps({"error": "Interrupted by operator before execution"})
 
 
 def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
@@ -68,6 +99,64 @@ def _wants_deferral(meta: dict[str, Any], tool_call: dict[str, Any]) -> bool:
         return True
     args = safe_parse_arguments(tool_call.get("function", {}).get("arguments", ""))
     return bool(isinstance(args, dict) and args.get(arg))
+
+
+# How a synchronous (non-streaming) turn ended — TurnResult.status.
+TURN_COMPLETED = "completed"
+TURN_INPUT_REQUIRED = "input_required"
+TURN_IN_PROGRESS = "in_progress"
+TURN_INJECTED = "injected"
+
+
+@dataclass
+class TurnResult:
+    """What a non-streaming turn ended in (MessageService.run_turn).
+
+    - completed: `message` is the final reply.
+    - input_required: a tool round is parked on ask_user question(s) (and
+      possibly other deferred calls); `message` is the assistant message
+      that asked. The questions are the chat's pending inputs; answering the
+      last one resumes the round on a fresh channel.
+    - in_progress: a tool round is parked on work that completes it without
+      a human (a background run the model waits for); the conversation
+      continues by itself and streams on `channel_id`. `message` is the
+      assistant message that made the deferred calls.
+    - injected: the chat was busy — a turn running, or a round parked — so
+      the message was delivered into that run, to be read at its next
+      round boundary; `message` is the stored user message, and
+      `channel_id` the parked round's channel when one is parked.
+    """
+
+    status: str
+    message: Message
+    channel_id: Optional[str] = None
+
+
+@dataclass
+class _RoundEnd:
+    """How a drained tool-round generator ended (see _consume_round)."""
+
+    chunks: int = 0
+    stopped: bool = False  # suspended or interrupted: no follow-through
+    suspension: Optional[dict[str, Any]] = None  # the round_suspended event
+    asked: bool = False  # the suspension includes ask_user questions
+
+
+async def _consume_round(chunks: AsyncIterator[dict[str, Any]]) -> _RoundEnd:
+    """Drain a round's events for a caller that does not stream them."""
+    ended = _RoundEnd()
+    async for chunk in chunks:
+        ended.chunks += 1
+        if not isinstance(chunk, dict):
+            continue
+        kind = chunk.get("type")
+        if kind in ("interrupted", *SUSPENSION_EVENT_TYPES):
+            ended.stopped = True
+        if kind == "input_required":
+            ended.asked = True
+        elif kind == ROUND_SUSPENDED:
+            ended.suspension = chunk
+    return ended
 
 
 class MessageService:
@@ -121,6 +210,7 @@ class MessageService:
             agent_name=agent.name,
             title=name or f"Chat with {agent.name}",
             chat_metadata={"agent_input": input_data} if input_data else None,
+            attribution=await new_chat_attribution(self.db, user_id),
         )
         self.db.add(chat)
         await self.db.commit()
@@ -180,6 +270,10 @@ class MessageService:
         # Determine final provider/model/temperature
         # Priority: message params > agent settings > database default
         provider_name = None
+        # Why the turn can't run (provider_not_configured), raised once the
+        # user's message is stored, so the chat shows the message and why it
+        # got no answer (issue #202).
+        not_runnable: Optional[LLMError] = None
         if provider:
             provider_name = provider
         elif agent and agent.llm_provider_id:
@@ -200,10 +294,12 @@ class MessageService:
                 )
                 inactive_provider = result.scalar_one_or_none()
                 if inactive_provider:
-                    raise ValueError(
-                        f"Agent '{agent.namespace}/{agent.name}' is configured to use LLM provider "
-                        f"'{inactive_provider.name}' which is currently inactive. Please activate the "
-                        f"provider or update the agent's LLM provider setting."
+                    not_runnable = LLMError(
+                        PROVIDER_NOT_CONFIGURED,
+                        f"Agent '{agent.namespace}/{agent.name}' uses LLM provider "
+                        f"'{inactive_provider.name}', which is inactive. An admin can activate it "
+                        "under LLM Providers, or set another provider for this agent.",
+                        provider=inactive_provider.name,
                     )
 
         final_model = model or (agent.model if agent else None)
@@ -254,6 +350,8 @@ class MessageService:
         self.db.add(user_message)
         await self.db.commit()
         await self.db.refresh(user_message)
+        if not_runnable is not None:
+            raise not_runnable
 
         # Run user message hooks (before LLM call)
         hook_result = None
@@ -356,6 +454,14 @@ class MessageService:
             provider_config = result.scalar_one_or_none()
             if provider_config:
                 final_model = provider_config.default_model
+        if not final_model:
+            raise LLMError(
+                PROVIDER_NOT_CONFIGURED,
+                "No model is set for this agent, and its LLM provider has no default model. "
+                "An admin can set the provider's default model under LLM Providers, or set "
+                "this agent's model.",
+                provider=provider_name,
+            )
 
         # Build response_format from agent's output_schema if present
         response_format = None
@@ -496,22 +602,37 @@ class MessageService:
     ) -> Message:
         """Send a message and get LLM response (non-streaming).
 
-        One loop per chat: if another loop is already running this chat, the
-        message is injected into it (picked up at the next tool-round
-        boundary) instead of starting a concurrent loop.
+        The message `run_turn` ended on; see there for what it is when the
+        turn did not complete.
+        """
+        return (await self.run_turn(chat_id, user_id, user_token, content)).message
+
+    async def run_turn(
+        self, chat_id: str, user_id: str, user_token: str, content: str
+    ) -> TurnResult:
+        """Send a message and run the turn it starts (non-streaming).
+
+        One loop per chat: if another loop is already running this chat, or
+        a round is parked on it, the message is injected (picked up at the
+        next tool-round boundary) instead of starting a concurrent loop —
+        status "injected". A turn whose tool round suspends on deferred
+        calls (ask_user, a background run it waits for) ends here with the
+        round parked — status "input_required" or "in_progress"; see
+        TurnResult.
         """
         from app.services import chat_steering
 
-        from app.services.chat_wakeups import chat_is_parked
+        from app.services.chat_wakeups import parked_round_channel
 
+        parked_channel = None
         lock_token = await chat_steering.acquire_chat_lock(chat_id)
         if lock_token is not None:
             try:
-                parked = await chat_is_parked(self.db, chat_id)
+                parked_channel = await parked_round_channel(self.db, chat_id)
             except BaseException:
                 await chat_steering.release_chat_lock(chat_id, lock_token)
                 raise
-            if parked:
+            if parked_channel is not None:
                 # A round is parked (on ask_user, a background run, a
                 # sub-agent, an approval): it holds no lock but owns the
                 # chat. The message waits for it like for a running loop.
@@ -521,16 +642,46 @@ class MessageService:
             injected = await self.inject_user_message(chat_id, user_id, content)
             if injected is None:
                 raise ValueError("Message blocked by hook")
-            return injected
+            return TurnResult(TURN_INJECTED, injected, channel_id=parked_channel)
         try:
             await chat_steering.clear_interrupt(chat_id)
             return await self._send_message_locked(chat_id, user_id, user_token, content)
         finally:
             await chat_steering.release_chat_lock(chat_id, lock_token)
 
+    async def _parked_turn(self, chat_id: str, ended: _RoundEnd) -> TurnResult:
+        """The result of a turn whose round suspended: its reply comes later
+        (on the answer, or when the awaited work lands). What it has so far
+        is the assistant message that made the deferred calls."""
+        asking_msg = (
+            await self.db.execute(
+                select(Message)
+                .where(Message.chat_id == chat_id, Message.role == "assistant")
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        return TurnResult(
+            TURN_INPUT_REQUIRED if ended.asked else TURN_IN_PROGRESS,
+            asking_msg,
+            channel_id=(ended.suspension or {}).get("channel_id"),
+        )
+
     async def _send_message_locked(
         self, chat_id: str, user_id: str, user_token: str, content: str
-    ) -> Message:
+    ) -> TurnResult:
+        try:
+            return await self._run_turn_locked(chat_id, user_id, user_token, content)
+        except LLMError as e:
+            # A failed LLM call (or no provider to make it with): the API
+            # answers it with its envelope; the chat keeps why, as a
+            # streamed turn's does (issue #202).
+            await self._record_turn_error(chat_id, e)
+            raise
+
+    async def _run_turn_locked(
+        self, chat_id: str, user_id: str, user_token: str, content: str
+    ) -> TurnResult:
         prep = await self._prepare_message_context(
             chat_id=chat_id,
             user_id=user_id,
@@ -545,7 +696,7 @@ class MessageService:
 
         # User hook blocked the pipeline
         if prep.get("blocked"):
-            return prep["block_message"]
+            return TurnResult(TURN_COMPLETED, prep["block_message"])
 
         # Metering leaf: one agent invocation per (unblocked) user message
         from app.services import metering
@@ -563,142 +714,150 @@ class MessageService:
             otel_attr("user_id"): user_id,
             otel_attr("labels"): _labels,
         })
+        # Current for the turn (the provider call, tools and queries made for it
+        # are recorded under it); a failure records the exception and ends it.
+        with ending_on_error(_llm_span), trace.use_span(
+            _llm_span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+        ):
+            start_time = datetime.now(UTC)
 
-        start_time = datetime.now(UTC)
+            llm_kwargs = {}
+            if prep["response_format"]:
+                llm_kwargs["response_format"] = prep["response_format"]
 
-        llm_kwargs = {}
-        if prep["response_format"]:
-            llm_kwargs["response_format"] = prep["response_format"]
+            clean_tools = strip_tool_metadata(prep["tools"])
 
-        clean_tools = strip_tool_metadata(prep["tools"])
-
-        response = await prep["llm_provider"].complete(
-            messages=prep["messages"],
-            model=prep["final_model"],
-            tools=clean_tools,
-            temperature=prep["final_temperature"],
-            max_tokens=prep["final_max_tokens"],
-            **llm_kwargs,
-        )
-        end_time = datetime.now(UTC)
-
-        _usage = response.get("usage") or {}
-        if _usage.get("total_tokens"):
-            _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
-            _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
-
-        await self._log_request(
-            user_id=user_id,
-            chat_id=str(chat_id),
-            message_id=str(prep["user_message"].id),
-            provider=prep["provider_name"],
-            model=prep["final_model"],
-            messages=prep["messages"],
-            response=response,
-            latency_ms=int((end_time - start_time).total_seconds() * 1000),
-        )
-
-        if response.get("tool_calls"):
-            # The same decision the streaming path makes (agent rules and
-            # session grants over the intrinsic flags): a call the rules
-            # would ask about cannot be parked here, so it is refused; one
-            # they allow runs, even if its function is flagged.
-            actions = await resolve_tool_approval_actions(
-                self.db, response["tool_calls"], chat_id, prep.get("tools")
-            )
-            for tool_call in response["tool_calls"]:
-                if actions.get(tool_call["id"]) == "ask":
-                    _llm_span.end()
-                    raise ValueError(
-                        f"Tool {tool_call['function']['name']} requires user approval. "
-                        "Please use streaming mode to handle approval flow."
-                    )
-
-            suspended = False
-            async for chunk in self._handle_tool_calls(
+            response = await call_with_retry(
+                lambda: prep["llm_provider"].complete(
+                    messages=prep["messages"],
+                    model=prep["final_model"],
+                    tools=clean_tools,
+                    temperature=prep["final_temperature"],
+                    max_tokens=prep["final_max_tokens"],
+                    **llm_kwargs,
+                ),
                 chat_id=chat_id,
+            )
+            end_time = datetime.now(UTC)
+
+            _usage = response.get("usage") or {}
+            if _usage.get("total_tokens"):
+                _llm_span.set_attribute("gen_ai.usage.input_tokens", _usage.get("prompt_tokens", 0))
+                _llm_span.set_attribute("gen_ai.usage.output_tokens", _usage.get("completion_tokens", 0))
+
+            await self._log_request(
                 user_id=user_id,
-                user_token=user_token,
-                messages=prep["messages"],
-                tool_calls=response["tool_calls"],
+                chat_id=str(chat_id),
+                message_id=str(prep["user_message"].id),
                 provider=prep["provider_name"],
                 model=prep["final_model"],
-                temperature=prep["final_temperature"],
-                max_tokens=prep["final_max_tokens"],
-                tools=prep["tools"],
-                agent_label=agent_label,
-            ):
-                if isinstance(chunk, dict) and chunk.get("type") in ("interrupted", *SUSPENSION_EVENT_TYPES):
-                    suspended = True  # parked or stopped: no follow-through
-            if not suspended:
-                async for _ in self.answer_pending_injections(
-                    chat_id=chat_id, user_id=user_id, user_token=user_token,
-                    provider=prep["provider_name"], model=prep["final_model"],
-                    temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
-                    tools=prep["tools"], agent_label=agent_label,
-                ):
-                    pass
-
-            result = await self.db.execute(
-                select(Message)
-                .where(Message.chat_id == chat_id)
-                .order_by(Message.created_at.desc())
-                .limit(1)
+                messages=prep["messages"],
+                response=response,
+                latency_ms=int((end_time - start_time).total_seconds() * 1000),
             )
-            final_msg = result.scalar_one()
-            _llm_span.set_attribute(otel_attr("output"), (final_msg.content or "")[:10000])
+
+            if response.get("tool_calls"):
+                # The same decision the streaming path makes (agent rules and
+                # session grants over the intrinsic flags): a call the rules
+                # would ask about cannot be parked here, so it is refused; one
+                # they allow runs, even if its function is flagged.
+                actions = await resolve_tool_approval_actions(
+                    self.db, response["tool_calls"], chat_id, prep.get("tools")
+                )
+                for tool_call in response["tool_calls"]:
+                    if actions.get(tool_call["id"]) == "ask":
+                        _llm_span.end()
+                        raise ValueError(
+                            f"Tool {tool_call['function']['name']} requires user approval. "
+                            "Please use streaming mode to handle approval flow."
+                        )
+
+                ended = await _consume_round(self._handle_tool_calls(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    messages=prep["messages"],
+                    tool_calls=response["tool_calls"],
+                    provider=prep["provider_name"],
+                    model=prep["final_model"],
+                    temperature=prep["final_temperature"],
+                    max_tokens=prep["final_max_tokens"],
+                    tools=prep["tools"],
+                    agent_label=agent_label,
+                ))
+                if not ended.stopped:
+                    ended = await _consume_round(self.answer_pending_injections(
+                        chat_id=chat_id, user_id=user_id, user_token=user_token,
+                        provider=prep["provider_name"], model=prep["final_model"],
+                        temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                        tools=prep["tools"], agent_label=agent_label,
+                    ))
+                if ended.suspension is not None:
+                    parked = await self._parked_turn(chat_id, ended)
+                    _llm_span.set_attribute(otel_attr("output"), (parked.message.content or "")[:10000])
+                    _llm_span.end()
+                    return parked
+
+                result = await self.db.execute(
+                    select(Message)
+                    .where(Message.chat_id == chat_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(1)
+                )
+                final_msg = result.scalar_one()
+                _llm_span.set_attribute(otel_attr("output"), (final_msg.content or "")[:10000])
+                _llm_span.end()
+                return TurnResult(TURN_COMPLETED, final_msg)
+
+            assistant_content = response.get("content", "")
+
+            # Run assistant message hooks
+            agent = None
+            if prep["chat"].agent_id:
+                agent = await self.db.get(Agent, prep["chat"].agent_id)
+
+            if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
+                hook_result = await run_hooks(
+                    hooks=agent.hooks["on_assistant_message"],
+                    message_content=assistant_content,
+                    message_role="assistant",
+                    chat_id=chat_id,
+                    agent_namespace=agent.namespace,
+                    agent_name=agent.name,
+                    user_id=user_id,
+                    session_key=getattr(prep["chat"], "session_key", None),
+                )
+                if hook_result.blocked:
+                    assistant_content = hook_result.reply or "Response blocked by hook"
+                elif hook_result.mutated_content:
+                    assistant_content = hook_result.mutated_content
+
+            assistant_message = Message(
+                chat_id=chat_id, role="assistant", content=assistant_content
+            )
+            self.db.add(assistant_message)
+            await self.db.commit()
+            await self.db.refresh(assistant_message)
+
+            _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
             _llm_span.end()
-            return final_msg
 
-        assistant_content = response.get("content", "")
-
-        # Run assistant message hooks
-        agent = None
-        if prep["chat"].agent_id:
-            agent = await self.db.get(Agent, prep["chat"].agent_id)
-
-        if agent and agent.hooks and agent.hooks.get("on_assistant_message"):
-            hook_result = await run_hooks(
-                hooks=agent.hooks["on_assistant_message"],
-                message_content=assistant_content,
-                message_role="assistant",
-                chat_id=chat_id,
-                agent_namespace=agent.namespace,
-                agent_name=agent.name,
-                user_id=user_id,
-                session_key=getattr(prep["chat"], "session_key", None),
-            )
-            if hook_result.blocked:
-                assistant_content = hook_result.reply or "Response blocked by hook"
-            elif hook_result.mutated_content:
-                assistant_content = hook_result.mutated_content
-
-        assistant_message = Message(
-            chat_id=chat_id, role="assistant", content=assistant_content
-        )
-        self.db.add(assistant_message)
-        await self.db.commit()
-        await self.db.refresh(assistant_message)
-
-        _llm_span.set_attribute(otel_attr("output"), (assistant_content or "")[:10000])
-        _llm_span.end()
-
-        # A message injected while this reply streamed has no boundary left
-        # to be read at: answer it now, still under the lock.
-        answered = False
-        async for _ in self.answer_pending_injections(
-            chat_id=chat_id, user_id=user_id, user_token=user_token,
-            provider=prep["provider_name"], model=prep["final_model"],
-            temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
-            tools=prep["tools"], agent_label=agent_label,
-        ):
-            answered = True
-        if answered:
-            result = await self.db.execute(
-                select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
-            )
-            return result.scalar_one()
-        return assistant_message
+            # A message injected while this reply streamed has no boundary left
+            # to be read at: answer it now, still under the lock.
+            ended = await _consume_round(self.answer_pending_injections(
+                chat_id=chat_id, user_id=user_id, user_token=user_token,
+                provider=prep["provider_name"], model=prep["final_model"],
+                temperature=prep["final_temperature"], max_tokens=prep["final_max_tokens"],
+                tools=prep["tools"], agent_label=agent_label,
+            ))
+            if ended.suspension is not None:
+                return await self._parked_turn(chat_id, ended)
+            if ended.chunks:
+                result = await self.db.execute(
+                    select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+                )
+                return TurnResult(TURN_COMPLETED, result.scalar_one())
+            return TurnResult(TURN_COMPLETED, assistant_message)
 
     async def send_message_stream(
         self,
@@ -793,6 +952,33 @@ class MessageService:
         )
         await self.db.commit()
 
+    async def _record_turn_error(self, chat_id: str, error: LLMError) -> str:
+        """Leave a failed turn's error in its chat as an assistant reply (its
+        code first), so the chat stays valid and shows why the turn got no
+        answer. Best-effort: never masks the failure it records. Returns the
+        reply's text."""
+        content = chat_error_content(error)
+        for attempt in range(2):
+            try:
+                self.db.add(Message(chat_id=chat_id, role="assistant", content=content))
+                await self.db.commit()
+                break
+            except Exception as persist_error:
+                # The session may be in a failed transaction (the error came
+                # from the database): start over once on a clean one.
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                if attempt:
+                    logger.error(f"Could not persist turn error for chat {chat_id}: {persist_error}")
+        return content
+
+    def _error_event(self, error: LLMError, content: str) -> dict[str, Any]:
+        """A failed turn's terminal stream event: the error envelope, with the
+        reply it left in the chat as `content`."""
+        return {"content": content, "type": "error", **error.event_fields()}
+
     async def _send_message_stream_locked(
         self,
         chat_id: str,
@@ -800,17 +986,26 @@ class MessageService:
         user_token: str,
         content: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        prep = await self._prepare_message_context(
-            chat_id=chat_id,
-            user_id=user_id,
-            content=content,
-            provider=None,
-            model=None,
-            temperature=None,
-            inject_context=True,
-            context_limit=5,
-            template_variables=None,
-        )
+        try:
+            prep = await self._prepare_message_context(
+                chat_id=chat_id,
+                user_id=user_id,
+                content=content,
+                provider=None,
+                model=None,
+                temperature=None,
+                inject_context=True,
+                context_limit=5,
+                template_variables=None,
+            )
+        except Exception as e:
+            # The turn can't start (no provider or model, the agent's provider
+            # inactive, ...): it ends here like any failed turn, its reason in
+            # the chat and on the stream (issue #202), not just in a log.
+            logger.warning(f"Turn for chat {chat_id} could not start: {e}")
+            error = turn_error(e)
+            yield self._error_event(error, await self._record_turn_error(chat_id, error))
+            return
 
         # User hook blocked the pipeline
         if prep.get("blocked"):
@@ -872,14 +1067,13 @@ class MessageService:
                         _turn_output_parts.append(chunk["content"])
                     yield chunk
         except Exception as e:
-            print(f"❌ Error during message streaming: {e}", flush=True)
-            turn_span.set_status(trace.StatusCode.ERROR, str(e)[:200])
-            error_content = f"An error occurred while processing your message. Please try again.\n\nError: {str(e)[:300]}"
-            # Save error as assistant message so chat history stays valid
-            error_message = Message(chat_id=chat_id, role="assistant", content=error_content)
-            self.db.add(error_message)
-            await self.db.commit()
-            yield {"content": error_content, "type": "error", "error": str(e)[:300]}
+            logger.error(f"Error during message streaming for chat {chat_id}: {e}")
+            record_error(turn_span, e)
+            # The error envelope (code, retryable, upstream_status), for API
+            # clients, job records and pipeline steps to tell failures apart;
+            # saved as an assistant message so chat history stays valid.
+            error = turn_error(e)
+            yield self._error_event(error, await self._record_turn_error(chat_id, error))
         finally:
             _turn_output = "".join(_turn_output_parts)
             if _turn_output:
@@ -908,35 +1102,11 @@ class MessageService:
 
         clean_tools = strip_tool_metadata(tools)
 
-        async for chunk in llm_provider.stream(
-            messages=messages,
-            model=final_model,
-            tools=clean_tools,
-            temperature=final_temperature,
-            max_tokens=max_tokens,
-        ):
-            if chunk.get("usage"):
-                stream_usage = chunk["usage"]
-
-            if chunk.get("content"):
-                if isinstance(chunk["content"], str):
-                    full_content += chunk["content"]
-                else:
-                    chunk["content"] = None
-
-            if chunk.get("tool_calls"):
-                for tc in chunk["tool_calls"]:
-                    accumulate_tool_call_delta(tool_calls_list, tc)
-
-            yield chunk
-
-        # Record LLM call as a span (after streaming completes, never affects the flow)
-        try:
-            # Capture input: last user message (up to 10k for NER/extraction use cases)
+        def _llm_attributes() -> dict[str, Any]:
+            # Input: the last user message (up to 10k for NER/extraction use cases)
             _last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
             _input_summary = _last_user[:10000] if isinstance(_last_user, str) else json.dumps(_last_user, default=str)[:10000]
-            _labels = json.dumps([f"agent:{agent_label}"]) if agent_label else "[]"
-            _s = _tracer.start_span("llm.call", attributes={
+            return {
                 "gen_ai.request.model": final_model or "",
                 "gen_ai.system": provider_name or "",
                 otel_attr("span_type"): "llm",
@@ -944,14 +1114,41 @@ class MessageService:
                 otel_attr("output"): full_content if full_content else "",
                 otel_attr("thread_id"): chat_id,
                 otel_attr("user_id"): user_id,
-                otel_attr("labels"): _labels,
-            })
-            if stream_usage and stream_usage.get("total_tokens"):
-                _s.set_attribute("gen_ai.usage.input_tokens", stream_usage.get("prompt_tokens", 0))
-                _s.set_attribute("gen_ai.usage.output_tokens", stream_usage.get("completion_tokens", 0))
-            _s.end()
-        except Exception:
-            pass
+                otel_attr("labels"): json.dumps([f"agent:{agent_label}"]) if agent_label else "[]",
+            }
+
+        _llm_start = time.time_ns()
+        try:
+            async for chunk in stream_with_retry(
+                lambda: llm_provider.stream(
+                    messages=messages,
+                    model=final_model,
+                    tools=clean_tools,
+                    temperature=final_temperature,
+                    max_tokens=max_tokens,
+                ),
+                chat_id=chat_id,
+            ):
+                if chunk.get("usage"):
+                    stream_usage = chunk["usage"]
+
+                if chunk.get("content"):
+                    if isinstance(chunk["content"], str):
+                        full_content += chunk["content"]
+                    else:
+                        chunk["content"] = None
+
+                if chunk.get("tool_calls"):
+                    for tc in chunk["tool_calls"]:
+                        accumulate_tool_call_delta(tool_calls_list, tc)
+
+                yield chunk
+        except Exception as exc:
+            _record_llm_span(_llm_start, _llm_attributes(), stream_usage, error=exc)
+            raise
+
+        # Record the LLM call as a span (after streaming completes, never affects the flow)
+        _record_llm_span(_llm_start, _llm_attributes(), stream_usage)
 
         tool_calls = tool_calls_list if tool_calls_list else []
 
@@ -1101,7 +1298,7 @@ class MessageService:
             # The user said no to these at the approval gate: the model gets
             # a rejection result (so the transcript stays valid and it can
             # react), and nothing of them executes.
-            rejected_content = json.dumps({"error": "Rejected by user at the approval gate", "rejected": True})
+            rejected_content = REJECTED_TOOL_RESULT
             for tc in valid_tool_calls:
                 if tc["id"] in rejected_ids:
                     self.db.add(
@@ -1120,7 +1317,7 @@ class MessageService:
 
         await chat_steering.refresh_chat_lock(chat_id)  # heartbeat at the round boundary
         if await chat_steering.consume_interrupt(chat_id):
-            interrupted_result = json.dumps({"error": "Interrupted by operator before execution"})
+            interrupted_result = INTERRUPTED_TOOL_RESULT
             for tc in valid_tool_calls:
                 self.db.add(
                     Message(
@@ -1140,41 +1337,47 @@ class MessageService:
 
         # Deferred calls are split off — they don't execute (and block) here.
         # After the regular tools finish, this generator suspends the round
-        # (deferred_completions checkpoint) and ends, freeing the worker
-        # slot; a resume job continues the conversation when the last
-        # completion lands. Requires a job channel (current_channel_id).
-        # Two kinds today:
-        # - agent delegation in "suspend" mode (issue #90) — completed by
-        #   the child job's terminal handler;
+        # (deferred_completions checkpoint) and ends; a resume job continues
+        # the conversation when the last completion lands. Three kinds:
         # - ask_user (human_input) — completed by the user's answer over
-        #   the API. Always deferred when a channel exists; the
-        #   direct/synchronous path returns an error result instead (see
-        #   execute_single_tool).
+        #   the API;
+        # - run_in_background with wait=true (background_job) — completed
+        #   by the background run;
+        # - agent delegation in "suspend" mode (issue #90) — completed by
+        #   the child job's terminal handler.
+        # The first two always defer, in a queued turn (a job channel) and
+        # in an inline one (a request running the turn itself) alike: their
+        # result arrives from outside the turn, so there is nothing to wait
+        # for here. The inline round's continuation gets a channel of its
+        # own (see the suspend block below). Delegations defer only in a
+        # queued turn: suspend mode exists to free the worker slot a waiting
+        # parent would hold, and an inline turn holds none — it keeps
+        # waiting for the child's reply, so a synchronous caller still gets
+        # one (ADR 2026-10-20-deferred-rounds-in-inline-turns).
         from app.services.delegation import current_channel_id
 
+        job_channel = current_channel_id.get()
         delegate_calls: list[dict[str, Any]] = []
         ask_user_calls: list[dict[str, Any]] = []
         background_calls: list[dict[str, Any]] = []
-        _meta_by_name: dict[str, dict[str, Any]] = {}
-        if current_channel_id.get() is not None:
-            _meta_by_name = (
-                {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools}
-                if tools
-                else {}
-            )
-            suspend_delegates = settings.agent_delegate_mode == "suspend"
-            executable_calls = []
-            for tc in valid_tool_calls:
-                meta = _meta_by_name.get(tc["function"]["name"], {})
-                if suspend_delegates and meta.get("agent_id"):
-                    delegate_calls.append(tc)
-                elif meta.get("deferred_completer") == "human_input":
-                    ask_user_calls.append(tc)
-                elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
-                    background_calls.append(tc)
-                else:
-                    executable_calls.append(tc)
-            valid_tool_calls = executable_calls
+        _meta_by_name: dict[str, dict[str, Any]] = (
+            {t["function"]["name"]: t["function"].get("_metadata", {}) for t in tools}
+            if tools
+            else {}
+        )
+        suspend_delegates = job_channel is not None and settings.agent_delegate_mode == "suspend"
+        executable_calls = []
+        for tc in valid_tool_calls:
+            meta = _meta_by_name.get(tc["function"]["name"], {})
+            if suspend_delegates and meta.get("agent_id"):
+                delegate_calls.append(tc)
+            elif meta.get("deferred_completer") == "human_input":
+                ask_user_calls.append(tc)
+            elif meta.get("deferred_completer") == "background_job" and _wants_deferral(meta, tc):
+                background_calls.append(tc)
+            else:
+                executable_calls.append(tc)
+        valid_tool_calls = executable_calls
 
         parallel_calls = []
         sequential_calls = []
@@ -1347,7 +1550,7 @@ class MessageService:
                         continue
                 meta = _meta_by_name.get(tc["function"]["name"], {})
                 prep = await prepare_agent_delegation(
-                    self.db, user_id, meta.get("agent_id"), args
+                    self.db, user_id, meta.get("agent_id"), args, parent_chat_id=chat_id
                 )
                 if "error" in prep:
                     error_content = json.dumps(prep)
@@ -1491,11 +1694,17 @@ class MessageService:
                 background_jobs.append((tc["id"], job_id, code, description))
 
             if entries:
+                # The channel the round's continuation streams on when it
+                # resumes on its own (a background run finishing, a question
+                # expiring, a sub-agent reporting): a queued turn's own job
+                # channel; for an inline turn, which has none, a fresh one —
+                # recorded as the chat's reconnect channel below.
+                round_channel = job_channel or str(uuid.uuid4())
                 row = await deferred_completions.suspend_round(
                     self.db,
                     chat_id=chat_id,
                     user_id=user_id,
-                    channel_id=current_channel_id.get(),
+                    channel_id=round_channel,
                     entries=entries,
                     conversation_context={
                         "provider": provider,
@@ -1518,6 +1727,13 @@ class MessageService:
                         **current_job_meta.get(),
                     },
                 )
+                if job_channel is None:
+                    await self.db.execute(
+                        update(Chat)
+                        .where(Chat.id == uuid.UUID(str(chat_id)))
+                        .values(active_channel_id=round_channel)
+                    )
+                    await self.db.commit()
                 # Children only after the checkpoint exists — a fast child
                 # must never report against a row that isn't there yet.
                 if prepared:
@@ -1575,6 +1791,7 @@ class MessageService:
                     "type": deferred_completions.ROUND_SUSPENDED,
                     "pending_completion_id": str(row.id),
                     "tool_call_ids": list(entries),
+                    "channel_id": round_channel,
                 }
                 return
             # Every deferred call failed before suspending — fall through to
@@ -1702,43 +1919,55 @@ class MessageService:
         full_content = ""
         tool_calls_list = []
 
-        async for chunk in llm_provider.stream(
-            messages=updated_messages,
-            model=model,
-            tools=clean_tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        ):
-            if chunk.get("content"):
-                if isinstance(chunk["content"], str):
-                    full_content += chunk["content"]
-                else:
-                    chunk["content"] = None
-
-            if chunk.get("tool_calls"):
-                for tc in chunk["tool_calls"]:
-                    accumulate_tool_call_delta(tool_calls_list, tc)
-
-            yield chunk
-
-        # Record follow-up LLM call as a span
-        try:
-            # Summarize: tool results that were fed back to the LLM
-            _tool_summary = tool_summary
-            _labels = json.dumps([f"agent:{agent_label}"]) if agent_label else "[]"
-            _s2 = _tracer.start_span("llm.call", attributes={
+        def _followup_attributes() -> dict[str, Any]:
+            # Input: a summary of the tool results fed back to the LLM
+            return {
                 "gen_ai.request.model": model or "",
                 "gen_ai.system": provider or "",
                 otel_attr("span_type"): "llm",
-                otel_attr("input"): f"Follow-up after tools: {_tool_summary}",
+                otel_attr("input"): f"Follow-up after tools: {tool_summary}",
                 otel_attr("output"): full_content if full_content else "",
                 otel_attr("thread_id"): chat_id,
                 otel_attr("user_id"): user_id,
-                otel_attr("labels"): _labels,
-            })
-            _s2.end()
-        except Exception:
-            pass
+                otel_attr("labels"): json.dumps([f"agent:{agent_label}"]) if agent_label else "[]",
+            }
+
+        _llm_start = time.time_ns()
+        _followup_usage = None
+        try:
+            # A rate limit (or an unavailable model API) here would throw
+            # away every tool call of the turn so far: retried within bounds,
+            # before anything streamed (app/services/llm_retry.py, #131).
+            async for chunk in stream_with_retry(
+                lambda: llm_provider.stream(
+                    messages=updated_messages,
+                    model=model,
+                    tools=clean_tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+                chat_id=chat_id,
+            ):
+                if chunk.get("usage"):
+                    _followup_usage = chunk["usage"]
+
+                if chunk.get("content"):
+                    if isinstance(chunk["content"], str):
+                        full_content += chunk["content"]
+                    else:
+                        chunk["content"] = None
+
+                if chunk.get("tool_calls"):
+                    for tc in chunk["tool_calls"]:
+                        accumulate_tool_call_delta(tool_calls_list, tc)
+
+                yield chunk
+        except Exception as exc:
+            _record_llm_span(_llm_start, _followup_attributes(), _followup_usage, error=exc)
+            raise
+
+        # Record the follow-up LLM call as a span
+        _record_llm_span(_llm_start, _followup_attributes(), _followup_usage)
 
         final_tool_calls = tool_calls_list if tool_calls_list else None
 

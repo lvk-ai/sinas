@@ -383,9 +383,121 @@ def _has_group_rules(provider: IdentityProvider) -> bool:
 
 
 def needs_userinfo(provider: IdentityProvider, claims: dict) -> bool:
-    return claim_values(claims, provider.email_claim) is None or (
-        _has_group_rules(provider) and claim_values(claims, provider.groups_claim) is None
+    return (
+        claim_values(claims, provider.email_claim) is None
+        or (_has_group_rules(provider) and claim_values(claims, provider.groups_claim) is None)
+        or any(
+            _lookup(claims, str(m.get("claim") or "").split(".")) is _MISSING
+            for m in provider.claim_mappings or []
+        )
     )
+
+
+# ------------------------------------------------------------------ claim mappings
+
+# A copied string longer than this, or a list longer than MAX_CLAIM_ITEMS, is
+# not copied (never cut: a cut value is a wrong value).
+MAX_CLAIM_VALUE_LENGTH = 1024
+MAX_CLAIM_ITEMS = 50
+_SCALAR = (str, int, float, bool)
+
+
+def mapped_claim_value(claims: dict, path: str) -> Any:
+    """The value a claim mapping copies: a string, number or boolean; a list
+    of them (a one-item list as its item, so a single `organization` in a
+    list claim reads as that organization). None — the field is removed —
+    when the claim is absent, empty, an object, or too long."""
+    found = _lookup(claims, path.split("."))
+    if found is _MISSING or found is None:
+        return None
+    if isinstance(found, list):
+        if not found or len(found) > MAX_CLAIM_ITEMS or not all(isinstance(v, _SCALAR) for v in found):
+            return None
+        items = [_scalar(v) for v in found]
+        if any(v is None for v in items):
+            return None
+        return items[0] if len(items) == 1 else items
+    return _scalar(found) if isinstance(found, _SCALAR) else None
+
+
+def _scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value and len(value) <= MAX_CLAIM_VALUE_LENGTH else None
+    return value
+
+
+def session_context(provider: IdentityProvider, claims: dict) -> dict[str, Any]:
+    """The session context this login's `target: session` claim mappings
+    give: each mapped claim's value (a string, number or boolean; a one-item
+    list as its item), for the tokens of this login only."""
+    from app.providers.attribution import validate_context
+
+    context: dict[str, Any] = {}
+    for mapping in provider.claim_mappings or []:
+        if mapping.get("target") != "session" or not mapping.get("claim") or not mapping.get("field"):
+            continue
+        value = mapped_claim_value(claims, mapping["claim"])
+        found = _lookup(claims, mapping["claim"].split("."))
+        present = found is not _MISSING and not (found is None or (isinstance(found, (str, list)) and not found))
+        if value is None and present:
+            # Sent, but not as a usable value (an object, an overlong string):
+            # refused like an invalid one, never read as absent.
+            raise SsoError(
+                f"{provider.display_name} sent {mapping['claim']}, which says what this session "
+                "is for, in a form Sinas can't use."
+            )
+        if isinstance(value, list):
+            raise SsoError(
+                f"{provider.display_name} sent several values for {mapping['claim']}, which says "
+                "what this session is for; it must be one."
+            )
+        if value is not None:
+            context[mapping["field"]] = value
+    # A value that can't be a context is refused, never dropped: dropping it
+    # would sign the session in for no organization, or another one.
+    try:
+        return validate_context(context)
+    except ValueError as e:
+        raise SsoError(f"{provider.display_name} sent a session claim Sinas can't use: {e}")
+
+
+def sync_custom_fields(
+    user: User, provider: IdentityProvider, claims: dict, previous: Optional[dict] = None
+) -> dict[str, Any]:
+    """Make the custom fields this provider maps match the claims of this login.
+
+    A mapped field is the identity provider's: set to the claim's value, and
+    removed when the claim is absent, so a value the IdP no longer sends
+    doesn't linger. Fields no mapping names are never touched, whoever set
+    them (an admin, token exchange). A field this provider set at its last
+    login (`previous`, kept on the identity) whose mapping was removed since
+    is removed too, unless its value changed since (then someone else owns
+    it now). Returns what this login set, to keep as the next `previous`."""
+    mappings = [
+        m for m in provider.claim_mappings or []
+        if m.get("claim") and m.get("field") and m.get("target") != "session"
+    ]
+    if not mappings and not previous:
+        return {}
+    current = dict(user.custom_fields or {})
+    fields = dict(current)
+    now: dict[str, Any] = {}
+    for mapping in mappings:
+        value = mapped_claim_value(claims, mapping["claim"])
+        if value is None:
+            fields.pop(mapping["field"], None)
+        else:
+            fields[mapping["field"]] = now[mapping["field"]] = value
+    mapped = {m["field"] for m in mappings}
+    for field, value in (previous or {}).items():
+        if field not in mapped and field in fields and fields[field] == value:
+            del fields[field]
+    if fields != current:
+        user.custom_fields = fields
+        changed = sorted(k for k in set(fields) | set(current) if fields.get(k) != current.get(k))
+        logger.info(f"SSO {provider.name}: custom fields of user {user.id} synced: {changed}")
+    return now
 
 
 # ------------------------------------------------------------------ who signs in
@@ -398,6 +510,8 @@ class SignIn:
     linked_by_email: bool = False
     roles_added: list[str] = field(default_factory=list)
     roles_removed: list[str] = field(default_factory=list)
+    # The session context of this login (session claim mappings).
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 def is_superadmin(email: Optional[str]) -> bool:
@@ -488,6 +602,17 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
                     # Given once, like a role granted by hand: no sync takes it away.
                     db.add(UserRole(role_id=role.id, user_id=user.id, active=True))
 
+    previous_metadata = (
+        await db.execute(
+            select(UserIdentity.identity_metadata).where(
+                UserIdentity.provider == issuer, UserIdentity.subject == subject
+            )
+        )
+    ).scalar_one_or_none() or {}
+    previous_fields = previous_metadata.get("claim_fields") if isinstance(previous_metadata, dict) else None
+    claim_fields = sync_custom_fields(
+        user, provider, claims, previous_fields if isinstance(previous_fields, dict) else None
+    )
     await link_user_identity(
         db, user, issuer, subject,
         {
@@ -495,13 +620,23 @@ async def sign_in(db: AsyncSession, provider: IdentityProvider, issuer: str, cla
             "email": email,
             "email_verified": verified,
             **{k: claims[k] for k in ("name", "preferred_username") if isinstance(claims.get(k), str)},
+            # What the claim mappings set at this login (sync_custom_fields).
+            **({"claim_fields": claim_fields} if claim_fields else {}),
         },
     )
     groups = set(claim_values(claims, provider.groups_claim) or [])
     added, removed = await sync_roles(db, user, provider, groups, trusted_domain)
+
+    from app.providers.attribution import membership_problem
+
+    context = session_context(provider, claims)
+    problem = membership_problem(context, user.custom_fields)
+    if problem:
+        raise SsoError(f"{problem}, so {name} can't sign you in for it.")
+
     user.last_login_at = datetime.now(UTC)
     await db.flush()
-    return SignIn(user, provisioned, linked_by_email, added, removed)
+    return SignIn(user, provisioned, linked_by_email, added, removed, context)
 
 
 def mapped_role_names(provider: IdentityProvider, groups: set[str], email_domain: Optional[str]) -> set[str]:
@@ -606,16 +741,19 @@ class RefreshSession:
 
     identity_provider: Optional[str]  # the SSO login that issued it, if any
     expires_at: datetime  # for an SSO session: its hard end
+    context: Optional[dict] = None  # the session's attribution context
 
 
 async def refresh_session(db: AsyncSession, plain_token: str) -> Optional[RefreshSession]:
     token_hash = hashlib.sha256(plain_token.encode()).hexdigest()
     row = (
         await db.execute(
-            select(RefreshToken.identity_provider, RefreshToken.expires_at).where(RefreshToken.token_hash == token_hash)
+            select(RefreshToken.identity_provider, RefreshToken.expires_at, RefreshToken.context).where(
+                RefreshToken.token_hash == token_hash
+            )
         )
     ).first()
-    return RefreshSession(row[0], row[1]) if row else None
+    return RefreshSession(row[0], row[1], row[2]) if row else None
 
 
 async def refresh_blocked(db: AsyncSession, email: str, session: Optional[RefreshSession]) -> Optional[str]:
@@ -673,13 +811,18 @@ async def consume_state(key: str) -> Optional[LoginState]:
         return None
 
 
-async def store_code(*, user_id: str, provider: str, session_hours: int, console_challenge: str, return_to: str) -> str:
+async def store_code(
+    *, user_id: str, provider: str, session_hours: int, console_challenge: str, return_to: str,
+    context: Optional[dict] = None,
+) -> str:
     """The one-time code the console trades for tokens. Only who signed in
-    is kept; the tokens are minted at the exchange."""
+    (and the session context of the login) is kept; the tokens are minted at
+    the exchange."""
     code = secrets.token_urlsafe(32)
     payload = {
         "user_id": user_id, "provider": provider, "session_hours": session_hours,
         "console_challenge": console_challenge, "return_to": return_to,
+        "context": context or None,
     }
     await (await get_redis()).set(_CODE_PREFIX + code, json.dumps(payload), ex=CODE_TTL_SECONDS)
     return code

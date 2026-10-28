@@ -35,7 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult, ResultStatus
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable, ResultStatus, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -244,15 +244,18 @@ class K8sSharedTrustedExecutor:
         )
         from app.services.shared_worker_manager import shared_worker_manager
 
-        result = await db.execute(
-            select(Function).where(
-                Function.namespace == function_namespace,
-                Function.name == function_name,
-                Function.is_active == True,
-                Function.shared_pool == True,
+        async with before_run("Loading the function"):
+            result = await db.execute(
+                select(Function).where(
+                    Function.namespace == function_namespace,
+                    Function.name == function_name,
+                    Function.is_active == True,
+                    Function.shared_pool == True,
+                )
             )
-        )
-        function = result.scalar_one_or_none()
+            function = result.scalar_one_or_none()
+        async with before_run("Loading secrets"):
+            secrets = await shared_worker_manager._load_secrets(db, user_id)
         if not function:
             return ExecutionResult.failed(
                 f"Function {function_namespace}/{function_name} not found "
@@ -277,7 +280,7 @@ class K8sSharedTrustedExecutor:
                 "trigger_type": trigger_type,
                 "chat_id": chat_id,
                 # Same trusted-context secrets the Docker shared workers get
-                "secrets": await shared_worker_manager._load_secrets(db, user_id),
+                "secrets": secrets,
             },
         }
 
@@ -285,11 +288,13 @@ class K8sSharedTrustedExecutor:
         names = _pod_names()
         start = next(_rr)
         last_error: Exception | None = None
+        dispatched = False
         for i in range(len(names)):
             name = names[(start + i) % len(names)]
             try:
                 if not await asyncio.to_thread(_pod_ready_blocking, name, namespace):
                     await _ensure_pod(db, name, namespace)
+                dispatched = True
                 wire = await run_payload_in_pod(
                     name, namespace, payload, effective_timeout
                 )
@@ -309,6 +314,10 @@ class K8sSharedTrustedExecutor:
                     name,
                     e,
                 )
+        if not dispatched:
+            # No pod ever got the payload (none ready, recreate failed), so
+            # the code never ran: the queue may retry it.
+            raise ExecutorUnavailable(f"No trusted worker pod available: {last_error}")
         return ExecutionResult.failed(
             f"All trusted worker pods failed: {last_error}"
         )

@@ -617,6 +617,32 @@ function UserProfileModal({ user, onClose }: { user: any; onClose: () => void })
           </div>
           <p className="text-sm text-gray-400 mb-6">{user.email}</p>
 
+          {/* Memberships (ATTRIBUTION_MEMBERSHIPS): the session contexts the user may hold */}
+          {detail?.memberships && Object.keys(detail.memberships).length > 0 && (
+            <div className="mb-6">
+              <h3 className="text-sm font-medium text-gray-300 mb-1">Memberships</h3>
+              <p className="text-xs text-gray-500 mb-2">
+                The values a session or API key may carry as its attribution context, from the user's custom fields.
+              </p>
+              <div className="space-y-1">
+                {Object.entries(detail.memberships as Record<string, unknown[]>).map(([field, values]) => (
+                  <div key={field} className="flex flex-wrap items-center gap-1 text-xs">
+                    <span className="font-mono text-gray-400 mr-1">{field}</span>
+                    {values.length === 0 ? (
+                      <span className="text-gray-500">none</span>
+                    ) : (
+                      values.map((v) => (
+                        <span key={String(v)} className="px-2 py-0.5 bg-surface-2 text-gray-300 rounded font-mono">
+                          {String(v)}
+                        </span>
+                      ))
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Custom fields */}
           <div className="mb-8">
             <div className="flex items-center justify-between mb-2">

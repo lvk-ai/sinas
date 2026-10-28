@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from app.models.identity_provider import IdentityProvider
 from app.models.user import Role
-from app.schemas.spec.identity_provider import IdentityProviderSpec, RoleMappingSpec
+from app.schemas.spec.identity_provider import ClaimMappingSpec, IdentityProviderSpec, RoleMappingSpec
 from app.services.resources.base import ApplyContext, ReferenceNotFound, ResourceApplier
 
 
@@ -68,6 +68,13 @@ class IdentityProviderApplier(ResourceApplier[IdentityProviderSpec]):
                 )
                 for rule in row.role_mappings or []
             ],
+            claim_mappings=[
+                ClaimMappingSpec.model_construct(
+                    claim=m.get("claim"), field=m.get("field"),
+                    target=m.get("target") if m.get("target") == "session" else None,
+                )
+                for m in row.claim_mappings or []
+            ],
             allowed_domains=list(row.allowed_domains or []),
             auto_provision=bool(row.auto_provision),
             default_role=row.default_role or None,
@@ -90,6 +97,7 @@ class IdentityProviderApplier(ResourceApplier[IdentityProviderSpec]):
         row.email_claim = spec.email_claim
         row.groups_claim = spec.groups_claim
         row.role_mappings = [rule.model_dump(mode="json") for rule in spec.role_mappings]
+        row.claim_mappings = [m.model_dump(mode="json", exclude_none=True) for m in spec.claim_mappings]
         row.allowed_domains = list(spec.allowed_domains)
         row.auto_provision = spec.auto_provision
         row.default_role = spec.default_role

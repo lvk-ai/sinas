@@ -14,6 +14,7 @@ context with no SDK installed. A pure ASGI middleware rather than
 from collections.abc import Iterable
 
 from opentelemetry import context as otel_context
+from opentelemetry import trace
 from opentelemetry.propagate import extract
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -46,7 +47,12 @@ class TraceContextMiddleware:
             await self.app(scope, receive, send)
             return
         carrier = _carrier(scope.get("headers") or [])
-        if not carrier:
+        if not carrier or trace.get_current_span().get_span_context().is_valid:
+            # Nothing to adopt, or already adopted: with telemetry on,
+            # FastAPI's native tracing has extracted the same headers, trace
+            # and baggage, and made its request span (a child of the
+            # caller's) current. Attaching the caller's context again would
+            # hide that span from everything recorded while serving.
             await self.app(scope, receive, send)
             return
         token = otel_context.attach(extract(carrier))

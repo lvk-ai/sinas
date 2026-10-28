@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.executor.base import ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -439,14 +440,15 @@ class ContainerPool:
         # Fetch function code
         from app.models.function import Function
 
-        result = await db.execute(
-            select(Function).where(
-                Function.namespace == function_namespace,
-                Function.name == function_name,
-                Function.is_active == True,
+        async with before_run("Loading the function"):
+            result = await db.execute(
+                select(Function).where(
+                    Function.namespace == function_namespace,
+                    Function.name == function_name,
+                    Function.is_active == True,
+                )
             )
-        )
-        function = result.scalar_one_or_none()
+            function = result.scalar_one_or_none()
 
         if not function:
             return {
@@ -454,9 +456,13 @@ class ContainerPool:
                 "error": f"Function {function_namespace}/{function_name} not found",
             }
 
-        # Acquire a container
+        # Acquire a container. Failing here means the code never ran, so the
+        # queue may retry it (ExecutorUnavailable).
         acquire_start = time.time()
-        pc = await self.acquire()
+        try:
+            pc = await self.acquire()
+        except TimeoutError as e:
+            raise ExecutorUnavailable(str(e)) from e
         acquire_elapsed = time.time() - acquire_start
         logger.info(
             f"Acquired sandbox container {pc.name} in {acquire_elapsed:.3f}s "
@@ -504,7 +510,11 @@ class ContainerPool:
                 container.id,
                 [
                     "python3", "-c",
-                    f'import sys; open("{request_path}","wb").write(sys.stdin.buffer.read())',
+                    # A result file left by an earlier run of this execution
+                    # id (a retry, a DLQ requeue) would be read as this run's.
+                    f'import os, sys\n'
+                    f'if os.path.exists("{result_file}"): os.remove("{result_file}")\n'
+                    f'open("{request_path}","wb").write(sys.stdin.buffer.read())',
                 ],
                 stdin=True,
                 stdout=True,

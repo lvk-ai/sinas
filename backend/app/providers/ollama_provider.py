@@ -7,7 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from .base import BaseLLMProvider
-from .clients import shared_client
+from .clients import guard_trace_context, shared_client
 
 
 class OllamaProvider(BaseLLMProvider):
@@ -21,7 +21,9 @@ class OllamaProvider(BaseLLMProvider):
 
     def _http(self):
         """The shared HTTP client, in a context that leaves it open."""
-        return nullcontext(shared_client(("ollama",), lambda: httpx.AsyncClient(timeout=300.0)))
+        return nullcontext(
+            shared_client(("ollama",), lambda: guard_trace_context(httpx.AsyncClient(timeout=300.0)))
+        )
 
     async def complete(
         self,
@@ -51,7 +53,7 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             response = await client.post(
-                f"{self.base_url}/api/chat", json=payload, headers=self._context_headers()
+                f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             )
 
             # Debug logging
@@ -75,7 +77,8 @@ class OllamaProvider(BaseLLMProvider):
                 "content": content,
                 "tool_calls": None,
                 "usage": self.extract_usage(data),
-                "finish_reason": "stop",  # Ollama doesn't always provide this
+                # done_reason: "stop", "length", ...; older Ollamas send none
+                "finish_reason": data.get("done_reason") or "stop",
             }
 
             if tool_calls_data:
@@ -110,8 +113,13 @@ class OllamaProvider(BaseLLMProvider):
                 payload["tools"] = self._convert_tools_to_ollama_format(tools)
 
             async with client.stream(
-                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._context_headers()
+                "POST", f"{self.base_url}/api/chat", json=payload, headers=self._request_headers()
             ) as response:
+                if response.is_error:
+                    # Read the body first: the error raised next carries the
+                    # response, and classifying it (a gateway's budget
+                    # refusal, app/providers/errors.py) needs the body.
+                    await response.aread()
                 response.raise_for_status()
 
                 async for line in response.aiter_lines():
@@ -128,7 +136,7 @@ class OllamaProvider(BaseLLMProvider):
                         result = {
                             "content": content if content else None,
                             "tool_calls": None,
-                            "finish_reason": "stop" if done else None,
+                            "finish_reason": (data.get("done_reason") or "stop") if done else None,
                         }
 
                         # Thinking models (with thinking on) send it apart

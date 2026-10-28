@@ -55,6 +55,9 @@ ROUND_SUSPENDED = "round_suspended"
 # Event types after which the enclosing agent job must NOT publish "done" /
 # terminate — a resume job owns the rest of the conversation.
 SUSPENSION_EVENT_TYPES = frozenset({ROUND_SUSPENDED, "delegation_pending"})
+# Published on a suspended round's channel when the round resumes on another
+# one ({"type": ROUND_MOVED, "channel_id": <new>}): stream relays follow it.
+ROUND_MOVED = "round_moved"
 
 SUB_AGENT = "sub_agent"
 HUMAN_INPUT = "human_input"
@@ -335,6 +338,20 @@ async def complete(
     except Exception:
         logger.debug("Could not publish deferred tool_end to %s", channel_id)
 
+    if is_last and resume_channel != channel_id:
+        # The round continues on another channel (an answer's fresh one):
+        # tell whoever still reads the round's own channel — a stream kept
+        # open on a round that also waited on background work — to move
+        # over, rather than wait for a reply that will never arrive here.
+        try:
+            from app.services.stream_relay import stream_relay
+
+            await stream_relay.publish(
+                channel_id, {"type": ROUND_MOVED, "channel_id": resume_channel}
+            )
+        except Exception:
+            logger.debug("Could not announce the resume channel on %s", channel_id)
+
     if not is_last:
         return {"status": "completed", "resumed": False}
 
@@ -413,6 +430,9 @@ async def list_pending_inputs(db, chat_id: str) -> list[dict[str, Any]]:
         select(PendingCompletion)
         .where(PendingCompletion.chat_id == chat_id)
         .order_by(PendingCompletion.created_at)
+        # complete() resolves entries in its own session: a row this session
+        # loaded before must be re-read, not served from its identity map.
+        .execution_options(populate_existing=True)
     )
     out: list[dict[str, Any]] = []
     for row in result.scalars().all():
@@ -442,8 +462,8 @@ async def expire_due(now: Optional[datetime] = None) -> int:
       will fail with auth errors the model can report.
     - Pending tool approvals: still-unanswered rows past their deadline are
       auto-rejected (approved=False), same terminal state as a user
-      rejection; the transcript repair in conversation_history covers the
-      never-executed calls on the next turn.
+      rejection. Expiring the last open ask of a round resumes it, so the
+      expired calls get a rejection result the model can react to.
 
     Runs from the worker cron sweep. Safe to run concurrently: `complete()`
     locks per row, and an entry that lands in between is skipped.
@@ -519,13 +539,11 @@ async def expire_due(now: Optional[datetime] = None) -> int:
             .with_for_update(skip_locked=True)
         )
         expired = result.scalars().all()
-        # Expiring the last open ask of a round the user partly approved
-        # resumes it: the approved calls run, the expired ones are answered
-        # as rejected. The resume is queued BEFORE the rows are recorded as
-        # rejected, so a queue failure leaves them for the next sweep to
-        # retry instead of stranding work the user approved. (A round with
-        # nothing approved just stays rejected: the repair on the next turn
-        # covers it, as before.)
+        # Expiring the last open ask of a round resumes it: the approved
+        # calls run, the expired (and rejected) ones are answered as
+        # rejected, and the model reacts. The resume is queued BEFORE the
+        # rows are recorded as rejected, so a queue failure leaves them for
+        # the next sweep to retry instead of stranding the round.
         from app.core.auth import bind_api_key, reset_api_key
 
         failed_rounds: set = set()
@@ -535,7 +553,7 @@ async def expire_due(now: Optional[datetime] = None) -> int:
             if round_id in queued_rounds or round_id in failed_rounds:
                 continue
             decision = await approval_rules.round_decision(db, approval)
-            if not decision or not decision["approved_ids"]:
+            if not decision:
                 continue
             chat = await db.get(Chat, approval.chat_id)
             if chat is None:
@@ -550,7 +568,7 @@ async def expire_due(now: Optional[datetime] = None) -> int:
                     user_id=str(approval.user_id),
                     user_token="",
                     pending_approval_id=str(approval.id),
-                    approved=True,
+                    approved=bool(decision["approved_ids"]),
                     channel_id=approval_rules.round_channel_id(approval),
                     agent=f"{chat.agent_namespace}/{chat.agent_name}" if chat.agent_name else None,
                     rejected_tool_call_ids=decision["rejected_ids"],

@@ -233,6 +233,26 @@ scheduling:
 ## Backend (FastAPI)
 backend:
   replicas: 1
+  ## Proxies trusted to report the client IP (FORWARDED_ALLOW_IPS), which IP
+  ## rate limits and request logs use. uvicorn takes the client from
+  ## X-Forwarded-For only on a connection from one of these (IPs or CIDRs),
+  ## walking the header right to left to the first address not listed. The
+  ## backend Service is ClusterIP, reached through the ingress controller, so
+  ## the default trusts the private ranges pod and node IPs come from.
+  ##   - Narrow it to your ingress controller's pod CIDR when clients
+  ##     themselves have private addresses (internal deployments): a trusted
+  ##     client could otherwise put any address in front of its own.
+  ##   - Never "*": uvicorn then believes the leftmost, client-supplied entry.
+  ##   - Empty = 127.0.0.1 only, i.e. X-Forwarded-For is ignored.
+  ## The ingress must see the real client IP itself, e.g. its LoadBalancer
+  ## Service with externalTrafficPolicy: Local (or PROXY protocol); otherwise
+  ## every client arrives as a node IP and shares one rate-limit bucket.
+  forwardedAllowIps:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - fc00::/7
   resources:
     requests:
       cpu: "300m"
@@ -343,6 +363,50 @@ jwt:
   ## iss / aud claims on RS256 tokens; issuer defaults to the instance URL.
   issuer: ""
   audience: ""
+
+## OpenTelemetry: traces (and optionally logs) to any OTLP backend, several at
+## once. Off by default; nothing is installed in the services while off.
+## Docs: Admin > Observability. Every service gets the same settings and tags
+## its telemetry with its own sinas.process (backend, queue-agent, ...).
+otel:
+  enabled: false
+  ## service.name; "{process}" is replaced, e.g. "sinas-{process}". "" = "sinas".
+  serviceName: ""
+  ## OTEL_RESOURCE_ATTRIBUTES, e.g. "deployment.environment=production"
+  resourceAttributes: ""
+  ## OTEL_TRACES_SAMPLER / _ARG, e.g. parentbased_traceidratio / "0.25".
+  ## "" = the SDK default (parentbased_always_on).
+  sampler: ""
+  samplerArg: ""
+  ## Named exporters (OTEL_EXPORTERS). Each: name, endpoint (OTLP base URL,
+  ## or a full .../v1/traces URL; host:port for grpc), protocol
+  ## (http/protobuf | grpc), preset (genai | langfuse | langwatch | none),
+  ## spans (all | sinas), signals ([traces] / [traces, logs]), timeout (s),
+  ## compression (gzip), insecure (grpc).
+  ## headersSecret: credentials from an existing Secret, whose key holds
+  ## "name=value,name2=value2"; becomes OTEL_EXPORTER_<NAME>_HEADERS.
+  exporters: []
+  #  - name: langfuse
+  #    endpoint: https://cloud.langfuse.com/api/public/otel
+  #    preset: langfuse
+  #    headersSecret:
+  #      name: langfuse-otel
+  #      key: headers
+  #  - name: collector
+  #    endpoint: http://otel-collector.observability:4318
+  #    preset: none
+  #    signals: [traces, logs]
+  ## A collector in another namespace also needs
+  ## networkPolicy.egressNamespaces (e.g. namespace: observability,
+  ## ports: [4318]), or exports time out.
+  logs:
+    ## Python logging -> OTLP logs, to the exporters with the logs signal.
+    enabled: false
+    level: INFO
+  ## Trace context on outgoing webhook/connector/MCP calls:
+  ## none | tracecontext | all. LLM provider calls follow each provider's
+  ## own propagate_context setting.
+  httpClientPropagation: none
 
 ## Extra environment variables appended to every sinas service (backend,
 ## queue workers, scheduler, cdc-worker). Any backend Settings knob

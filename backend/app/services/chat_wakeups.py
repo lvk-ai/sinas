@@ -518,7 +518,7 @@ async def start_background_job(
     checkpoint entry (the round suspended on it)."""
     from app.core.auth import current_api_key_id
     from app.core.redis import get_arq_pool, get_redis
-    from app.core.telemetry import inject_trace_context
+    from app.core.telemetry import inject_job_context
 
     if not settings.code_execution_enabled:
         return {"error": "Code execution is disabled on this deployment."}
@@ -543,7 +543,7 @@ async def start_background_job(
         "execute_background_code_job",
         job_id=job_id, chat_id=chat_id, user_id=user_id, code=code, description=description,
         tool_call_id=tool_call_id, pending_completion_id=pending_completion_id,
-        api_key_id=current_api_key_id(), trace_context=inject_trace_context(),
+        api_key_id=current_api_key_id(), trace_context=inject_job_context(),
         # Timed by the function's own arq timeout (WorkerSettings): arq's
         # enqueue_job takes no per-job timeout.
         _job_id=job_id, _queue_name=BACKGROUND_QUEUE,
@@ -650,6 +650,12 @@ async def run_background_code_job(
             logger.exception("Background job %s crashed", job_id)
             result = {"error": str(e)}
             status = "failed"
+        if status == "failed":
+            from opentelemetry import trace
+
+            from app.core.telemetry import mark_error
+
+            mark_error(trace.get_current_span(), f"Background run failed: {result.get('error')}", "job_failed")
         await report(status, result)
     finally:
         reset_api_key(key_token)
@@ -780,15 +786,15 @@ async def execute_background_tool(db, chat: Chat, user_id: str, tool_name: str, 
         return {"error": "Background tools need a chat"}
     if tool_name == RUN_IN_BACKGROUND:
         if arguments.get("wait"):
-            # Reaching the inline executor with wait=true means the round
-            # could not suspend (no job channel: an inline stream or a
-            # synchronous send). Say so rather than returning a handle the
-            # model did not ask for.
+            # Every chat tool round splits a waited-on run off and suspends
+            # on it (message_service), queued or inline; only a caller
+            # outside a chat tool round gets here. Say so rather than
+            # returning a handle the model did not ask for.
             return {
                 "error": (
-                    "wait=true needs a queued turn (a chat created with keep_alive: true); "
-                    "this turn runs inline. Call again with wait=false and you will be "
-                    "sent the result, or poll background_job_status."
+                    "wait=true can only be used in a chat turn, which suspends until "
+                    "the run finishes. Call again with wait=false and you will be sent "
+                    "the result, or poll background_job_status."
                 )
             }
         return await start_background_job(

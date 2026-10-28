@@ -192,6 +192,11 @@ class APIKey(Base, PermissionMixin):
     created_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
     revoked_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     revoked_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.id"))
+    # Attribution context (app/providers/attribution.py): copied from the
+    # session that created the key, or set by an admin holding
+    # sinas.api_keys.assign_context:all (the only ones who may change it).
+    # Requests made with the key carry it.
+    context: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="api_keys", foreign_keys=[user_id])
@@ -246,6 +251,9 @@ class RefreshToken(Base):
     # or token exchange). Its lifetime is capped at that provider's
     # session_hours.
     identity_provider: Mapped[Optional[str]] = mapped_column(String(100))
+    # The session's attribution context (token exchange `context`, or an SSO
+    # login's session claims): every access token it mints carries it.
+    context: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # Relationships
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])

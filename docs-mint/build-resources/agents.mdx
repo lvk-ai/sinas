@@ -27,8 +27,10 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `enabled_queries` | Database queries available as tools. Supports wildcards. |
 | `query_parameters` | Default query parameter values |
 | `enabled_collections` | File collections the agent can access. Plain string (readonly) or `{"collection": "namespace/name", "access": "readonly\|readwrite"}`. Supports wildcards. Readwrite enables write/edit/delete file tools. |
-| `enabled_stores` | Stores the agent can access. List of `{"store": "namespace/name", "access": "readonly"}` or `{"store": "namespace/name", "access": "readwrite"}` |
-| `enabled_connectors` | Connectors available as tools. List of `{"connector": "namespace/name", "operations": [...], "parameters": {"op_name": {"param": "value"}}}`. Parameters support Jinja2 templates and are locked (hidden from LLM). |
+| `enabled_stores` | Stores the agent can access. List of `{"store": "namespace/name", "access": "readonly"}` or `{"store": "namespace/name", "access": "readwrite"}`. Supports wildcards: the entry's access mode applies to every store it matches. |
+| `enabled_components` | Components the agent can show in the chat (one `show_component_*` tool each). Supports wildcards. |
+| `enabled_connectors` | Connectors available as tools. List of `{"connector": "namespace/name", "operations": [...], "parameters": {"op_name": {"param": "value"}}}`. Parameters support Jinja2 templates and are locked (hidden from LLM). Supports wildcards: the entry's operations and parameters apply to every connector it matches. |
+| `enabled_mcp_servers` | [MCP servers](/build-resources/mcp-servers) whose tools the agent gets. `"namespace/name"` or `{"server": "namespace/name", "tools": ["glob", ...]}`. Supports wildcards: the entry's tool globs apply to every server it matches. |
 | `enabled_pipelines` | [Pipelines](/build-resources/pipelines) available as tools — only those marked `asTool`. Supports wildcards. Each becomes one semantic tool whose parameters are the pipeline's `inputSchema`. |
 | `hooks` | Message lifecycle hooks. `{"on_user_message": [...], "on_assistant_message": [...]}` |
 | `system_tools` | Platform capabilities. List of strings or config objects. See [System Tools](#system-tools). |
@@ -36,13 +38,32 @@ Agents are configurable AI assistants. Each agent has an LLM provider, a system 
 | `retention_days` | How long chats with this agent are kept after their last activity before they are archived and deleted: `null` = the deployment default, `0` = keep forever (`"never"` in config), `N` = N days. Only applies when the operator has switched [chat retention](/admin/chat-retention) on. Changing it takes `sinas.retention.update:all`. Config key: `retentionDays`. |
 | `icon` | Icon reference (see [Icons](#icons)) |
 
-**Wildcard patterns** for `enabled_*` fields:
+**Wildcard patterns** work in every `enabled_*` field:
 
 | Pattern | Matches |
 |---|---|
 | `namespace/name` | Exact resource |
 | `namespace/*` | All active resources in that namespace |
 | `*/*` | All active resources |
+
+Only a whole name is a wildcard. Anything else with a `*` in it (`*/name`, `sales/send_*`) is refused when the agent is saved, through the API or config apply, as is a `*` where exactly one thing must be named: a hook's `function`, or a key of `function_parameters` / `query_parameters`.
+
+A named resource (`namespace/name`) is the agent author's grant and is offered to every user of the agent. A wildcard is a blanket that also sweeps in resources created later, by anyone, so it only ever expands to the resources **the chat's user may use themselves** (skills excepted):
+
+| Field | A wildcard reaches the resources the user has |
+|---|---|
+| `enabled_functions` | `sinas.functions/{ns}/{name}.execute` (`:own` for their own functions) |
+| `enabled_queries` | `sinas.queries/{ns}/{name}.execute:own` |
+| `enabled_pipelines` | `sinas.pipelines/{ns}/{name}.run:own` |
+| `enabled_agents` | `sinas.agents/{ns}/{name}.read:own` (as named agents) |
+| `enabled_skills` | no permission: skills are instructions, and an enabled skill is the author's grant, named or through a pattern (every matching skill) |
+| `enabled_components` | read access to the component (own, shared or public with `:own`) |
+| `enabled_connectors` | read access to the connector (what running an operation through the API takes) |
+| `enabled_mcp_servers` | read access to the server (as named servers) |
+| `enabled_stores` | `sinas.stores/{ns}/{name}.read_state:own`; read-write only with `.write_state:own` too |
+| `enabled_collections` | `sinas.collections/{ns}/{name}.download:own`; read-write only with `.upload:own` too |
+
+Entries that carry settings carry them to every resource a wildcard matches: a store or collection entry's `access`, a connector entry's `operations` and `parameters`, an MCP binding's `tools`. When several entries match one resource, the most specific decides (`namespace/name` over `namespace/*` over `*/*`), so a named entry can narrow what a wildcard gives one resource; equally specific entries combine (read-write if any says so; the union of operations or tool globs).
 
 ```yaml
 enabledFunctions:
@@ -59,9 +80,19 @@ enabledMcpServers:
 enabledCollections:
   - collection: "docs/*"
     access: readonly
+enabledComponents:
+  - ui/*             # every component in ui the user may read
+enabledConnectors:
+  - connector: "apis/*"
+    operations: [get_status]   # this operation, on every matching connector
+enabledStores:
+  - store: "crm/*"
+    access: readwrite          # read-write where the user may write states
+  - store: crm/archive
+    access: readonly           # the named entry decides for this store
 ```
 
-Wildcards expand at tool discovery time. The resolved tools are validated against user permissions at execution time.
+Wildcards expand at tool discovery time, and every call is checked again at execution time against the agent's current list and the user's permissions, so a call can't reach anything discovery would not have offered.
 
 **Message hooks:** Functions that run before/after agent messages. Each hook has:
 - `function`: reference to a function (`namespace/name`)
@@ -110,6 +141,8 @@ POST   /chats/{id}/messages                          # Send message
 POST   /chats/{id}/messages/stream                   # Send message (SSE streaming)
 GET    /chats/{id}/stream/{channel_id}               # Reconnect to active stream
 POST   /chats/{id}/approve-tool/{tool_call_id}       # Approve/reject a tool call
+GET    /chats/{id}/pending-input                     # Open ask_user questions
+POST   /chats/{id}/pending-input/{tool_call_id}      # Answer one (add "wait": true for the result)
 ```
 
 **Invoke endpoint:** A synchronous request/response alternative to the two-step chat flow. Intended for integrations (Slack, Telegram, webhooks) that need a simple call-and-response.
@@ -162,9 +195,50 @@ curl -X POST https://yourdomain.com/agents/support/helper/invoke \
 - Each call is also an `llm_usage` row, saved before the response is sent, so `/api/v1/usage` reports agree with it right away. `cost_usd` only includes calls whose row was saved. If a row fails to save, or takes more than 10 seconds, that call still counts in `calls` and the token totals (it was made, and the provider bills it), but as unpriced, without its cost. In that rare case the tokens are higher than what `/api/v1/usage` has on record.
 - Not included: calls made by sub-agents this agent delegates to (they run as separate jobs, in their own chats; query `/api/v1/usage/summary?chat_id=…` for those), and background history compaction.
 - `usage` is `null` only if it couldn't be worked out.
-- If the session's chat is already busy with another request, the message is queued into that run and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
+- If the session's chat is already busy with another request, the message is queued into that run, `status` is `injected`, `reply` is empty and `usage` shows 0 calls: the reply's calls are counted on the request that runs them.
+- If the agent waited on a background run (`run_in_background` with `wait: true`) and this request followed it to the reply, `usage` includes the calls made after the run finished. If the request runs out of time before the turn finishes (status `in_progress`), `usage` is `null`: the rest of the turn may already be making calls that can't be counted yet. Calls made after you answer a question are counted on the answer, when it waits for the result (see below).
 
 `POST /chats/{id}/messages` (non-streaming) returns the same `usage` with the reply message.
+
+#### When the agent asks or waits
+
+An agent with `askUser` can stop a turn to ask the user a question, and one with `background` can wait for a background run (`run_in_background` with `wait: true`). The turn's tool round then parks until the answer or the result arrives, without holding a worker. This works however the turn was started. Each entry point says what the turn ended in:
+
+| `status` | Meaning | What to do |
+|---|---|---|
+| `completed` | The final reply is in the response | — |
+| `input_required` | The agent asked a question. The turn waits for the answer. `pending_inputs` lists the open questions (`tool_call_id`, `question`, `options`, `expires_at`) | Answer with `POST /chats/{id}/pending-input/{tool_call_id}` |
+| `in_progress` | The turn goes on without this request: background work outlasted the request's time budget | Follow it on `channel_id` (`GET /chats/{id}/stream/{channel_id}`), or read the chat later |
+| `injected` | The chat was busy, so the message was passed to the turn already running there (or parked on a question or background work). Nothing was answered here | `pending_inputs` and `channel_id` say what that turn waits on |
+
+`POST /agents/{ns}/{name}/invoke` and `POST /chats/{id}/messages` carry `status`, `pending_inputs` and `channel_id`. With `input_required` or `in_progress`, `reply` (or the returned message) holds only what the agent said before it asked or started waiting, which is often nothing. A turn that waits on a background run is followed to its reply within the request: the agent's `default_job_timeout` for invoke, and the chat's job timeout for messages. Only a question, or running out of that time, ends the request early.
+
+```json
+{
+  "status": "input_required",
+  "reply": "",
+  "chat_id": "…",
+  "session_key": "slack:U09ABC123",
+  "pending_inputs": [
+    {"tool_call_id": "call_8f2…", "question": "Which order number?", "options": null, "expires_at": "…"}
+  ],
+  "channel_id": null,
+  "usage": {"calls": 1, "…": "…"}
+}
+```
+
+**Answering.** `POST /chats/{id}/pending-input/{tool_call_id}` with `{"answer": "…"}` makes the answer the question's tool result. If it was the last thing the turn waited for, the turn resumes on a new stream channel. The response is `202` with that `channel_id`, which you follow with `GET /chats/{id}/stream/{channel_id}`. Add `"wait": true` to get the resumed turn's result in the same response instead. That response is `200` and has the invoke shape above: `status`, `reply`, `message`, `pending_inputs`, `channel_id` and the `usage` of the resumed turn. If the agent asks again, it is `input_required` with the new question. Unanswered questions expire after `ASK_USER_TIMEOUT_SECONDS` (24 hours by default). The turn then resumes without an answer, and the agent is told the user didn't respond.
+
+```bash
+curl -X POST https://yourdomain.com/chats/$CHAT_ID/pending-input/call_8f2… \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"answer": "123", "wait": true}'
+# → {"status": "completed", "reply": "Order 123 shipped yesterday.", …}
+```
+
+Sending another message to a chat that waits on a question doesn't answer the question. The message is `injected` and read once the turn resumes. The exception is the [OpenAI-compatible endpoint](/platform/api-overview), which can only send messages: there, the next message in the chat is the answer.
+
+On a stream (`POST /chats/{id}/messages/stream`) the question arrives as an `input_required` event, followed by `round_suspended`, and the stream ends with `done` `{"status": "suspended"}`. A round waiting on a background run keeps the stream open and streams the rest of the turn when the run finishes. If that round also asked a question and you answer it while the stream is open, the stream follows the turn to the channel the answer resumed it on. This is the same for keep-alive and inline chats.
 
 **How chat works:**
 
@@ -208,7 +282,9 @@ curl -X POST https://yourdomain.com/agents/default/default/chats \
 | `limit` | — | Page size, 1–200. Passing `limit` or `cursor` turns on pagination |
 | `cursor` | — | The `X-Next-Cursor` value of the previous page. Pages hold 50 chats unless `limit` says otherwise |
 
-The body is a JSON array of chats either way. Without `limit` or `cursor`, every matching chat is returned in one response, as in earlier versions. That stays supported, but it is slow for accounts with many chats, so new clients should page. When paging, a response that has more chats after it carries the cursor for the next page in the `X-Next-Cursor` header, and the same next page as a relative URL in a `Link: <...>; rel="next"` header. The last page has neither header. Treat the cursor as opaque, and pass the same filters with it. An invalid cursor returns `400`.
+The body is a JSON array of chats either way. Without `limit` or `cursor`, every matching chat is returned in one response, as in earlier versions, up to `CHATS_UNPAGINATED_MAX` (default 10,000). That stays supported, but it is slow for accounts with many chats, so new clients should page. When paging, a response that has more chats after it carries the cursor for the next page in the `X-Next-Cursor` header, and the same next page as a relative URL in a `Link: <...>; rel="next"` header. The last page has neither header. Treat the cursor as opaque, and pass the same filters with it. An invalid cursor returns `400`.
+
+An account with more than `CHATS_UNPAGINATED_MAX` chats gets only the most recently updated that many from an unpaginated request. The response then says so with `X-Truncated: true` and carries the same `X-Next-Cursor` and `Link` headers a page does, and the backend logs a warning. Continue from that cursor as you would from any page; the `Link` URL asks for pages of 200. A response without `X-Truncated` is the complete list.
 
 ```bash
 # First page of 50

@@ -18,7 +18,7 @@ class DatabaseConnection(Base):
 
     id: Mapped[uuid_pk]
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    connection_type: Mapped[str] = mapped_column(String(50), nullable=False)  # postgresql, clickhouse, snowflake
+    connection_type: Mapped[str] = mapped_column(String(50), nullable=False)  # app.schemas.database_connection.SUPPORTED_CONNECTION_TYPES
 
     host: Mapped[str] = mapped_column(String(500), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False)

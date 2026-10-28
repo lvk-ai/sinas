@@ -6,12 +6,15 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import set_permission_used, verify_jwt_or_api_key
 from app.core.database import get_db
+from app.providers.attribution import new_chat_attribution
+from app.providers.errors import JOB_TIMEOUT, LLMError
 from app.core.permissions import check_permission
 from app.models.execution import TriggerType
 from app.models.webhook import Webhook
@@ -200,6 +203,7 @@ async def _execute_agent_webhook(
             title=f"webhook:{webhook.path}",
             session_key=session_key,
             job_timeout=agent.default_job_timeout,
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.flush()
@@ -224,27 +228,56 @@ async def _execute_agent_webhook(
         )
         return JSONResponse({"chat_id": chat_id, "job_id": job_id}, status_code=202)
 
-    # Sync mode: run inline and wait for the reply (same as agent invoke)
+    # Sync mode: run inline and wait for the reply (same as agent invoke,
+    # including following a round that waits on background work and
+    # reporting a turn that waits on the user).
+    from app.services import sync_turns
+
     message_service = MessageService(db)
     timeout = agent.default_job_timeout or settings.function_timeout or 300
+    started = asyncio.get_running_loop().time()
+    from app.services.chat_steering import job_deadline
+
     try:
-        response_message = await asyncio.wait_for(
-            message_service.send_message(
-                chat_id=chat_id,
-                user_id=user_id,
-                user_token=token,
-                content=message,
-            ),
-            timeout=timeout,
-        )
+        # An LLM call's retry never waits past the timeout (app/services/llm_retry.py).
+        with job_deadline(timeout):
+            turn = await asyncio.wait_for(
+                message_service.run_turn(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=token,
+                    content=message,
+                ),
+                timeout=timeout,
+            )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Agent execution timed out")
+        # 504 with the error envelope, like the agent invoke's.
+        raise LLMError(JOB_TIMEOUT, f"Agent execution timed out after {timeout}s")
+    try:
+        outcome = await sync_turns.settle_turn(
+            db,
+            chat_id,
+            status=turn.status,
+            message=turn.message,
+            channel_id=turn.channel_id,
+            usage_parts=[],
+            budget=timeout - (asyncio.get_running_loop().time() - started),
+        )
+    except sync_turns.TurnFailed as e:
+        raise HTTPException(status_code=502, detail=f"The agent's turn failed: {e}")
 
     response = {
         "success": True,
         "chat_id": chat_id,
-        "reply": response_message.content or "",
+        "reply": outcome.reply,
+        "status": outcome.status,
     }
+    if outcome.status != "completed":
+        # The turn waits on the chat owner (ask_user), goes on in the
+        # background, or the message joined a busy turn: say so, and how
+        # to follow it, rather than pass off an empty reply as the answer.
+        response["pending_inputs"] = jsonable_encoder(outcome.pending_inputs)
+        response["channel_id"] = outcome.channel_id
 
     # Cache result for dedup
     if webhook.dedup:
@@ -594,7 +627,9 @@ async def execute_webhook(
 
         return response
 
-    except HTTPException:
+    except (HTTPException, LLMError):
+        # A failed agent turn answers with its code's status and the error
+        # envelope (app/providers/errors.py), like the agent invoke.
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Webhook execution failed: {str(e)}")

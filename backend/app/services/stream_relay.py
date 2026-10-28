@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Optional
 
 from app.core.redis import get_redis
+from app.core.telemetry import untraced
 
 logger = logging.getLogger(__name__)
 
@@ -38,23 +39,51 @@ class StreamRelay:
         redis = await get_redis()
         stream_key = f"{STREAM_PREFIX}{channel_id}"
 
-        entry_id = await redis.xadd(
-            stream_key,
-            {"data": json.dumps(event, default=str)},
-        )
+        # Not traced: called per streamed chunk, it would add two Redis
+        # spans per token to the turn's trace.
+        with untraced():
+            entry_id = await redis.xadd(
+                stream_key,
+                {"data": json.dumps(event, default=str)},
+            )
 
-        # Set TTL on stream key (refresh on each write)
-        await redis.expire(stream_key, ttl or STREAM_TTL)
+            # Set TTL on stream key (refresh on each write)
+            await redis.expire(stream_key, ttl or STREAM_TTL)
 
         return entry_id
 
-    async def publish_done(self, channel_id: str) -> None:
-        """Publish a terminal 'done' event."""
-        await self.publish(channel_id, {"type": "done", "status": "completed"})
+    async def publish_done(self, channel_id: str, usage: Optional[dict[str, Any]] = None) -> None:
+        """Publish a terminal 'done' event. `usage`: the LLM usage of the run
+        that ends here, for an internal subscriber that reports it (the SSE
+        relays rebuild their own `done` payload without it)."""
+        event: dict[str, Any] = {"type": "done", "status": "completed"}
+        if usage is not None:
+            event["usage"] = usage
+        await self.publish(channel_id, event)
 
-    async def publish_error(self, channel_id: str, error: str) -> None:
-        """Publish a terminal 'error' event."""
-        await self.publish(channel_id, {"type": "error", "error": error})
+    async def publish_error(self, channel_id: str, error: str, code: Optional[str] = None) -> None:
+        """Publish a terminal 'error' event; `code` names a refused LLM call
+        (budget_exceeded, rate_limited; app/providers/errors.py)."""
+        event: dict[str, Any] = {"type": "error", "error": error}
+        if code:
+            event["code"] = code
+        await self.publish(channel_id, event)
+
+    async def publish_failure(self, channel_id: str, error: BaseException) -> None:
+        """Publish a terminal 'error' event for a failed turn: the error
+        envelope (`code`, `retryable`, `upstream_status`, ...) of `error`, or
+        `internal_error` for an error that isn't an LLM failure
+        (app/providers/errors.py)."""
+        from app.providers.errors import turn_error
+
+        await self.publish(channel_id, {"type": "error", **turn_error(error).event_fields()})
+
+    async def last_entry_id(self, channel_id: str) -> str:
+        """The id of the channel's newest event ("0" when it has none): a
+        subscription from here sees only what is published after now."""
+        redis = await get_redis()
+        newest = await redis.xrevrange(f"{STREAM_PREFIX}{channel_id}", count=1)
+        return newest[0][0] if newest else "0"
 
     async def subscribe(
         self, channel_id: str, last_id: str = "0", timeout: Optional[int] = None
@@ -79,11 +108,13 @@ class StreamRelay:
 
         while True:
             # XREAD blocks for up to 5 seconds waiting for new entries
-            entries = await redis.xread(
-                {stream_key: last_id},
-                count=100,
-                block=5000,
-            )
+            # (not traced: one span per read for as long as a stream lasts).
+            with untraced():
+                entries = await redis.xread(
+                    {stream_key: last_id},
+                    count=100,
+                    block=5000,
+                )
 
             if not entries:
                 idle_time = time.monotonic() - last_data_at

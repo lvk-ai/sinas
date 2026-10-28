@@ -1,5 +1,10 @@
 # ADR: Deferred tool rounds — one checkpoint, pluggable completers
 
+> Extended by [2026-10-20-deferred-rounds-in-inline-turns.md](2026-10-20-deferred-rounds-in-inline-turns.md):
+> ask_user and waited-on background runs now defer in inline turns too (no
+> job channel), and every entry point reports what the turn ended in. The
+> "synchronous paths get an explanatory error" behavior below is gone.
+
 - **Status:** Accepted
 - **Date:** 2026-09-02
 - **Authors:** Kjeld Oostra (with Claude)

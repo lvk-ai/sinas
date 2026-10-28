@@ -93,6 +93,31 @@ class LLMProviderSpec(SpecModel):
     def _none_is_empty(cls, value: Any) -> Any:
         return {} if value is None else value
 
+    @field_validator("config")
+    @classmethod
+    def _request_settings(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """`headers` (identity header templates, app/providers/attribution.py)
+        and `budget_errors` (budget refusal rules, app/providers/errors.py)
+        are checked like the rest of a spec; other keys are the provider
+        type's own."""
+        from app.providers.attribution import validate_header_templates
+        from app.providers.errors import validate_budget_rules
+
+        out = dict(value)
+        if "headers" in out:
+            headers = validate_header_templates(out["headers"])
+            if headers:
+                out["headers"] = headers
+            else:
+                out.pop("headers")
+        if "budget_errors" in out:
+            rules = validate_budget_rules(out["budget_errors"])
+            if rules:
+                out["budget_errors"] = rules
+            else:
+                out.pop("budget_errors")
+        return out
+
     @field_validator("pricing", "model_aliases")
     @classmethod
     def _model_names(cls, value: dict[str, Any]) -> dict[str, Any]:

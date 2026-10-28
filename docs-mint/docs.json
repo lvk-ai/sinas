@@ -30,6 +30,7 @@
               "platform/verifying-tokens",
               "platform/rbac",
               "platform/api-overview",
+      "platform/errors",
               "platform/async-jobs"
             ]
           },
@@ -82,6 +83,8 @@
               "admin/permissions",
               "admin/system",
               "admin/usage-cost",
+              "admin/llm-gateway-attribution",
+              "admin/observability",
               "admin/chat-retention",
               "admin/config-manager",
               "admin/icons"

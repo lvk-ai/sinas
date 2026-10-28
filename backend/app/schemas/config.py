@@ -113,7 +113,7 @@ class DatabaseConnectionConfig(BaseModel):
     """Database connection configuration"""
 
     name: str
-    connectionType: str  # postgresql, clickhouse, snowflake
+    connectionType: str  # postgresql (checked per resource by DatabaseConnectionSpec)
     host: str
     port: int
     database: str
@@ -162,6 +162,8 @@ class FunctionConfig(BaseModel):
     outputSchema: Optional[dict[str, Any]] = None
     icon: Optional[str] = None
     timeout: Optional[int] = None
+    # Queued runs: retries of the function's own failures (0 = never).
+    maxRetries: Optional[int] = None
     # Unset: a new function gets the default, an existing one keeps its value.
     sharedPool: Optional[bool] = None
     requiresApproval: Optional[bool] = None
@@ -651,6 +653,16 @@ class RoleMappingConfig(BaseModel):
     roles: list[str]
 
 
+class ClaimMappingConfig(BaseModel):
+    """An identity provider's claim mapping: a claim path, the custom field it fills"""
+
+    model_config = {"extra": "forbid"}
+
+    claim: str
+    field: str
+    target: Optional[str] = None  # "user" (default) or "session"
+
+
 class IdentityProviderConfig(BaseModel):
     """OpenID Connect identity provider (see docs/design/oidc-sso.md)"""
 
@@ -665,6 +677,7 @@ class IdentityProviderConfig(BaseModel):
     emailClaim: Optional[str] = None
     groupsClaim: Optional[str] = None
     roleMappings: list[RoleMappingConfig] = Field(default_factory=list)
+    claimMappings: list[ClaimMappingConfig] = Field(default_factory=list)
     allowedDomains: list[str] = Field(default_factory=list)
     autoProvision: bool = False
     defaultRole: Optional[str] = None

@@ -25,6 +25,7 @@ class QueryToolConverter:
         enabled_queries: Optional[list[str]] = None,
         query_parameters: Optional[dict[str, dict[str, Any]]] = None,
         agent_input_context: Optional[dict[str, Any]] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """
         Get queries and convert to OpenAI tools format.
@@ -35,16 +36,21 @@ class QueryToolConverter:
             enabled_queries: List of "namespace/name" strings to include
             query_parameters: Pre-filled parameters with Jinja2 templates
             agent_input_context: Context for rendering Jinja2 templates
+            permissions: The user's effective permissions (looked up if None)
         """
         tools = []
 
         if not enabled_queries:
             return tools
 
-        from app.services.resource_resolver import resolve_resource_refs
-        from app.models.query import Query
+        from app.services.resource_resolver import resolve_resource_refs, user_has
 
-        resolved = await resolve_resource_refs(db, enabled_queries, Query)
+        if permissions is None:
+            permissions = await get_effective_permissions(db, user_id)
+        # A wildcard offers only what the user may execute (execute_query_tool's check)
+        resolved = await resolve_resource_refs(
+            db, enabled_queries, Query, can_access=user_has(user_id, permissions, "queries", "execute")
+        )
 
         for query_ref, query in resolved:
 

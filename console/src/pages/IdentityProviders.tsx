@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Code2, Copy, Edit2, Fingerprint, Lock, Plus, ShieldAlert, Trash2, X } from 'lucide-react';
 import { API_BASE_URL, apiClient, getApiErrorMessage } from '../lib/api';
 import type { IdentityProvider, IdentityProviderCreate, Role, RoleMapping } from '../types';
+import { claimMappingProblems, type ClaimMappingRow } from '../lib/attribution';
 
 // As IdentityProviderSpec.name: it is in the redirect URI, so no renames.
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/;
@@ -128,6 +129,17 @@ export function IdentityProviders() {
                       {provider.role_mappings.map((rule, i) => <li key={i}>{describeRule(rule)}</li>)}
                     </ul>
                   )}
+                  {(provider.claim_mappings ?? []).length > 0 && (
+                    <ul className="text-xs text-gray-400 space-y-0.5">
+                      {(provider.claim_mappings ?? []).map((m, i) => (
+                        <li key={i}>
+                          Claim <span className="font-mono">{m.claim}</span> →{' '}
+                          {m.target === 'session' ? 'session context' : 'custom field'}{' '}
+                          <span className="font-mono">{m.field}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-500">
                     <span>{provider.auto_provision ? 'Creates new users' : 'Existing users only'}</span>
                     {provider.default_role && <span>New users get {provider.default_role}</span>}
@@ -234,6 +246,13 @@ function ProviderModal({
     is_active: provider?.is_active ?? true,
   }));
   const [rules, setRules] = useState<RuleRow[]>(() => toRows(provider?.role_mappings ?? []));
+  const [claims, setClaims] = useState<ClaimMappingRow[]>(() =>
+    (provider?.claim_mappings ?? []).map((m) => ({
+      claim: m.claim,
+      field: m.field,
+      target: m.target === 'session' ? ('session' as const) : ('user' as const),
+    })),
+  );
   const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
 
   const { data: secrets } = useQuery({ queryKey: ['secrets'], queryFn: () => apiClient.listSecrets(), retry: false });
@@ -255,6 +274,12 @@ function ProviderModal({
         // Every rule is complete by now (ruleProblems blocks saving otherwise).
         role_mappings: rules
           .map((r) => (r.kind === 'group' ? { group: r.value.trim(), roles: r.roles } : { email_domain: r.value.trim(), roles: r.roles })),
+        // Complete too (claimProblems blocks saving otherwise).
+        claim_mappings: claims.map((c) => ({
+          claim: c.claim.trim(),
+          field: c.field.trim(),
+          ...(c.target === 'session' ? { target: 'session' as const } : {}),
+        })),
         allowed_domains: splitList(form.allowed_domains),
         enforce_for_domains: splitList(form.enforce_for_domains),
         auto_provision: form.auto_provision,
@@ -282,8 +307,10 @@ function ProviderModal({
     return null;
   });
   const rulesComplete = ruleProblems.every((p) => p === null);
+  const claimProblems = claimMappingProblems(claims);
+  const claimsComplete = claimProblems.every((p) => p === null);
   const canSubmit =
-    rulesComplete &&
+    rulesComplete && claimsComplete &&
     nameValid && form.display_name.trim() !== '' && form.issuer.trim() !== '' && form.client_id.trim() !== '' &&
     Number.isInteger(hours) && hours >= 1 && !save.isPending;
   const redirectUri = provider?.redirect_uri ?? `${API_BASE_URL}/auth/oidc/${form.name || '<name>'}/callback`;
@@ -476,6 +503,78 @@ function ProviderModal({
             </div>
           </div>
 
+          <div className="border-t border-line-soft pt-4">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-medium text-gray-300">Claim mappings</h3>
+              <button
+                type="button"
+                onClick={() => setClaims((cs) => [...cs, { claim: '', field: '', target: 'user' }])}
+                className="btn btn-secondary text-xs flex items-center"
+              >
+                <Plus className="w-3 h-3 mr-1" />
+                Add mapping
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              At each sign-in a claim is copied into the user's custom field, and the field is removed when the claim
+              is gone. Fields no mapping names are never touched. E.g. <span className="font-mono">org_id</span> →{' '}
+              <span className="font-mono">orgId</span>, for attribution and usage per customer. A{' '}
+              <em>session</em> mapping puts the value in that login's session context instead (the organization
+              chosen at sign-in), which the chats it starts are attributed by.
+            </p>
+            <div className="space-y-2">
+              {claims.map((c, i) => (
+                <div key={i} className="p-3 bg-surface-2 rounded space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 min-w-0">
+                      <input
+                        value={c.claim}
+                        onChange={(e) => setClaims((cs) => cs.map((x, j) => (j === i ? { ...x, claim: e.target.value } : x)))}
+                        placeholder="org_id"
+                        className="input font-mono"
+                        aria-label="Claim"
+                      />
+                    </div>
+                    <span className="text-xs text-gray-500">→</span>
+                    <div className="w-36 flex-shrink-0">
+                      <select
+                        value={c.target ?? 'user'}
+                        onChange={(e) =>
+                          setClaims((cs) =>
+                            cs.map((x, j) => (j === i ? { ...x, target: e.target.value as 'user' | 'session' } : x)),
+                          )
+                        }
+                        className="input"
+                        aria-label="Target"
+                      >
+                        <option value="user">custom field</option>
+                        <option value="session">session context</option>
+                      </select>
+                    </div>
+                    <div className="w-40 flex-shrink-0">
+                      <input
+                        value={c.field}
+                        onChange={(e) => setClaims((cs) => cs.map((x, j) => (j === i ? { ...x, field: e.target.value } : x)))}
+                        placeholder="orgId"
+                        className="input font-mono"
+                        aria-label="Custom field"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setClaims((cs) => cs.filter((_, j) => j !== i))}
+                      className="p-2 text-gray-500 hover:text-red-600"
+                      title="Remove mapping"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                  {claimProblems[i] && <p className="text-xs text-red-400">{claimProblems[i]}</p>}
+                </div>
+              ))}
+            </div>
+          </div>
+
           <div className="border-t border-line-soft pt-4 space-y-4">
             <h3 className="text-sm font-medium text-gray-300">Who may sign in</h3>
             <div className="grid grid-cols-2 gap-4">
@@ -540,6 +639,9 @@ function ProviderModal({
 
           {!rulesComplete && (
             <p className="text-sm text-red-400">Complete or remove the role rules marked above to save.</p>
+          )}
+          {!claimsComplete && (
+            <p className="text-sm text-red-400">Complete or remove the claim mappings marked above to save.</p>
           )}
 
           {save.isError && (

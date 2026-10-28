@@ -85,7 +85,15 @@ class TestWorkbenchFence:
         assert found is None
 
     @pytest.mark.asyncio
-    async def test_wildcard_tool_expansion_skips_workbenches(self, db, chat, test_user):
+    async def test_wildcard_tool_expansion_skips_workbenches(self, db, chat, test_user, test_role):
+        # A wildcard only reaches collections the user may download from:
+        # grant every one, workbenches included, so only the fence keeps them out.
+        from app.models.user import RolePermission
+
+        db.add(RolePermission(
+            role_id=test_role.id, permission_key="sinas.collections/*/*.download:own", permission_value=True
+        ))
+        await db.flush()
         await get_or_create_workbench(db, chat)
         await _make_collection(db, test_user, f"real-{uuid.uuid4().hex[:6]}")
 

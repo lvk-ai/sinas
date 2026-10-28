@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.executor.base import ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -706,10 +707,8 @@ class SharedWorkerManager:
                 # attempt re-discovery before giving up.
                 await self._discover_existing_workers()
             if not self.workers:
-                return {
-                    "status": "failed",
-                    "error": "No workers available. Please scale workers up first.",
-                }
+                # Nothing ran: the queue may retry this (ExecutorUnavailable).
+                raise ExecutorUnavailable("No workers available. Please scale workers up first.")
 
             # Round-robin load balancing
             worker_ids = list(self.workers.keys())
@@ -727,20 +726,23 @@ class SharedWorkerManager:
                 logger.warning(f"Worker {container_name} not running (status={container.status}), removing")
                 async with self._lock:
                     self.workers.pop(worker_id, None)
-                return {"status": "failed", "error": f"Worker {container_name} not running"}
+                raise ExecutorUnavailable(f"Worker {container_name} not running")
 
             # Fetch function code from database
             from app.models.function import Function
 
-            result = await db.execute(
-                select(Function).where(
-                    Function.namespace == function_namespace,
-                    Function.name == function_name,
-                    Function.is_active == True,
-                    Function.shared_pool == True,
+            async with before_run("Loading the function"):
+                result = await db.execute(
+                    select(Function).where(
+                        Function.namespace == function_namespace,
+                        Function.name == function_name,
+                        Function.is_active == True,
+                        Function.shared_pool == True,
+                    )
                 )
-            )
-            function = result.scalar_one_or_none()
+                function = result.scalar_one_or_none()
+            async with before_run("Loading secrets"):
+                secrets = await self._load_secrets(db, user_id)
 
             if not function:
                 return {
@@ -766,7 +768,7 @@ class SharedWorkerManager:
                     "execution_id": execution_id,
                     "trigger_type": trigger_type,
                     "chat_id": chat_id,
-                    "secrets": await self._load_secrets(db, user_id),
+                    "secrets": secrets,
                 },
             }
 
@@ -786,7 +788,13 @@ class SharedWorkerManager:
             api = container.client.api
             exec_id = api.exec_create(
                 container.id,
-                ['python3', '-c', f'import sys; open("{request_file}","wb").write(sys.stdin.buffer.read())'],
+                # A result file left by an earlier run of this execution id
+                # (a retry, a DLQ requeue) would be read back as this run's.
+                ['python3', '-c', (
+                    f'import os, sys\n'
+                    f'if os.path.exists("{result_file}"): os.remove("{result_file}")\n'
+                    f'open("{request_file}","wb").write(sys.stdin.buffer.read())'
+                )],
                 stdin=True,
                 stdout=True,
                 stderr=True,
@@ -873,6 +881,8 @@ sys.exit(1)
                 error_msg = stderr_str or stdout_str or f"Function execution failed with exit code {exec_result.exit_code}"
                 return {"status": "failed", "error": error_msg}
 
+        except ExecutorUnavailable:
+            raise
         except Exception as e:
             return {"status": "failed", "error": f"Worker execution failed: {str(e)}"}
 

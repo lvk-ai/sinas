@@ -6,7 +6,7 @@ the frontend renders as an embedded iframe.
 """
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,20 @@ from app.models.component import Component
 logger = logging.getLogger(__name__)
 
 
+async def _component_access(
+    db: AsyncSession, user_id: Optional[str], permissions: Optional[dict[str, bool]]
+) -> Callable[[Any], bool]:
+    """Which components a wildcard may reach: those the user may read (the
+    components API's check: own, shared or public, or read:all)."""
+    from app.services.resource_resolver import user_can
+
+    if user_id and permissions is None:
+        from app.core.auth import get_effective_permissions
+
+        permissions = await get_effective_permissions(db, user_id)
+    return user_can(user_id, permissions, "read")
+
+
 class ComponentToolConverter:
     """Converts components to OpenAI tool format for agent tool calling."""
 
@@ -23,13 +37,18 @@ class ComponentToolConverter:
         self,
         db: AsyncSession,
         enabled_components: Optional[list[str]] = None,
+        user_id: Optional[str] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """
         Get components and convert to OpenAI tools format.
 
         Args:
             db: Database session
-            enabled_components: List of "namespace/name" component references
+            enabled_components: "namespace/name" component references, or
+                "namespace/*" / "*/*" wildcards
+            user_id: The chat's user: a wildcard offers only components they may read
+            permissions: The user's effective permissions (looked up if None)
 
         Returns:
             List of components in OpenAI tool format
@@ -39,20 +58,16 @@ class ComponentToolConverter:
         if not enabled_components:
             return tools
 
-        for comp_ref in enabled_components:
-            if "/" not in comp_ref:
-                logger.warning(f"Invalid component reference format: {comp_ref}")
+        from app.services.resource_resolver import resolve_resource_refs
+
+        resolved = await resolve_resource_refs(
+            db, enabled_components, Component,
+            can_access=await _component_access(db, user_id, permissions),
+        )
+        for _, component in resolved:
+            if not component.is_active:
                 continue
-
-            namespace, name = comp_ref.split("/", 1)
-
-            component = await Component.get_by_name(db, namespace, name)
-            if not component or not component.is_active:
-                logger.warning(f"Component {comp_ref} not found or inactive")
-                continue
-
-            tool = self._component_to_tool(component)
-            tools.append(tool)
+            tools.append(self._component_to_tool(component))
 
         return tools
 
@@ -135,6 +150,7 @@ class ComponentToolConverter:
         tool_name: str,
         arguments: dict[str, Any],
         user_id: str = "",
+        enabled_components: Optional[list[str]] = None,
     ) -> Optional[dict[str, Any]]:
         """
         Handle a component tool call by returning a component reference block.
@@ -147,6 +163,9 @@ class ComponentToolConverter:
             tool_name: Name of the tool (e.g., "show_component_default_dashboard")
             arguments: Tool arguments (component input vars)
             user_id: User ID for generating render token
+            enabled_components: The chat agent's enabled components: when
+                given, only a component they grant is shown (through a
+                wildcard: only one the user may read, as discovery offers)
 
         Returns:
             Component reference dict or None if component not found
@@ -173,6 +192,13 @@ class ComponentToolConverter:
         if not component or not component.is_active:
             logger.warning(f"Component {namespace}/{name} not found or inactive")
             return None
+        if enabled_components is not None:
+            from app.services.resource_resolver import ref_granted
+
+            access = await _component_access(db, user_id, None)
+            if not ref_granted(f"{namespace}/{name}", enabled_components, component, access):
+                logger.warning(f"Security: component '{namespace}/{name}' is not enabled for this agent")
+                return None
 
         # Generate render token for iframe embedding
         from app.services.content_tokens import generate_component_render_token

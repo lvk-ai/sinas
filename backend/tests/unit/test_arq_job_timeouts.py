@@ -93,6 +93,7 @@ class StrictPool:
         job_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
         inspect.signature(_registered(function).coroutine).bind({}, *args, **job_kwargs)
         self.jobs.append((function, kwargs))
+        return object()  # arq returns a Job (None when the id is taken)
 
 
 class FakeRedis:

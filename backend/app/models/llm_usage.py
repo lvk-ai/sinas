@@ -47,6 +47,12 @@ class LLMUsage(Base):
     streamed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Set when the call raised; token counts may then be 0/partial
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Why generation stopped, normalized (app/providers/tracking.py
+    # FINISH_REASONS: stop, length, tool_calls, content_filter, error,
+    # other), and as the provider said it (end_turn, max_tokens, ...). NULL
+    # for calls recorded before it was, or when the provider gave none.
+    finish_reason: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    finish_reason_raw: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Cost in USD, priced when the row is written and never recomputed
     # (app/services/llm_pricing.py). NULL: no price was known for the model.
@@ -57,6 +63,10 @@ class LLMUsage(Base):
     price_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     # A provider batch-API call (usually discounted)
     batch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Whom the call is for: the user's USAGE_CUSTOMER_FIELD custom field
+    # (an organization id, say) when the call was made. NULL when that
+    # setting is off or the user had no such field.
+    customer: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -67,4 +77,5 @@ class LLMUsage(Base):
         Index("idx_llm_usage_created", "created_at"),
         Index("idx_llm_usage_agent_created", "agent", "created_at"),
         Index("idx_llm_usage_provider_created", "provider_name", "created_at"),
+        Index("idx_llm_usage_customer_created", "customer", "created_at"),
     )

@@ -22,11 +22,55 @@ hands it back to `resume()` unchanged.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class ExecutorUnavailable(Exception):
+    """The executor could not start the function: no worker to run it on, or
+    the container/pod for it failed to come up.
+
+    Raised only where the function's code has certainly not run yet, which
+    is what makes the failure safe to retry: the function queue retries it
+    with backoff (`QUEUE_MAX_RETRIES`) instead of failing the job. Anything
+    that may have happened after the code started is an ordinary failure.
+    """
+
+
+def is_transient_infra_error(exc: BaseException) -> bool:
+    """A lost connection to the database, Redis or another service: worth
+    retrying, provided the function's code has not run yet."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+    from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+
+    if isinstance(
+        exc,
+        (OSError, RedisConnectionError, RedisTimeoutError, OperationalError, InterfaceError),
+    ):
+        return True
+    return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
+
+
+@contextlib.asynccontextmanager
+async def before_run(what: str) -> AsyncIterator[None]:
+    """Wraps an executor's preparation, before the code is handed over
+    (loading the function or its secrets, resolving the image): a lost
+    connection there means the code never ran, so it surfaces as
+    `ExecutorUnavailable` and the queue may retry it."""
+    try:
+        yield
+    except ExecutorUnavailable:
+        raise
+    except Exception as e:
+        if is_transient_infra_error(e):
+            raise ExecutorUnavailable(f"{what}: {e}") from e
+        raise
 
 
 class ResultStatus(str, Enum):
