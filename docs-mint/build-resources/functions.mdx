@@ -18,6 +18,7 @@ Functions are Python code that runs in isolated Docker containers. They can be u
 | `shared_pool` | Run in shared container instead of sandbox container (admin-only) |
 | `requires_approval` | Require user approval when called by an agent |
 | `timeout` | Per-function timeout in seconds (overrides global `FUNCTION_TIMEOUT`, default: null) |
+| `max_retries` | Retries of a failed run of the function's own code, 0-10 (default: 0 — never). See [Failures and retries](#failures-and-retries) |
 
 ## Function signature
 
@@ -95,6 +96,32 @@ In sandbox containers (`shared_pool=false`), calling `input()` raises a `Runtime
 <Note>
 **Nested executions are depth-limited.** A function can invoke other functions or agents (e.g. by calling the Sinas API with its execution token). Such chains are bounded by `MAX_EXECUTION_DEPTH` (defaults to the shared worker count): a call past the limit is rejected immediately rather than silently exhausting the shared worker pool and deadlocking. Keep `shared_pool` functions shallow, or raise `SHARED_POOL_RESERVE` / scale workers if you intentionally nest deeply. See [environment variables](/getting-started/environment-variables).
 </Note>
+
+## Failures and retries
+
+Every function run goes through the function queue. What happens when a run fails depends on *why* it failed:
+
+| Failure | Retried? | After the last attempt |
+|---|---|---|
+| **The function's own code** raised, timed out, or returned output that fails `output_schema` | Only if the function opts in with `max_retries` (default 0). Output-schema failures never retry. | Execution `FAILED`. Dead-lettered only when the function opted in. |
+| **Infrastructure** — no worker or sandbox available, the container or pod failed to start, the database unreachable while preparing the run. The code never ran. | Yes, up to `QUEUE_MAX_RETRIES` times (default 3), whatever `max_retries` says. | Execution `FAILED`, job moved to the dead-letter queue. |
+| **Deterministic** — `input_schema` validation, the function missing or disabled, execution disabled on the deployment | Never — the next run would fail the same way. | Execution `FAILED`. |
+| **Shared pool saturated** (backpressure, not a failure) | The job waits in the queue, not counting as an attempt, up to `QUEUE_SATURATION_TIMEOUT_SECONDS`. | Execution `FAILED`, job moved to the dead-letter queue. |
+
+Functions can have side effects (send an email, charge a card, write to another system), so retrying a failure of their own code is opt-in: set `max_retries` only on functions that are safe to run more than once.
+
+Retries back off exponentially: `QUEUE_RETRY_DELAY` seconds (default 10) for the first, doubling per attempt, capped at 5 minutes, with jitter. Infrastructure failures and the function's own failures each have their own budget, so an outage never uses up a function's `max_retries`; waiting for a pool slot uses up neither.
+
+While a run waits for its retry, the execution is `PENDING` and its `error` says which attempt failed and why (`Attempt 1 of 4 failed, retrying: ...`); a caller waiting for the result (sync execute, agent tool call) keeps waiting, and no callback fires. After the last attempt the execution is `FAILED`; if it was dead-lettered, its `error` ends with `(failed N attempts; moved to the dead-letter queue)`. A run that succeeds after a failed attempt ends `COMPLETED` with no error.
+
+Dead-lettered jobs are listed under `GET /api/v1/queue/dlq` (with the error, `error_type` — `infrastructure`, `function` or `saturation` — and the number of attempts) and on the System page, and can be requeued with `POST /api/v1/queue/dlq/{job_id}/retry` once the cause is fixed. A requeued job keeps its execution id, starts with a fresh retry budget, and its execution goes back to `PENDING`; a finished batch it belongs to is reopened, so the batch's final status (and its callback, which fires again) reflects the new outcome. A job that is still queued or running cannot be requeued (409). See [System](/admin/system#queue-workers).
+
+```yaml
+functions:
+  - namespace: billing
+    name: sync_invoice
+    maxRetries: 3          # idempotent: safe to retry
+```
 
 **Endpoints:**
 

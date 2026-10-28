@@ -7,8 +7,11 @@ providers get their own pricing, model aliases and a discount multiplier.
 ratecard_cache keeps the last good copy of a ratecard fetched from
 MODEL_PRICES_URL.
 
-Existing rows stay unpriced (POST /usage/backfill prices them); rows the
-batch poller wrote are marked batch.
+Existing rows stay unpriced (POST /usage/backfill prices them). Rows the
+batch poller wrote are marked batch by b4f5i6l7l8b9, in short batches: an
+UPDATE of every such row here held ACCESS EXCLUSIVE on llm_usage for as
+long as it took to rewrite them (18 s on 800k rows), as this revision's
+ADD COLUMNs take that lock.
 
 All in one transaction, so a failure leaves nothing behind. The indexes the
 usage API needs are built CONCURRENTLY (outside a transaction) by the next
@@ -33,7 +36,6 @@ def upgrade() -> None:
     op.add_column(
         "llm_usage", sa.Column("batch", sa.Boolean(), nullable=False, server_default=sa.false())
     )
-    op.execute("UPDATE llm_usage SET batch = true WHERE source = 'provider_batch'")
 
     op.add_column("llm_providers", sa.Column("pricing", sa.JSON(), nullable=True))
     op.add_column("llm_providers", sa.Column("model_aliases", sa.JSON(), nullable=True))

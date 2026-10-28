@@ -12,7 +12,7 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "fastapi>=0.138.0",
+    "fastapi>=0.143.0",
     "uvicorn[standard]>=0.24.0",
     # [asyncio] pulls in greenlet, which the async engine needs: SQLAlchemy 2.1
     # stopped installing it by default, so the unbounded pin resolved to
@@ -54,6 +54,14 @@ dependencies = [
     "opentelemetry-api>=1.25.0",
     "opentelemetry-sdk>=1.25.0",
     "opentelemetry-exporter-otlp-proto-http>=1.25.0",
+    # Auto-instrumentation, installed only when OTEL_ENABLED=true (see
+    # app/core/telemetry.py). FastAPI requests are traced by FastAPI's own
+    # OpenTelemetry support (fastapi>=0.142), not a contrib package.
+    # Contrib packages version in lockstep with the SDK (0.Xb1 <-> 1.Y);
+    # `uv lock` resolves the matching pair.
+    "opentelemetry-instrumentation-sqlalchemy>=0.46b0",
+    "opentelemetry-instrumentation-redis>=0.46b0",
+    "opentelemetry-instrumentation-httpx>=0.46b0",
     # Model Context Protocol client (agents calling tools on remote MCP
     # servers). Bounded to the 2.x line we code against: the 1.x → 2.0 move
     # replaced the client API (mcp.Client, transports as context managers),
@@ -71,6 +79,12 @@ dependencies = [
 # See CONTRIBUTING.md > "Backend dependencies".
 
 [project.optional-dependencies]
+# OTLP over gRPC (`protocol: grpc`). Not in the default image: grpcio is a
+# large native wheel, and every supported backend also accepts OTLP/HTTP.
+# A custom image can add it with `uv sync --locked --extra otel-grpc`.
+otel-grpc = [
+    "opentelemetry-exporter-otlp-proto-grpc>=1.25.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

@@ -21,7 +21,7 @@ def _run(coro):
 
 
 def test_delegation_failure_returns_the_real_error(monkeypatch):
-    async def boom(db, user_id, agent_id_str, arguments):
+    async def boom(db, user_id, agent_id_str, arguments, **kwargs):
         raise ValueError("upstream boom")
 
     monkeypatch.setattr(te, "prepare_agent_delegation", boom)
@@ -40,7 +40,7 @@ def test_delegation_failure_returns_the_real_error(monkeypatch):
 
 
 def test_delegation_failure_is_not_masked_by_name_error(monkeypatch):
-    async def boom(db, user_id, agent_id_str, arguments):
+    async def boom(db, user_id, agent_id_str, arguments, **kwargs):
         raise RuntimeError("redis unavailable")
 
     monkeypatch.setattr(te, "prepare_agent_delegation", boom)

@@ -260,6 +260,16 @@ class Settings(BaseSettings):
     compaction_summary_max_tokens: int = 800
     max_tool_iterations: int = 25  # Max consecutive tool-call rounds before stopping
 
+    # Sinas's own retry of an agent turn's LLM calls (app/services/llm_retry.py),
+    # on top of the SDK's: a call refused as rate_limited, or failing as
+    # provider_unavailable, before it streamed anything is made again after
+    # the wait the provider asked for (Retry-After, Gemini's retryDelay) or a
+    # backoff. At most llm_retry_max_attempts calls (1 turns it off) and
+    # llm_retry_max_wait_seconds of waiting per call, and never past the
+    # agent job's timeout. budget_exceeded is never retried.
+    llm_retry_max_attempts: int = 3
+    llm_retry_max_wait_seconds: float = 90.0
+
     # Tool result store
     tool_result_retention_days: int = int(os.getenv("TOOL_RESULT_RETENTION_DAYS", "30"))
     tool_result_max_inline: int = int(os.getenv("TOOL_RESULT_MAX_INLINE", "5"))  # Last N results kept inline
@@ -283,6 +293,11 @@ class Settings(BaseSettings):
     queue_agent_concurrency: int = 5
     queue_agent_sub_concurrency: int = 5  # concurrency of the sub-agent queue worker
     queue_default_timeout: int = 300
+    # Function jobs: how often a run that failed because the infrastructure
+    # could not start the code (no worker, container/pod start failure, the
+    # database unreachable) is retried, with backoff, before the job goes to
+    # the dead-letter queue. Failures of the function's own code are retried
+    # only when the function opts in (Function.max_retries). Issue #135.
     queue_max_retries: int = 3
     # Saturation backpressure: how long a function job may wait in the queue
     # (deferred retries, backoff capped at 30s) for a shared-pool slot before
@@ -291,6 +306,8 @@ class Settings(BaseSettings):
     # hours. The bound exists only so a permanently wedged pool eventually
     # fails loudly instead of spinning forever. 0 = wait forever.
     queue_saturation_timeout_seconds: int = 21600  # 6 hours
+    # First retry delay (seconds) of a failed function job; doubles per
+    # failed attempt, capped at 5 minutes, plus jitter.
     queue_retry_delay: int = 10
     # How often an idle worker checks its queue for new jobs (seconds). arq's
     # default, 0.5, added up to half a second before a queued job started: an
@@ -303,6 +320,18 @@ class Settings(BaseSettings):
     queue_pipeline_concurrency: int = 50
     pipeline_job_timeout: int = 1800  # hard ceiling for one queued run (incl. agent steps)
     pipeline_run_retention_days: int = 30  # pipeline_runs rows older than this are pruned
+
+    # GET /chats without limit or cursor returns at most this many chats;
+    # past it the response is truncated (X-Truncated: true) and carries the
+    # cursor for the rest. Bounds the memory one request can take.
+    chats_unpaginated_max: int = 10000
+
+    @field_validator("chats_unpaginated_max")
+    @classmethod
+    def _validate_chats_unpaginated_max(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"CHATS_UNPAGINATED_MAX must be positive, got {v}")
+        return v
 
     # Chat retention (docs/design/chat-retention.md). Off unless enabled:
     # nothing is archived or deleted on a deployment that hasn't opted in.
@@ -486,6 +515,22 @@ class Settings(BaseSettings):
     model_prices_refresh_hours: int = 24
     model_prices_timeout_seconds: int = 30
     model_prices_max_bytes: int = 16 * 1024 * 1024
+    # Attribution (app/providers/attribution.py): the user custom fields
+    # (comma-separated users.custom_fields keys, e.g. "orgId,costCenter") a
+    # chat takes a snapshot of when it is created; every LLM call in the chat
+    # is attributed by that snapshot ({{attribution.<key>}} in a provider's
+    # header templates), however and by whomever the chat is continued.
+    attribution_fields: Optional[str] = None
+    # The attribution field that names the customer a call is for, e.g.
+    # "orgId" (an attribution field whether or not ATTRIBUTION_FIELDS lists
+    # it). Recorded on each llm_usage row as `customer`, and offered by the
+    # usage API as the `customer` dimension and filter. Unset: none recorded.
+    usage_customer_field: Optional[str] = None
+    # Membership checks on a credential's session context (comma-separated
+    # `contextField:listingField` pairs, e.g. "orgId:orgs"): a session context
+    # value for orgId must be one the user's custom field `orgs` lists, or the
+    # token exchange, sign-in or refresh that would carry it is refused.
+    attribution_memberships: Optional[str] = None
 
     # Encryption
     encryption_key: Optional[str] = None  # Fernet key for encrypting sensitive data
@@ -604,12 +649,42 @@ class Settings(BaseSettings):
     metering_push_minutes: int = 15  # heartbeat cadence (jittered per instance)
 
 
-    # OpenTelemetry (opt-in observability — e.g. Langwatch)
+    # OpenTelemetry (opt-in, vendor-neutral; docs-mint/admin/observability.mdx).
+    # Off: nothing is installed, no span is recorded. On: traces (and, with
+    # otel_logs_enabled, logs) go to every exporter configured below and/or
+    # by the standard OTEL_EXPORTER_OTLP_* variables, which the OpenTelemetry
+    # SDK reads itself (as are OTEL_TRACES_SAMPLER, OTEL_RESOURCE_ATTRIBUTES).
     otel_enabled: bool = False
-    otel_exporter_endpoint: Optional[str] = None  # e.g. https://app.langwatch.ai/api/otel/v1/traces
-    otel_exporter_headers: Optional[str] = None  # e.g. X-Auth-Token=lw_xxx
-    otel_service_name: str = "sinas"
-    otel_vendor: str = "langwatch"  # Vendor preset: "langwatch", "langfuse", "generic_otel"
+    # JSON list of named exporters, e.g.
+    # [{"name": "langfuse", "endpoint": "https://cloud.langfuse.com/api/public/otel", "preset": "langfuse"},
+    #  {"name": "apm", "endpoint": "http://otel-collector:4318", "preset": "none"}]
+    # Secret headers: OTEL_EXPORTER_<NAME>_HEADERS=k=v,... (merged per entry).
+    otel_exporters: Optional[str] = None
+    # Attribute preset of the exporter the standard OTEL_EXPORTER_OTLP_*
+    # variables configure: genai | langfuse | langwatch | none (no content).
+    otel_preset: str = "genai"
+    # service.name; "{process}" is replaced by the process (backend,
+    # queue-agent, scheduler...). Unset: OTEL_RESOURCE_ATTRIBUTES' service.name,
+    # else "sinas". Every process also carries sinas.process.
+    otel_service_name: Optional[str] = None
+    # Python logging -> OTLP logs, to the exporters with the "logs" signal.
+    otel_logs_enabled: bool = False
+    otel_logs_level: str = "INFO"
+    # Trace context on outgoing HTTP calls Sinas makes (webhooks, connectors,
+    # MCP servers, OAuth...): none | tracecontext (traceparent, tracestate) |
+    # all (+ baggage). LLM provider calls are governed by each provider's own
+    # propagate_context, never by this.
+    otel_http_client_propagation: str = "none"
+    # Request paths not traced: comma-separated, "*" suffix for a prefix.
+    otel_excluded_paths: str = "/health,/api/v1/system/health,/ui/*"
+    # FastAPI's per-request operation spans (dependencies, endpoint,
+    # serialization) under each request span.
+    otel_fastapi_operation_spans: bool = True
+    # Deprecated (0.5.0): one exporter. Still honoured, as an exporter named
+    # "legacy" that receives Sinas's own spans in the OTEL_VENDOR preset.
+    otel_exporter_endpoint: Optional[str] = None  # full OTLP/HTTP traces URL
+    otel_exporter_headers: Optional[str] = None  # k=v,k2=v2
+    otel_vendor: str = "langwatch"  # langwatch | langfuse | generic_otel | genai | none
 
     # Declarative Configuration
     config_file: Optional[str] = None  # Path to YAML config file

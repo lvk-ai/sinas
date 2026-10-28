@@ -14,6 +14,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.providers.attribution import new_chat_attribution
 from app.models.batch import Batch, BatchKind, BatchStatus
 from app.models.chat import Chat, Message
 from app.models.execution import Execution, ExecutionStatus, TriggerType
@@ -88,10 +89,15 @@ def _provider_batch_blockers(agent: Any) -> list[str]:
 
 
 async def _resolve_batch_provider(
-    db: AsyncSession, agent: Any
+    db: AsyncSession, agent: Any, user_id: Optional[str] = None
 ) -> tuple[Any, Any, str]:
     """Resolve (provider instance, LLMProvider row, model) for provider-mode
-    batches. Raises BatchError when unresolvable or unsupported."""
+    batches. Raises BatchError when unresolvable or unsupported.
+
+    A batch goes out as one request for all its items, so the provider's
+    identity headers are the submitter's (user, agent, the API key the
+    submission acts through); per-item values such as {{chat.id}} have no
+    single value and leave their headers out."""
     from app.models import LLMProvider
     from app.providers import create_provider
 
@@ -118,7 +124,14 @@ async def _resolve_batch_provider(
         )
 
     provider = await create_provider(
-        provider_name=provider_row.name, db=db, overrides=agent.provider_overrides
+        provider_name=provider_row.name,
+        db=db,
+        overrides=agent.provider_overrides,
+        usage_context={
+            "user_id": user_id,
+            "agent": f"{agent.namespace}/{agent.name}",
+            "source": "provider_batch",
+        },
     )
     if not provider.supports_batch:
         raise BatchError(
@@ -263,7 +276,7 @@ async def submit_agent_batch(
                 f"it uses: {', '.join(blockers)}. Provider batches support only "
                 f"tool-less agents (preload-only skills are allowed)."
             )
-        provider, provider_row, batch_model = await _resolve_batch_provider(db, agent)
+        provider, provider_row, batch_model = await _resolve_batch_provider(db, agent, user_id)
     elif execution_mode != "queue":
         raise BatchError(f"Unknown execution_mode: {execution_mode!r}")
 
@@ -314,6 +327,7 @@ async def submit_agent_batch(
             title=f"batch:{batch.id}:{i}",
             chat_metadata={"agent_input": input_variables} if input_variables else None,
             job_timeout=agent.default_job_timeout,
+            attribution=await new_chat_attribution(db, user_id),
         )
         db.add(chat)
         await db.flush()
@@ -386,9 +400,16 @@ async def submit_agent_batch(
                 "max_tokens": agent.max_tokens,
             })
 
+        from app.providers.errors import LLMError
+
         try:
             provider_batch_id = await provider.submit_batch(requests)
         except BatchError:
+            raise
+        except LLMError:
+            # budget_exceeded / rate_limited / provider_auth_failed / ...:
+            # answered with its own status and the error envelope.
+            await db.rollback()
             raise
         except Exception as e:
             await db.rollback()
@@ -632,6 +653,10 @@ async def on_execution_terminated(
     if batch_id is None:
         return
 
+    # Count under the batch's row lock: a DLQ requeue reopens a finished
+    # batch under the same lock, so a late call can't finish the reopened
+    # batch from counts taken before the requeued child went PENDING.
+    await db.execute(select(Batch.id).where(Batch.id == batch_id).with_for_update())
     pending = await _count_pending(db, batch_id)
     if pending > 0:
         # Bump batch.status to RUNNING the first time we see any non-queued state.

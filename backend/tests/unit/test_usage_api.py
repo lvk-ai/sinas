@@ -155,6 +155,7 @@ class TestPermissions:
         assert body["totals"]["calls"] == 0
         calls = await _get(client, other, "calls", _q(seeded))
         assert {c["user_id"] for c in calls["items"]} == {str(other.id)}
+        assert {c["user_email"] for c in calls["items"]} == {other.email}
         points = (await _get(client, other, "timeseries", _q(seeded)))["points"]
         assert sum(p["calls"] for p in points) == 1
 
@@ -196,6 +197,9 @@ class TestTimeseriesAndCalls:
     async def test_calls_page_newest_first(self, client, admin_user, seeded):
         first = await _get(client, admin_user, "calls", _q(seeded, limit=3))
         assert len(first["items"]) == 3 and first["has_more"] is True
+        emails = {admin_user.email, seeded["other"].email}
+        assert {c["user_email"] for c in first["items"]} <= emails
+        assert all(c["user_email"] for c in first["items"])
         stamps = [c["created_at"] for c in first["items"]]
         assert stamps == sorted(stamps, reverse=True)
         rest = await _get(client, admin_user, "calls", _q(seeded, limit=3, offset=3))

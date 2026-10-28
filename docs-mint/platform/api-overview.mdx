@@ -69,6 +69,8 @@ GET    /adapters/openai/v1/models/{model_id}    # Get model info
 
 Agents are listed as models with names like `agent:namespace/name`. Provider models are listed with their provider prefix.
 
+An agent's turn is tied to a chat, returned in the `X-Chat-ID` response header. Send that header back to continue the conversation. If the agent asks the user a question (`ask_user`), the question and its options are the assistant's reply text. Non-streaming responses also set `X-Sinas-Turn-Status: input_required`. The next message sent with that `X-Chat-ID` is the answer, and the response is the rest of the turn. A turn that waits on a background run is followed to its reply within the agent's `default_job_timeout`. If the run takes longer, the reply ends with a note that the agent is still working, and the status is `in_progress`.
+
 ## Interactive API Docs
 
 Swagger UI is available at `/docs` (runtime API), `/api/v1/docs` (management API), and `/adapters/openai/docs` (OpenAI adapter) for exploring all endpoints and schemas interactively.

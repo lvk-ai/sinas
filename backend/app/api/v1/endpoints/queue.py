@@ -89,8 +89,11 @@ async def retry_dlq_job(
     job_id: str,
     user_id: str = Depends(require_permission("sinas.system.update:all")),
 ) -> dict[str, Any]:
-    """Remove a job from the DLQ and re-enqueue it."""
+    """Re-enqueue a dead-lettered job (same execution id, failure count reset)
+    and remove it from the DLQ."""
     try:
         return await queue_service.retry_dlq_job(job_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:  # the job is already queued or running again
+        raise HTTPException(status_code=409, detail=str(e))

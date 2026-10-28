@@ -62,6 +62,19 @@ Required when `AUTH_MODE` is `otp` or `password+otp`. Skip entirely for `passwor
 | `RATE_LIMIT_SETUP_LINK_IP_MAX` | `10` | Max setup-link exchange (and, separately, complete) requests per IP per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `900` | Rate limit window (15 minutes) |
 
+### Client IP behind a reverse proxy
+
+IP rate limits and request logs use the client's IP address. Behind a proxy, every connection comes from the proxy, so uvicorn runs with `--proxy-headers` and takes the client from `X-Forwarded-For`, but only on connections from the addresses in `FORWARDED_ALLOW_IPS`. It reads the header right to left and stops at the first address it doesn't trust, so a client can't pick its own IP by sending the header itself.
+
+| Variable | Default | Description |
+|---|---|---|
+| `FORWARDED_ALLOW_IPS` | compose: `10.254.253.2` (Caddy); lite: `127.0.0.1`; image: `127.0.0.1` | Comma-separated IPs or CIDRs of the proxies allowed to set `X-Forwarded-For`. Never `*` while port 8000 can be reached directly: uvicorn then believes the leftmost, client-supplied entry. On Kubernetes, set `backend.forwardedAllowIps` instead. |
+| `SINAS_CADDY_IP` | `10.254.253.2` | docker compose: Caddy's fixed address on the `proxy` network, the one address the backend trusts. Keep `FORWARDED_ALLOW_IPS` equal to it. |
+| `SINAS_PROXY_SUBNET` | `10.254.253.0/24` | docker compose: subnet of the `proxy` network that connects Caddy to the backend and console. Change it (with the two variables around it) if it collides with a network of yours. |
+| `SINAS_PROXY_IP_RANGE` | `10.254.253.128/25` | docker compose: part of `SINAS_PROXY_SUBNET` for addresses Docker hands out. Must not contain `SINAS_CADDY_IP`. |
+
+With the lite profile (no Caddy), set `FORWARDED_ALLOW_IPS` to the address your own TLS proxy has as the container sees it, for example the Docker bridge gateway when the proxy runs on the host.
+
 ## Function Execution
 
 | Variable | Default | Description |
@@ -85,7 +98,7 @@ reject explicitly rather than half-working.
 | Variable | Default | Description |
 |---|---|---|
 | `CODE_EXECUTION_ENABLED` | `true` | `false` disables **all** execution of user-supplied code: Functions and the agent `codeExecution` tool. The tool is not advertised to the model, function execution is refused at every trigger (API, webhook, schedule, agent, CDC), and sandbox/shared-worker startup is skipped entirely — no pool, no per-execution pods, no executor image. The single biggest footprint reduction available. |
-| `BUILTIN_DATABASE_ENABLED` | `true` | `false` skips creating the `sinas_data` database and its default Database Connection at startup, for deployments that only use their own connections. Does **not** affect the platform's own PostgreSQL, and an already-created database and record are left untouched (so the toggle is reversible and non-destructive). |
+| `BUILTIN_DATABASE_ENABLED` | `true` | `false` skips creating the `sinas_data` database and its default Database Connection at startup, for deployments that only use their own connections. Does **not** affect the platform's own PostgreSQL, and an already-created database and record are left untouched (so the toggle is reversible and non-destructive). With docker compose, the postgres container also reads it: on a fresh data volume, `false` skips the `CREATE DATABASE sinas_data` in its init script. |
 
 ## Usage Metering (Optional)
 
@@ -102,6 +115,20 @@ Default off. When enabled, every operation (function execution, code execution, 
 
 Meter integrity: sandbox and shared executor containers/pods receive no Redis/database credentials, so code they run cannot alter the count. `TRUSTED_EXECUTOR=inprocess` breaks that guarantee (client code runs inside a credential-bearing process) — enabling metering in that mode logs a warning. Metered instances should use `docker_shared` (Docker) or `k8s_shared` (Kubernetes), or `disabled` if shared-pool functions aren't needed.
 
+## OpenTelemetry (Optional)
+
+Off by default. Traces, and optionally logs, to any OTLP backend, several at once. The standard `OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_TRACES_SAMPLER` variables apply. Full reference and backend recipes: [Observability](/admin/observability).
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_ENABLED` | `false` | Master switch. Off: nothing is installed. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(none)_ | One exporter, configured by the OpenTelemetry SDK from the standard variables. |
+| `OTEL_EXPORTERS` | _(none)_ | JSON list of named exporters, each with its own endpoint, protocol and preset; credentials in `OTEL_EXPORTER_<NAME>_HEADERS`. |
+| `OTEL_PRESET` | `genai` | LLM attribute names for the standard exporter: `genai`, `langfuse`, `langwatch`, `none` (no conversation content). |
+| `OTEL_LOGS_ENABLED` | `false` | Export Python logs as OTLP logs, correlated with traces and redacted. |
+| `OTEL_HTTP_CLIENT_PROPAGATION` | `none` | Trace context on outgoing webhook/connector/MCP calls: `none`, `tracecontext`, `all`. |
+| `OTEL_EXPORTER_ENDPOINT`, `OTEL_EXPORTER_HEADERS`, `OTEL_VENDOR` | _(none)_ | Deprecated single exporter; still honoured. |
+
 ## LLM Cost (Optional)
 
 The deployment ratecard calls are priced from, in LiteLLM's `model_prices_and_context_window.json` format. Unset (and no per-provider pricing), calls are recorded unpriced. See [Usage & Cost](/admin/usage-cost).
@@ -114,6 +141,9 @@ The deployment ratecard calls are priced from, in LiteLLM's `model_prices_and_co
 | `MODEL_PRICES_REFRESH_HOURS` | `24` | Age at which the URL copy is fetched again. |
 | `MODEL_PRICES_TIMEOUT_SECONDS` | `30` | URL fetch timeout. |
 | `MODEL_PRICES_MAX_BYTES` | `16777216` | Largest ratecard accepted. |
+| `ATTRIBUTION_FIELDS` | _(none)_ | Comma-separated user custom fields (e.g. `orgId,costCenter`) a chat takes a snapshot of when it is created, for `{{attribution.<key>}}` in an LLM provider's header templates. See [Attribution and budgets through an LLM gateway](/admin/llm-gateway-attribution). |
+| `USAGE_CUSTOMER_FIELD` | _(none)_ | The attribution field (e.g. `orgId`) recorded on every LLM call as its `customer`, for the usage API's `customer` dimension. Always part of the snapshot. |
+| `ATTRIBUTION_MEMBERSHIPS` | _(none)_ | Membership checks on a session's attribution context: comma-separated `contextField:listingField` pairs, e.g. `orgId:orgs` (a context `orgId` must be listed in the user's `orgs` custom field). |
 
 ## Executors
 
@@ -167,8 +197,11 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 |---|---|---|
 | `MAX_TOOL_ITERATIONS` | `25` | Max consecutive tool-call rounds per message |
 | `MAX_HISTORY_MESSAGES` | `100` | Messages loaded for conversation context |
+| `CHATS_UNPAGINATED_MAX` | `10000` | Most chats `GET /chats` returns without `limit` or `cursor`. Past it the response holds the most recently updated this many, with `X-Truncated: true` and the cursor for the rest (see **Listing chats** under [Agents](/build-resources/agents)) |
 | `AGENT_JOB_TIMEOUT` | `600` | Agent job timeout (seconds). A chat's or agent's `job_timeout` overrides it for that chat's messages |
 | `AGENT_JOB_TIMEOUT_MAX` | `3600` | Cap on a chat's or agent's `job_timeout` (seconds); a longer one runs this long |
+| `LLM_RETRY_MAX_ATTEMPTS` | `3` | Calls Sinas makes at most for one of an agent turn's LLM calls that is rate limited (`rate_limited`) or finds the model API unavailable (`provider_unavailable`), on top of the SDK's own retries; `1` turns Sinas's retry off. See [LLM and agent errors](/platform/errors#retries) |
+| `LLM_RETRY_MAX_WAIT_SECONDS` | `90` | How long Sinas waits in all, per call, before making it again (the provider's `Retry-After` or `retryDelay`, else a backoff); never past the turn's job timeout |
 | `AGENT_DELEGATE_TIMEOUT` | `600` | How long a parent agent waits for a delegated sub-agent (block mode). Raise together with `AGENT_JOB_TIMEOUT` — in block mode the parent's own job clock keeps running while it waits |
 | `AGENT_DELEGATE_MODE` | `block` | `block`: parent holds its worker slot while awaiting sub-agents. `suspend`: parent job ends at delegation and a resume job continues the conversation when the children finish (frees the slot) |
 | `AGENT_MAX_DELEGATION_DEPTH` | `5` | Reject agent-to-agent delegation chains deeper than this (`0` disables the bound) |
@@ -195,7 +228,9 @@ Used by `SANDBOX_EXECUTOR=docker_pool` (the warm pool).
 | `QUEUE_FUNCTION_CONCURRENCY` | `10` | Concurrent functions per worker |
 | `QUEUE_AGENT_CONCURRENCY` | `5` | Concurrent agent jobs per worker |
 | `QUEUE_POLL_DELAY` | `0.05` | Seconds between an idle worker's checks for new jobs. Lower starts queued jobs sooner; each check is one Redis command. |
-| `QUEUE_SATURATION_TIMEOUT_SECONDS` | `21600` | How long a queued function job may wait for a shared-pool slot (deferred retries with backoff) before failing. Bulk ingest drains through this window; `0` = wait forever. |
+| `QUEUE_SATURATION_TIMEOUT_SECONDS` | `21600` | How long a queued function job may wait for a shared-pool slot (deferred retries with backoff) before failing (the job is then dead-lettered). Bulk ingest drains through this window; `0` = wait forever. Waiting never counts as a failed attempt. |
+| `QUEUE_MAX_RETRIES` | `3` | Retries of a function job whose infrastructure failed before the code ran (no worker, container/pod start failure, database unreachable), before it is dead-lettered. The function's own failures retry only per `max_retries` on the function. |
+| `QUEUE_RETRY_DELAY` | `10` | First retry delay of a failed function job, in seconds; doubles per failed attempt, capped at 5 minutes, plus jitter. |
 | `WORKER_MEMORY_LIMIT` | `1g` | Memory limit per shared worker container (Docker size string). |
 | `QUEUE_AGENT_SUB_REPLICAS` | `2` | Sub-agent queue worker replicas (delegated agent jobs) |
 | `QUEUE_AGENT_SUB_CONCURRENCY` | `5` | Concurrent jobs per sub-agent worker |

@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 import httpx
 
+from .clients import guard_trace_context
 from .openai_provider import OpenAIProvider
 
 logger = logging.getLogger(__name__)
@@ -44,13 +45,13 @@ class GeminiProvider(OpenAIProvider):
         self._upload_root = f"{scheme_host}/upload/v1{api_path}"
 
     def _files_headers(self) -> dict[str, str]:
-        return {"x-goog-api-key": self.api_key or "", **self._context_headers()}
+        return {"x-goog-api-key": self.api_key or "", **self._request_headers()}
 
     async def _upload_batch_file(self, jsonl: bytes) -> str:
         """Upload via Google's resumable Files API; returns the file name
         (e.g. "files/abc123"), which the compat batches.create accepts as
         input_file_id."""
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with guard_trace_context(httpx.AsyncClient(timeout=120.0)) as client:
             start = await client.post(
                 f"{self._upload_root}/files",
                 headers={
@@ -79,7 +80,7 @@ class GeminiProvider(OpenAIProvider):
 
     async def _download_batch_file(self, file_id: str) -> str:
         """Download a generated batch result file via the Files API."""
-        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
+        async with guard_trace_context(httpx.AsyncClient(timeout=300.0, follow_redirects=True)) as client:
             resp = await client.get(
                 f"{self._files_root}/{file_id}:download",
                 params={"alt": "media"},

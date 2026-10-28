@@ -28,6 +28,8 @@ DIMENSIONS: dict[str, Any] = {
     "source": LLMUsage.source,
     "chat": LLMUsage.chat_id,
     "batch": LLMUsage.batch,
+    # USAGE_CUSTOMER_FIELD of the user each call was for (NULL: none)
+    "customer": LLMUsage.customer,
     "day": func.date_trunc(literal_column("'day'"), _UTC_CREATED),
     "hour": func.date_trunc(literal_column("'hour'"), _UTC_CREATED),
 }
@@ -55,6 +57,7 @@ class UsageFilters:
     user_ids: list[uuid.UUID] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     chat_ids: list[uuid.UUID] = field(default_factory=list)
+    customers: list[str] = field(default_factory=list)
     own_user_id: Optional[uuid.UUID] = None
 
     def window(self, *, bounded: bool) -> tuple[Optional[datetime], datetime]:
@@ -81,6 +84,7 @@ class UsageFilters:
             (LLMUsage.user_id, self.user_ids),
             (LLMUsage.source, self.sources),
             (LLMUsage.chat_id, self.chat_ids),
+            (LLMUsage.customer, self.customers),
         ):
             if len(values) == 1:
                 clauses.append(column == values[0])
@@ -274,11 +278,14 @@ async def calls(
             .limit(limit + 1)
         )
     ).scalars().all()
+    # Who made each call, as the summary's user groups name them.
+    emails = await _user_emails(db, {str(r.user_id) for r in rows[:limit] if r.user_id})
     items = [
         {
             "id": str(r.id),
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "user_id": str(r.user_id) if r.user_id else None,
+            "user_email": emails.get(str(r.user_id)) if r.user_id else None,
             "chat_id": str(r.chat_id) if r.chat_id else None,
             "message_id": str(r.message_id) if r.message_id else None,
             "agent": r.agent,
@@ -297,6 +304,9 @@ async def calls(
             "streamed": r.streamed,
             "latency_ms": r.latency_ms,
             "error": r.error,
+            "finish_reason": r.finish_reason,
+            "finish_reason_raw": r.finish_reason_raw,
+            "customer": r.customer,
         }
         for r in rows[:limit]
     ]

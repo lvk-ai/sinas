@@ -13,8 +13,10 @@ from opentelemetry import trace
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.telemetry import attached, extract_trace_context, otel_attr
+from app.core.telemetry import attached, extract_trace_context, otel_attr, traced_job
 from app.models.execution import Execution, ExecutionStatus
+from app.providers.tracking import collect_usage
+from app.services.deferred_completions import ROUND_SUSPENDED
 from app.services.queue_service import JOB_STATUS_PREFIX, JOB_TTL
 
 logger = logging.getLogger(__name__)
@@ -22,22 +24,69 @@ logger = logging.getLogger(__name__)
 PING_INTERVAL = 15  # seconds between keep-alive pings
 
 
+def _failure_fields(error: BaseException) -> dict[str, Any]:
+    """A failed job's error for its status record and its parent's report:
+    `error`, and the error envelope's `error_code`, `retryable` and (when
+    the model API answered) `upstream_status` (app/providers/errors.py)."""
+    from app.providers.errors import failure_fields
+
+    return failure_fields(error)
+
+
+# What a job that was cancelled, or ran out of its job_timeout, reports.
+_TIMED_OUT = "Job cancelled or timed out"
+
+
+def _timed_out_error():
+    from app.providers.errors import JOB_TIMEOUT, LLMError
+
+    return LLMError(JOB_TIMEOUT, _TIMED_OUT)
+
+
 def _acting_as_job_key(job):
     """Run an agent job through the API key its request came in on (if any):
-    its tools then check the key's permissions, as in the request itself."""
+    its tools then check the key's permissions, as in the request itself.
+    The job also carries that request's attribution context (chats, pipeline
+    runs and component pages it starts are attributed as the request's
+    would be): the one it was enqueued with, else the key's own."""
     import functools
 
-    from app.core.auth import bind_api_key, reset_api_key
+    from app.core.auth import (
+        bind_api_key,
+        bind_credential_context,
+        reset_api_key,
+        reset_credential_context,
+    )
 
     @functools.wraps(job)
     async def wrapper(ctx: dict, **kwargs: Any) -> None:
         token = bind_api_key(kwargs.get("api_key_id"))
+        context = kwargs.get("credential_context")
+        if context is None and kwargs.get("api_key_id"):
+            context = await _stored_key_context(kwargs["api_key_id"])
+        context_token = bind_credential_context(context)
         try:
             return await job(ctx, **kwargs)
         finally:
+            reset_credential_context(context_token)
             reset_api_key(token)
 
     return wrapper
+
+
+async def _stored_key_context(api_key_id: str) -> Optional[dict[str, Any]]:
+    """An API key's stored attribution context, for a job enqueued without
+    one (a wakeup, a watch, an MCP task delivered from a stored key id)."""
+    from app.core.database import AsyncSessionLocal
+    from app.models.user import APIKey
+
+    try:
+        async with AsyncSessionLocal() as db:
+            key = await db.get(APIKey, uuid_lib.UUID(str(api_key_id)))
+            return key.context if key is not None else None
+    except Exception as e:
+        logger.warning(f"Could not read the context of API key {api_key_id}: {e}")
+        return None
 
 
 def agent_job_timeout_ceiling() -> int:
@@ -78,8 +127,10 @@ def _within_job_timeout(
         # The chat lock the job takes lives as long as the job may run.
         token = chat_steering.current_job_timeout.set(seconds)
         try:
-            async with asyncio.timeout(seconds):
-                return await job(ctx, **kwargs)
+            # LLM call retries don't wait past it (app/services/llm_retry.py).
+            with chat_steering.job_deadline(seconds):
+                async with asyncio.timeout(seconds):
+                    return await job(ctx, **kwargs)
         finally:
             chat_steering.current_job_timeout.reset(token)
 
@@ -94,6 +145,15 @@ def _is_suspension_chunk(chunk: dict) -> bool:
     from app.services.deferred_completions import SUSPENSION_EVENT_TYPES
 
     return chunk.get("type") in SUSPENSION_EVENT_TYPES
+
+
+async def _usage_totals(collector) -> Optional[dict[str, Any]]:
+    """The LLM usage a job collected, or None (logged) if it can't be totalled."""
+    try:
+        return await collector.totals()
+    except Exception:
+        logger.exception("Failed to total the LLM usage of this job")
+        return None
 
 
 def _in_enqueued_context(
@@ -199,11 +259,19 @@ async def _requeue_when_busy(kwargs: dict, channel_id: str, enqueue, redis=None,
     return True
 
 
-async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db) -> bool:
+async def _stopped_by_interrupt(
+    chat_id: str, kwargs: dict, channel_id: str, db,
+    open_tool_calls: Optional[list[dict]] = None, rejected_ids: frozenset = frozenset(),
+) -> bool:
     """A continuation queued before an operator interrupt must not run on,
-    even though the running turn may have consumed the flag already."""
+    even though the running turn may have consumed the flag already.
+
+    `open_tool_calls`: the calls of a round that has no results yet (an
+    approval round); each is answered before the marker, so the assistant's
+    tool_calls are never left without matching results."""
     from app.models.chat import Message
     from app.services import chat_steering
+    from app.services.message_service import INTERRUPTED_TOOL_RESULT, REJECTED_TOOL_RESULT
     from app.services.stream_relay import stream_relay
 
     requested_at = await chat_steering.interrupt_requested_at(chat_id)
@@ -211,6 +279,16 @@ async def _stopped_by_interrupt(chat_id: str, kwargs: dict, channel_id: str, db)
     if requested_at is None or enqueued_at is None or float(enqueued_at) > requested_at:
         return False
     await chat_steering.consume_interrupt(chat_id)
+    for tc in open_tool_calls or []:
+        if tc.get("id"):
+            db.add(Message(
+                chat_id=chat_id, role="tool", tool_call_id=tc["id"], name=tc["function"]["name"],
+                content=REJECTED_TOOL_RESULT if tc["id"] in rejected_ids else INTERRUPTED_TOOL_RESULT,
+            ))
+    if open_tool_calls:
+        # Own transaction: created_at is the transaction's now(), so this
+        # orders the results before the marker.
+        await db.commit()
     db.add(Message(chat_id=chat_id, role="system", content=chat_steering.INTERRUPT_MARKER))
     await db.commit()
     await stream_relay.publish(channel_id, {"type": "interrupted", "content": chat_steering.INTERRUPT_MARKER})
@@ -324,6 +402,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
     ):
         _agent_output_parts: list[str] = []
         _suspended = False
+        _failed_turn: Optional[dict[str, Any]] = None
         try:
             async with AsyncSessionLocal() as db:
                 message_service = MessageService(db)
@@ -342,7 +421,18 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                         _agent_output_parts.append(chunk["content"])
                     if _is_suspension_chunk(chunk):
                         _suspended = True
+                    if chunk.get("type") == "error" and chunk.get("code"):
+                        _failed_turn = chunk
                     await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+
+            if _failed_turn is not None:
+                # The turn failed (a refused or failed LLM call, no provider,
+                # ...), already streamed as its error event with its code:
+                # the job fails with it, so its status, batch execution and
+                # parent delegation record the code too.
+                from app.providers.errors import LLMError
+
+                raise LLMError.from_event(_failed_turn)
 
             # Set agent output on the current span
             _agent_output = "".join(_agent_output_parts)
@@ -402,13 +492,14 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             logger.error(f"Agent message job {job_id} failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
 
-            # Publish error to stream
-            await stream_relay.publish_error(channel_id, str(e))
+            # Publish error to stream (a failed turn streamed its own already)
+            if _failed_turn is None:
+                await stream_relay.publish_failure(channel_id, e)
 
             # Update status
             await redis.set(
                 f"{JOB_STATUS_PREFIX}{job_id}",
-                json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+                json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
                 ex=JOB_TTL,
             )
 
@@ -426,7 +517,7 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
                     await on_child_complete(
                         pending_delegation_id,
                         parent_tool_call_id,
-                        json.dumps({"error": str(e), "chat_id": chat_id}),
+                        json.dumps({**_failure_fields(e), "chat_id": chat_id}),
                         user_token=user_token,
                     )
                 except Exception:
@@ -443,10 +534,10 @@ async def execute_agent_message_job(ctx: dict, **kwargs: Any) -> None:
             if not completed:
                 logger.warning(f"Agent message job {job_id} cancelled/timed out")
                 try:
-                    await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                    await stream_relay.publish_failure(channel_id, _timed_out_error())
                     await redis.set(
                         f"{JOB_STATUS_PREFIX}{job_id}",
-                        json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                        json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                         ex=JOB_TTL,
                     )
                 except Exception:
@@ -468,11 +559,9 @@ async def _persist_turn_error(chat_id: str, error: Exception) -> None:
     """
     from app.core.database import AsyncSessionLocal
     from app.models.chat import Message
+    from app.providers.errors import chat_error_content, turn_error
 
-    content = (
-        "An error occurred while processing your message. Please try again."
-        f"\n\nError: {str(error)[:300]}"
-    )
+    content = chat_error_content(turn_error(error))
     try:
         async with AsyncSessionLocal() as db:
             db.add(Message(chat_id=chat_id, role="assistant", content=content))
@@ -484,6 +573,7 @@ async def _persist_turn_error(chat_id: str, error: Exception) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@traced_job("agent.resume")
 @_within_job_timeout
 async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
     """
@@ -585,67 +675,83 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
                 if agent_obj:
                     status_templates = agent_obj.status_templates or {}
 
-            if approved:
-                # Continuations re-enter the loop, so they hold the chat lock
-                # like any other loop (waiting briefly for a running one).
-                from app.services import chat_steering
+            if not approved:
+                # Nothing in the round was allowed: every asked call of it is
+                # a rejected one (a job queued before rounds named none).
+                asked = await db.execute(
+                    select(PendingToolApproval.tool_call_id).where(
+                        PendingToolApproval.chat_id == pending_approval.chat_id,
+                        PendingToolApproval.message_id == pending_approval.message_id,
+                    )
+                )
+                rejected_tool_call_ids = list(dict.fromkeys([*rejected_tool_call_ids, *asked.scalars()]))
 
-                lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
-                if lock_token is None:
-                    # The approval is already resolved; giving up would strand
-                    # it. Come back when the running turn is done.
-                    if await _requeue_when_busy(
-                        kwargs, channel_id,
-                        lambda attempt: queue_service.enqueue_agent_resume(
-                            chat_id=chat_id, user_id=user_id, user_token=user_token,
-                            pending_approval_id=pending_approval_id, approved=approved,
-                            channel_id=channel_id, agent=base_fields.get("agent"),
-                            defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
-                            enqueued_at=kwargs.get("enqueued_at"),
-                            rejected_tool_call_ids=rejected_tool_call_ids,
-                            job_timeout=kwargs.get("job_timeout"),
-                        ),
-                        redis=redis, base_fields=base_fields,
-                    ):
-                        completed = True
-                    return
-                try:
-                    # Inside the release-protected block: a failure in the
-                    # stop check must not leave the chat locked.
-                    if await _stopped_by_interrupt(chat_id, kwargs, channel_id, db):
-                        completed = True
-                        return
-                    # Execute the approved tool calls and stream the LLM response
-                    async for chunk in message_service._handle_tool_calls(
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        user_token=user_token,
-                        messages=pending_approval.conversation_context["messages"],
-                        tool_calls=pending_approval.all_tool_calls,
-                        provider=pending_approval.conversation_context.get("provider"),
-                        model=pending_approval.conversation_context.get("model"),
-                        temperature=pending_approval.conversation_context.get("temperature", 0.7),
-                        max_tokens=pending_approval.conversation_context.get("max_tokens"),
-                        tools=pending_approval.conversation_context.get("tools", []),
-                        status_templates=status_templates,
+            # Approved or not, the round continues: approved calls run,
+            # rejected ones get a rejection result the model reacts to.
+            # Continuations re-enter the loop, so they hold the chat lock
+            # like any other loop (waiting briefly for a running one).
+            from app.services import chat_steering
+
+            lock_token = await chat_steering.acquire_chat_lock_wait(chat_id)
+            if lock_token is None:
+                # The approval is already resolved; giving up would strand
+                # it. Come back when the running turn is done.
+                if await _requeue_when_busy(
+                    kwargs, channel_id,
+                    lambda attempt: queue_service.enqueue_agent_resume(
+                        chat_id=chat_id, user_id=user_id, user_token=user_token,
+                        pending_approval_id=pending_approval_id, approved=approved,
+                        channel_id=channel_id, agent=base_fields.get("agent"),
+                        defer_seconds=_BUSY_RETRY_SECONDS, attempt=attempt,
+                        enqueued_at=kwargs.get("enqueued_at"),
                         rejected_tool_call_ids=rejected_tool_call_ids,
-                    ):
-                        if isinstance(chunk, dict):
-                            if _is_suspension_chunk(chunk):
-                                _suspended = True
-                            await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
-                finally:
-                    await chat_steering.release_chat_lock(chat_id, lock_token)
-            else:
-                # Nothing in the round was allowed: report each rejection.
-                for tc in pending_approval.all_tool_calls or []:
-                    if tc.get("id") in rejected_tool_call_ids or tc.get("id") == pending_approval.tool_call_id:
-                        await stream_relay.publish(channel_id, {
-                            "type": "tool_rejected",
-                            "tool_call_id": tc.get("id"),
-                            "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
-                            "function_name": tc.get("function", {}).get("name"),
-                        }, ttl=stream_ttl)
+                        job_timeout=kwargs.get("job_timeout"),
+                    ),
+                    redis=redis, base_fields=base_fields,
+                ):
+                    completed = True
+                return
+            try:
+                # Inside the release-protected block: a failure in the
+                # stop check must not leave the chat locked.
+                if await _stopped_by_interrupt(
+                    chat_id, kwargs, channel_id, db,
+                    open_tool_calls=pending_approval.all_tool_calls,
+                    rejected_ids=frozenset(rejected_tool_call_ids),
+                ):
+                    completed = True
+                    return
+                if not approved:
+                    for tc in pending_approval.all_tool_calls or []:
+                        if tc.get("id") in rejected_tool_call_ids:
+                            await stream_relay.publish(channel_id, {
+                                "type": "tool_rejected",
+                                "tool_call_id": tc.get("id"),
+                                "function_namespace": pending_approval.function_namespace if tc.get("id") == pending_approval.tool_call_id else "tool",
+                                "function_name": tc.get("function", {}).get("name"),
+                            }, ttl=stream_ttl)
+                # Run the approved calls, answer the rejected ones, and
+                # stream the LLM response
+                async for chunk in message_service._handle_tool_calls(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    messages=pending_approval.conversation_context["messages"],
+                    tool_calls=pending_approval.all_tool_calls,
+                    provider=pending_approval.conversation_context.get("provider"),
+                    model=pending_approval.conversation_context.get("model"),
+                    temperature=pending_approval.conversation_context.get("temperature", 0.7),
+                    max_tokens=pending_approval.conversation_context.get("max_tokens"),
+                    tools=pending_approval.conversation_context.get("tools", []),
+                    status_templates=status_templates,
+                    rejected_tool_call_ids=rejected_tool_call_ids,
+                ):
+                    if isinstance(chunk, dict):
+                        if _is_suspension_chunk(chunk):
+                            _suspended = True
+                        await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            finally:
+                await chat_steering.release_chat_lock(chat_id, lock_token)
 
         if _suspended:
             # The approved round suspended again (delegations or an ask_user
@@ -675,11 +781,11 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Traceback: {traceback.format_exc()}")
 
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e))
+        await stream_relay.publish_failure(channel_id, e)
 
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+            json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
             ex=JOB_TTL,
         )
 
@@ -691,10 +797,10 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
         if not completed:
             logger.warning(f"Agent resume job {job_id} cancelled/timed out")
             try:
-                await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                await stream_relay.publish_failure(channel_id, _timed_out_error())
                 await redis.set(
                     f"{JOB_STATUS_PREFIX}{job_id}",
-                    json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                    json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                     ex=JOB_TTL,
                 )
             except Exception:
@@ -703,6 +809,7 @@ async def execute_agent_resume_job(ctx: dict, **kwargs: Any) -> None:
 
 @_acting_as_job_key
 @_in_enqueued_context
+@traced_job("agent.delegate_resume")
 @_within_job_timeout
 async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
     """Continue a parent conversation suspended on sub-agent delegations.
@@ -825,26 +932,42 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                 completed = True
                 return
             message_service = MessageService(db)
-            async for chunk in message_service._stream_followup_after_tools(
-                chat_id=chat_id,
-                user_id=user_id,
-                user_token=user_token,
-                provider=context.get("provider"),
-                model=context.get("model"),
-                temperature=context.get("temperature", 0.7),
-                max_tokens=context.get("max_tokens"),
-                tools=context.get("tools", []),
-                status_templates=context.get("status_templates", {}),
-                depth=context.get("tool_iteration_depth", 0),
-                agent_label=context.get("agent_label"),
-                tool_summary="delegated sub-agent results",
-            ):
-                if isinstance(chunk, dict):
-                    if chunk.get("content"):
-                        _output_parts.append(chunk["content"])
-                    if _is_suspension_chunk(chunk):
-                        _suspended = True
-                    await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            # The LLM usage of this continuation rides on the event that ends
+            # it here (done, or round_suspended), for a caller following the
+            # channel synchronously (a waited answer, an inline turn waiting
+            # on a background run) to add to its own `usage`. round_suspended
+            # is the round's last event: it is held back until the round is
+            # over so it can carry the total.
+            held_suspension = None
+            with collect_usage() as usage_collector:
+                async for chunk in message_service._stream_followup_after_tools(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_token=user_token,
+                    provider=context.get("provider"),
+                    model=context.get("model"),
+                    temperature=context.get("temperature", 0.7),
+                    max_tokens=context.get("max_tokens"),
+                    tools=context.get("tools", []),
+                    status_templates=context.get("status_templates", {}),
+                    depth=context.get("tool_iteration_depth", 0),
+                    agent_label=context.get("agent_label"),
+                    tool_summary="delegated sub-agent results",
+                ):
+                    if isinstance(chunk, dict):
+                        if chunk.get("content"):
+                            _output_parts.append(chunk["content"])
+                        if _is_suspension_chunk(chunk):
+                            _suspended = True
+                        if chunk.get("type") == ROUND_SUSPENDED:
+                            held_suspension = chunk
+                            continue
+                        await stream_relay.publish(channel_id, chunk, ttl=stream_ttl)
+            run_usage = await _usage_totals(usage_collector)
+            if held_suspension is not None:
+                await stream_relay.publish(
+                    channel_id, {**held_suspension, "usage": run_usage}, ttl=stream_ttl
+                )
 
         if _suspended:
             # Suspended again on a further round of pending completions —
@@ -858,7 +981,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
             logger.info(f"Delegate-resume job {job_id} suspended again on delegation")
             return
 
-        await stream_relay.publish_done(channel_id)
+        await stream_relay.publish_done(channel_id, usage=run_usage)
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
             json.dumps({**base_fields, "status": "completed"}),
@@ -894,10 +1017,10 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         logger.error(f"Delegate-resume job {job_id} failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         await _persist_turn_error(chat_id, e)
-        await stream_relay.publish_error(channel_id, str(e))
+        await stream_relay.publish_failure(channel_id, e)
         await redis.set(
             f"{JOB_STATUS_PREFIX}{job_id}",
-            json.dumps({**base_fields, "status": "failed", "error": str(e)}),
+            json.dumps({**base_fields, "status": "failed", **_failure_fields(e)}),
             ex=JOB_TTL,
         )
         if execution_id:
@@ -911,7 +1034,7 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
                 await on_child_complete(
                     parent_pending_delegation_id,
                     parent_tool_call_id,
-                    json.dumps({"error": str(e), "chat_id": chat_id}),
+                    json.dumps({**_failure_fields(e), "chat_id": chat_id}),
                     user_token=user_token,
                 )
             except Exception:
@@ -929,10 +1052,10 @@ async def execute_agent_delegate_resume_job(ctx: dict, **kwargs: Any) -> None:
         if not completed:
             logger.warning(f"Delegate-resume job {job_id} cancelled/timed out")
             try:
-                await stream_relay.publish_error(channel_id, "Job cancelled or timed out")
+                await stream_relay.publish_failure(channel_id, _timed_out_error())
                 await redis.set(
                     f"{JOB_STATUS_PREFIX}{job_id}",
-                    json.dumps({**base_fields, "status": "failed", "error": "Job cancelled or timed out"}),
+                    json.dumps({**base_fields, "status": "failed", **_failure_fields(_timed_out_error())}),
                     ex=JOB_TTL,
                 )
             except Exception:

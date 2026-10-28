@@ -353,6 +353,7 @@ DEFAULT_ROLE_PERMISSIONS = {
         # API Keys (non-namespaced)
         "sinas.api_keys.create:own": True,
         "sinas.api_keys.read:own": True,
+        "sinas.api_keys.update:own": True,  # Rename or re-scope own keys (capped by the owner)
         "sinas.api_keys.delete:own": True,
         # Templates (namespaced: namespace/name)
         "sinas.templates/*/*.create:own": True,  # Create templates in any namespace

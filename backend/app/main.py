@@ -16,6 +16,7 @@ from app.core.auth import initialize_default_roles, initialize_superadmin, warn_
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.templates import initialize_default_templates
 from app.core.config import settings
+from app.core.telemetry import fastapi_telemetry_config
 from app.middleware.request_logger import RedactQueryTokensFilter, RequestLoggerMiddleware
 from app.middleware.trace_context import TraceContextMiddleware
 from app.services.clickhouse_logger import clickhouse_logger
@@ -54,9 +55,11 @@ async def lifespan(app: FastAPI):
     await redis.ping()
     print("✅ Redis connection established")
 
-    # Initialize OpenTelemetry (no-op if disabled)
+    # OpenTelemetry (off unless OTEL_ENABLED): request spans come from
+    # FastAPI's native support (telemetry= below), on this provider.
     from app.core.telemetry import init_telemetry
-    init_telemetry()
+
+    init_telemetry("all-in-one" if settings.all_in_one else "backend")
 
     # --- Idempotent tasks: safe on all replicas ---
 
@@ -136,6 +139,10 @@ async def lifespan(app: FastAPI):
     await clickhouse_logger.aclose()
     await close_redis()
 
+    from app.core.telemetry import flush_telemetry
+
+    flush_telemetry()
+
 
 
 # Create main application with runtime API documentation
@@ -146,6 +153,7 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url=None,  # We'll create custom docs endpoint
     openapi_url=None,  # We'll create custom OpenAPI endpoint
+    telemetry=fastapi_telemetry_config(),
 )
 
 app.add_middleware(
@@ -156,7 +164,7 @@ app.add_middleware(
     allow_headers=["*"],
     # Pagination headers (GET /chats) must be readable by browser clients
     # on another origin, such as the console's dev server.
-    expose_headers=["X-Next-Cursor", "Link"],
+    expose_headers=["X-Next-Cursor", "Link", "X-Truncated"],
 )
 
 # Add request logging middleware
@@ -189,6 +197,7 @@ management_app = FastAPI(
     docs_url="/docs",
     openapi_url="/openapi.json",
     servers=_servers,
+    telemetry=fastapi_telemetry_config(),
 )
 
 # Include management routes in sub-app
@@ -205,6 +214,7 @@ adapters_openai_app = FastAPI(
     docs_url="/docs",
     openapi_url="/openapi.json",
     servers=_servers,
+    telemetry=fastapi_telemetry_config(),
 )
 
 adapters_openai_app.add_middleware(
@@ -224,6 +234,16 @@ app.mount("/adapters/openai", adapters_openai_app)
 
 # Include runtime API routes (root level)
 app.include_router(runtime_router)
+
+# A failed LLM call or agent turn (budget_exceeded, rate_limited,
+# provider_unavailable, ...) answers with its own status and the error
+# envelope, on every app; in OpenAI's error format on the OpenAI-compatible
+# adapter (app/providers/errors.py).
+from app.providers.errors import install_error_handler
+
+for _api in (app, management_app):
+    install_error_handler(_api)
+install_error_handler(adapters_openai_app, openai_format=True)
 
 # Console SPA served from this process (lite profile — replaces the console
 # container). app.frontend() is only consulted when no API route matched, so
@@ -273,4 +293,5 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Trusted proxies come from FORWARDED_ALLOW_IPS, as with the CLI.
+    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=True)

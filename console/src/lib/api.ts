@@ -1,5 +1,8 @@
 import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios';
 import { chatListParams, type ChatListFilter, type ChatListPage } from './chatPages';
+import { configApplyBody, type ConfigApplyOptions, type ConfigApplyResponse } from './configApply';
+import { usageCallsParams, type UsageCallsOptions } from './usage';
+import type { APIKeyUpdate } from './apiKeyEdit';
 import type {
   AdminCreateResetLinkResponse,
   RetentionPreview,
@@ -26,6 +29,10 @@ import type {
   ChatWithMessages,
   Message,
   MessageSendRequest,
+  PendingInputAnswerResponse,
+  PendingInputResponse,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
   Agent,
   AgentCreate,
   AgentUpdate,
@@ -106,6 +113,7 @@ import type {
   SsoProvider,
   SsoExchangeResponse,
   PackageCatalogEntry,
+  UsageCallsPage,
   UsageDimension,
   UsageFilters,
   UsageSummary,
@@ -400,6 +408,12 @@ class APIClient {
     await this.configClient.delete(`/api-keys/${keyId}`);
   }
 
+  /** Edit a key in place (no rotation): send only what changed. */
+  async updateAPIKey(keyId: string, data: APIKeyUpdate): Promise<APIKey> {
+    const response = await this.configClient.patch(`/api-keys/${keyId}`, data);
+    return response.data;
+  }
+
   // Chats (Runtime API)
   /** One page of the caller's chats, newest first; `nextCursor` is null on the last page. */
   async listChatsPage(
@@ -436,6 +450,39 @@ class APIClient {
   /** Stop the chat's running agent loop at its next step (cooperative). */
   async interruptChat(chatId: string): Promise<{ interrupted: boolean; was_running: boolean }> {
     const response = await this.runtimeClient.post(`/chats/${chatId}/interrupt`);
+    return response.data;
+  }
+
+  /** Decide an asked tool call. `resume` is "waiting" until the round's last
+   *  decision; the resuming one returns the stream channel to follow. */
+  async approveToolCall(
+    chatId: string,
+    toolCallId: string,
+    data: ToolApprovalRequest,
+  ): Promise<ToolApprovalResponse> {
+    const response = await this.runtimeClient.post(
+      `/chats/${chatId}/approve-tool/${encodeURIComponent(toolCallId)}`,
+      data,
+    );
+    return response.data;
+  }
+
+  /** The ask_user questions the chat is suspended on. */
+  async listPendingInputs(chatId: string): Promise<PendingInputResponse[]> {
+    const response = await this.runtimeClient.get(`/chats/${chatId}/pending-input`);
+    return response.data;
+  }
+
+  /** Answer an ask_user question; the answer becomes the call's tool result. */
+  async answerPendingInput(
+    chatId: string,
+    toolCallId: string,
+    answer: string,
+  ): Promise<PendingInputAnswerResponse> {
+    const response = await this.runtimeClient.post(
+      `/chats/${chatId}/pending-input/${encodeURIComponent(toolCallId)}`,
+      { answer },
+    );
     return response.data;
   }
 
@@ -1287,8 +1334,8 @@ class APIClient {
     return response.data;
   }
 
-  async applyConfig(config: string, dryRun: boolean = false, force: boolean = false): Promise<any> {
-    const response = await this.configClient.post('/config/apply', { config, dryRun, force });
+  async applyConfig(config: string, options: ConfigApplyOptions = {}): Promise<ConfigApplyResponse> {
+    const response = await this.configClient.post('/config/apply', configApplyBody(config, options));
     return response.data;
   }
 
@@ -1563,6 +1610,15 @@ class APIClient {
   async getUsageTimeseries(filters: UsageFilters, interval: 'hour' | 'day'): Promise<UsageTimeseries> {
     const response = await this.configClient.get('/usage/timeseries', {
       params: { ...filters, interval },
+      paramsSerializer: { indexes: null },
+    });
+    return response.data;
+  }
+
+  // Individual calls, newest first. read:own callers get only their own.
+  async getUsageCalls(filters: UsageFilters, options: UsageCallsOptions = {}): Promise<UsageCallsPage> {
+    const response = await this.configClient.get('/usage/calls', {
+      params: usageCallsParams(filters, options),
       paramsSerializer: { indexes: null },
     });
     return response.data;

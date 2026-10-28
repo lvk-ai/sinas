@@ -24,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.services.executor.base import ExecutionResult
+from app.services.executor.base import ExecutionResult, ExecutorUnavailable, before_run
 
 logger = logging.getLogger(__name__)
 
@@ -59,23 +59,28 @@ class DockerEphemeralSandboxExecutor:
             remove_ephemeral_container,
         )
 
-        result = await db.execute(
-            select(Function).where(
-                Function.namespace == function_namespace,
-                Function.name == function_name,
-                Function.is_active == True,
+        async with before_run("Loading the function"):
+            result = await db.execute(
+                select(Function).where(
+                    Function.namespace == function_namespace,
+                    Function.name == function_name,
+                    Function.is_active == True,
+                )
             )
-        )
-        function = result.scalar_one_or_none()
+            function = result.scalar_one_or_none()
         if not function:
             return ExecutionResult.failed(
                 f"Function {function_namespace}/{function_name} not found"
             )
 
         effective_timeout = timeout or settings.function_timeout
-        client, container, name = await create_ephemeral_container(
-            db, execution_id=execution_id
-        )
+        try:
+            client, container, name = await create_ephemeral_container(
+                db, execution_id=execution_id
+            )
+        except Exception as e:
+            # The container never came up, so the code never ran.
+            raise ExecutorUnavailable(f"Sandbox container failed to start: {e}") from e
         try:
             payload = {
                 "action": "execute_inline",

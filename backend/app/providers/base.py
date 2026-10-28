@@ -41,6 +41,13 @@ class BaseLLMProvider(ABC):
         # use for; on for a gateway that records it, such as a LiteLLM proxy.
         # Set from the provider's config (`propagate_context`).
         self.propagate_context = False
+        # The provider's header templates, rendered for this call's identity
+        # (app/providers/attribution.py). Sent on every request, over any
+        # other header of the same name.
+        self.identity_headers: dict[str, str] = {}
+        # The provider's own budget refusal rules (`config.budget_errors`,
+        # app/providers/errors.py), for the SDK client's no-retry hook.
+        self.budget_rules: list[dict[str, Any]] = []
 
     def _context_headers(self) -> dict[str, str]:
         """The headers that carry the current trace context, when enabled."""
@@ -62,17 +69,44 @@ class BaseLLMProvider(ABC):
 
         return {**headers, CONTEXT_OPT_IN_HEADER: "1"}
 
+    def _request_headers(self) -> dict[str, str]:
+        """Every header Sinas adds to a request sent over plain HTTP (not
+        through an SDK client, but through a client guarded the same way):
+        the trace context, when enabled and marked for the guard, and the
+        identity headers."""
+        from .attribution import merge_headers
+
+        return merge_headers(self._sdk_context_headers(), self.identity_headers)
+
+    def _sdk_request_headers(self) -> dict[str, str]:
+        """`_request_headers` for a call through an SDK client: the trace
+        context marked for the client's guard, and the budget rules for its
+        no-retry hook (private headers the hooks take off again)."""
+        from .attribution import merge_headers
+
+        private: dict[str, str] = {}
+        if self.budget_rules:
+            import json
+
+            from .clients import BUDGET_RULES_HEADER
+
+            private[BUDGET_RULES_HEADER] = json.dumps(self.budget_rules, separators=(",", ":"))
+        return merge_headers(self._sdk_context_headers(), private, self.identity_headers)
+
     def _add_context_headers(self, call_kwargs: dict[str, Any]) -> None:
-        """Add the current trace context to an SDK call's `extra_headers`, in
-        place, when enabled.
+        """Add Sinas's headers (`_sdk_request_headers`) to an SDK call's
+        `extra_headers`, in place, over any of the same name already there
+        (from `extra_params`, say).
 
         For the keyword arguments of the call that sends a request, never for
-        a request body: the context travels as HTTP headers, and a body that
-        is sent as data (a batch item) would carry it as an unknown field.
+        a request body: they travel as HTTP headers, and a body that is sent
+        as data (a batch item) would carry them as unknown fields.
         """
-        headers = self._sdk_context_headers()
+        headers = self._sdk_request_headers()
         if headers:
-            call_kwargs["extra_headers"] = {**(call_kwargs.get("extra_headers") or {}), **headers}
+            from .attribution import merge_headers
+
+            call_kwargs["extra_headers"] = merge_headers(call_kwargs.get("extra_headers"), headers)
 
     @abstractmethod
     async def complete(
@@ -182,7 +216,8 @@ class BaseLLMProvider(ABC):
     #    "temperature": float, "max_tokens": Optional[int]}
     # Result item shape (output of fetch_batch_results):
     #   {"custom_id": str, "status": "succeeded"|"errored"|"cancelled"|"expired",
-    #    "content": Optional[str], "usage": Optional[dict], "error": Optional[str]}
+    #    "content": Optional[str], "usage": Optional[dict], "error": Optional[str],
+    #    "finish_reason": Optional[str]}  (the provider's own; when it reports one)
 
     async def submit_batch(self, requests: list[dict[str, Any]]) -> str:
         """Submit requests to the provider's batch API; returns the provider batch id."""

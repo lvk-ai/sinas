@@ -111,10 +111,16 @@ All function and agent executions are processed asynchronously through Redis-bas
 
 | Worker | Docker service | Queue | Concurrency | Retries |
 |---|---|---|---|---|
-| **Function workers** | `queue-worker` | `sinas:queue:functions` | 10 jobs/worker | Up to 3 |
+| **Function workers** | `queue-worker` | `sinas:queue:functions` | 10 jobs/worker | Infrastructure failures up to 3; the function's own failures only if it opts in (`max_retries`) |
 | **Agent workers** | `queue-agent` | `sinas:queue:agents` | 5 jobs/worker | None (not idempotent) |
 
-**Function workers** dequeue function execution jobs, route them to either sandbox or shared containers, track results in Redis, and handle retries. Failed jobs that exhaust retries are moved to a **dead letter queue** (DLQ) for inspection and manual retry.
+**Function workers** dequeue function execution jobs, route them to either sandbox or shared containers, track results in Redis, and handle retries. A failure of the infrastructure before the code ran (no worker, a container or pod that would not start, the database unreachable) is retried with exponential backoff; a failure of the function's own code is final unless the function opts in with `max_retries`, since functions may have side effects. A job whose retryable failure runs out of attempts — or that waited longer than `QUEUE_SATURATION_TIMEOUT_SECONDS` for a shared-pool slot — is moved to the **dead letter queue** (DLQ) for inspection and requeue. Waiting for a pool slot never counts as a failed attempt. See [Failures and retries](/build-resources/functions#failures-and-retries).
+
+```
+GET  /api/v1/queue/dlq                   # Dead-lettered jobs: error, error_type, attempts, failed_at
+POST /api/v1/queue/dlq/{job_id}/retry    # Requeue (same execution id, fresh retry budget); 409 if already queued
+POST /api/v1/queue/dlq/flush             # Drop all entries
+```
 
 **Agent workers** handle chat message processing — they call the LLM, execute tool calls, and stream responses back via Redis Streams. Agent jobs don't retry because LLM calls with tool execution have side effects.
 
@@ -249,8 +255,8 @@ ALLOWED_PACKAGES=requests,pandas,numpy,redis,boto3
 | `QUEUE_AGENT_REPLICAS` | 2 | Agent queue worker processes |
 | `QUEUE_FUNCTION_CONCURRENCY` | 10 | Concurrent jobs per function worker |
 | `QUEUE_AGENT_CONCURRENCY` | 5 | Concurrent jobs per agent worker |
-| `QUEUE_MAX_RETRIES` | 3 | Retry attempts before DLQ |
-| `QUEUE_RETRY_DELAY` | 10 | Seconds between retries |
+| `QUEUE_MAX_RETRIES` | 3 | Retries of a function job whose infrastructure failed before the code ran, before it is dead-lettered |
+| `QUEUE_RETRY_DELAY` | 10 | First retry delay in seconds; doubles per failed attempt, capped at 5 minutes, plus jitter |
 | `QUEUE_POLL_DELAY` | 0.05 | Seconds between an idle worker's checks for new jobs |
 
 **Packages:**

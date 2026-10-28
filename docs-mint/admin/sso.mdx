@@ -40,6 +40,7 @@ In the console: **Admin → Single Sign-On → Add provider**.
 | Email claim | Where the email is, default `email`. |
 | Groups claim | Where the groups are, default `groups`. A path: `realm_access.roles` looks inside `realm_access`; a namespaced claim like `https://example.com/roles` is found as one key. |
 | Role mappings | Rules: **Group is** `<value>` or **Email domain is** `<domain>` → Sinas roles. |
+| Claim mappings | Claim path → custom field, synced at every sign-in (see [Claim mappings](#claim-mappings)). |
 | Allowed email domains | Only these domains may sign in with this provider. Empty: any. |
 | Required for domains | These domains must use this provider (see [Requiring SSO](#requiring-sso)). |
 | Create unknown users / Default role | See above. The default role is given once, when the user is created. |
@@ -56,6 +57,49 @@ It is built from `DOMAIN`. After signing in, the browser lands on the console at
 ### Role sync
 
 At every SSO sign-in, Sinas adds the roles the user's groups map to, and removes roles **this provider** granted earlier that no longer map. Roles an administrator gave by hand, roles from config, and roles from another provider are never touched, even when a mapping names the same role. A membership granted by a provider carries its source (`"source": "idp:<name>"` in `GET /api/v1/roles/{name}/members`). An administrator who re-adds a membership by hand makes it a manual one, which sync then leaves alone.
+
+### Claim mappings
+
+**Claim mappings** copy claims from the provider into the user's [custom fields](/admin/users-roles), at every sign-in: an organization id for [usage per customer](/admin/usage-cost#cost-per-customer) and [gateway attribution](/admin/llm-gateway-attribution), a department for a query's `{{user.custom_fields.department}}`, and so on.
+
+```yaml
+identityProviders:
+  - name: workos
+    # ...
+    claimMappings:
+      - claim: org_id                       # a claim path, like groupsClaim
+        field: orgId                        # the custom field it lands in
+      - claim: https://example.com/plan     # a namespaced claim, as one key
+        field: plan
+```
+
+- **claim** is a path into the verified ID token's claims, filled in from the userinfo response when the ID token lacks one: `org_id`, `organization.id` (inside `organization`), or a namespaced claim like `https://example.com/org_id`, found as one key.
+- **field** is the custom field name: letters, digits and `_`, not starting with a digit. One mapping per field.
+- **target** is `user` (the default: a custom field, as described here) or `session`: the value goes into this login's [session context](/admin/llm-gateway-attribution#several-organizations-per-user-session-context) instead, carried by the tokens of this login only. Use it for a claim that says what the session is for, such as the organization chosen at sign-in (WorkOS `org_id`, Auth0 `org_id`), and a `user` mapping for the list of organizations the user belongs to, for the membership check:
+
+```yaml
+    claimMappings:
+      - claim: org_id
+        field: orgId
+        target: session      # this login's organization
+      - claim: organizations
+        field: orgs          # all of the user's, for ATTRIBUTION_MEMBERSHIPS=orgId:orgs
+```
+- A string, number or boolean is copied as it is; a list of them as a list, except a one-item list, which is copied as its item (a single organization in a list claim reads as that organization). Objects, empty values and strings longer than 1024 characters aren't copied.
+
+A mapped field belongs to the provider: it is set at every sign-in, and **removed when the claim is absent**, so a value the provider stopped sending doesn't linger. Fields no mapping names, set by an administrator or by token exchange, are never touched. When you remove a mapping, the field it set is cleared at the user's next sign-in, unless someone changed its value since.
+
+Chats already running keep the [attribution snapshot](/admin/llm-gateway-attribution#the-attribution-snapshot) they took when they were created; a sign-in that changes a field applies to the chats started after it.
+
+Where common providers put an organization:
+
+| Provider | Claim | Notes |
+|---|---|---|
+| WorkOS (AuthKit) | `org_id` | The organization chosen at sign-in. WorkOS documents it on the access token; check a decoded ID token (or the userinfo response) of your environment, and add it through a JWT template if it's missing there. Sinas reads only the ID token and userinfo. |
+| Auth0 | `org_id`, `org_name` | With Auth0 Organizations, on the ID token of an organization login. Any other value through a Post Login Action: `api.idToken.setCustomClaim("https://example.com/org_id", ...)`, mapped as `https://example.com/org_id`. |
+| Keycloak | `organization` | Keycloak 26 Organizations, with the `organization` client scope: a list of aliases (a one-item list is copied as its item). Or any user attribute through a **User Attribute** mapper with **Add to ID token** on, e.g. claim `org_id`. |
+| Entra ID | `tid` | The tenant id, for multi-tenant apps. Directory extension attributes appear as `extn.<name>` (or `extension_<app id>_<name>`) once added under *Token configuration*. |
+| Okta | your claim | Add a custom claim to the ID token on the authorization server, e.g. `org_id` from a user profile attribute. |
 
 ## Requiring SSO
 

@@ -156,6 +156,11 @@ class FileVersion(Base):
     # File properties
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     hash_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Hash of the bytes as the uploader sent them, before a content filter
+    # could rewrite them (hash_sha256 is of what was stored). Lets a retried
+    # upload be recognised as the same content (on_conflict='return_existing').
+    # NULL on versions written by other paths (agent tools, workbench).
+    source_hash_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Audit
     uploaded_by: Mapped[uuid_lib.UUID] = mapped_column(

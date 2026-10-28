@@ -168,6 +168,7 @@ export function FunctionEditor() {
     shared_pool: false,
     requires_approval: false,
     timeout: null as number | null,
+    max_retries: 0,
   });
 
   const [iconMode, setIconMode] = useState<'collection' | 'url'>('collection');
@@ -221,6 +222,7 @@ export function FunctionEditor() {
         shared_pool: func.shared_pool || false,
         requires_approval: func.requires_approval || false,
         timeout: func.timeout || null,
+        max_retries: func.max_retries ?? 0,
       });
     }
   }, [func, isNew]);
@@ -622,6 +624,24 @@ print(details["status"], details["output_data"])`,
                   placeholder="Default"
                   value={formData.timeout ?? ''}
                   onChange={(e) => setFormData({ ...formData, timeout: e.target.value ? parseInt(e.target.value, 10) : null })}
+                  className="w-32 px-3 py-1.5 bg-hover border border-line rounded-md text-gray-100 text-sm focus:ring-primary-500 focus:border-primary-500"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="max_retries" className="block text-sm font-medium text-gray-300">
+                  Retries on failure
+                </label>
+                <span className="block text-xs text-gray-500 mt-0.5 mb-1.5">
+                  Queued runs only: how often a failure of this function's own code is retried, with backoff, before the job goes to the dead-letter queue. Only for functions that are safe to run again. Infrastructure failures are retried regardless.
+                </span>
+                <input
+                  type="number"
+                  id="max_retries"
+                  min={0}
+                  max={10}
+                  value={formData.max_retries}
+                  onChange={(e) => setFormData({ ...formData, max_retries: e.target.value ? parseInt(e.target.value, 10) : 0 })}
                   className="w-32 px-3 py-1.5 bg-hover border border-line rounded-md text-gray-100 text-sm focus:ring-primary-500 focus:border-primary-500"
                 />
               </div>

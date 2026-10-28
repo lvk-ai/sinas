@@ -60,7 +60,7 @@ A webhook can trigger an agent directly, without a bridge function. The request 
 
 With a `session_key_template`, repeated events that render the same key continue the same conversation (like the `session_key` on `POST /agents/{ns}/{name}/invoke`) — e.g. all events for one Jira issue or one Slack thread share a chat. Without it, each delivery starts a fresh chat.
 
-- `sync` waits for the agent's reply and returns `{"success": true, "chat_id": ..., "reply": "..."}`
+- `sync` waits for the agent's reply and returns `{"success": true, "chat_id": ..., "reply": "...", "status": "completed"}`. When the turn doesn't finish in the request, `status` says why, as on [invoke](/build-resources/agents#when-the-agent-asks-or-waits), and the response adds `pending_inputs` and `channel_id`. `input_required` means the agent asked a question (`ask_user`), which the webhook owner can answer in the chat. `in_progress` means it is still working on background work. `injected` means the session's chat was busy, so the event was passed to the turn already running there. In all three, `reply` holds only what the agent said so far.
 - `async` returns `202` with `{"chat_id": ..., "job_id": ...}` — use this for provider webhooks
 - For authenticated webhooks the caller needs chat permission on the target agent (`sinas.agents/{ns}/{name}.chat`); unauthenticated webhooks run as the webhook owner
 - Deduplication works identically for both target types

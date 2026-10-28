@@ -7,7 +7,7 @@ from typing import Any, Optional
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from .base import BaseLLMProvider
-from .clients import guard_trace_context, secret_id, shared_client
+from .clients import guard_client, secret_id, shared_client
 
 
 def anthropic_client(
@@ -26,7 +26,7 @@ def anthropic_client(
     client = AsyncAnthropic(
         api_key=api_key,
         base_url=base_url,
-        http_client=guard_trace_context(http_client or DefaultAsyncHttpxClient()),
+        http_client=guard_client(http_client or DefaultAsyncHttpxClient()),
         **options,
     )
     telemetry = getattr(client, "open_telemetry", None)  # anthropic >= 1.14.0
@@ -274,6 +274,9 @@ class AnthropicProvider(BaseLLMProvider):
         output_tokens = 0
         cache_read_tokens = 0
         cache_write_tokens = 0
+        # The message's stop_reason (message_delta), repeated on the final
+        # chunk so the last finish_reason a consumer sees is the real one.
+        stop_reason = None
 
         async with self.client.messages.stream(**params) as stream:
             async for event in stream:
@@ -352,6 +355,7 @@ class AnthropicProvider(BaseLLMProvider):
                 elif event.type == "message_delta":
                     if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                         chunk_data["finish_reason"] = event.delta.stop_reason
+                        stop_reason = event.delta.stop_reason
                     usage = getattr(event, "usage", None)
                     if usage:
                         if getattr(usage, "output_tokens", None) is not None:
@@ -360,7 +364,7 @@ class AnthropicProvider(BaseLLMProvider):
                             input_tokens = usage.input_tokens
 
                 elif event.type == "message_stop":
-                    chunk_data["finish_reason"] = chunk_data["finish_reason"] or "stop"
+                    chunk_data["finish_reason"] = stop_reason or "stop"
                     # input_tokens excludes cache reads/writes; prompt_tokens
                     # includes them (see extract_usage).
                     prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
@@ -684,7 +688,7 @@ class AnthropicProvider(BaseLLMProvider):
                 {"custom_id": req["custom_id"], "params": self._build_batch_params(req)}
                 for req in requests
             ],
-            extra_headers=self._sdk_context_headers() or None,
+            extra_headers=self._sdk_request_headers() or None,
         )
         return batch.id
 
@@ -714,6 +718,7 @@ class AnthropicProvider(BaseLLMProvider):
                     block.text for block in message.content if block.type == "text"
                 )
                 item["usage"] = self.extract_usage(message)
+                item["finish_reason"] = getattr(message, "stop_reason", None)
             elif result_type == "errored":
                 item["error"] = str(entry.result.error)
             elif result_type == "expired":

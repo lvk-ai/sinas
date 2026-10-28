@@ -1,0 +1,67 @@
+---
+title: "LLM and Agent Errors"
+description: "The error envelope and stable codes for failed LLM calls and agent turns, and where they show"
+---
+
+When an LLM call fails, or an agent turn can't run, Sinas reports it with a stable **code** and tells you whether trying again could help. The same information shows on every surface: API answers, stream events, job records, sub-agent results and pipeline steps.
+
+## The envelope
+
+```json
+{
+  "detail": "rate_limited: LLM provider 'gateway' refused the call (rate limited, HTTP 429): ...",
+  "code": "rate_limited",
+  "retryable": true,
+  "upstream_status": 429,
+  "retry_after": 7.0
+}
+```
+
+| Field | |
+|---|---|
+| `detail` | What happened. It always starts with the code, so the code survives wherever only a message is kept. |
+| `code` | One of the codes below. |
+| `retryable` | Whether the same request may well succeed later, unchanged. |
+| `upstream_status` | The HTTP status the model API answered with. Only when it answered. |
+| `retry_after` | How long, in seconds, the model API asked to wait. Only when it said so. |
+
+## Codes
+
+| Code | HTTP status | Retryable | Meaning |
+|---|---|---|---|
+| `budget_exceeded` | 402 | no | A budget, quota or credit balance is exhausted. Never retried: not by the SDK, not by Sinas, not by a pipeline step. See [budget refusals](/admin/llm-gateway-attribution#budget-refusals). |
+| `rate_limited` | 429 | yes | Too many requests now (a 429 that isn't a budget refusal). |
+| `provider_auth_failed` | 502 | no | The model API rejected the provider's credentials (401 or 403). An admin should check the provider's API key. The model API's own message is never passed on: it can quote part of the key. |
+| `model_not_found` | 502 | no | The model API doesn't know the model (404): check the agent's model, or the provider's endpoint. |
+| `provider_unavailable` | 503 | yes | The model API answered with a 5xx, is overloaded, or could not be reached. |
+| `provider_timeout` | 504 | yes | The model API did not answer in time. |
+| `context_length_exceeded` | 422 | no | The conversation is too long for the model's context window. Start a new chat, or use a model with a larger window. |
+| `content_filtered` | 422 | no | The model API's content filter or safety system blocked the call. |
+| `invalid_request` | 502 | no | The model API rejected the request as invalid (a 400 or 422): usually the agent's or the provider's configuration, such as a parameter the model doesn't support. |
+| `streaming_required` | 502 | no | The SDK refuses to make a call this long without streaming. Lower the agent's `max_tokens`. |
+| `provider_not_configured` | 503 | no | There is no LLM provider (or no model) to run the agent with: none is configured, the agent's provider is inactive or incomplete, or neither the agent nor its provider names a model. |
+| `provider_error` | 502 | no | Any other error the model API answered with. |
+| `job_timeout` | 504 | no | The turn did not finish within its job timeout. |
+| `internal_error` | 500 | no | The turn failed for a reason that isn't the model API's. |
+
+## Where it shows
+
+- **API answers**: non-streaming sends (`POST /chats/{id}/messages`), agent invoke, sync webhooks, answers with `wait: true` and provider batch submission answer with the code's HTTP status and the envelope as the body. A retryable error the model API said to wait on carries a `Retry-After` header.
+- **Streams**: a failed turn ends on an `error` event whose data has the message under `error` (as before) and the envelope's fields beside it, for inline and queued (keep-alive, reconnect) streams alike. No `done` follows it.
+- **Queued turns**: the job's status record is `failed`, with `error`, `error_code`, `retryable` and, when the model API answered, `upstream_status`.
+- **Sub-agents**: a failed sub-agent's tool result for its parent has `error`, `error_code`, `retryable` and `upstream_status`, so the parent can tell a passing failure from a final one.
+- **Pipelines**: the failed agent step's summary has `errorCode`.
+- **The OpenAI-compatible adapter** (`/adapters/openai`) answers in OpenAI's error format, `{"error": {"message", "type", "code", "param", "retryable", "upstream_status"}}`, also as a `data:` line that ends a stream (OpenAI's SDKs raise it as an `APIError`).
+- **The chat**: a failed turn leaves an assistant reply saying why, starting with the code (`Error: provider_not_configured: No LLM provider is configured. ...`), also when the turn couldn't start at all, so the transcript never just stops.
+- **Usage**: the call's `llm_usage` row has `error` starting with the code, and `finish_reason: "error"`.
+
+## Retries
+
+The OpenAI and Anthropic SDKs retry a rate limit or a 5xx a couple of times, quickly, honoring a `Retry-After` header. On top of that, Sinas makes an agent turn's LLM calls (its first call, and the follow-up after every tool round) again when they fail with `rate_limited` or `provider_unavailable`:
+
+- after the wait the provider asked for: its `Retry-After` header, or the `RetryInfo.retryDelay` Gemini puts in its error body (also behind an OpenAI-compatible gateway), else a backoff of 2, 4, 8... seconds;
+- at most `LLM_RETRY_MAX_ATTEMPTS` calls (default 3; 1 turns it off) and `LLM_RETRY_MAX_WAIT_SECONDS` of waiting (default 90) per call, and never past the turn's job timeout. A wait that doesn't fit fails the call at once, with its code;
+- a stream only before it showed anything: a call that fails part-way through its answer is not made again, so nothing is shown twice;
+- never `budget_exceeded`, or any other code.
+
+The chat stays locked while the turn waits, and stream clients keep getting their keep-alive pings.

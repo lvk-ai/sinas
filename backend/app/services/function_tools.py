@@ -27,6 +27,7 @@ class FunctionToolConverter:
         enabled_functions: Optional[list[str]] = None,
         function_parameters: Optional[dict[str, dict[str, Any]]] = None,
         agent_input_context: Optional[dict[str, Any]] = None,
+        permissions: Optional[dict[str, bool]] = None,
     ) -> list[dict[str, Any]]:
         """
         Get functions and convert to OpenAI tools format.
@@ -37,6 +38,7 @@ class FunctionToolConverter:
             enabled_functions: List of "namespace/name" strings to include
             function_parameters: Pre-filled parameters with Jinja2 templates
             agent_input_context: Context for rendering Jinja2 templates
+            permissions: The user's effective permissions (looked up if None)
 
         Returns:
             List of tools in OpenAI format with pre-filled parameters
@@ -47,9 +49,14 @@ class FunctionToolConverter:
         if not enabled_functions:
             return tools
 
-        from app.services.resource_resolver import resolve_resource_refs
+        from app.services.resource_resolver import resolve_resource_refs, user_can
 
-        resolved = await resolve_resource_refs(db, enabled_functions, Function)
+        if permissions is None:
+            permissions = await get_effective_permissions(db, user_id)
+        # A wildcard offers only what the user may execute (execute_function_tool's check)
+        resolved = await resolve_resource_refs(
+            db, enabled_functions, Function, can_access=user_can(user_id, permissions, "execute")
+        )
 
         for function_ref, function in resolved:
 

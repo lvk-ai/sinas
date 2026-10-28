@@ -47,6 +47,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         include_object=include_object,
+        transaction_per_migration=True,
     )
 
     with context.begin_transaction():
@@ -66,6 +67,13 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             include_object=include_object,
+            # Commit after every revision. Without this an upgrade that spans
+            # several revisions runs them all in one transaction (up to the
+            # next autocommit_block), so the ACCESS EXCLUSIVE lock an early
+            # ADD COLUMN takes is held until the last of them has finished:
+            # live traffic on that table stalls for the whole window. Each
+            # revision still runs atomically on its own.
+            transaction_per_migration=True,
         )
 
         with context.begin_transaction():

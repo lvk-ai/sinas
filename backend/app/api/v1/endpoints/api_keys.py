@@ -19,6 +19,10 @@ from app.schemas.api_key import (
 
 router = APIRouter()
 
+# Setting an API key's attribution context explicitly (rather than inheriting
+# the creating session's). In no default role but the Admins' wildcard.
+ASSIGN_CONTEXT = "sinas.api_keys.assign_context:all"
+
 
 async def _roles_by_key(db: AsyncSession, key_ids: list) -> dict[str, list[APIKeyRoleRef]]:
     """Role refs for a set of API keys, one query."""
@@ -51,6 +55,7 @@ def _key_response(key: APIKey, roles: list[APIKeyRoleRef]) -> APIKeyResponse:
         expires_at=key.expires_at,
         created_at=key.created_at,
         revoked_at=key.revoked_at,
+        context=key.context or None,
     )
 
 
@@ -103,6 +108,24 @@ async def create_api_key(
                 status_code=400, detail=f"Unknown role ids: {', '.join(sorted(missing))}"
             )
 
+    # The key's attribution context: the creating session's (or key's), which
+    # the caller can't change; or one given explicitly, which only an admin
+    # holding sinas.api_keys.assign_context:all may (app/providers/attribution.py).
+    from app.core.auth import current_credential_context
+    from app.providers.attribution import validate_context
+
+    if request_data.context is not None:
+        if not check_permission(permissions, ASSIGN_CONTEXT):
+            set_permission_used(http_request, ASSIGN_CONTEXT, has_perm=False)
+            raise HTTPException(status_code=403, detail="Not authorized to set an API key's context")
+        set_permission_used(http_request, ASSIGN_CONTEXT)
+        try:
+            key_context = validate_context(request_data.context) or None
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+    else:
+        key_context = current_credential_context()
+
     # Generate API key
     plain_key, key_hash, key_prefix = generate_api_key()
 
@@ -116,6 +139,7 @@ async def create_api_key(
         expires_at=request_data.expires_at,
         is_active=True,
         created_by=user_id,
+        context=key_context,
     )
 
     db.add(api_key)
@@ -136,6 +160,7 @@ async def create_api_key(
         roles=[APIKeyRoleRef(id=r.id, name=r.name) for r in roles],
         expires_at=api_key.expires_at,
         created_at=api_key.created_at,
+        context=api_key.context or None,
     )
 
 
@@ -249,6 +274,21 @@ async def update_api_key(
     )
     set_permission_used(http_request, "sinas.api_keys.update")
 
+    # A key's attribution context is fixed for its users: only an admin
+    # holding sinas.api_keys.assign_context:all may change it (null clears).
+    new_context = None
+    if "context" in request_data.model_fields_set:
+        from app.providers.attribution import validate_context
+
+        if not check_permission(permissions, ASSIGN_CONTEXT):
+            set_permission_used(http_request, ASSIGN_CONTEXT, has_perm=False)
+            raise HTTPException(status_code=403, detail="Not authorized to change an API key's context")
+        set_permission_used(http_request, ASSIGN_CONTEXT)
+        try:
+            new_context = validate_context(request_data.context) or None
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     if request_data.permissions is not None and request_data.permissions:
         # Same mint-time guard as create: the updater cannot grant beyond
         # their own permissions (the live cap bounds requests regardless)
@@ -280,6 +320,8 @@ async def update_api_key(
         api_key.name = request_data.name
     if request_data.permissions is not None:
         api_key.permissions = request_data.permissions
+    if "context" in request_data.model_fields_set:
+        api_key.context = new_context
 
     await db.flush()
 

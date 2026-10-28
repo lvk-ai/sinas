@@ -1,4 +1,5 @@
 import type { AuthUser } from '@sinas/sdk';
+import type { ToolApprovals } from '../lib/toolApprovals';
 
 /**
  * Per-agent provider behaviour overrides. Absent key = inherit the provider's
@@ -119,6 +120,8 @@ export interface APIKey {
   last_used_at: string | null;
   expires_at: string | null;
   created_at: string;
+  /** Attribution context the key's requests carry (copied from the creating session, or set by an admin). */
+  context?: Record<string, string | number | boolean> | null;
 }
 
 export interface APIKeyCreate {
@@ -244,11 +247,36 @@ export interface ChatWithMessages extends Chat {
 // Tool Approvals
 export interface ToolApprovalRequest {
   approved: boolean;
+  /** Approve, and don't ask again for this tool in this chat (session grant). */
+  always_allow?: boolean;
 }
 
 export interface ToolApprovalResponse {
   status: string;  // "approved" | "rejected"
   tool_call_id: string;
+  channel_id?: string | null;
+  /** "waiting" until the round's last asked call is decided, then "queued". */
+  resume?: 'waiting' | 'queued';
+  message?: string;
+}
+
+/** An ask_user question the conversation is suspended on. */
+export interface PendingInputResponse {
+  tool_call_id: string;
+  question: string;
+  options?: string[] | null;
+  expires_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface PendingInputAnswerResponse {
+  status: string;  // "answered"
+  tool_call_id: string;
+  /** The answer was the round's last outstanding completion: it resumes on channel_id. */
+  resumed: boolean;
+  /** The resume could not be queued yet; it is retried on channel_id. */
+  resume_pending: boolean;
+  channel_id: string | null;
   message?: string;
 }
 
@@ -328,6 +356,8 @@ export interface Agent {
   /** Chat retention override in days: null = the deployment default, 0 = keep forever. */
   retention_days: number | null;
   system_tools: Array<string | { name: string; connections?: string[] }>;
+  /** Permission mode: which tool calls stop for approval. null = unset (run everything). */
+  tool_approvals?: ToolApprovals | null;
   created_at: string;
   updated_at: string;
 }
@@ -401,6 +431,8 @@ export interface AgentUpdate {
   /** null = the deployment default (on update: back to it), 0 = keep forever. */
   retention_days?: number | null;
   system_tools?: Array<string | { name: string; connections?: string[] }>;
+  /** Left out = unchanged (the API ignores null). */
+  tool_approvals?: ToolApprovals;
 }
 
 // Roles & Users
@@ -455,6 +487,7 @@ export interface Function {
   shared_pool: boolean;
   requires_approval: boolean;
   timeout: number | null;
+  max_retries: number;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -470,6 +503,7 @@ export interface FunctionCreate {
   icon?: string;
   shared_pool?: boolean;
   requires_approval?: boolean;
+  max_retries?: number;
 }
 
 export interface FunctionUpdate {
@@ -482,6 +516,7 @@ export interface FunctionUpdate {
   icon?: string;
   shared_pool?: boolean;
   requires_approval?: boolean;
+  max_retries?: number;
   is_active?: boolean;
 }
 
@@ -863,6 +898,14 @@ export interface RoleMapping {
   roles: string[];
 }
 
+/** Copies a claim (a dotted path) into a user custom field at every sign-in. */
+export interface ClaimMapping {
+  claim: string;
+  field: string;
+  /** 'session': into the login's session context instead of a custom field. */
+  target?: 'user' | 'session' | null;
+}
+
 export interface IdentityProvider {
   id: string;
   name: string;
@@ -874,6 +917,7 @@ export interface IdentityProvider {
   email_claim: string;
   groups_claim: string;
   role_mappings: RoleMapping[];
+  claim_mappings?: ClaimMapping[];
   allowed_domains: string[];
   auto_provision: boolean;
   default_role: string | null;
@@ -896,6 +940,7 @@ export interface IdentityProviderCreate {
   email_claim?: string;
   groups_claim?: string;
   role_mappings?: RoleMapping[];
+  claim_mappings?: ClaimMapping[];
   allowed_domains?: string[];
   auto_provision?: boolean;
   default_role?: string | null;
@@ -1018,7 +1063,8 @@ export interface UsageMetrics {
   errors: number;
 }
 
-export type UsageDimension = 'agent' | 'provider' | 'model' | 'user' | 'source' | 'chat' | 'batch' | 'day' | 'hour';
+export type UsageDimension =
+  | 'agent' | 'provider' | 'model' | 'user' | 'source' | 'chat' | 'batch' | 'customer' | 'day' | 'hour';
 
 export interface UsageFilters {
   from?: string;
@@ -1029,6 +1075,8 @@ export interface UsageFilters {
   user_id?: string[];
   source?: string[];
   chat_id?: string[];
+  /** The USAGE_CUSTOMER_FIELD custom field of the user a call was for. */
+  customer?: string[];
 }
 
 export interface UsageSummary {
@@ -1045,6 +1093,44 @@ export interface UsageTimeseries {
   to: string;
   interval: 'hour' | 'day';
   points: Array<UsageMetrics & { bucket: string }>;
+}
+
+// One LLM call (GET /usage/calls), as recorded
+export interface UsageCall {
+  id: string;
+  created_at: string | null;
+  user_id: string | null;
+  user_email?: string | null;
+  chat_id: string | null;
+  message_id: string | null;
+  agent: string | null;
+  source: string | null;
+  provider_name: string | null;
+  provider_type: string | null;
+  model: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number | null;
+  price_source: string | null;
+  batch: boolean | null;
+  streamed: boolean | null;
+  latency_ms: number | null;
+  error: string | null;
+  // Why generation stopped: stop | length | tool_calls | content_filter |
+  // error | other (null for older calls), and the provider's own value.
+  finish_reason?: string | null;
+  finish_reason_raw?: string | null;
+  customer?: string | null;
+}
+
+export interface UsageCallsPage {
+  items: UsageCall[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 export interface RatecardSource {
@@ -1348,6 +1434,8 @@ export interface FileUploadRequest {
   content_type: string;
   visibility?: string;
   file_metadata?: Record<string, any>;
+  /** What to do when the name is taken; the server defaults to 'rename'. */
+  on_conflict?: 'rename' | 'return_existing' | 'new_version' | 'error';
 }
 
 export interface FileDownloadResponse {

@@ -18,17 +18,23 @@ _CURRENT_KEY = object()
 
 def generate_component_render_token(
     namespace: str, name: str, user_id: str, expires_in: int = 3600,
-    api_key_id=_CURRENT_KEY,
+    api_key_id=_CURRENT_KEY, context=_CURRENT_KEY,
 ) -> str:
     """Generate a signed render token for a component.
 
     Made during a request or agent run that acts through an API key, it
     carries the key: the page then acts with the key's permissions, not the
-    owner's (pass api_key_id explicitly to override)."""
+    owner's (pass api_key_id explicitly to override). It also carries the
+    credential's attribution context, so chats the page starts are
+    attributed as the request's would be."""
     if api_key_id is _CURRENT_KEY:
         from app.core.auth import current_api_key_id
 
         api_key_id = current_api_key_id()
+    if context is _CURRENT_KEY:
+        from app.core.auth import current_credential_context
+
+        context = current_credential_context()
     payload = {
         "namespace": namespace,
         "name": name,
@@ -38,6 +44,8 @@ def generate_component_render_token(
     }
     if api_key_id:
         payload["api_key_id"] = str(api_key_id)
+    if context:
+        payload["context"] = context
     # Internal purpose tokens are pinned to HS256 regardless of JWT_ALGORITHM:
     # only Sinas itself verifies them, so asymmetric signing buys nothing.
     return jose_jwt.encode(payload, settings.secret_key, algorithm="HS256")
